@@ -6,7 +6,7 @@ use crate::{
     BackendElement, BackendKind, Bytes, Cols, Error, Length, Result, RopeExtParams, Rows, Shape2D,
     TensorExpr, TensorIndex, ThreadCount, Type,
 };
-use std::ffi::{CStr, CString, c_char};
+use std::ffi::{CStr, CString};
 use std::marker::PhantomData;
 use std::num::NonZeroUsize;
 use std::os::raw::c_int;
@@ -143,9 +143,8 @@ impl Backend {
     /// Returns the backend runtime name reported by ggml.
     pub fn name(&self) -> Result<&str> {
         let name = unsafe { ffi::ggml_backend_name(self.raw.as_ptr()) };
-        let name = NonNull::new(name.cast_mut()).ok_or(Error::NullPointer {
-            api: "ggml_backend_name",
-        })?;
+        let name = NonNull::new(name.cast_mut())
+            .ok_or_else(|| Error::null_pointer("ggml_backend_name"))?;
         let cstr = unsafe { CStr::from_ptr(name.as_ptr()) };
         cstr.to_str().map_err(|_| Error::InvalidBackendNameUtf8)
     }
@@ -223,7 +222,7 @@ impl Context {
         };
 
         let raw = unsafe { ffi::ggml_init(params) };
-        let raw = NonNull::new(raw).ok_or(Error::NullPointer { api: "ggml_init" })?;
+        let raw = NonNull::new(raw).ok_or_else(|| Error::null_pointer("ggml_init"))?;
 
         Ok(Self {
             raw,
@@ -231,20 +230,19 @@ impl Context {
         })
     }
 
-    fn wrap_tensor<'ctx>(
-        &'ctx self,
-        raw: *mut ffi::ggml_tensor,
-        api: &'static str,
-    ) -> Result<Tensor<'ctx>> {
-        wrap_tensor(self.raw, raw, api)
+    fn wrap_tensor<'ctx>(&'ctx self, raw: *mut ffi::ggml_tensor) -> Result<Tensor<'ctx>> {
+        Ok(Tensor {
+            raw: NonNull::new(raw)
+                .ok_or_else(|| Error::null_pointer("tensor-producing ggml op"))?,
+            _ctx: PhantomData,
+        })
     }
 
-    fn wrap_graph<'ctx>(
-        &'ctx self,
-        raw: *mut ffi::ggml_cgraph,
-        api: &'static str,
-    ) -> Result<Graph<'ctx>> {
-        wrap_graph(self.raw, raw, api)
+    fn wrap_graph<'ctx>(&'ctx self, raw: *mut ffi::ggml_cgraph) -> Result<Graph<'ctx>> {
+        Ok(Graph {
+            raw: NonNull::new(raw).ok_or_else(|| Error::null_pointer("graph-producing ggml op"))?,
+            _ctx: PhantomData,
+        })
     }
 
     /// Returns a conservative memory estimate for `f32` matmul on context path.
@@ -333,9 +331,8 @@ impl Context {
     pub fn allocate_tensors<'ctx>(&'ctx self, backend: &Backend) -> Result<BackendBuffer<'ctx>> {
         let raw =
             unsafe { ffi::ggml_backend_alloc_ctx_tensors(self.raw.as_ptr(), backend.raw.as_ptr()) };
-        let raw = NonNull::new(raw).ok_or(Error::NullPointer {
-            api: "ggml_backend_alloc_ctx_tensors",
-        })?;
+        let raw = NonNull::new(raw)
+            .ok_or_else(|| Error::null_pointer("ggml_backend_alloc_ctx_tensors"))?;
 
         // Buffer lifetime must stay tied to the originating context.
         Ok(BackendBuffer {
@@ -351,11 +348,20 @@ impl Context {
 
     /// Creates a 2D tensor using semantic shape newtypes.
     pub fn new_tensor_2d_shape(&self, ty: Type, shape: Shape2D) -> Result<Tensor<'_>> {
-        let cols = shape.cols.get().try_into_checked()?;
-        let rows = shape.rows.get().try_into_checked()?;
+        let cols = shape
+            .cols
+            .get()
+            .try_into_checked()
+            .map_err(|source| Error::int_conversion("tensor dimension", source))?;
+        let rows = shape
+            .rows
+            .get()
+            .try_into_checked()
+            .map_err(|source| Error::int_conversion("tensor dimension", source))?;
 
         let raw = unsafe { ffi::ggml_new_tensor_2d(self.raw.as_ptr(), ty.as_raw(), cols, rows) };
-        self.wrap_tensor(raw, "ggml_new_tensor_2d")
+        self.wrap_tensor(raw)
+            .map_err(|error| error.with_context("ggml_new_tensor_2d"))
     }
 
     pub fn new_f32_tensor_2d(&self, cols: usize, rows: usize) -> Result<Tensor<'_>> {
@@ -373,9 +379,13 @@ impl Context {
 
     /// Creates a 1D tensor with semantic `Length`.
     pub fn new_tensor_1d_len(&self, ty: Type, len: Length) -> Result<Tensor<'_>> {
-        let len = len.get().try_into_checked()?;
+        let len = len
+            .get()
+            .try_into_checked()
+            .map_err(|source| Error::int_conversion("tensor dimension", source))?;
         let raw = unsafe { ffi::ggml_new_tensor_1d(self.raw.as_ptr(), ty.as_raw(), len) };
-        self.wrap_tensor(raw, "ggml_new_tensor_1d")
+        self.wrap_tensor(raw)
+            .map_err(|error| error.with_context("ggml_new_tensor_1d"))
     }
 
     pub fn new_f32_tensor_1d(&self, len: usize) -> Result<Tensor<'_>> {
@@ -401,11 +411,18 @@ impl Context {
         ne1: usize,
         ne2: usize,
     ) -> Result<Tensor<'_>> {
-        let ne0 = (ne0).try_into_checked()?;
-        let ne1 = (ne1).try_into_checked()?;
-        let ne2 = (ne2).try_into_checked()?;
+        let ne0 = (ne0)
+            .try_into_checked()
+            .map_err(|source| Error::int_conversion("tensor dimension", source))?;
+        let ne1 = (ne1)
+            .try_into_checked()
+            .map_err(|source| Error::int_conversion("tensor dimension", source))?;
+        let ne2 = (ne2)
+            .try_into_checked()
+            .map_err(|source| Error::int_conversion("tensor dimension", source))?;
         let raw = unsafe { ffi::ggml_new_tensor_3d(self.raw.as_ptr(), ty.as_raw(), ne0, ne1, ne2) };
-        self.wrap_tensor(raw, "ggml_new_tensor_3d")
+        self.wrap_tensor(raw)
+            .map_err(|error| error.with_context("ggml_new_tensor_3d"))
     }
 
     pub fn new_tensor_4d(
@@ -416,13 +433,22 @@ impl Context {
         ne2: usize,
         ne3: usize,
     ) -> Result<Tensor<'_>> {
-        let ne0 = (ne0).try_into_checked()?;
-        let ne1 = (ne1).try_into_checked()?;
-        let ne2 = (ne2).try_into_checked()?;
-        let ne3 = (ne3).try_into_checked()?;
+        let ne0 = (ne0)
+            .try_into_checked()
+            .map_err(|source| Error::int_conversion("tensor dimension", source))?;
+        let ne1 = (ne1)
+            .try_into_checked()
+            .map_err(|source| Error::int_conversion("tensor dimension", source))?;
+        let ne2 = (ne2)
+            .try_into_checked()
+            .map_err(|source| Error::int_conversion("tensor dimension", source))?;
+        let ne3 = (ne3)
+            .try_into_checked()
+            .map_err(|source| Error::int_conversion("tensor dimension", source))?;
         let raw =
             unsafe { ffi::ggml_new_tensor_4d(self.raw.as_ptr(), ty.as_raw(), ne0, ne1, ne2, ne3) };
-        self.wrap_tensor(raw, "ggml_new_tensor_4d")
+        self.wrap_tensor(raw)
+            .map_err(|error| error.with_context("ggml_new_tensor_4d"))
     }
 
     pub fn mul_mat<'ctx>(&'ctx self, a: &Tensor<'ctx>, b: &Tensor<'ctx>) -> Result<Tensor<'ctx>> {
@@ -431,42 +457,50 @@ impl Context {
         ensure_matmul_compatible(a_cols, b_cols)?;
 
         let raw = unsafe { ffi::ggml_mul_mat(self.raw.as_ptr(), a.raw.as_ptr(), b.raw.as_ptr()) };
-        self.wrap_tensor(raw, "ggml_mul_mat")
+        self.wrap_tensor(raw)
+            .map_err(|error| error.with_context("ggml_mul_mat"))
     }
 
     pub fn add<'ctx>(&'ctx self, a: &Tensor<'ctx>, b: &Tensor<'ctx>) -> Result<Tensor<'ctx>> {
         let raw = unsafe { ffi::ggml_add(self.raw.as_ptr(), a.raw.as_ptr(), b.raw.as_ptr()) };
-        self.wrap_tensor(raw, "ggml_add")
+        self.wrap_tensor(raw)
+            .map_err(|error| error.with_context("ggml_add"))
     }
 
     pub fn sub<'ctx>(&'ctx self, a: &Tensor<'ctx>, b: &Tensor<'ctx>) -> Result<Tensor<'ctx>> {
         let raw = unsafe { ffi::ggml_sub(self.raw.as_ptr(), a.raw.as_ptr(), b.raw.as_ptr()) };
-        self.wrap_tensor(raw, "ggml_sub")
+        self.wrap_tensor(raw)
+            .map_err(|error| error.with_context("ggml_sub"))
     }
 
     pub fn mul<'ctx>(&'ctx self, a: &Tensor<'ctx>, b: &Tensor<'ctx>) -> Result<Tensor<'ctx>> {
         let raw = unsafe { ffi::ggml_mul(self.raw.as_ptr(), a.raw.as_ptr(), b.raw.as_ptr()) };
-        self.wrap_tensor(raw, "ggml_mul")
+        self.wrap_tensor(raw)
+            .map_err(|error| error.with_context("ggml_mul"))
     }
 
     pub fn div<'ctx>(&'ctx self, a: &Tensor<'ctx>, b: &Tensor<'ctx>) -> Result<Tensor<'ctx>> {
         let raw = unsafe { ffi::ggml_div(self.raw.as_ptr(), a.raw.as_ptr(), b.raw.as_ptr()) };
-        self.wrap_tensor(raw, "ggml_div")
+        self.wrap_tensor(raw)
+            .map_err(|error| error.with_context("ggml_div"))
     }
 
     pub fn silu<'ctx>(&'ctx self, a: &Tensor<'ctx>) -> Result<Tensor<'ctx>> {
         let raw = unsafe { ffi::ggml_silu(self.raw.as_ptr(), a.raw.as_ptr()) };
-        self.wrap_tensor(raw, "ggml_silu")
+        self.wrap_tensor(raw)
+            .map_err(|error| error.with_context("ggml_silu"))
     }
 
     pub fn rms_norm<'ctx>(&'ctx self, a: &Tensor<'ctx>, eps: f32) -> Result<Tensor<'ctx>> {
         let raw = unsafe { ffi::ggml_rms_norm(self.raw.as_ptr(), a.raw.as_ptr(), eps) };
-        self.wrap_tensor(raw, "ggml_rms_norm")
+        self.wrap_tensor(raw)
+            .map_err(|error| error.with_context("ggml_rms_norm"))
     }
 
     pub fn scale<'ctx>(&'ctx self, a: &Tensor<'ctx>, scalar: f32) -> Result<Tensor<'ctx>> {
         let raw = unsafe { ffi::ggml_scale(self.raw.as_ptr(), a.raw.as_ptr(), scalar) };
-        self.wrap_tensor(raw, "ggml_scale")
+        self.wrap_tensor(raw)
+            .map_err(|error| error.with_context("ggml_scale"))
     }
 
     pub fn get_rows<'ctx>(
@@ -477,27 +511,32 @@ impl Context {
         let raw = unsafe {
             ffi::ggml_get_rows(self.raw.as_ptr(), data.raw.as_ptr(), indices.raw.as_ptr())
         };
-        self.wrap_tensor(raw, "ggml_get_rows")
+        self.wrap_tensor(raw)
+            .map_err(|error| error.with_context("ggml_get_rows"))
     }
 
     pub fn repeat<'ctx>(&'ctx self, a: &Tensor<'ctx>, b: &Tensor<'ctx>) -> Result<Tensor<'ctx>> {
         let raw = unsafe { ffi::ggml_repeat(self.raw.as_ptr(), a.raw.as_ptr(), b.raw.as_ptr()) };
-        self.wrap_tensor(raw, "ggml_repeat")
+        self.wrap_tensor(raw)
+            .map_err(|error| error.with_context("ggml_repeat"))
     }
 
     pub fn cpy<'ctx>(&'ctx self, a: &Tensor<'ctx>, b: &Tensor<'ctx>) -> Result<Tensor<'ctx>> {
         let raw = unsafe { ffi::ggml_cpy(self.raw.as_ptr(), a.raw.as_ptr(), b.raw.as_ptr()) };
-        self.wrap_tensor(raw, "ggml_cpy")
+        self.wrap_tensor(raw)
+            .map_err(|error| error.with_context("ggml_cpy"))
     }
 
     pub fn cont<'ctx>(&'ctx self, a: &Tensor<'ctx>) -> Result<Tensor<'ctx>> {
         let raw = unsafe { ffi::ggml_cont(self.raw.as_ptr(), a.raw.as_ptr()) };
-        self.wrap_tensor(raw, "ggml_cont")
+        self.wrap_tensor(raw)
+            .map_err(|error| error.with_context("ggml_cont"))
     }
 
     pub fn transpose<'ctx>(&'ctx self, a: &Tensor<'ctx>) -> Result<Tensor<'ctx>> {
         let raw = unsafe { ffi::ggml_transpose(self.raw.as_ptr(), a.raw.as_ptr()) };
-        self.wrap_tensor(raw, "ggml_transpose")
+        self.wrap_tensor(raw)
+            .map_err(|error| error.with_context("ggml_transpose"))
     }
 
     pub fn reshape_2d<'ctx>(
@@ -506,10 +545,15 @@ impl Context {
         ne0: usize,
         ne1: usize,
     ) -> Result<Tensor<'ctx>> {
-        let ne0 = (ne0).try_into_checked()?;
-        let ne1 = (ne1).try_into_checked()?;
+        let ne0 = (ne0)
+            .try_into_checked()
+            .map_err(|source| Error::int_conversion("tensor dimension", source))?;
+        let ne1 = (ne1)
+            .try_into_checked()
+            .map_err(|source| Error::int_conversion("tensor dimension", source))?;
         let raw = unsafe { ffi::ggml_reshape_2d(self.raw.as_ptr(), a.raw.as_ptr(), ne0, ne1) };
-        self.wrap_tensor(raw, "ggml_reshape_2d")
+        self.wrap_tensor(raw)
+            .map_err(|error| error.with_context("ggml_reshape_2d"))
     }
 
     pub fn reshape_3d<'ctx>(
@@ -519,11 +563,18 @@ impl Context {
         ne1: usize,
         ne2: usize,
     ) -> Result<Tensor<'ctx>> {
-        let ne0 = (ne0).try_into_checked()?;
-        let ne1 = (ne1).try_into_checked()?;
-        let ne2 = (ne2).try_into_checked()?;
+        let ne0 = (ne0)
+            .try_into_checked()
+            .map_err(|source| Error::int_conversion("tensor dimension", source))?;
+        let ne1 = (ne1)
+            .try_into_checked()
+            .map_err(|source| Error::int_conversion("tensor dimension", source))?;
+        let ne2 = (ne2)
+            .try_into_checked()
+            .map_err(|source| Error::int_conversion("tensor dimension", source))?;
         let raw = unsafe { ffi::ggml_reshape_3d(self.raw.as_ptr(), a.raw.as_ptr(), ne0, ne1, ne2) };
-        self.wrap_tensor(raw, "ggml_reshape_3d")
+        self.wrap_tensor(raw)
+            .map_err(|error| error.with_context("ggml_reshape_3d"))
     }
 
     pub fn view_1d<'ctx>(
@@ -532,9 +583,12 @@ impl Context {
         ne0: usize,
         offset: usize,
     ) -> Result<Tensor<'ctx>> {
-        let ne0 = (ne0).try_into_checked()?;
+        let ne0 = (ne0)
+            .try_into_checked()
+            .map_err(|source| Error::int_conversion("tensor dimension", source))?;
         let raw = unsafe { ffi::ggml_view_1d(self.raw.as_ptr(), a.raw.as_ptr(), ne0, offset) };
-        self.wrap_tensor(raw, "ggml_view_1d")
+        self.wrap_tensor(raw)
+            .map_err(|error| error.with_context("ggml_view_1d"))
     }
 
     pub fn view_2d<'ctx>(
@@ -545,8 +599,12 @@ impl Context {
         row_stride: usize,
         offset: usize,
     ) -> Result<Tensor<'ctx>> {
-        let ne0 = (ne0).try_into_checked()?;
-        let ne1 = (ne1).try_into_checked()?;
+        let ne0 = (ne0)
+            .try_into_checked()
+            .map_err(|source| Error::int_conversion("tensor dimension", source))?;
+        let ne1 = (ne1)
+            .try_into_checked()
+            .map_err(|source| Error::int_conversion("tensor dimension", source))?;
         let raw = unsafe {
             ffi::ggml_view_2d(
                 self.raw.as_ptr(),
@@ -557,7 +615,8 @@ impl Context {
                 offset,
             )
         };
-        self.wrap_tensor(raw, "ggml_view_2d")
+        self.wrap_tensor(raw)
+            .map_err(|error| error.with_context("ggml_view_2d"))
     }
 
     pub fn permute<'ctx>(
@@ -578,17 +637,20 @@ impl Context {
                 axis3,
             )
         };
-        self.wrap_tensor(raw, "ggml_permute")
+        self.wrap_tensor(raw)
+            .map_err(|error| error.with_context("ggml_permute"))
     }
 
     pub fn diag_mask_inf<'ctx>(&'ctx self, a: &Tensor<'ctx>, n_past: i32) -> Result<Tensor<'ctx>> {
         let raw = unsafe { ffi::ggml_diag_mask_inf(self.raw.as_ptr(), a.raw.as_ptr(), n_past) };
-        self.wrap_tensor(raw, "ggml_diag_mask_inf")
+        self.wrap_tensor(raw)
+            .map_err(|error| error.with_context("ggml_diag_mask_inf"))
     }
 
     pub fn soft_max<'ctx>(&'ctx self, a: &Tensor<'ctx>) -> Result<Tensor<'ctx>> {
         let raw = unsafe { ffi::ggml_soft_max(self.raw.as_ptr(), a.raw.as_ptr()) };
-        self.wrap_tensor(raw, "ggml_soft_max")
+        self.wrap_tensor(raw)
+            .map_err(|error| error.with_context("ggml_soft_max"))
     }
 
     pub fn soft_max_ext<'ctx>(
@@ -602,7 +664,8 @@ impl Context {
         let raw = unsafe {
             ffi::ggml_soft_max_ext(self.raw.as_ptr(), a.raw.as_ptr(), mask_raw, scale, max_bias)
         };
-        self.wrap_tensor(raw, "ggml_soft_max_ext")
+        self.wrap_tensor(raw)
+            .map_err(|error| error.with_context("ggml_soft_max_ext"))
     }
 
     pub fn rope_ext<'ctx>(
@@ -630,12 +693,14 @@ impl Context {
                 params.beta_slow,
             )
         };
-        self.wrap_tensor(raw, "ggml_rope_ext")
+        self.wrap_tensor(raw)
+            .map_err(|error| error.with_context("ggml_rope_ext"))
     }
 
     pub fn new_graph(&self) -> Result<Graph<'_>> {
         let raw = unsafe { ffi::ggml_new_graph(self.raw.as_ptr()) };
-        self.wrap_graph(raw, "ggml_new_graph")
+        self.wrap_graph(raw)
+            .map_err(|error| error.with_context("ggml_new_graph"))
     }
 
     /// Wraps a tensor into expression form for operator-based composition.
@@ -655,7 +720,10 @@ impl Context {
         n_threads: ThreadCount,
     ) -> Result<()> {
         let n_threads = {
-            let n_threads: c_int = n_threads.get().try_into_checked()?;
+            let n_threads: c_int = n_threads
+                .get()
+                .try_into_checked()
+                .map_err(|source| Error::int_conversion("thread count", source))?;
             if n_threads <= 0 {
                 return Err(Error::InvalidThreadCount(n_threads as usize));
             }
@@ -692,12 +760,16 @@ pub struct Tensor<'ctx> {
 impl<'ctx> Tensor<'ctx> {
     /// Returns total element count (`ggml_nelements`).
     pub fn element_count(&self) -> Result<usize> {
-        (unsafe { ffi::ggml_nelements(self.raw.as_ptr()) }).try_into_checked()
+        (unsafe { ffi::ggml_nelements(self.raw.as_ptr()) })
+            .try_into_checked()
+            .map_err(|source| Error::int_conversion("tensor dimension", source))
     }
 
     /// Returns row count (`ggml_nrows`).
     pub fn row_count(&self) -> Result<usize> {
-        (unsafe { ffi::ggml_nrows(self.raw.as_ptr()) }).try_into_checked()
+        (unsafe { ffi::ggml_nrows(self.raw.as_ptr()) })
+            .try_into_checked()
+            .map_err(|source| Error::int_conversion("tensor dimension", source))
     }
 
     pub fn col_count(&self) -> Result<usize> {
@@ -738,16 +810,18 @@ impl<'ctx> Tensor<'ctx> {
     pub fn set_name(&self, name: &str) -> Result<()> {
         let name = CString::new(name)?;
         let raw = unsafe { ffi::ggml_set_name(self.raw.as_ptr(), name.as_ptr()) };
-        let _ = NonNull::new(raw).ok_or(Error::NullPointer {
-            api: "ggml_set_name",
-        })?;
+        let _ = NonNull::new(raw).ok_or_else(|| Error::null_pointer("ggml_set_name"))?;
         Ok(())
     }
 
     /// Reads a tensor debug name.
     pub fn name(&self) -> Result<String> {
-        let name = unsafe { ffi::ggml_get_name(self.raw.as_ptr()) };
-        c_string_from_ptr(name, "ggml_get_name")
+        let ptr = unsafe { ffi::ggml_get_name(self.raw.as_ptr()) };
+        if ptr.is_null() {
+            return Err(Error::null_pointer("ggml_get_name"));
+        }
+        let cstr = unsafe { CStr::from_ptr(ptr) };
+        Ok(cstr.to_str()?.to_owned())
     }
 
     /// Writes host `f32` values through context tensor APIs.
@@ -761,7 +835,9 @@ impl<'ctx> Tensor<'ctx> {
         }
 
         for (index, value) in values.iter().copied().enumerate() {
-            let index = (index).try_into_checked()?;
+            let index = (index)
+                .try_into_checked()
+                .map_err(|source| Error::int_conversion("tensor index", source))?;
             unsafe {
                 ffi::ggml_set_f32_1d(self.raw.as_ptr(), index, value);
             }
@@ -823,7 +899,9 @@ impl<'ctx> Tensor<'ctx> {
             return Err(Error::IndexOutOfBounds { index, len });
         }
 
-        let index = (index).try_into_checked()?;
+        let index = (index)
+            .try_into_checked()
+            .map_err(|source| Error::int_conversion("tensor index", source))?;
         Ok(unsafe { ffi::ggml_get_f32_1d(self.raw.as_ptr(), index) })
     }
 
@@ -833,7 +911,9 @@ impl<'ctx> Tensor<'ctx> {
         let mut out = Vec::with_capacity(len);
 
         for index in 0..len {
-            let index = (index).try_into_checked()?;
+            let index = (index)
+                .try_into_checked()
+                .map_err(|source| Error::int_conversion("tensor index", source))?;
             out.push(unsafe { ffi::ggml_get_f32_1d(self.raw.as_ptr(), index) });
         }
 
@@ -905,9 +985,7 @@ impl<'ctx> Graph<'ctx> {
         }
 
         let raw = unsafe { ffi::ggml_graph_node(self.raw.as_ptr(), normalized) };
-        let raw = NonNull::new(raw).ok_or(Error::NullPointer {
-            api: "ggml_graph_node",
-        })?;
+        let raw = NonNull::new(raw).ok_or_else(|| Error::null_pointer("ggml_graph_node"))?;
 
         Ok(Tensor {
             raw,
@@ -927,40 +1005,6 @@ impl<'ctx> Graph<'ctx> {
 
         self.node(node_count - 1)
     }
-}
-
-fn wrap_tensor<'ctx>(
-    _ctx_raw: NonNull<ffi::ggml_context>,
-    raw: *mut ffi::ggml_tensor,
-    api: &'static str,
-) -> Result<Tensor<'ctx>> {
-    let raw = NonNull::new(raw).ok_or(Error::NullPointer { api })?;
-    Ok(Tensor {
-        raw,
-        _ctx: PhantomData,
-    })
-}
-
-fn wrap_graph<'ctx>(
-    _ctx_raw: NonNull<ffi::ggml_context>,
-    raw: *mut ffi::ggml_cgraph,
-    api: &'static str,
-) -> Result<Graph<'ctx>> {
-    let raw = NonNull::new(raw).ok_or(Error::NullPointer { api })?;
-    Ok(Graph {
-        raw,
-        _ctx: PhantomData,
-    })
-}
-
-fn c_string_from_ptr(ptr: *const c_char, api: &'static str) -> Result<String> {
-    if ptr.is_null() {
-        return Err(Error::NullPointer { api });
-    }
-
-    let cstr = unsafe { CStr::from_ptr(ptr) };
-    let text = cstr.to_str()?;
-    Ok(text.to_string())
 }
 
 fn ensure_matmul_compatible(lhs_cols: usize, rhs_cols: usize) -> Result<()> {

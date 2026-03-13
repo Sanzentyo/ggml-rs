@@ -1,5 +1,6 @@
 use crate::{Error, Result};
 use num_traits::{CheckedAdd, CheckedMul};
+use std::num::TryFromIntError;
 
 /// Checked arithmetic helpers that map overflow to crate `Error`.
 pub(crate) trait CheckedFieldOps: Sized + Copy + CheckedAdd + CheckedMul {
@@ -16,15 +17,14 @@ impl<T> CheckedFieldOps for T where T: Sized + Copy + CheckedAdd + CheckedMul {}
 
 /// Conversion helper that preserves conversion error sources through `Error`.
 pub(crate) trait TryIntoChecked<T> {
-    fn try_into_checked(self) -> Result<T>;
+    fn try_into_checked(self) -> std::result::Result<T, TryFromIntError>;
 }
 
 impl<T, U> TryIntoChecked<U> for T
 where
-    U: TryFrom<T>,
-    Error: From<<U as TryFrom<T>>::Error>,
+    U: TryFrom<T, Error = TryFromIntError>,
 {
-    fn try_into_checked(self) -> Result<U> {
-        U::try_from(self).map_err(Error::from)
+    fn try_into_checked(self) -> std::result::Result<U, TryFromIntError> {
+        U::try_from(self)
     }
 }

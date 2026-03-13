@@ -13,14 +13,18 @@ pub enum Error {
     #[error("context memory size must be greater than zero")]
     ZeroMemorySize,
 
-    #[error("integer conversion failed")]
-    IntConversion(#[from] TryFromIntError),
+    #[error("integer conversion failed ({context})")]
+    IntConversion {
+        context: String,
+        #[source]
+        source: TryFromIntError,
+    },
 
     #[error("numeric overflow")]
     Overflow,
 
-    #[error("{api} returned a null pointer")]
-    NullPointer { api: &'static str },
+    #[error("null pointer returned from ggml API ({context})")]
+    NullPointer { context: String },
 
     #[error("string contains interior NUL byte")]
     CString(#[from] NulError),
@@ -65,4 +69,35 @@ pub enum Error {
 
     #[error("ggml graph compute failed with status {0}")]
     ComputeFailed(i32),
+}
+
+impl Error {
+    pub(crate) fn int_conversion(context: &'static str, source: TryFromIntError) -> Self {
+        Self::IntConversion {
+            context: context.to_owned(),
+            source,
+        }
+    }
+
+    pub(crate) fn null_pointer(context: &'static str) -> Self {
+        Self::NullPointer {
+            context: context.to_owned(),
+        }
+    }
+
+    pub fn with_context(self, context: &'static str) -> Self {
+        match self {
+            Self::IntConversion {
+                context: inner,
+                source,
+            } => Self::IntConversion {
+                context: format!("{context} :: {inner}"),
+                source,
+            },
+            Self::NullPointer { context: inner } => Self::NullPointer {
+                context: format!("{context} :: {inner}"),
+            },
+            other => other,
+        }
+    }
 }

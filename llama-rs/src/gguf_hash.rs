@@ -48,8 +48,14 @@ impl Default for HashOptions {
 
 #[derive(Debug)]
 pub enum GgufHashError {
-    Io(std::io::Error),
-    Ggml(ggml_rs::Error),
+    Io {
+        context: &'static str,
+        source: std::io::Error,
+    },
+    Ggml {
+        context: &'static str,
+        source: ggml_rs::Error,
+    },
     InvalidTensorRange {
         tensor_name: String,
         start: usize,
@@ -61,8 +67,8 @@ pub enum GgufHashError {
 impl fmt::Display for GgufHashError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Io(err) => write!(f, "{err}"),
-            Self::Ggml(err) => write!(f, "{err}"),
+            Self::Io { context, source } => write!(f, "{context}: {source}"),
+            Self::Ggml { context, source } => write!(f, "{context}: {source}"),
             Self::InvalidTensorRange {
                 tensor_name,
                 start,
@@ -76,17 +82,23 @@ impl fmt::Display for GgufHashError {
     }
 }
 
-impl StdError for GgufHashError {}
-
-impl From<std::io::Error> for GgufHashError {
-    fn from(value: std::io::Error) -> Self {
-        Self::Io(value)
+impl StdError for GgufHashError {
+    fn source(&self) -> Option<&(dyn StdError + 'static)> {
+        match self {
+            Self::Io { source, .. } => Some(source),
+            Self::Ggml { source, .. } => Some(source),
+            Self::InvalidTensorRange { .. } => None,
+        }
     }
 }
 
-impl From<ggml_rs::Error> for GgufHashError {
-    fn from(value: ggml_rs::Error) -> Self {
-        Self::Ggml(value)
+impl GgufHashError {
+    fn io(context: &'static str, source: std::io::Error) -> Self {
+        Self::Io { context, source }
+    }
+
+    fn ggml(context: &'static str, source: ggml_rs::Error) -> Self {
+        Self::Ggml { context, source }
     }
 }
 
@@ -95,8 +107,9 @@ pub fn hash_file<P: AsRef<Path>>(
     options: &HashOptions,
 ) -> Result<Vec<HashRecord>, GgufHashError> {
     let path = path.as_ref();
-    let report = inspect_gguf(path)?;
-    let bytes = std::fs::read(path)?;
+    let report =
+        inspect_gguf(path).map_err(|source| GgufHashError::ggml("inspect_gguf", source))?;
+    let bytes = std::fs::read(path).map_err(|source| GgufHashError::io("std::fs::read", source))?;
     let filename = path
         .file_name()
         .and_then(|name| name.to_str())

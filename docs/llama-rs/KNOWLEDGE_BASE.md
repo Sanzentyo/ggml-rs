@@ -39,6 +39,12 @@ DYLD_LIBRARY_PATH=target/vendor/ggml/build/src:target/vendor/ggml/build/src/ggml
 - `llama-rs/examples/backend_smoke.rs`: CPU and Metal both run and report expected matrix result.
 - `llama-rs/examples/gguf_inspect.rs`: can read and print metadata/tensor info from a sample GGUF file.
 
+## Error-context rollout policy
+
+- `llama-rs` layers that orchestrate ggml-backed operations follow the same
+  call-site context policy as `ggml-rs`.
+- Reference: `docs/ggml-rs/ERROR_CONTEXT_POLICY.md`
+
 ## Recent ggml-rs API expansion (safe wrappers)
 
 - Added safe wrappers for llama-runtime-critical ops:

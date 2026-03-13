@@ -3,7 +3,7 @@
 use crate::ffi;
 use crate::num_ext::TryIntoChecked;
 use crate::{Error, Result};
-use std::ffi::{CStr, CString, c_char};
+use std::ffi::{CStr, CString};
 use std::marker::PhantomData;
 use std::os::raw::c_int;
 use std::path::Path;
@@ -73,9 +73,7 @@ impl GgufFile {
             ctx: ptr::null_mut(),
         };
         let raw = unsafe { ffi::gguf_init_from_file(path.as_ptr(), params) };
-        let raw = NonNull::new(raw).ok_or(Error::NullPointer {
-            api: "gguf_init_from_file",
-        })?;
+        let raw = NonNull::new(raw).ok_or_else(|| Error::null_pointer("gguf_init_from_file"))?;
 
         Ok(Self {
             raw,
@@ -96,13 +94,21 @@ impl GgufFile {
     }
 
     pub fn kv_count(&self) -> Result<usize> {
-        (unsafe { ffi::gguf_get_n_kv(self.raw.as_ptr()) }).try_into_checked()
+        (unsafe { ffi::gguf_get_n_kv(self.raw.as_ptr()) })
+            .try_into_checked()
+            .map_err(|source| Error::int_conversion("gguf_get_n_kv", source))
     }
 
     pub fn kv_key(&self, index: usize) -> Result<String> {
-        let index = index.try_into_checked()?;
-        let key = unsafe { ffi::gguf_get_key(self.raw.as_ptr(), index) };
-        c_string_from_ptr(key, "gguf_get_key")
+        let index = index
+            .try_into_checked()
+            .map_err(|source| Error::int_conversion("gguf_get_key index", source))?;
+        let ptr = unsafe { ffi::gguf_get_key(self.raw.as_ptr(), index) };
+        if ptr.is_null() {
+            return Err(Error::null_pointer("gguf_get_key"));
+        }
+        let cstr = unsafe { CStr::from_ptr(ptr) };
+        Ok(cstr.to_str()?.to_owned())
     }
 
     pub fn find_key(&self, key: &str) -> Result<Option<usize>> {
@@ -111,41 +117,68 @@ impl GgufFile {
         if idx < 0 {
             Ok(None)
         } else {
-            Ok(Some(idx.try_into_checked()?))
+            Ok(Some(idx.try_into_checked().map_err(|source| {
+                Error::int_conversion("gguf_find_key index", source)
+            })?))
         }
     }
 
     pub fn kv_type(&self, index: usize) -> Result<GgufType> {
-        let index = index.try_into_checked()?;
+        let index = index
+            .try_into_checked()
+            .map_err(|source| Error::int_conversion("gguf_get_kv_type index", source))?;
         let raw = unsafe { ffi::gguf_get_kv_type(self.raw.as_ptr(), index) };
         Ok(GgufType::from_raw(raw))
     }
 
     pub fn kv_type_name(&self, index: usize) -> Result<String> {
-        let index = index.try_into_checked()?;
+        let index = index
+            .try_into_checked()
+            .map_err(|source| Error::int_conversion("gguf_get_kv_type index", source))?;
         let raw = unsafe { ffi::gguf_get_kv_type(self.raw.as_ptr(), index) };
-        let name = unsafe { ffi::gguf_type_name(raw) };
-        c_string_from_ptr(name, "gguf_type_name")
+        let ptr = unsafe { ffi::gguf_type_name(raw) };
+        if ptr.is_null() {
+            return Err(Error::null_pointer("gguf_type_name"));
+        }
+        let cstr = unsafe { CStr::from_ptr(ptr) };
+        Ok(cstr.to_str()?.to_owned())
     }
 
     pub fn kv_string_value(&self, index: usize) -> Result<String> {
-        let index = index.try_into_checked()?;
-        let value = unsafe { ffi::gguf_get_val_str(self.raw.as_ptr(), index) };
-        c_string_from_ptr(value, "gguf_get_val_str")
+        let index = index
+            .try_into_checked()
+            .map_err(|source| Error::int_conversion("gguf_get_val_str index", source))?;
+        let ptr = unsafe { ffi::gguf_get_val_str(self.raw.as_ptr(), index) };
+        if ptr.is_null() {
+            return Err(Error::null_pointer("gguf_get_val_str"));
+        }
+        let cstr = unsafe { CStr::from_ptr(ptr) };
+        Ok(cstr.to_str()?.to_owned())
     }
 
     pub fn tensor_count(&self) -> Result<usize> {
-        (unsafe { ffi::gguf_get_n_tensors(self.raw.as_ptr()) }).try_into_checked()
+        (unsafe { ffi::gguf_get_n_tensors(self.raw.as_ptr()) })
+            .try_into_checked()
+            .map_err(|source| Error::int_conversion("gguf_get_n_tensors", source))
     }
 
     pub fn tensor_info(&self, index: usize) -> Result<GgufTensorInfo> {
-        let index_i64 = index.try_into_checked()?;
-        let name = unsafe { ffi::gguf_get_tensor_name(self.raw.as_ptr(), index_i64) };
-        let name = c_string_from_ptr(name, "gguf_get_tensor_name")?;
+        let index_i64 = index
+            .try_into_checked()
+            .map_err(|source| Error::int_conversion("gguf_get_tensor_name index", source))?;
+
+        let name_ptr = unsafe { ffi::gguf_get_tensor_name(self.raw.as_ptr(), index_i64) };
+        if name_ptr.is_null() {
+            return Err(Error::null_pointer("gguf_get_tensor_name"));
+        }
+        let name = unsafe { CStr::from_ptr(name_ptr) }.to_str()?.to_owned();
 
         let ggml_type_raw = unsafe { ffi::gguf_get_tensor_type(self.raw.as_ptr(), index_i64) };
-        let ggml_type_name = unsafe { ffi::ggml_type_name(ggml_type_raw) };
-        let ggml_type_name = c_string_from_ptr(ggml_type_name, "ggml_type_name")?;
+        let type_ptr = unsafe { ffi::ggml_type_name(ggml_type_raw) };
+        if type_ptr.is_null() {
+            return Err(Error::null_pointer("ggml_type_name"));
+        }
+        let ggml_type_name = unsafe { CStr::from_ptr(type_ptr) }.to_str()?.to_owned();
 
         let offset = unsafe { ffi::gguf_get_tensor_offset(self.raw.as_ptr(), index_i64) };
         let size = unsafe { ffi::gguf_get_tensor_size(self.raw.as_ptr(), index_i64) };
@@ -180,12 +213,4 @@ fn path_to_c_string(path: &Path) -> Result<CString> {
         let lossy = path.to_string_lossy();
         CString::new(lossy.as_bytes()).map_err(Error::from)
     }
-}
-
-fn c_string_from_ptr(ptr: *const c_char, api: &'static str) -> Result<String> {
-    if ptr.is_null() {
-        return Err(Error::NullPointer { api });
-    }
-    let cstr = unsafe { CStr::from_ptr(ptr) };
-    Ok(cstr.to_str()?.to_string())
 }

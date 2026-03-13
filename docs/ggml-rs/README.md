@@ -40,9 +40,13 @@ let out = expr?.into_tensor();
 ## Error handling policy
 
 - `thiserror`-based structured errors.
-- Conversion failures are propagated as `Error::IntConversion`.
-- API-level null returns are represented by `Error::NullPointer { api }`.
+- Conversion failures are propagated as `Error::IntConversion { context, source }`.
+- API-level null returns are represented by `Error::NullPointer { context }`.
 - Numeric overflow is handled by checked helpers (`Error::Overflow`).
+
+Detailed policy:
+
+- `docs/ggml-rs/ERROR_CONTEXT_POLICY.md`
 
 ## Test and benchmark coverage
 

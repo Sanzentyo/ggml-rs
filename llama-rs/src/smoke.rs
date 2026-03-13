@@ -26,7 +26,10 @@ pub type Result<T> = std::result::Result<T, SmokeError>;
 
 #[derive(Debug)]
 pub enum SmokeError {
-    Ggml(ggml_rs::Error),
+    Ggml {
+        context: &'static str,
+        source: ggml_rs::Error,
+    },
     OutputLengthMismatch {
         expected: usize,
         actual: usize,
@@ -42,7 +45,7 @@ pub enum SmokeError {
 impl fmt::Display for SmokeError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Ggml(err) => write!(f, "{err}"),
+            Self::Ggml { context, source } => write!(f, "{context}: {source}"),
             Self::OutputLengthMismatch { expected, actual } => {
                 write!(
                     f,
@@ -62,11 +65,18 @@ impl fmt::Display for SmokeError {
     }
 }
 
-impl StdError for SmokeError {}
+impl StdError for SmokeError {
+    fn source(&self) -> Option<&(dyn StdError + 'static)> {
+        match self {
+            Self::Ggml { source, .. } => Some(source),
+            Self::OutputLengthMismatch { .. } | Self::OutputMismatch { .. } => None,
+        }
+    }
+}
 
-impl From<ggml_rs::Error> for SmokeError {
-    fn from(value: ggml_rs::Error) -> Self {
-        Self::Ggml(value)
+impl SmokeError {
+    fn ggml(context: &'static str, source: ggml_rs::Error) -> Self {
+        Self::Ggml { context, source }
     }
 }
 
@@ -81,29 +91,60 @@ pub struct SmokeReport {
 pub fn run_backend_smoke(backend: LlamaBackend) -> Result<SmokeReport> {
     ggml_rs::Backend::load_all();
 
-    let backend = ggml_rs::Backend::new(backend.into())?;
-    let backend_name = backend.name()?.to_string();
+    let backend = ggml_rs::Backend::new(backend.into())
+        .map_err(|source| SmokeError::ggml("Backend::new", source))?;
+    let backend_name = backend
+        .name()
+        .map_err(|source| SmokeError::ggml("Backend::name", source))?
+        .to_string();
 
     let ctx_size =
-        ggml_rs::Context::recommended_backend_matmul_memory_f32_shapes_bytes(SHAPE_A, SHAPE_B)?;
-    let ctx = ggml_rs::Context::new_no_alloc_bytes(ctx_size)?;
+        ggml_rs::Context::recommended_backend_matmul_memory_f32_shapes_bytes(SHAPE_A, SHAPE_B)
+            .map_err(|source| {
+                SmokeError::ggml(
+                    "Context::recommended_backend_matmul_memory_f32_shapes_bytes",
+                    source,
+                )
+            })?;
+    let ctx = ggml_rs::Context::new_no_alloc_bytes(ctx_size)
+        .map_err(|source| SmokeError::ggml("Context::new_no_alloc_bytes", source))?;
 
-    let a = ctx.new_f32_tensor_2d_typed::<AShape>()?;
-    let b = ctx.new_f32_tensor_2d_typed::<BShape>()?;
-    let result = ctx.mul_mat(a.inner(), b.inner())?;
+    let a = ctx
+        .new_f32_tensor_2d_typed::<AShape>()
+        .map_err(|source| SmokeError::ggml("Context::new_f32_tensor_2d_typed<A>", source))?;
+    let b = ctx
+        .new_f32_tensor_2d_typed::<BShape>()
+        .map_err(|source| SmokeError::ggml("Context::new_f32_tensor_2d_typed<B>", source))?;
+    let result = ctx
+        .mul_mat(a.inner(), b.inner())
+        .map_err(|source| SmokeError::ggml("Context::mul_mat", source))?;
 
-    let mut graph = ctx.new_graph()?;
+    let mut graph = ctx
+        .new_graph()
+        .map_err(|source| SmokeError::ggml("Context::new_graph", source))?;
     graph.build_forward_expand(&result);
 
-    let _buffer = ctx.allocate_tensors(&backend)?;
-    a.set_f32_backend(&MATRIX_A)?;
-    b.set_f32_backend(&MATRIX_B)?;
-    backend.compute(&mut graph)?;
+    let _buffer = ctx
+        .allocate_tensors(&backend)
+        .map_err(|source| SmokeError::ggml("Context::allocate_tensors", source))?;
+    a.set_f32_backend(&MATRIX_A)
+        .map_err(|source| SmokeError::ggml("TypedTensor2D::set_f32_backend<A>", source))?;
+    b.set_f32_backend(&MATRIX_B)
+        .map_err(|source| SmokeError::ggml("TypedTensor2D::set_f32_backend<B>", source))?;
+    backend
+        .compute(&mut graph)
+        .map_err(|source| SmokeError::ggml("Backend::compute", source))?;
 
-    let output = graph.last_node()?;
-    let values = output.to_vec_f32_backend()?;
+    let output = graph
+        .last_node()
+        .map_err(|source| SmokeError::ggml("Graph::last_node", source))?;
+    let values = output
+        .to_vec_f32_backend()
+        .map_err(|source| SmokeError::ggml("Tensor::to_vec_f32_backend", source))?;
     assert_expected(&values)?;
-    let shape = output.shape()?;
+    let shape = output
+        .shape()
+        .map_err(|source| SmokeError::ggml("Tensor::shape", source))?;
 
     Ok(SmokeReport {
         backend_name,

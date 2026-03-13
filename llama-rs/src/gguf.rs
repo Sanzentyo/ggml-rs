@@ -18,14 +18,27 @@ pub struct GgufReport {
 }
 
 pub fn inspect_gguf<P: AsRef<Path>>(path: P) -> ggml_rs::Result<GgufReport> {
-    let file = GgufFile::open(path)?;
+    let file = GgufFile::open(path).map_err(|error| error.with_context("GgufFile::open"))?;
 
-    let kv_entries = (0..file.kv_count()?)
+    let kv_count = file
+        .kv_count()
+        .map_err(|error| error.with_context("GgufFile::kv_count"))?;
+    let kv_entries = (0..kv_count)
         .map(|index| {
-            let key = file.kv_key(index)?;
-            let value_type = file.kv_type_name(index)?;
-            let string_value = match file.kv_type(index)? {
-                GgufType::String => Some(file.kv_string_value(index)?),
+            let key = file
+                .kv_key(index)
+                .map_err(|error| error.with_context("GgufFile::kv_key"))?;
+            let value_type = file
+                .kv_type_name(index)
+                .map_err(|error| error.with_context("GgufFile::kv_type_name"))?;
+            let string_value = match file
+                .kv_type(index)
+                .map_err(|error| error.with_context("GgufFile::kv_type"))?
+            {
+                GgufType::String => Some(
+                    file.kv_string_value(index)
+                        .map_err(|error| error.with_context("GgufFile::kv_string_value"))?,
+                ),
                 _ => None,
             };
 
@@ -37,8 +50,14 @@ pub fn inspect_gguf<P: AsRef<Path>>(path: P) -> ggml_rs::Result<GgufReport> {
         })
         .collect::<ggml_rs::Result<Vec<_>>>()?;
 
-    let tensors = (0..file.tensor_count()?)
-        .map(|index| file.tensor_info(index))
+    let tensor_count = file
+        .tensor_count()
+        .map_err(|error| error.with_context("GgufFile::tensor_count"))?;
+    let tensors = (0..tensor_count)
+        .map(|index| {
+            file.tensor_info(index)
+                .map_err(|error| error.with_context("GgufFile::tensor_info"))
+        })
         .collect::<ggml_rs::Result<Vec<_>>>()?;
 
     Ok(GgufReport {

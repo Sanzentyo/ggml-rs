@@ -42,7 +42,7 @@
   - moved numeric conversion/checked-arithmetic traits to `src/num_ext.rs`,
   - moved expression DSL (`TensorExpr`, operator impls) to `src/tensor_expr.rs`.
 - Reworked error flow to remove `field` string threading:
-  - `Error` now uses source-based variants (`IntConversion`, `CString`, `Utf8`) and explicit structured variants (`NullPointer { api }`, `Overflow`),
+  - `Error` now uses source-based variants (`IntConversion { context, source }`, `CString`, `Utf8`) and explicit structured variants (`NullPointer { context }`, `Overflow`),
   - conversion helpers now expose `try_into_checked()` / checked arithmetic methods without field-name arguments.
 - Per additional modularization request, moved compute-layer implementation into `src/compute.rs` and made `src/lib.rs` a compact re-export façade.
 - Expanded newtype usage further with `Length`, `TensorIndex`, `ThreadCount` and typed entrypoints (`new_*_1d_len`, `compute_with_threads`, `get_f32_at`).

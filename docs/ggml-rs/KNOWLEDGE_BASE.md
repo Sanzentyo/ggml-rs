@@ -30,6 +30,12 @@ DYLD_LIBRARY_PATH=target/vendor/ggml/build/src:target/vendor/ggml/build/src/ggml
 - `ggml_metal_device_init` may log warnings while still producing valid matmul
   execution results.
 
+## Error context policy
+
+- Low-level/FFI-adjacent code must use call-site `map_err` / `ok_or_else`
+  context attachment.
+- See: `docs/ggml-rs/ERROR_CONTEXT_POLICY.md`
+
 ## Baseline validation commands
 
 ```bash
