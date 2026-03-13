@@ -52,6 +52,19 @@
 - Added full vendor suite harnesses:
   - `tests/ggml_upstream_suite.rs` to build/run all upstream ggml test targets,
   - `examples/bench_upstream_suite.rs` to run upstream perf-focused targets.
+- Added explicit policy gate to llama migration docs:
+  - implementation preflight now requires reading `docs/ggml-rs/ERROR_CONTEXT_POLICY.md`.
+- Added `llama-rs` benchmark API and example:
+  - `llama-rs/src/bench.rs` (`run_backend_matmul_bench`, `MatmulBenchConfig`, `MatmulBenchReport`),
+  - `llama-rs/examples/bench_matmul.rs` (`--iters`, `--warmup`, `--size`, `cpu`/`metal`).
+- Added a `simple-ctx` parity path in `llama-rs`:
+  - `llama-rs/src/simple.rs` (`run_simple_ctx`, `SimpleReport`, `SimpleError`),
+  - `llama-rs/examples/simple.rs`.
+- Validated benchmark parity snapshot with safe API only (`256x256`, `--iters 10`):
+  - run A: `ggml-rs` CPU `0.272 ms`, Metal `0.386 ms`; `llama-rs` CPU `0.276 ms`, Metal `0.293 ms`,
+  - run B: `ggml-rs` CPU `0.285 ms`, Metal `0.379 ms`; `llama-rs` CPU `0.286 ms`, Metal `0.443 ms`,
+  - run C: `ggml-rs` CPU `0.287 ms`, Metal `0.187 ms`; `llama-rs` CPU `0.282 ms`, Metal `0.344 ms`,
+  - checksum remained `956.435547` on both implementations.
 
 ## Next concrete steps
 

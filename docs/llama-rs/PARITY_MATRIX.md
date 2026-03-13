@@ -9,6 +9,8 @@ Status legend:
 Baseline readiness check:
 
 - `llama-rs/examples/backend_smoke.rs` is passing on CPU and Metal, confirming the current scaffold can execute via `ggml-rs` safe API on both backends.
+- For every migration task, preflight starts with `docs/ggml-rs/ERROR_CONTEXT_POLICY.md`.
+- `llama-rs/examples/bench_matmul.rs` now provides a reproducible CPU/Metal performance gate using only `ggml-rs` safe API.
 
 | Example target | Status | CPU verified | Metal verified | Notes |
 | --- | --- | --- | --- | --- |
@@ -25,7 +27,7 @@ Baseline readiness check:
 | passkey | Not started | No | No |  |
 | retrieval | Not started | No | No |  |
 | save-load-state | Not started | No | No |  |
-| simple | Not started | No | No |  |
+| simple | In progress | Yes | Yes | `llama-rs/examples/simple` (host path) plus CPU/Metal runtime/bench scaffolds are done; full model/token inference parity is pending |
 | simple-chat | Not started | No | No |  |
 | speculative | Not started | No | No |  |
 | speculative-simple | Not started | No | No |  |

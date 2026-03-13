@@ -35,8 +35,11 @@ DYLD_LIBRARY_PATH=target/vendor/ggml/build/src:target/vendor/ggml/build/src/ggml
 
 - `ggml-rs/examples/simple_ctx.rs`: CPU path runs and reproduces expected matrix result.
 - `ggml-rs/examples/backend_matmul.rs`: CPU and Metal both run and report expected matrix result.
+- `ggml-rs/examples/bench_matmul.rs`: CPU and Metal matmul benchmark path runs with stable checksum.
 - `ggml-rs/examples/arithmetic_expr.rs`: trait-based `TensorExpr` arithmetic (`+ - * /`) runs and validates expected output.
+- `llama-rs/examples/simple.rs`: safe `simple-ctx` parity path runs and validates expected output on the host compute path.
 - `llama-rs/examples/backend_smoke.rs`: CPU and Metal both run and report expected matrix result.
+- `llama-rs/examples/bench_matmul.rs`: CPU and Metal benchmark path runs via `ggml-rs` safe API only.
 - `llama-rs/examples/gguf_inspect.rs`: can read and print metadata/tensor info from a sample GGUF file.
 
 ## Error-context rollout policy
@@ -68,3 +71,21 @@ target/vendor/llama.cpp/build/bin/llama-gguf target/vendor/llama.cpp/build/sampl
 cargo run -p llama-rs --example gguf_hash --features link-system -- --all target/vendor/llama.cpp/build/sample.gguf > target/vendor/llama.cpp/build/sample.gguf.manifest
 cargo run -p llama-rs --example gguf_hash --features link-system -- --all --check target/vendor/llama.cpp/build/sample.gguf.manifest target/vendor/llama.cpp/build/sample.gguf
 ```
+
+## Benchmark parity snapshot (same host, 256x256, `--iters 10`)
+
+Observed samples:
+
+- Run A
+  - `ggml-rs`: CPU `0.272 ms`, Metal `0.386 ms`
+  - `llama-rs`: CPU `0.276 ms`, Metal `0.293 ms`
+- Run B
+  - `ggml-rs`: CPU `0.285 ms`, Metal `0.379 ms`
+  - `llama-rs`: CPU `0.286 ms`, Metal `0.443 ms`
+- Run C
+  - `ggml-rs`: CPU `0.287 ms`, Metal `0.187 ms`
+  - `llama-rs`: CPU `0.282 ms`, Metal `0.344 ms`
+
+All runs produced identical checksum `956.435547`.
+Latency fluctuates run-to-run on Metal, but both binaries stay in the same
+order of magnitude with no systemic overhead from the `llama-rs` wrapper path.

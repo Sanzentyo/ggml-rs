@@ -20,6 +20,16 @@ path = "examples/backend_smoke.rs"
 required-features = ["link-system"]
 
 [[example]]
+name = "simple"
+path = "examples/simple.rs"
+required-features = ["link-system"]
+
+[[example]]
+name = "bench_matmul"
+path = "examples/bench_matmul.rs"
+required-features = ["link-system"]
+
+[[example]]
 name = "gguf_inspect"
 path = "examples/gguf_inspect.rs"
 required-features = ["link-system"]
