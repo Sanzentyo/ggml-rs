@@ -35,6 +35,7 @@ DYLD_LIBRARY_PATH=target/vendor/ggml/build/src:target/vendor/ggml/build/src/ggml
 
 - `ggml-rs/examples/simple_ctx.rs`: CPU path runs and reproduces expected matrix result.
 - `ggml-rs/examples/backend_matmul.rs`: CPU and Metal both run and report expected matrix result.
+- `ggml-rs/examples/arithmetic_expr.rs`: trait-based `TensorExpr` arithmetic (`+ - * /`) runs and validates expected output.
 - `llama-rs/examples/backend_smoke.rs`: CPU and Metal both run and report expected matrix result.
 - `llama-rs/examples/gguf_inspect.rs`: can read and print metadata/tensor info from a sample GGUF file.
 

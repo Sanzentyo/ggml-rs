@@ -1,5 +1,11 @@
 #![allow(non_camel_case_types)]
 
+//! Minimal FFI surface used by the safe wrapper.
+//!
+//! Opaque C types are represented as zero-sized pinned marker structs and are
+//! only handled through raw pointers inside this module.
+
+use std::marker::{PhantomData, PhantomPinned};
 use std::os::raw::{c_char, c_int, c_void};
 
 pub const GGML_TYPE_F32: c_int = 0;
@@ -25,36 +31,43 @@ pub const GGUF_TYPE_FLOAT64: c_int = 12;
 #[repr(C)]
 pub struct ggml_context {
     _private: [u8; 0],
+    _pin: PhantomData<(*mut u8, PhantomPinned)>,
 }
 
 #[repr(C)]
 pub struct ggml_tensor {
     _private: [u8; 0],
+    _pin: PhantomData<(*mut u8, PhantomPinned)>,
 }
 
 #[repr(C)]
 pub struct ggml_cgraph {
     _private: [u8; 0],
+    _pin: PhantomData<(*mut u8, PhantomPinned)>,
 }
 
 #[repr(C)]
 pub struct ggml_backend {
     _private: [u8; 0],
+    _pin: PhantomData<(*mut u8, PhantomPinned)>,
 }
 
 #[repr(C)]
 pub struct ggml_backend_buffer {
     _private: [u8; 0],
+    _pin: PhantomData<(*mut u8, PhantomPinned)>,
 }
 
 #[repr(C)]
 pub struct ggml_backend_device {
     _private: [u8; 0],
+    _pin: PhantomData<(*mut u8, PhantomPinned)>,
 }
 
 #[repr(C)]
 pub struct gguf_context {
     _private: [u8; 0],
+    _pin: PhantomData<(*mut u8, PhantomPinned)>,
 }
 
 #[repr(C)]
@@ -124,7 +137,17 @@ unsafe extern "C" {
         a: *mut ggml_tensor,
         b: *mut ggml_tensor,
     ) -> *mut ggml_tensor;
+    pub fn ggml_sub(
+        ctx: *mut ggml_context,
+        a: *mut ggml_tensor,
+        b: *mut ggml_tensor,
+    ) -> *mut ggml_tensor;
     pub fn ggml_mul(
+        ctx: *mut ggml_context,
+        a: *mut ggml_tensor,
+        b: *mut ggml_tensor,
+    ) -> *mut ggml_tensor;
+    pub fn ggml_div(
         ctx: *mut ggml_context,
         a: *mut ggml_tensor,
         b: *mut ggml_tensor,
@@ -176,6 +199,7 @@ unsafe extern "C" {
         nb1: usize,
         offset: usize,
     ) -> *mut ggml_tensor;
+    pub fn ggml_transpose(ctx: *mut ggml_context, a: *mut ggml_tensor) -> *mut ggml_tensor;
     pub fn ggml_permute(
         ctx: *mut ggml_context,
         a: *mut ggml_tensor,

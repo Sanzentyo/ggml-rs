@@ -6,6 +6,10 @@ const ROWS_A: usize = 4;
 const COLS_A: usize = 2;
 const ROWS_B: usize = 3;
 const COLS_B: usize = 2;
+const SHAPE_A: ggml_rs::Shape2D = ggml_rs::Shape2D::new(COLS_A, ROWS_A);
+const SHAPE_B: ggml_rs::Shape2D = ggml_rs::Shape2D::new(COLS_B, ROWS_B);
+type AShape = ggml_rs::StaticShape2D<COLS_A, ROWS_A>;
+type BShape = ggml_rs::StaticShape2D<COLS_B, ROWS_B>;
 
 const MATRIX_A: [f32; ROWS_A * COLS_A] = [2.0, 8.0, 5.0, 1.0, 4.0, 2.0, 8.0, 6.0];
 const MATRIX_B: [f32; ROWS_B * COLS_B] = [10.0, 5.0, 9.0, 9.0, 5.0, 4.0];
@@ -81,12 +85,12 @@ pub fn run_backend_smoke(backend: LlamaBackend) -> Result<SmokeReport> {
     let backend_name = backend.name()?.to_string();
 
     let ctx_size =
-        ggml_rs::Context::recommended_backend_matmul_memory_f32(ROWS_A, COLS_A, ROWS_B, COLS_B)?;
-    let ctx = ggml_rs::Context::new_no_alloc(ctx_size)?;
+        ggml_rs::Context::recommended_backend_matmul_memory_f32_shapes_bytes(SHAPE_A, SHAPE_B)?;
+    let ctx = ggml_rs::Context::new_no_alloc_bytes(ctx_size)?;
 
-    let a = ctx.new_f32_tensor_2d(COLS_A, ROWS_A)?;
-    let b = ctx.new_f32_tensor_2d(COLS_B, ROWS_B)?;
-    let result = ctx.mul_mat(&a, &b)?;
+    let a = ctx.new_f32_tensor_2d_typed::<AShape>()?;
+    let b = ctx.new_f32_tensor_2d_typed::<BShape>()?;
+    let result = ctx.mul_mat(a.inner(), b.inner())?;
 
     let mut graph = ctx.new_graph()?;
     graph.build_forward_expand(&result);
@@ -99,12 +103,12 @@ pub fn run_backend_smoke(backend: LlamaBackend) -> Result<SmokeReport> {
     let output = graph.last_node()?;
     let values = output.to_vec_f32_backend()?;
     assert_expected(&values)?;
-    let (cols, rows) = output.shape_2d()?;
+    let shape = output.shape()?;
 
     Ok(SmokeReport {
         backend_name,
-        cols,
-        rows,
+        cols: shape.cols.get(),
+        rows: shape.rows.get(),
         values,
     })
 }

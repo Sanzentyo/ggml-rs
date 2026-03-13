@@ -21,7 +21,23 @@ name = "backend_matmul"
 path = "examples/backend_matmul.rs"
 required-features = ["link-system"]
 
+[[example]]
+name = "arithmetic_expr"
+path = "examples/arithmetic_expr.rs"
+required-features = ["link-system"]
+
+[[example]]
+name = "bench_matmul"
+path = "examples/bench_matmul.rs"
+required-features = ["link-system"]
+
+[[example]]
+name = "bench_upstream_suite"
+path = "examples/bench_upstream_suite.rs"
+
 [dependencies]
+num-traits = "0.2"
+thiserror = "2"
 
 [workspace]
 members = ["llama-rs"]
