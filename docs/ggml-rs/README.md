@@ -28,7 +28,7 @@ let out = expr?.into_tensor();
 
 - `src/error.rs`: crate error type (`Error`, `Result`)
 - `src/shape.rs`: semantic newtypes and static-shape traits
-- `src/types.rs`: `Type`, `BackendKind`, `RopeExtParams`
+- `src/types.rs`: `Type`, `BackendKind`, `BackendDeviceType`, `ComputeStatus`, `RopeExtParams`
 - `src/num_ext.rs`: checked conversion/arithmetic helpers
 - `src/gguf.rs`: safe GGUF inspection helpers
 - `src/tensor_expr.rs`: expression wrapper and operator impls
@@ -36,6 +36,25 @@ let out = expr?.into_tensor();
 - `src/compute.rs`: context/backend/tensor/graph implementations
 - `src/ffi.rs`: minimal C FFI declarations
 - `src/lib.rs`: public façade and re-exports
+
+## FFI generation policy
+
+The default path uses `bindgen` (common Rust C-FFI workflow):
+
+- `build.rs` generates bindings from ggml headers into `$OUT_DIR/ffi_bindings.rs`
+- `src/ffi.rs` includes those generated bindings
+
+Fallback path:
+
+- `GGML_RS_DISABLE_BINDGEN=1` switches to checked-in fallback bindings (`src/ffi_manual.rs`)
+- fallback mode can still auto-generate numeric constants via:
+
+```bash
+GGML_RS_DISABLE_BINDGEN=1 \
+GGML_RS_AUTOGEN_FFI_CONSTS=1 \
+GGML_RS_GGML_INCLUDE_DIR=target/vendor/ggml/include \
+cargo test --workspace
+```
 
 ## Error handling policy
 

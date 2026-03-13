@@ -18,10 +18,12 @@ fn main() -> Result<(), Box<dyn StdError>> {
 
     println!("\n[kv]");
     for entry in &report.kv_entries {
-        match &entry.string_value {
-            Some(value) => println!("- {} ({}) = {:?}", entry.key, entry.value_type, value),
-            None => println!("- {} ({})", entry.key, entry.value_type),
-        }
+        println!(
+            "- {} ({}) = {:?}",
+            entry.key,
+            entry.value_type_name(),
+            entry.value
+        );
     }
 
     println!("\n[tensors]");

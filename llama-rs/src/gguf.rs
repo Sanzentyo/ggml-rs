@@ -1,14 +1,19 @@
-use ggml_rs::{GgufFile, GgufTensorInfo, GgufType};
+use ggml_rs::{GgufFile, GgufTensorInfo, GgufValue};
 use std::path::Path;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct GgufKvEntry {
     pub key: String,
-    pub value_type: String,
-    pub string_value: Option<String>,
+    pub value: GgufValue,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+impl GgufKvEntry {
+    pub fn value_type_name(&self) -> &'static str {
+        self.value.type_name()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct GgufReport {
     pub version: u32,
     pub alignment: usize,
@@ -28,25 +33,11 @@ pub fn inspect_gguf<P: AsRef<Path>>(path: P) -> ggml_rs::Result<GgufReport> {
             let key = file
                 .kv_key(index)
                 .map_err(|error| error.with_context("GgufFile::kv_key"))?;
-            let value_type = file
-                .kv_type_name(index)
-                .map_err(|error| error.with_context("GgufFile::kv_type_name"))?;
-            let string_value = match file
-                .kv_type(index)
-                .map_err(|error| error.with_context("GgufFile::kv_type"))?
-            {
-                GgufType::String => Some(
-                    file.kv_string_value(index)
-                        .map_err(|error| error.with_context("GgufFile::kv_string_value"))?,
-                ),
-                _ => None,
-            };
+            let value = file
+                .kv_value(index)
+                .map_err(|error| error.with_context("GgufFile::kv_value"))?;
 
-            Ok(GgufKvEntry {
-                key,
-                value_type,
-                string_value,
-            })
+            Ok(GgufKvEntry { key, value })
         })
         .collect::<ggml_rs::Result<Vec<_>>>()?;
 

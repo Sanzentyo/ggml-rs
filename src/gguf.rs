@@ -5,7 +5,7 @@ use crate::num_ext::TryIntoChecked;
 use crate::{Error, Result};
 use std::ffi::{CStr, CString};
 use std::marker::PhantomData;
-use std::os::raw::c_int;
+use std::os::raw::{c_char, c_int};
 use std::path::Path;
 use std::ptr::{self, NonNull};
 
@@ -45,6 +45,101 @@ impl GgufType {
             ffi::GGUF_TYPE_INT64 => Self::Int64,
             ffi::GGUF_TYPE_FLOAT64 => Self::Float64,
             _ => Self::Unknown(raw),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+/// Typed GGUF array payload.
+pub enum GgufArrayValue {
+    U8(Vec<u8>),
+    I8(Vec<i8>),
+    U16(Vec<u16>),
+    I16(Vec<i16>),
+    U32(Vec<u32>),
+    I32(Vec<i32>),
+    F32(Vec<f32>),
+    Bool(Vec<bool>),
+    U64(Vec<u64>),
+    I64(Vec<i64>),
+    F64(Vec<f64>),
+    String(Vec<String>),
+}
+
+impl GgufArrayValue {
+    pub fn len(&self) -> usize {
+        match self {
+            Self::U8(values) => values.len(),
+            Self::I8(values) => values.len(),
+            Self::U16(values) => values.len(),
+            Self::I16(values) => values.len(),
+            Self::U32(values) => values.len(),
+            Self::I32(values) => values.len(),
+            Self::F32(values) => values.len(),
+            Self::Bool(values) => values.len(),
+            Self::U64(values) => values.len(),
+            Self::I64(values) => values.len(),
+            Self::F64(values) => values.len(),
+            Self::String(values) => values.len(),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    pub fn element_type_name(&self) -> &'static str {
+        match self {
+            Self::U8(_) => "u8",
+            Self::I8(_) => "i8",
+            Self::U16(_) => "u16",
+            Self::I16(_) => "i16",
+            Self::U32(_) => "u32",
+            Self::I32(_) => "i32",
+            Self::F32(_) => "f32",
+            Self::Bool(_) => "bool",
+            Self::U64(_) => "u64",
+            Self::I64(_) => "i64",
+            Self::F64(_) => "f64",
+            Self::String(_) => "string",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+/// Typed GGUF key-value payload.
+pub enum GgufValue {
+    U8(u8),
+    I8(i8),
+    U16(u16),
+    I16(i16),
+    U32(u32),
+    I32(i32),
+    F32(f32),
+    Bool(bool),
+    String(String),
+    U64(u64),
+    I64(i64),
+    F64(f64),
+    Array(GgufArrayValue),
+}
+
+impl GgufValue {
+    pub fn type_name(&self) -> &'static str {
+        match self {
+            Self::U8(_) => "u8",
+            Self::I8(_) => "i8",
+            Self::U16(_) => "u16",
+            Self::I16(_) => "i16",
+            Self::U32(_) => "u32",
+            Self::I32(_) => "i32",
+            Self::F32(_) => "f32",
+            Self::Bool(_) => "bool",
+            Self::String(_) => "string",
+            Self::U64(_) => "u64",
+            Self::I64(_) => "i64",
+            Self::F64(_) => "f64",
+            Self::Array(_) => "array",
         }
     }
 }
@@ -128,7 +223,22 @@ impl GgufFile {
             .try_into_checked()
             .map_err(|source| Error::int_conversion("gguf_get_kv_type index", source))?;
         let raw = unsafe { ffi::gguf_get_kv_type(self.raw.as_ptr(), index) };
-        Ok(GgufType::from_raw(raw))
+        Ok(GgufType::from_raw(raw as c_int))
+    }
+
+    pub fn kv_value(&self, index: usize) -> Result<GgufValue> {
+        let value_type = self.kv_type(index)?;
+        let key_id = index
+            .try_into_checked()
+            .map_err(|source| Error::int_conversion("gguf_get_val index", source))?;
+        self.kv_value_from_type(key_id, value_type)
+    }
+
+    pub fn kv_value_by_key(&self, key: &str) -> Result<Option<GgufValue>> {
+        let Some(index) = self.find_key(key)? else {
+            return Ok(None);
+        };
+        self.kv_value(index).map(Some)
     }
 
     pub fn kv_type_name(&self, index: usize) -> Result<String> {
@@ -149,11 +259,7 @@ impl GgufFile {
             .try_into_checked()
             .map_err(|source| Error::int_conversion("gguf_get_val_str index", source))?;
         let ptr = unsafe { ffi::gguf_get_val_str(self.raw.as_ptr(), index) };
-        if ptr.is_null() {
-            return Err(Error::null_pointer("gguf_get_val_str"));
-        }
-        let cstr = unsafe { CStr::from_ptr(ptr) };
-        Ok(cstr.to_str()?.to_owned())
+        c_string_from_ptr(ptr, "gguf_get_val_str")
     }
 
     pub fn tensor_count(&self) -> Result<usize> {
@@ -174,7 +280,7 @@ impl GgufFile {
         let name = unsafe { CStr::from_ptr(name_ptr) }.to_str()?.to_owned();
 
         let ggml_type_raw = unsafe { ffi::gguf_get_tensor_type(self.raw.as_ptr(), index_i64) };
-        let type_ptr = unsafe { ffi::ggml_type_name(ggml_type_raw) };
+        let type_ptr = unsafe { ffi::ggml_type_name(ggml_type_raw as _) };
         if type_ptr.is_null() {
             return Err(Error::null_pointer("ggml_type_name"));
         }
@@ -187,9 +293,125 @@ impl GgufFile {
             name,
             offset,
             size,
-            ggml_type_raw,
+            ggml_type_raw: ggml_type_raw as c_int,
             ggml_type_name,
         })
+    }
+
+    fn kv_value_from_type(&self, index: i64, value_type: GgufType) -> Result<GgufValue> {
+        let value = match value_type {
+            GgufType::Uint8 => {
+                GgufValue::U8(unsafe { ffi::gguf_get_val_u8(self.raw.as_ptr(), index) })
+            }
+            GgufType::Int8 => {
+                GgufValue::I8(unsafe { ffi::gguf_get_val_i8(self.raw.as_ptr(), index) })
+            }
+            GgufType::Uint16 => {
+                GgufValue::U16(unsafe { ffi::gguf_get_val_u16(self.raw.as_ptr(), index) })
+            }
+            GgufType::Int16 => {
+                GgufValue::I16(unsafe { ffi::gguf_get_val_i16(self.raw.as_ptr(), index) })
+            }
+            GgufType::Uint32 => {
+                GgufValue::U32(unsafe { ffi::gguf_get_val_u32(self.raw.as_ptr(), index) })
+            }
+            GgufType::Int32 => {
+                GgufValue::I32(unsafe { ffi::gguf_get_val_i32(self.raw.as_ptr(), index) })
+            }
+            GgufType::Float32 => {
+                GgufValue::F32(unsafe { ffi::gguf_get_val_f32(self.raw.as_ptr(), index) })
+            }
+            GgufType::Bool => {
+                GgufValue::Bool(unsafe { ffi::gguf_get_val_bool(self.raw.as_ptr(), index) })
+            }
+            GgufType::String => {
+                let ptr = unsafe { ffi::gguf_get_val_str(self.raw.as_ptr(), index) };
+                GgufValue::String(c_string_from_ptr(ptr, "gguf_get_val_str")?)
+            }
+            GgufType::Uint64 => {
+                GgufValue::U64(unsafe { ffi::gguf_get_val_u64(self.raw.as_ptr(), index) })
+            }
+            GgufType::Int64 => {
+                GgufValue::I64(unsafe { ffi::gguf_get_val_i64(self.raw.as_ptr(), index) })
+            }
+            GgufType::Float64 => {
+                GgufValue::F64(unsafe { ffi::gguf_get_val_f64(self.raw.as_ptr(), index) })
+            }
+            GgufType::Array => GgufValue::Array(self.read_array(index)?),
+            GgufType::Unknown(raw) => return Err(Error::UnsupportedType(raw)),
+        };
+        Ok(value)
+    }
+
+    fn read_array(&self, index: i64) -> Result<GgufArrayValue> {
+        let arr_type_raw = unsafe { ffi::gguf_get_arr_type(self.raw.as_ptr(), index) };
+        let arr_type = GgufType::from_raw(arr_type_raw as c_int);
+        let len = unsafe { ffi::gguf_get_arr_n(self.raw.as_ptr(), index) };
+        match arr_type {
+            GgufType::Uint8 => self
+                .read_array_data::<u8>(index, len, "gguf_get_arr_data<u8>")
+                .map(GgufArrayValue::U8),
+            GgufType::Int8 => self
+                .read_array_data::<i8>(index, len, "gguf_get_arr_data<i8>")
+                .map(GgufArrayValue::I8),
+            GgufType::Uint16 => self
+                .read_array_data::<u16>(index, len, "gguf_get_arr_data<u16>")
+                .map(GgufArrayValue::U16),
+            GgufType::Int16 => self
+                .read_array_data::<i16>(index, len, "gguf_get_arr_data<i16>")
+                .map(GgufArrayValue::I16),
+            GgufType::Uint32 => self
+                .read_array_data::<u32>(index, len, "gguf_get_arr_data<u32>")
+                .map(GgufArrayValue::U32),
+            GgufType::Int32 => self
+                .read_array_data::<i32>(index, len, "gguf_get_arr_data<i32>")
+                .map(GgufArrayValue::I32),
+            GgufType::Float32 => self
+                .read_array_data::<f32>(index, len, "gguf_get_arr_data<f32>")
+                .map(GgufArrayValue::F32),
+            GgufType::Uint64 => self
+                .read_array_data::<u64>(index, len, "gguf_get_arr_data<u64>")
+                .map(GgufArrayValue::U64),
+            GgufType::Int64 => self
+                .read_array_data::<i64>(index, len, "gguf_get_arr_data<i64>")
+                .map(GgufArrayValue::I64),
+            GgufType::Float64 => self
+                .read_array_data::<f64>(index, len, "gguf_get_arr_data<f64>")
+                .map(GgufArrayValue::F64),
+            GgufType::Bool => self
+                .read_array_data::<i8>(index, len, "gguf_get_arr_data<bool>")
+                .map(|values| values.into_iter().map(|value| value != 0).collect())
+                .map(GgufArrayValue::Bool),
+            GgufType::String => {
+                let mut values = Vec::with_capacity(len);
+                for arr_index in 0..len {
+                    let ptr = unsafe { ffi::gguf_get_arr_str(self.raw.as_ptr(), index, arr_index) };
+                    values.push(c_string_from_ptr(ptr, "gguf_get_arr_str")?);
+                }
+                Ok(GgufArrayValue::String(values))
+            }
+            GgufType::Array => Err(Error::UnsupportedType(ffi::GGUF_TYPE_ARRAY)),
+            GgufType::Unknown(raw) => Err(Error::UnsupportedType(raw)),
+        }
+    }
+
+    fn read_array_data<T: Copy>(
+        &self,
+        index: i64,
+        len: usize,
+        context: &'static str,
+    ) -> Result<Vec<T>> {
+        let ptr = unsafe { ffi::gguf_get_arr_data(self.raw.as_ptr(), index) };
+        if ptr.is_null() && len != 0 {
+            return Err(Error::null_pointer(context));
+        }
+        let data = if len == 0 {
+            Vec::new()
+        } else {
+            let slice = unsafe { std::slice::from_raw_parts(ptr.cast::<T>(), len) };
+            slice.to_vec()
+        };
+        Ok(data)
     }
 }
 
@@ -213,4 +435,12 @@ fn path_to_c_string(path: &Path) -> Result<CString> {
         let lossy = path.to_string_lossy();
         CString::new(lossy.as_bytes()).map_err(Error::from)
     }
+}
+
+fn c_string_from_ptr(ptr: *const c_char, context: &'static str) -> Result<String> {
+    if ptr.is_null() {
+        return Err(Error::null_pointer(context));
+    }
+    let cstr = unsafe { CStr::from_ptr(ptr) };
+    Ok(cstr.to_str()?.to_owned())
 }

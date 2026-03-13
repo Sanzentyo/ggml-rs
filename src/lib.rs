@@ -35,18 +35,19 @@ pub use compute::{
     tensor_overhead_bytes, type_size,
 };
 pub use error::{Error, Result};
-pub use gguf::{GgufFile, GgufTensorInfo, GgufType};
+pub use gguf::{GgufArrayValue, GgufFile, GgufTensorInfo, GgufType, GgufValue};
 pub use shape::{
     Bytes, Cols, Length, Rows, Shape2D, Shape2DSpec, StaticShape2D, TensorIndex, ThreadCount,
 };
 pub use tensor_expr::{BackendElement, TensorExpr};
 pub use typed_tensor::{Tensor2D, Tensor2DConst};
-pub use types::{BackendKind, RopeExtParams, Type};
+pub use types::{BackendDeviceType, BackendKind, ComputeStatus, RopeExtParams, Type};
 
 pub mod prelude {
     pub use crate::{
-        Backend, BackendBuffer, BackendElement, BackendKind, Bytes, Cols, Context, GgufFile, Graph,
-        Length, RopeExtParams, Rows, Shape2D, Shape2DSpec, StaticShape2D, Tensor, Tensor2D,
-        Tensor2DConst, TensorExpr, TensorIndex, ThreadCount, Type,
+        Backend, BackendBuffer, BackendDeviceType, BackendElement, BackendKind, Bytes, Cols,
+        ComputeStatus, Context, GgufArrayValue, GgufFile, GgufValue, Graph, Length, RopeExtParams,
+        Rows, Shape2D, Shape2DSpec, StaticShape2D, Tensor, Tensor2D, Tensor2DConst, TensorExpr,
+        TensorIndex, ThreadCount, Type,
     };
 }

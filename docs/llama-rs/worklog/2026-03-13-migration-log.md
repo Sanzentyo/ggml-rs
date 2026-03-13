@@ -1,0 +1,193 @@
+# llama-rs worklog: 2026-03-13 (migration phase)
+
+## Current session milestones
+
+- Verified `ggml-rs` safe API matmul on CPU and Metal.
+- Added local `llama.cpp` checkout for migration reference.
+- Added structured migration docs:
+  - `docs/llama-rs/README.md`
+  - `docs/llama-rs/PARITY_MATRIX.md`
+  - `docs/llama-rs/KNOWLEDGE_BASE.md`
+- Created initial `llama-rs` crate skeleton and backend smoke example powered by `ggml-rs` safe API.
+- Validated `llama-rs/examples/backend_smoke.rs` on both CPU and Metal (`[CPU] ... OK`, `[MTL0] ... OK`).
+- Added safe GGUF reader API to `ggml-rs` and `llama-rs/examples/gguf_inspect.rs`.
+- Verified `gguf_inspect` against a generated sample GGUF file from upstream `llama-gguf`.
+- Added `llama-rs/examples/gguf_hash.rs` with layer/global hashing and manifest verification.
+- Verified `gguf_hash` generation and `--check` round-trip success on sample GGUF manifest.
+- Expanded `ggml-rs` safe op surface for llama runtime needs: `add`, `mul`, `silu`, `rms_norm`, `scale`, `get_rows`, `repeat`, `cpy`, `cont`, `reshape_*`, `view_*`, `permute`, `diag_mask_inf`, `soft_max(_ext)`, `rope_ext`.
+- Added tensor naming (`set_name` / `name`) and backend `i32` tensor transfer helpers.
+- Re-ran CPU + Metal execution checks after the op-surface expansion:
+  - `ggml-rs/examples/backend_matmul.rs`
+  - `llama-rs/examples/backend_smoke.rs`
+- Applied Rust API polishing pass:
+  - split core definitions into `src/error.rs` and `src/types.rs`,
+  - added trait-based typed backend tensor I/O (`BackendElement`),
+  - added arithmetic expression abstraction (`TensorExpr`) with `+ - * /` operator support,
+  - added `prelude` re-export module.
+- Added `ggml-rs/examples/arithmetic_expr.rs` and verified runtime execution.
+- Added `docs/ggml-rs/README.md` and `docs/ggml-rs/KNOWLEDGE_BASE.md`.
+- Addressed `docs/third_reviews/review_0.md` feedback:
+  - switched error definition to `thiserror`,
+  - changed error string payloads to `Cow<'static, str>`,
+  - added `TryFrom<c_int> for Type` with `UnsupportedType` fallback,
+  - replaced integer conversion helper functions with `TryFrom`/`TryInto`-based extension trait,
+  - updated FFI opaque types to include pinned marker metadata while keeping FFI-safe opaque layout.
+- Per follow-up review feedback, further refactored to Rust-idiomatic style:
+  - replaced nested `checked_add`/`checked_mul` helper style with `num-traits` (`CheckedAdd`/`CheckedMul`) trait-based checked arithmetic,
+  - switched backend name init path from raw `*const c_char` plumbing to `&CStr` internal API,
+  - optimized path-to-C-string conversion to avoid unnecessary lossy conversion on Unix.
+- Added zero-overhead newtype layer (`Cols`, `Rows`, `Shape2D`) and typed API entrypoints for 2D tensor creation / shape handling / matmul memory estimation.
+- Continued module split to reduce `lib.rs` concentration:
+  - moved GGUF implementation to `src/gguf.rs`,
+  - moved numeric conversion/checked-arithmetic traits to `src/num_ext.rs`,
+  - moved expression DSL (`TensorExpr`, operator impls) to `src/tensor_expr.rs`.
+- Reworked error flow to remove `field` string threading:
+  - `Error` now uses source-based variants (`IntConversion { context, source }`, `CString`, `Utf8`) and explicit structured variants (`NullPointer { context }`, `Overflow`),
+  - conversion helpers now expose `try_into_checked()` / checked arithmetic methods without field-name arguments.
+- Per additional modularization request, moved compute-layer implementation into `src/compute.rs` and made `src/lib.rs` a compact re-export façade.
+- Expanded newtype usage further with `Length`, `TensorIndex`, `ThreadCount` and typed entrypoints (`new_*_1d_len`, `compute_with_threads`, `get_f32_at`).
+- Migrated ggml test/bench assets (safe API scope):
+  - added `tests/ggml_simple_ctx.rs` and `tests/ggml_test_cont.rs` (feature-gated with `link-system`),
+  - added `examples/bench_matmul.rs` benchmark harness for CPU/Metal timing.
+- Added full vendor suite harnesses:
+  - `tests/ggml_upstream_suite.rs` to build/run all upstream ggml test targets,
+  - `examples/bench_upstream_suite.rs` to run upstream perf-focused targets.
+- Added explicit policy gate to llama migration docs:
+  - implementation preflight now requires reading `docs/ggml-rs/ERROR_CONTEXT_POLICY.md`.
+- Added `llama-rs` benchmark API and example:
+  - `llama-rs/src/bench.rs` (`run_backend_matmul_bench`, `MatmulBenchConfig`, `MatmulBenchReport`),
+  - `llama-rs/examples/bench_matmul.rs` (`--iters`, `--warmup`, `--size`, `cpu`/`metal`).
+- Added a `simple-ctx` parity path in `llama-rs`:
+  - `llama-rs/src/simple.rs` (`run_simple_ctx`, `SimpleReport`, `SimpleError`),
+  - `llama-rs/examples/simple.rs`.
+- Added GGUF model-catalog foundation for future embedding/batched work:
+  - `llama-rs/src/model.rs` (`GgufModel`, `ModelError`) with full tensor-range validation at load time,
+  - `llama-rs/examples/model_catalog.rs` for reusable model inventory/validation workflow.
+  - validated on local `sample.gguf` (`file_size=2016`, `n_kv=15`, `n_tensors=10`, tensor payload checks OK).
+- Added embedding probe foundation:
+  - `llama-rs/src/embedding.rs` (`summarize_embedding_tensor`, `EmbeddingStats`, `EmbeddingError`),
+  - `llama-rs/examples/embedding_probe.rs` to inspect f32 tensor statistics as an embedding-oriented primitive.
+  - validated on local `sample.gguf` (`tensor_0`: `len=2`, `mean=100.0`, `l2_norm=141.421356`).
+- Added batched execution graph foundation:
+  - `llama-rs/src/batched.rs` (`run_batched_matmul`, `BatchedConfig`, `BatchedReport`, `BatchedError`),
+  - `llama-rs/examples/batched.rs` (`--batch`, `--repeats`, `--readback-every`, `--size`, `cpu`/`metal`).
+  - validated on CPU/Metal (`--batch 8 --repeats 5 --readback-every 2 --size 128`, checksum `2310.615234`, CPU `~0.085-0.108 ms`, Metal `~0.169-0.371 ms`).
+- Refined model/embedding decode path:
+  - added `GgufModel::decode_tensor_f32_into` for caller-owned buffer reuse,
+  - updated embedding summary path to use the reuse-oriented decode API.
+- Added first minimal inference path:
+  - `llama-rs/src/inference.rs` (`run_linear_inference`, `LinearInferenceConfig`, `LinearInferenceReport`, `InferenceError`),
+  - `llama-rs/examples/min_infer_linear.rs` (`Y = W * X` backend execution from GGUF tensor weights).
+  - validated on CPU/Metal with `sample.gguf` (`tensor_2`, `--in 6 --out 6`, matching preview values).
+- API/design polish pass for inference and batched foundations:
+  - added reusable `LinearWeights` and `run_linear_inference_with_weights_repeats`,
+  - added reusable `BatchedWorkload` and `run_batched_matmul_with_workload`,
+  - added config-level validation APIs (`LinearInferenceConfig::new`, `BatchedConfig::validated`),
+  - added type-safety features (`InFeatures`, `OutFeatures`) and type-state config builder (`LinearInferenceConfig::builder`),
+  - switched batched inputs to contiguous storage inside `BatchedWorkload` for cleaner responsibility and locality,
+  - updated examples to use the reusable APIs.
+- Validated benchmark parity snapshot with safe API only (`256x256`, `--iters 10`):
+  - run A: `ggml-rs` CPU `0.272 ms`, Metal `0.386 ms`; `llama-rs` CPU `0.276 ms`, Metal `0.293 ms`,
+  - run B: `ggml-rs` CPU `0.285 ms`, Metal `0.379 ms`; `llama-rs` CPU `0.286 ms`, Metal `0.443 ms`,
+  - run C: `ggml-rs` CPU `0.287 ms`, Metal `0.187 ms`; `llama-rs` CPU `0.282 ms`, Metal `0.344 ms`,
+  - checksum remained `956.435547` on both implementations.
+- API polish pass (type safety + boundary cleanup):
+  - `llama-rs/src/batched.rs` now uses non-zero schedule newtypes (`BatchSize`, `RepeatCount`, `ReadbackEvery`),
+  - `llama-rs/src/model.rs` now exposes handle-based lookup (`TensorHandle`) and handle-based decode/read APIs,
+  - added crate-level unified error boundary (`llama-rs/src/error.rs`: `LlamaError`, `LlamaResult<T>`),
+  - re-validated `cargo fmt`, `cargo clippy --workspace --all-targets`, `cargo test --workspace`.
+- Runtime re-verification with a fresh local `ggml` checkout (shared libs in `build/src`):
+  - `llama-rs/examples/backend_smoke`: CPU and Metal both pass,
+  - `llama-rs/examples/batched`: CPU and Metal both pass (`--size 64 --batch 4 --repeats 2 --readback-every 1`),
+  - checksum parity confirmed (`CPU` = `MTL0` = `465.457031`).
+- Added next inference-graph building block (minimal MLP block):
+  - extended `llama-rs/src/inference.rs` with `MlpInferenceConfig`, `MlpWeights`, and `run_mlp_inference*` APIs,
+  - added `llama-rs/examples/min_infer_mlp.rs` for backend execution of `down(silu(gate(x)) * up(x))`,
+  - validated on CPU/Metal with deterministic weights (`--hidden 64 --ffn 128 --repeats 2`) and matched preview outputs.
+- Added GGUF tensor-name resolution layer for real-model wiring:
+  - new `llama-rs/src/naming.rs` (`detect_layer_indices`, `resolve_llama_tensor_names`, `NamingError`),
+  - supports `blk.*`, `layers.*`, and `model.layers.*` naming families for core attention/FFN roles,
+  - added `llama-rs/examples/resolve_tensor_names.rs` with non-strict inspection mode and optional strict failure.
+- Re-validated runtime path:
+  - `llama-rs/examples/backend_smoke`: CPU and Metal pass,
+  - `llama-rs/examples/resolve_tensor_names`: runs against generated `sample.gguf` and reports unresolved status cleanly when model is non-transformer sample.
+- Added layer-index GGUF-backed MLP execution path:
+  - `run_mlp_inference_for_layer(_repeats)` resolves layer names then executes MLP path,
+  - `MlpWeights::from_model_layer` infers FFN width from resolved `ffn_gate` weights,
+  - added `llama-rs/examples/min_infer_mlp_layer.rs`.
+- Added synthetic GGUF fixture workflow for integration checks:
+  - generated `/tmp/mlp_layer_sample.gguf` via `uv run --with numpy --with pyyaml ...` using `llama.cpp/gguf-py` writer,
+  - includes required global tensors and `blk.0.*` layer tensors.
+- Re-validated after layer-index API addition:
+  - `cargo fmt`, `cargo clippy --workspace --all-targets`, `cargo test --workspace`,
+  - `llama-rs/examples/backend_smoke` on CPU and Metal,
+  - `llama-rs/examples/resolve_tensor_names --strict` on fixture (resolved layer 0 roles),
+  - `llama-rs/examples/min_infer_mlp_layer` on CPU and Metal with matching preview outputs.
+- Added explicit parity/coverage artifacts for the same capability cluster:
+  - name-resolver unit tests in `llama-rs/src/naming.rs` (blk/hf layouts + missing-role diagnostics + layer-index detection),
+  - C++ reference comparator test `llama-rs/tests/mlp_cpp_parity.rs` + `tests/cpp/mlp_reference.cpp`,
+  - benchmark example `llama-rs/examples/bench_mlp_layer.rs`.
+- Verified new parity artifacts:
+  - `cargo test -p llama-rs --features link-system --test mlp_cpp_parity` passes,
+  - `bench_mlp_layer` runs on CPU/Metal and reports stable checksum parity.
+- Expanded coverage set per follow-up request:
+  - C++ parity test now validates multiple shape cases (`8x16`, `16x32`, `32x64`),
+  - added CPU-vs-Metal parity assertions across the same case matrix,
+  - `bench_mlp_layer` now supports multi-case sweeps via `--cases HxF,...` and was validated on two sizes (`64x128`, `96x192`).
+- Hardened llama.cpp comparison path:
+  - `tests/cpp/mlp_reference.cpp` switched from plain loops to ggml CPU graph execution (`mul_mat/silu/mul`),
+  - rust parity test now compares against ggml-backed C++ execution and remains green across multi-size cases.
+- API polish pass:
+  - added `resolve_llama_layer_tensor_names(_from_names)` to resolve one layer directly,
+  - added `resolve_mlp_weights_for_layer` and updated `min_infer_mlp_layer` to reuse decoded weights across backends.
+- Started attention-path migration (requested next step):
+  - added minimal layer-index attention APIs in `inference.rs` (`AttentionInferenceConfig/Weights/Report`, resolver-backed decode, backend run helpers),
+  - added `examples/min_infer_attention_layer.rs`,
+  - added `tests/attention_parity.rs` (CPU vs Metal parity),
+  - validated on CPU/Metal using synthetic llama-like GGUF fixture.
+- Completed metadata-first hardening (requested step 2):
+  - expanded `ggml-rs` GGUF safe API with typed values (`GgufValue`, `GgufArrayValue`) and scalar/array readers,
+  - updated `llama-rs` GGUF report to carry typed KV payloads,
+  - added architecture-aware metadata module (`metadata.rs`) with ADTs:
+    - `ModelArchitecture`, `ModelMetadata`, `LlamaModelMetadata`,
+    - `resolve_model_metadata(_from_kv)`, `resolve_llama_metadata(_from_kv)`,
+    - `resolve_transformer_metadata(_from_kv)` for `{architecture}.*` key namespaces,
+  - added `GgufModel::kv_value` and `tensor_f32_len` for metadata/shape-driven inference setup.
+- Added layer shape auto-resolution:
+  - `resolve_llama_layer_dimensions` now derives hidden/ffn/head/rope dimensions from metadata + tensor lengths,
+  - when full metadata is not present, it falls back to tensor-derived topology inference (`attn_q/attn_k`) with preferred head-dimension candidates,
+  - exposes `resolution_mode` (`FullMetadata` / `TensorHeuristic`) for runtime traceability in examples,
+  - added auto weight resolvers:
+    - `resolve_mlp_weights_for_layer_auto`,
+    - `resolve_attention_weights_for_layer_auto`,
+  - implemented fallback path for sparse fixtures missing full metadata (infer hidden width from `attn_q` tensor size).
+- Completed attention refactor (requested step 1 after step 2):
+  - replaced single-head config with ADT-based configuration:
+    - `AttentionLayout`, `AttentionMaskPolicy`, `RotaryEmbedding`, `RopeConfig`,
+  - implemented multi-head grouped-attention execution path using safe ggml APIs,
+  - added optional causal mask path via `soft_max_ext`,
+  - added optional RoPE application via `rope_ext`,
+  - added auto-run helpers:
+    - `run_attention_inference_for_layer_auto(_repeats)`.
+- Re-validated:
+  - `cargo fmt`
+  - `cargo clippy --workspace --all-targets`
+  - `cargo test --workspace`
+  - `cargo test -p llama-rs --features link-system --test mlp_cpp_parity --test attention_parity`
+  - runtime examples on fixture `/tmp/mlp_layer_sample.gguf`:
+    - `min_infer_mlp_layer` on CPU/Metal (auto shape),
+    - `min_infer_attention_layer` on CPU/Metal (auto shape),
+    - `min_infer_attention_layer --causal cpu` (causal execution path).
+- Metal portability note:
+  - non-causal attention path is verified on Metal.
+  - causal-mask parity on Metal is not yet part of the default parity gate.
+- Added metadata-rich synthetic fixture (`/tmp/mlp_layer_sample_meta.gguf`) and verified full metadata resolution path end-to-end.
+- Fixed RoPE runtime integration for head-sliced tensors:
+  - make head views contiguous before reshape,
+  - apply RoPE on reshaped 3D tensor and reshape back to 2D.
+
+## Next concrete steps
+
+1. Expand `llama-rs` core API beyond smoke-level matrix operations.
+2. Start implementing feature parity per example target from the parity matrix.
+3. Mark each target as in-progress/done with CPU+Metal verification evidence.

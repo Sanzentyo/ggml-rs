@@ -39,6 +39,9 @@ path = "examples/bench_upstream_suite.rs"
 num-traits = "0.2"
 thiserror = "2"
 
+[build-dependencies]
+bindgen = "0.72.1"
+
 [workspace]
 members = ["llama-rs"]
 resolver = "2"

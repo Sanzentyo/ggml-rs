@@ -25,13 +25,58 @@ path = "examples/simple.rs"
 required-features = ["link-system"]
 
 [[example]]
+name = "batched"
+path = "examples/batched.rs"
+required-features = ["link-system"]
+
+[[example]]
 name = "bench_matmul"
 path = "examples/bench_matmul.rs"
 required-features = ["link-system"]
 
 [[example]]
+name = "bench_mlp_layer"
+path = "examples/bench_mlp_layer.rs"
+required-features = ["link-system"]
+
+[[example]]
 name = "gguf_inspect"
 path = "examples/gguf_inspect.rs"
+required-features = ["link-system"]
+
+[[example]]
+name = "model_catalog"
+path = "examples/model_catalog.rs"
+required-features = ["link-system"]
+
+[[example]]
+name = "resolve_tensor_names"
+path = "examples/resolve_tensor_names.rs"
+required-features = ["link-system"]
+
+[[example]]
+name = "embedding_probe"
+path = "examples/embedding_probe.rs"
+required-features = ["link-system"]
+
+[[example]]
+name = "min_infer_linear"
+path = "examples/min_infer_linear.rs"
+required-features = ["link-system"]
+
+[[example]]
+name = "min_infer_mlp"
+path = "examples/min_infer_mlp.rs"
+required-features = ["link-system"]
+
+[[example]]
+name = "min_infer_mlp_layer"
+path = "examples/min_infer_mlp_layer.rs"
+required-features = ["link-system"]
+
+[[example]]
+name = "min_infer_attention_layer"
+path = "examples/min_infer_attention_layer.rs"
 required-features = ["link-system"]
 
 [[example]]

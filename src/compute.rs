@@ -3,8 +3,8 @@
 use crate::ffi;
 use crate::num_ext::{CheckedFieldOps, TryIntoChecked};
 use crate::{
-    BackendElement, BackendKind, Bytes, Cols, Error, Length, Result, RopeExtParams, Rows, Shape2D,
-    TensorExpr, TensorIndex, ThreadCount, Type,
+    BackendDeviceType, BackendElement, BackendKind, Bytes, Cols, ComputeStatus, Error, Length,
+    Result, RopeExtParams, Rows, Shape2D, TensorExpr, TensorIndex, ThreadCount, Type,
 };
 use std::ffi::{CStr, CString};
 use std::marker::PhantomData;
@@ -23,7 +23,7 @@ pub fn init_timing() {
 
 /// Returns the byte size of a single element for the given type.
 pub fn type_size(ty: Type) -> usize {
-    unsafe { ffi::ggml_type_size(ty.as_raw()) }
+    unsafe { ffi::ggml_type_size(ty.as_raw() as _) }
 }
 
 /// Returns ggml's internal per-tensor metadata overhead in bytes.
@@ -70,12 +70,14 @@ impl Backend {
         NonNull::new(unsafe { ffi::ggml_backend_init_by_name(name.as_ptr(), ptr::null()) })
     }
 
-    fn init_by_type(device_type: c_int) -> Option<NonNull<ffi::ggml_backend>> {
-        NonNull::new(unsafe { ffi::ggml_backend_init_by_type(device_type, ptr::null()) })
+    fn init_by_type(device_type: BackendDeviceType) -> Option<NonNull<ffi::ggml_backend>> {
+        NonNull::new(unsafe {
+            ffi::ggml_backend_init_by_type(device_type.as_raw() as _, ptr::null())
+        })
     }
 
     fn init_cpu_backend() -> Result<NonNull<ffi::ggml_backend>> {
-        Self::init_by_type(ffi::GGML_BACKEND_DEVICE_TYPE_CPU)
+        Self::init_by_type(BackendDeviceType::Cpu)
             .or_else(|| Self::init_by_name(c"CPU"))
             .ok_or(Error::BackendUnavailable(BackendKind::Cpu.as_name()))
     }
@@ -88,10 +90,11 @@ impl Backend {
                 continue;
             };
 
-            let device_type = unsafe { ffi::ggml_backend_dev_type(device.as_ptr()) };
-            let is_gpu_like = device_type == ffi::GGML_BACKEND_DEVICE_TYPE_GPU
-                || device_type == ffi::GGML_BACKEND_DEVICE_TYPE_IGPU;
-            if !is_gpu_like {
+            let device_type_raw = unsafe { ffi::ggml_backend_dev_type(device.as_ptr()) };
+            let Some(device_type) = BackendDeviceType::from_raw(device_type_raw as c_int) else {
+                continue;
+            };
+            if !device_type.is_gpu_like() {
                 continue;
             }
 
@@ -123,10 +126,7 @@ impl Backend {
 
         // Final fallback: any GPU-like backend type when explicit metal
         // matching is unavailable in the local ggml build.
-        for device_type in [
-            ffi::GGML_BACKEND_DEVICE_TYPE_IGPU,
-            ffi::GGML_BACKEND_DEVICE_TYPE_GPU,
-        ] {
+        for device_type in [BackendDeviceType::IntegratedGpu, BackendDeviceType::Gpu] {
             if let Some(raw) = Self::init_by_type(device_type) {
                 return Ok(raw);
             }
@@ -154,7 +154,7 @@ impl Backend {
         let status =
             unsafe { ffi::ggml_backend_graph_compute(self.raw.as_ptr(), graph.raw.as_ptr()) };
 
-        if status == ffi::GGML_STATUS_SUCCESS {
+        if ComputeStatus::is_success(status) {
             Ok(())
         } else {
             Err(Error::ComputeFailed(status))
@@ -359,7 +359,8 @@ impl Context {
             .try_into_checked()
             .map_err(|source| Error::int_conversion("tensor dimension", source))?;
 
-        let raw = unsafe { ffi::ggml_new_tensor_2d(self.raw.as_ptr(), ty.as_raw(), cols, rows) };
+        let raw =
+            unsafe { ffi::ggml_new_tensor_2d(self.raw.as_ptr(), ty.as_raw() as _, cols, rows) };
         self.wrap_tensor(raw)
             .map_err(|error| error.with_context("ggml_new_tensor_2d"))
     }
@@ -383,7 +384,7 @@ impl Context {
             .get()
             .try_into_checked()
             .map_err(|source| Error::int_conversion("tensor dimension", source))?;
-        let raw = unsafe { ffi::ggml_new_tensor_1d(self.raw.as_ptr(), ty.as_raw(), len) };
+        let raw = unsafe { ffi::ggml_new_tensor_1d(self.raw.as_ptr(), ty.as_raw() as _, len) };
         self.wrap_tensor(raw)
             .map_err(|error| error.with_context("ggml_new_tensor_1d"))
     }
@@ -420,7 +421,8 @@ impl Context {
         let ne2 = (ne2)
             .try_into_checked()
             .map_err(|source| Error::int_conversion("tensor dimension", source))?;
-        let raw = unsafe { ffi::ggml_new_tensor_3d(self.raw.as_ptr(), ty.as_raw(), ne0, ne1, ne2) };
+        let raw =
+            unsafe { ffi::ggml_new_tensor_3d(self.raw.as_ptr(), ty.as_raw() as _, ne0, ne1, ne2) };
         self.wrap_tensor(raw)
             .map_err(|error| error.with_context("ggml_new_tensor_3d"))
     }
@@ -445,8 +447,9 @@ impl Context {
         let ne3 = (ne3)
             .try_into_checked()
             .map_err(|source| Error::int_conversion("tensor dimension", source))?;
-        let raw =
-            unsafe { ffi::ggml_new_tensor_4d(self.raw.as_ptr(), ty.as_raw(), ne0, ne1, ne2, ne3) };
+        let raw = unsafe {
+            ffi::ggml_new_tensor_4d(self.raw.as_ptr(), ty.as_raw() as _, ne0, ne1, ne2, ne3)
+        };
         self.wrap_tensor(raw)
             .map_err(|error| error.with_context("ggml_new_tensor_4d"))
     }
@@ -734,7 +737,7 @@ impl Context {
             ffi::ggml_graph_compute_with_ctx(self.raw.as_ptr(), graph.raw.as_ptr(), n_threads)
         };
 
-        if status == ffi::GGML_STATUS_SUCCESS {
+        if ComputeStatus::is_success(status) {
             Ok(())
         } else {
             Err(Error::ComputeFailed(status))

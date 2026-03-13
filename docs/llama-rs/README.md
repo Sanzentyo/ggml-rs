@@ -28,3 +28,15 @@ This preflight step is mandatory and must be done before coding.
 4. Verify each migrated example on CPU and Metal and record results.
 5. Start each implementation batch by explicitly referencing the error-context policy document above.
 6. Keep a benchmark parity gate (`ggml-rs` vs `llama-rs`) for core workloads so regression is visible while feature parity expands.
+
+## Current runtime foundations
+
+- `model`: GGUF load + tensor lookup + payload validation, with handle-based lookup (`TensorHandle`) for repeated access and typed KV access (`kv_value`).
+- `embedding`: f32 tensor summary helpers for embedding-oriented workflows.
+- `batched`: backend graph reuse and batched matmul execution scaffolding.
+- `metadata`: architecture-aware GGUF metadata ADTs (`ModelArchitecture`, `TransformerMetadata`, `ModelMetadata`, `LlamaModelMetadata`) for config derivation across architecture-prefixed GGUF keys.
+- `inference`: minimal linear inference (`Y = W * X`), MLP-block inference, layer-index GGUF-backed MLP execution, layer-dimension auto-resolution (`resolve_llama_layer_dimensions`, with `FullMetadata` / `TensorHeuristic` resolution mode), and ADT-based attention path (multi-head + optional causal mask + optional RoPE).
+- `naming`: GGUF tensor-name resolver (`blk.*` / `layers.*` / `model.layers.*`) for real-model wiring.
+- Type-safety additions: feature-count newtypes and type-state builder for linear inference config, plus non-zero schedule newtypes for batched execution.
+- Public error boundary: crate-level `LlamaError` / `LlamaResult<T>` for cross-module integration.
+- Coverage additions: name-resolver unit tests, metadata parser unit tests, ggml-based C++ parity + CPU/Metal parity tests (`mlp_cpp_parity`), attention CPU/Metal parity + causal CPU test (`attention_parity`), and multi-case MLP-layer benchmark (`bench_mlp_layer`).

@@ -21,6 +21,28 @@ GGML_RS_LIBS=ggml,ggml-base,ggml-cpu,ggml-metal,ggml-blas
 DYLD_LIBRARY_PATH=target/vendor/ggml/build/src:target/vendor/ggml/build/src/ggml-metal:target/vendor/ggml/build/src/ggml-blas:$DYLD_LIBRARY_PATH
 ```
 
+## FFI generation modes
+
+Default mode (recommended):
+
+- `build.rs` uses `bindgen` and emits `$OUT_DIR/ffi_bindings.rs`
+- `src/ffi.rs` includes generated bindings
+
+Fallback mode:
+
+```bash
+GGML_RS_DISABLE_BINDGEN=1 cargo test --workspace
+```
+
+Optional constant auto-generation in fallback mode:
+
+```bash
+GGML_RS_DISABLE_BINDGEN=1 \
+GGML_RS_AUTOGEN_FFI_CONSTS=1 \
+GGML_RS_GGML_INCLUDE_DIR=target/vendor/ggml/include \
+cargo test --workspace
+```
+
 ## Backend behavior notes
 
 - In this environment the Metal backend name may appear as `MTL0` rather than
