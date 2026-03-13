@@ -1,0 +1,30 @@
+[package]
+name = "llama-rs"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+default = []
+link-system = ["ggml-rs/link-system"]
+
+[dependencies]
+ggml-rs = { path = "..", package = "ggml-rs", default-features = false }
+sha1 = "0.10"
+sha2 = "0.10"
+uuid = { version = "1", features = ["v5"] }
+xxhash-rust = { version = "0.8", features = ["xxh64"] }
+
+[[example]]
+name = "backend_smoke"
+path = "examples/backend_smoke.rs"
+required-features = ["link-system"]
+
+[[example]]
+name = "gguf_inspect"
+path = "examples/gguf_inspect.rs"
+required-features = ["link-system"]
+
+[[example]]
+name = "gguf_hash"
+path = "examples/gguf_hash.rs"
+required-features = ["link-system"]

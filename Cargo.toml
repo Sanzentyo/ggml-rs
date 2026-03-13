@@ -1,0 +1,28 @@
+[package]
+name = "ggml-rs"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+default = []
+link-system = []
+
+[lib]
+name = "ggml_rs"
+path = "src/lib.rs"
+
+[[example]]
+name = "simple_ctx"
+path = "examples/simple_ctx.rs"
+required-features = ["link-system"]
+
+[[example]]
+name = "backend_matmul"
+path = "examples/backend_matmul.rs"
+required-features = ["link-system"]
+
+[dependencies]
+
+[workspace]
+members = ["llama-rs"]
+resolver = "2"
