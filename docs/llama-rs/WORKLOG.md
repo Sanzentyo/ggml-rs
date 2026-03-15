@@ -641,3 +641,18 @@ Detailed logs are split under `docs/llama-rs/worklog/` to keep this top-level fi
 - Current pass decision:
   - keep `block_gateup_fused=false` as default (cross-model direction remains mixed after broader validation),
   - keep the flag available for backend-specific or model-specific A/B exploration.
+- Rechecked `head_stage_buf` after graph-builder/schedule passes on ELYZA layers `5..7`:
+  - base:
+    - `target/benchmarks/llama_rs_stepwise_post_graphbuilder_elyza_layers5_7.txt`,
+  - variant(on):
+    - `target/benchmarks/llama_rs_stepwise_post_graphbuilder_elyza_layers5_7_headstage_on.txt`,
+  - impact:
+    - `target/benchmarks/llama_stepwise_post_graphbuilder_elyza_layers5_7_headstage_impact.md`,
+  - checksum check:
+    - `target/benchmarks/llama_stepwise_post_graphbuilder_elyza_layers5_7_headstage_checksum_check.md` (`max abs delta = 0.0`),
+  - means (`on/base`):
+    - CPU `~1.000`,
+    - MTL0 `~1.004`,
+    - overall `~1.002`.
+- Policy for this pass:
+  - keep `head_stage_buf=false` as default (near-neutral to slight regression on the current hotspot slice).
