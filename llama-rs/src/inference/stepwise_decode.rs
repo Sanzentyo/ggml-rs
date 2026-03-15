@@ -363,6 +363,33 @@ impl StepwiseGraphBuilder for KvPolicyStepwiseGraphBuilder<'_> {
     }
 }
 
+#[derive(Debug, Clone)]
+struct StepGraphSchedule {
+    graph_indices: Vec<usize>,
+}
+
+impl StepGraphSchedule {
+    fn new(kv_cache_write_strategy: &dyn KvCacheWriteStrategy, steps: usize) -> Self {
+        let graph_indices = (0..steps)
+            .map(|step| kv_cache_write_strategy.graph_index_for_step(step))
+            .collect();
+        Self { graph_indices }
+    }
+
+    fn debug_validate(&self, graph_count: usize) {
+        debug_assert!(
+            self.graph_indices
+                .iter()
+                .all(|&graph_index| graph_index < graph_count),
+            "stepwise graph schedule must stay within graph range",
+        );
+    }
+
+    fn iter(&self) -> impl Iterator<Item = (usize, usize)> + '_ {
+        self.graph_indices.iter().copied().enumerate()
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 enum HeadOutputProjectionMode {
     PerHead,
@@ -1521,6 +1548,8 @@ fn execute_stepwise_sweep_internal(
             kv_cache_write_nodes: &kv_cache_write_nodes,
         },
     )?;
+    let step_graph_schedule = StepGraphSchedule::new(kv_cache_write_strategy, steps);
+    step_graph_schedule.debug_validate(graphs.len());
     let _buffer = ctx
         .allocate_tensors(&backend)
         .map_err(|source| InferenceError::ggml("Context::allocate_tensors", source))?;
@@ -1646,13 +1675,12 @@ fn execute_stepwise_sweep_internal(
 
             sequence_state_updater.initialize_mask(mask.as_ref(), past_start)?;
 
-            for step in 0..steps {
+            for (step, graph_index) in step_graph_schedule.iter() {
                 let step_past_tokens = past_start
                     .checked_add(step)
                     .ok_or(InferenceError::MemorySizeOverflow)?;
                 sequence_state_updater.update_positions(positions_q.as_ref(), step_past_tokens)?;
                 sequence_state_updater.update_mask(mask.as_ref(), step, step_past_tokens)?;
-                let graph_index = kv_cache_write_strategy.graph_index_for_step(step);
                 let graph = graphs
                     .get_mut(graph_index)
                     .expect("stepwise graph index must stay in range");

@@ -599,3 +599,29 @@ Detailed logs are split under `docs/llama-rs/worklog/` to keep this top-level fi
     - introduced `StepwiseGraphBuilder` + `KvPolicyStepwiseGraphBuilder` and `StepwiseGraphBuildInput`,
     - centralized stepwise graph construction (graph count, prereq nodes, KV write wiring) under one ADT-driven builder,
     - runtime smoke artifact: `target/benchmarks/llama_rs_stepwise_graph_builder_adt_smoke.txt`.
+- Continued stepwise execution-loop cleanup after Candidate C:
+  - added `StepGraphSchedule` to precompute per-step graph indices once and reuse them across warmup/bench loops.
+  - runtime smoke artifact:
+    - `target/benchmarks/llama_rs_stepwise_graph_schedule_smoke.txt`.
+- Refreshed layer hotspot profile on the active lock (`outproj_fused_layerx5`, ELYZA layers `5..7`):
+  - raw:
+    - `target/benchmarks/llama_rs_stepwise_post_graphbuilder_elyza_layers5_7.txt`,
+  - summaries:
+    - `target/benchmarks/llama_stepwise_post_graphbuilder_elyza_layers5_7_summary.csv`,
+    - `target/benchmarks/llama_stepwise_post_graphbuilder_elyza_layers5_7_summary.md`,
+  - current hotspot snapshot:
+    - CPU max in this slice: `layer=7` (`29.283 ms/token`),
+    - MTL0 max in this slice: `layer=6` (`20.165 ms/token`).
+- Rechecked `block_gateup_fused` after the graph-builder/schedule refactors on the same ELYZA hotspot slice:
+  - base:
+    - `target/benchmarks/llama_rs_stepwise_post_graphbuilder_elyza_layers5_7_blockgateup_base.txt`,
+  - variant(on):
+    - `target/benchmarks/llama_rs_stepwise_post_graphbuilder_elyza_layers5_7_blockgateup_on.txt`,
+  - impact:
+    - `target/benchmarks/llama_stepwise_post_graphbuilder_elyza_layers5_7_blockgateup_impact.md`,
+  - checksum check:
+    - `target/benchmarks/llama_stepwise_post_graphbuilder_elyza_layers5_7_blockgateup_checksum_check.md` (`max abs delta = 0.0`),
+  - means (`on/base`):
+    - CPU `~0.988`,
+    - MTL0 `~0.995`,
+    - overall `~0.991`.
