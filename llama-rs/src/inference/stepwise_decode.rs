@@ -215,6 +215,92 @@ impl AttentionDecodeStepwiseConfig {
     }
 }
 
+#[derive(Default)]
+struct KvCacheWriteNodes<'ctx> {
+    shared_k: Option<ggml_rs::Tensor<'ctx>>,
+    shared_v: Option<ggml_rs::Tensor<'ctx>>,
+    step_k: Option<Vec<ggml_rs::Tensor<'ctx>>>,
+    step_v: Option<Vec<ggml_rs::Tensor<'ctx>>>,
+}
+
+trait KvCacheWriteStrategy {
+    fn graph_count(&self, steps: usize) -> usize;
+    fn graph_index_for_step(&self, step: usize) -> usize;
+    fn bench_needs_kv_reset(&self, warmup_repeats_per_step: usize) -> bool;
+    fn expand_graph_nodes<'ctx>(
+        &self,
+        graph: &mut ggml_rs::Graph<'ctx>,
+        graph_step: usize,
+        write_nodes: &KvCacheWriteNodes<'ctx>,
+    );
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct SharedKvCacheWriteStrategy;
+
+impl KvCacheWriteStrategy for SharedKvCacheWriteStrategy {
+    fn graph_count(&self, _steps: usize) -> usize {
+        1
+    }
+
+    fn graph_index_for_step(&self, _step: usize) -> usize {
+        0
+    }
+
+    fn bench_needs_kv_reset(&self, warmup_repeats_per_step: usize) -> bool {
+        warmup_repeats_per_step == 0
+    }
+
+    fn expand_graph_nodes<'ctx>(
+        &self,
+        graph: &mut ggml_rs::Graph<'ctx>,
+        _graph_step: usize,
+        write_nodes: &KvCacheWriteNodes<'ctx>,
+    ) {
+        if let Some(kv_cache_write_k) = write_nodes.shared_k.as_ref() {
+            graph.build_forward_expand(kv_cache_write_k);
+        }
+        if let Some(kv_cache_write_v) = write_nodes.shared_v.as_ref() {
+            graph.build_forward_expand(kv_cache_write_v);
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct StepSpecificKvCacheWriteStrategy;
+
+impl KvCacheWriteStrategy for StepSpecificKvCacheWriteStrategy {
+    fn graph_count(&self, steps: usize) -> usize {
+        steps
+    }
+
+    fn graph_index_for_step(&self, step: usize) -> usize {
+        step
+    }
+
+    fn bench_needs_kv_reset(&self, _warmup_repeats_per_step: usize) -> bool {
+        true
+    }
+
+    fn expand_graph_nodes<'ctx>(
+        &self,
+        graph: &mut ggml_rs::Graph<'ctx>,
+        graph_step: usize,
+        write_nodes: &KvCacheWriteNodes<'ctx>,
+    ) {
+        if let Some(step_nodes) = write_nodes.step_k.as_ref()
+            && let Some(kv_cache_write_k) = step_nodes.get(graph_step)
+        {
+            graph.build_forward_expand(kv_cache_write_k);
+        }
+        if let Some(step_nodes) = write_nodes.step_v.as_ref()
+            && let Some(kv_cache_write_v) = step_nodes.get(graph_step)
+        {
+            graph.build_forward_expand(kv_cache_write_v);
+        }
+    }
+}
+
 trait SequenceStateUpdater {
     fn initialize_mask<'ctx>(
         &mut self,
@@ -735,37 +821,35 @@ fn execute_stepwise_sweep_internal(
         .ok_or(InferenceError::MemorySizeOverflow)?;
     let step_specific_kv_cache_writes =
         include_kv_projection && include_kv_cache_write && include_kv_cache_write_to_cache;
+    let shared_kv_cache_write_strategy = SharedKvCacheWriteStrategy;
+    let step_specific_kv_cache_write_strategy = StepSpecificKvCacheWriteStrategy;
+    let kv_cache_write_strategy: &dyn KvCacheWriteStrategy = if step_specific_kv_cache_writes {
+        &step_specific_kv_cache_write_strategy
+    } else {
+        &shared_kv_cache_write_strategy
+    };
     let precompute_kv_head_views =
         precompute_static_kv_head_views && !step_specific_kv_cache_writes;
 
-    let (
-        w_k,
-        w_v,
-        projected_k_step,
-        projected_v_step,
-        kv_cache_write_k,
-        kv_cache_write_v,
-        kv_cache_write_k_steps,
-        kv_cache_write_v_steps,
-    ) = if include_kv_projection {
-        let w_k = ctx
-            .new_f32_tensor_2d_shape(Shape2D::new(hidden_features, kv_features))
-            .map_err(|source| {
-                InferenceError::ggml("Context::new_f32_tensor_2d_shape<W_K>", source)
-            })?;
-        let w_v = ctx
-            .new_f32_tensor_2d_shape(Shape2D::new(hidden_features, kv_features))
-            .map_err(|source| {
-                InferenceError::ggml("Context::new_f32_tensor_2d_shape<W_V>", source)
-            })?;
-        let projected_k_step = ctx
-            .mul_mat(&w_k, &x_q)
-            .map_err(|source| InferenceError::ggml("Context::mul_mat(K_STEP)", source))?;
-        let projected_v_step = ctx
-            .mul_mat(&w_v, &x_q)
-            .map_err(|source| InferenceError::ggml("Context::mul_mat(V_STEP)", source))?;
-        let (kv_cache_write_k, kv_cache_write_v, kv_cache_write_k_steps, kv_cache_write_v_steps) =
-            if include_kv_cache_write {
+    let (w_k, w_v, projected_k_step, projected_v_step, kv_cache_write_nodes) =
+        if include_kv_projection {
+            let w_k = ctx
+                .new_f32_tensor_2d_shape(Shape2D::new(hidden_features, kv_features))
+                .map_err(|source| {
+                    InferenceError::ggml("Context::new_f32_tensor_2d_shape<W_K>", source)
+                })?;
+            let w_v = ctx
+                .new_f32_tensor_2d_shape(Shape2D::new(hidden_features, kv_features))
+                .map_err(|source| {
+                    InferenceError::ggml("Context::new_f32_tensor_2d_shape<W_V>", source)
+                })?;
+            let projected_k_step = ctx
+                .mul_mat(&w_k, &x_q)
+                .map_err(|source| InferenceError::ggml("Context::mul_mat(K_STEP)", source))?;
+            let projected_v_step = ctx
+                .mul_mat(&w_v, &x_q)
+                .map_err(|source| InferenceError::ggml("Context::mul_mat(V_STEP)", source))?;
+            let kv_cache_write_nodes = if include_kv_cache_write {
                 if step_specific_kv_cache_writes {
                     let mut kv_cache_write_k_steps = Vec::with_capacity(steps);
                     let mut kv_cache_write_v_steps = Vec::with_capacity(steps);
@@ -820,12 +904,11 @@ fn execute_stepwise_sweep_internal(
                         kv_cache_write_k_steps.push(kv_cache_write_k);
                         kv_cache_write_v_steps.push(kv_cache_write_v);
                     }
-                    (
-                        None,
-                        None,
-                        Some(kv_cache_write_k_steps),
-                        Some(kv_cache_write_v_steps),
-                    )
+                    KvCacheWriteNodes {
+                        step_k: Some(kv_cache_write_k_steps),
+                        step_v: Some(kv_cache_write_v_steps),
+                        ..KvCacheWriteNodes::default()
+                    }
                 } else {
                     let k_write_slot = ctx
                         .new_f32_tensor_2d_shape(Shape2D::new(kv_features, query_length))
@@ -853,24 +936,25 @@ fn execute_stepwise_sweep_internal(
                             .map_err(|source| {
                                 InferenceError::ggml("Context::cpy(V_STEP->V_WRITE_SLOT)", source)
                             })?;
-                    (Some(kv_cache_write_k), Some(kv_cache_write_v), None, None)
+                    KvCacheWriteNodes {
+                        shared_k: Some(kv_cache_write_k),
+                        shared_v: Some(kv_cache_write_v),
+                        ..KvCacheWriteNodes::default()
+                    }
                 }
             } else {
-                (None, None, None, None)
+                KvCacheWriteNodes::default()
             };
-        (
-            Some(w_k),
-            Some(w_v),
-            Some(projected_k_step),
-            Some(projected_v_step),
-            kv_cache_write_k,
-            kv_cache_write_v,
-            kv_cache_write_k_steps,
-            kv_cache_write_v_steps,
-        )
-    } else {
-        (None, None, None, None, None, None, None, None)
-    };
+            (
+                Some(w_k),
+                Some(w_v),
+                Some(projected_k_step),
+                Some(projected_v_step),
+                kv_cache_write_nodes,
+            )
+        } else {
+            (None, None, None, None, KvCacheWriteNodes::default())
+        };
 
     let mut output_projection = None;
     let mut attention_head_outputs = if fuse_output_projection && !use_head_output_staging_buffer {
@@ -1220,11 +1304,7 @@ fn execute_stepwise_sweep_internal(
         y_attention
     };
 
-    let graph_count = if step_specific_kv_cache_writes {
-        steps
-    } else {
-        1
-    };
+    let graph_count = kv_cache_write_strategy.graph_count(steps);
     let mut graphs = Vec::with_capacity(graph_count);
     for graph_step in 0..graph_count {
         let mut graph = ctx
@@ -1242,25 +1322,7 @@ fn execute_stepwise_sweep_internal(
         if let Some(projected_v_step) = projected_v_step.as_ref() {
             graph.build_forward_expand(projected_v_step);
         }
-        if step_specific_kv_cache_writes {
-            if let Some(step_nodes) = kv_cache_write_k_steps.as_ref()
-                && let Some(kv_cache_write_k) = step_nodes.get(graph_step)
-            {
-                graph.build_forward_expand(kv_cache_write_k);
-            }
-            if let Some(step_nodes) = kv_cache_write_v_steps.as_ref()
-                && let Some(kv_cache_write_v) = step_nodes.get(graph_step)
-            {
-                graph.build_forward_expand(kv_cache_write_v);
-            }
-        } else {
-            if let Some(kv_cache_write_k) = kv_cache_write_k.as_ref() {
-                graph.build_forward_expand(kv_cache_write_k);
-            }
-            if let Some(kv_cache_write_v) = kv_cache_write_v.as_ref() {
-                graph.build_forward_expand(kv_cache_write_v);
-            }
-        }
+        kv_cache_write_strategy.expand_graph_nodes(&mut graph, graph_step, &kv_cache_write_nodes);
         graphs.push(graph);
     }
     let _buffer = ctx
@@ -1394,11 +1456,7 @@ fn execute_stepwise_sweep_internal(
                     .ok_or(InferenceError::MemorySizeOverflow)?;
                 sequence_state_updater.update_positions(positions_q.as_ref(), step_past_tokens)?;
                 sequence_state_updater.update_mask(mask.as_ref(), step, step_past_tokens)?;
-                let graph_index = if step_specific_kv_cache_writes {
-                    step
-                } else {
-                    0
-                };
+                let graph_index = kv_cache_write_strategy.graph_index_for_step(step);
                 let graph = graphs
                     .get_mut(graph_index)
                     .expect("stepwise graph index must stay in range");
@@ -1427,7 +1485,8 @@ fn execute_stepwise_sweep_internal(
     for block_mlp_weights in block_mlp_runs {
         upload_block_mlp_weights(block_mlp_weights)?;
         execute_phase(warmup_repeats_per_step, true)?;
-        let bench_needs_kv_reset = warmup_repeats_per_step == 0 || step_specific_kv_cache_writes;
+        let bench_needs_kv_reset =
+            kv_cache_write_strategy.bench_needs_kv_reset(warmup_repeats_per_step);
         let bench_start = Instant::now();
         execute_phase(repeats_per_step, bench_needs_kv_reset)?;
         let bench_duration = bench_start.elapsed();
