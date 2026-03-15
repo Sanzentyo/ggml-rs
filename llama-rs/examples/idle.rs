@@ -59,6 +59,10 @@ fn main() -> Result<(), ExampleError> {
 #[derive(Debug, Error)]
 enum ExampleError {
     #[error(transparent)]
+    Model(#[from] llama_rs::ModelError),
+    #[error(transparent)]
+    Idle(#[from] llama_rs::IdleError),
+    #[error(transparent)]
     Llama(#[from] llama_rs::LlamaError),
     #[error(transparent)]
     Boxed(#[from] Box<dyn StdError>),

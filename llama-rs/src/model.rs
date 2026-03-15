@@ -3,103 +3,54 @@
 //! This module provides a safe base layer for future inference pipelines.
 
 use crate::gguf::{GgufKvEntry, GgufReport, inspect_gguf};
-use ggml_rs::{GgufTensorInfo, GgufValue};
+use ggml_rs::{GgmlElement, GgufTensorInfo, GgufValue};
+use num_traits::NumCast;
 use std::collections::HashMap;
-use std::error::Error as StdError;
-use std::fmt;
 use std::path::{Path, PathBuf};
+use thiserror::Error;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 /// Opaque tensor identifier returned by [`GgufModel::find_tensor`].
 pub struct TensorHandle(usize);
 
-#[derive(Debug)]
+#[derive(Debug, Error)]
 /// Errors surfaced by [`GgufModel`] loading and tensor access.
 pub enum ModelError {
+    #[error("{context}: {source}")]
     Io {
         context: &'static str,
+        #[source]
         source: std::io::Error,
     },
+    #[error("{context}: {source}")]
     Ggml {
         context: &'static str,
+        #[source]
         source: ggml_rs::Error,
     },
-    DuplicateTensorName {
-        name: String,
-    },
-    DuplicateKvKey {
-        key: String,
-    },
-    MissingTensor {
-        name: String,
-    },
+    #[error("duplicate tensor name in GGUF tensor table: {name}")]
+    DuplicateTensorName { name: String },
+    #[error("duplicate key in GGUF KV table: {key}")]
+    DuplicateKvKey { key: String },
+    #[error("tensor not found: {name}")]
+    MissingTensor { name: String },
+    #[error(
+        "tensor `{tensor_name}` points outside file range: [{start}, {end}) with file size {file_size}"
+    )]
     InvalidTensorRange {
         tensor_name: String,
         start: usize,
         end: usize,
         file_size: usize,
     },
+    #[error("tensor `{tensor_name}` is not decodable (type={ggml_type_name} raw={ggml_type_raw})")]
     UnsupportedTensorType {
         tensor_name: String,
         ggml_type_name: String,
         ggml_type_raw: i32,
     },
-    InvalidTensorByteLength {
-        tensor_name: String,
-        bytes: usize,
-    },
-}
-
-impl fmt::Display for ModelError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Io { context, source } => write!(f, "{context}: {source}"),
-            Self::Ggml { context, source } => write!(f, "{context}: {source}"),
-            Self::DuplicateTensorName { name } => {
-                write!(f, "duplicate tensor name in GGUF tensor table: {name}")
-            }
-            Self::DuplicateKvKey { key } => {
-                write!(f, "duplicate key in GGUF KV table: {key}")
-            }
-            Self::MissingTensor { name } => write!(f, "tensor not found: {name}"),
-            Self::InvalidTensorRange {
-                tensor_name,
-                start,
-                end,
-                file_size,
-            } => write!(
-                f,
-                "tensor `{tensor_name}` points outside file range: [{start}, {end}) with file size {file_size}"
-            ),
-            Self::UnsupportedTensorType {
-                tensor_name,
-                ggml_type_name,
-                ggml_type_raw,
-            } => write!(
-                f,
-                "tensor `{tensor_name}` is not f32 (type={ggml_type_name} raw={ggml_type_raw})"
-            ),
-            Self::InvalidTensorByteLength { tensor_name, bytes } => write!(
-                f,
-                "tensor `{tensor_name}` payload length is not f32-aligned: {bytes} bytes"
-            ),
-        }
-    }
-}
-
-impl StdError for ModelError {
-    fn source(&self) -> Option<&(dyn StdError + 'static)> {
-        match self {
-            Self::Io { source, .. } => Some(source),
-            Self::Ggml { source, .. } => Some(source),
-            Self::DuplicateTensorName { .. }
-            | Self::DuplicateKvKey { .. }
-            | Self::MissingTensor { .. }
-            | Self::InvalidTensorRange { .. }
-            | Self::UnsupportedTensorType { .. }
-            | Self::InvalidTensorByteLength { .. } => None,
-        }
-    }
+    #[error("tensor `{tensor_name}` payload length is not element-aligned: {bytes} bytes")]
+    InvalidTensorByteLength { tensor_name: String, bytes: usize },
 }
 
 impl ModelError {
@@ -109,6 +60,56 @@ impl ModelError {
 
     fn ggml(context: &'static str, source: ggml_rs::Error) -> Self {
         Self::Ggml { context, source }
+    }
+}
+
+/// Conversion trait used by generic GGUF metadata accessors.
+pub trait TryFromGgufValue: Sized {
+    fn try_from_gguf(value: &GgufValue) -> Option<Self>;
+}
+
+impl TryFromGgufValue for usize {
+    fn try_from_gguf(value: &GgufValue) -> Option<Self> {
+        match value {
+            GgufValue::U8(value) => Some(*value as usize),
+            GgufValue::I8(value) if *value >= 0 => Some(*value as usize),
+            GgufValue::U16(value) => Some(*value as usize),
+            GgufValue::I16(value) if *value >= 0 => Some(*value as usize),
+            GgufValue::U32(value) => Some(*value as usize),
+            GgufValue::I32(value) if *value >= 0 => Some(*value as usize),
+            GgufValue::U64(value) => usize::try_from(*value).ok(),
+            GgufValue::I64(value) if *value >= 0 => usize::try_from(*value as u64).ok(),
+            GgufValue::F32(value) if *value >= 0.0 && value.fract() == 0.0 => Some(*value as usize),
+            GgufValue::F64(value) if *value >= 0.0 && value.fract() == 0.0 => Some(*value as usize),
+            _ => None,
+        }
+    }
+}
+
+impl TryFromGgufValue for f32 {
+    fn try_from_gguf(value: &GgufValue) -> Option<Self> {
+        match value {
+            GgufValue::F32(value) => Some(*value),
+            GgufValue::F64(value) => Some(*value as f32),
+            GgufValue::U8(value) => Some(*value as f32),
+            GgufValue::I8(value) => Some(*value as f32),
+            GgufValue::U16(value) => Some(*value as f32),
+            GgufValue::I16(value) => Some(*value as f32),
+            GgufValue::U32(value) => Some(*value as f32),
+            GgufValue::I32(value) => Some(*value as f32),
+            GgufValue::U64(value) => Some(*value as f32),
+            GgufValue::I64(value) => Some(*value as f32),
+            _ => None,
+        }
+    }
+}
+
+impl TryFromGgufValue for String {
+    fn try_from_gguf(value: &GgufValue) -> Option<Self> {
+        match value {
+            GgufValue::String(value) => Some(value.clone()),
+            _ => None,
+        }
     }
 }
 
@@ -181,18 +182,22 @@ impl GgufModel {
     }
 
     /// Returns tensor metadata by exact tensor name.
-    pub fn tensor_info(&self, name: &str) -> Result<&GgufTensorInfo, ModelError> {
+    pub fn tensor_info(&self, name: impl AsRef<str>) -> Result<&GgufTensorInfo, ModelError> {
+        let name = name.as_ref();
         let handle = self
             .find_tensor(name)
             .ok_or_else(|| ModelError::MissingTensor {
-                name: name.to_string(),
+                name: name.to_owned(),
             })?;
         Ok(self.tensor_info_by_handle(handle))
     }
 
     /// Resolves a tensor name to an opaque handle.
-    pub fn find_tensor(&self, name: &str) -> Option<TensorHandle> {
-        self.tensor_index.get(name).copied().map(TensorHandle)
+    pub fn find_tensor(&self, name: impl AsRef<str>) -> Option<TensorHandle> {
+        self.tensor_index
+            .get(name.as_ref())
+            .copied()
+            .map(TensorHandle)
     }
 
     /// Returns tensor metadata from a previously resolved handle.
@@ -201,11 +206,12 @@ impl GgufModel {
     }
 
     /// Returns raw tensor payload bytes by exact tensor name.
-    pub fn tensor_payload(&self, name: &str) -> Result<&[u8], ModelError> {
+    pub fn tensor_payload(&self, name: impl AsRef<str>) -> Result<&[u8], ModelError> {
+        let name = name.as_ref();
         let handle = self
             .find_tensor(name)
             .ok_or_else(|| ModelError::MissingTensor {
-                name: name.to_string(),
+                name: name.to_owned(),
             })?;
         self.tensor_payload_by_handle(handle)
     }
@@ -216,46 +222,78 @@ impl GgufModel {
         self.tensor_payload_internal(tensor)
     }
 
-    /// Decodes a tensor into `f32` values.
-    ///
-    /// Quantized GGUF tensor payloads are decoded via GGML type traits.
-    pub fn tensor_f32_values(&self, name: &str) -> Result<Vec<f32>, ModelError> {
+    /// Decodes a tensor into caller-selected element type.
+    pub fn tensor_values<T>(&self, name: impl AsRef<str>) -> Result<Vec<T>, ModelError>
+    where
+        T: GgmlElement + NumCast,
+    {
         let mut values = Vec::new();
-        self.decode_tensor_f32_into(name, &mut values)?;
+        self.decode_tensor_into(name, &mut values)?;
         Ok(values)
     }
 
-    /// Decodes a tensor into caller-owned `f32` storage.
-    ///
-    /// This is useful for hot paths that want to reuse buffers and avoid
-    /// repeated allocations.
-    pub fn decode_tensor_f32_into(&self, name: &str, out: &mut Vec<f32>) -> Result<(), ModelError> {
+    /// Decodes a tensor into caller-owned output storage.
+    pub fn decode_tensor_into<T>(
+        &self,
+        name: impl AsRef<str>,
+        out: &mut Vec<T>,
+    ) -> Result<(), ModelError>
+    where
+        T: GgmlElement + NumCast,
+    {
+        let name = name.as_ref();
         let handle = self
             .find_tensor(name)
             .ok_or_else(|| ModelError::MissingTensor {
-                name: name.to_string(),
+                name: name.to_owned(),
             })?;
-        self.decode_tensor_f32_into_by_handle(handle, out)
+        self.decode_tensor_into_by_handle(handle, out)
     }
 
-    /// Decodes a tensor handle into caller-owned `f32` storage.
-    pub fn decode_tensor_f32_into_by_handle(
+    /// Decodes a tensor handle into caller-owned output storage.
+    pub fn decode_tensor_into_by_handle<T>(
         &self,
         handle: TensorHandle,
-        out: &mut Vec<f32>,
-    ) -> Result<(), ModelError> {
+        out: &mut Vec<T>,
+    ) -> Result<(), ModelError>
+    where
+        T: GgmlElement + NumCast,
+    {
         let tensor = self.tensor_info_by_handle(handle);
         let payload = self.tensor_payload_internal(tensor)?;
-        ggml_rs::decode_tensor_data_to_f32(tensor.ggml_type_raw, payload, out).map_err(|source| {
+        ggml_rs::decode_tensor_data_to::<T>(tensor.ggml_type_raw, payload, out).map_err(|source| {
             match source {
                 ggml_rs::Error::UnsupportedType(_) => ModelError::UnsupportedTensorType {
                     tensor_name: tensor.name.clone(),
                     ggml_type_name: tensor.ggml_type_name.clone(),
                     ggml_type_raw: tensor.ggml_type_raw,
                 },
-                other => ModelError::ggml("decode_tensor_data_to_f32", other),
+                other => ModelError::ggml("decode_tensor_data_to", other),
             }
         })
+    }
+
+    /// Compatibility helper for callers that explicitly need `f32`.
+    pub fn tensor_f32_values(&self, name: impl AsRef<str>) -> Result<Vec<f32>, ModelError> {
+        self.tensor_values(name)
+    }
+
+    /// Compatibility helper for callers that explicitly need `f32`.
+    pub fn decode_tensor_f32_into(
+        &self,
+        name: impl AsRef<str>,
+        out: &mut Vec<f32>,
+    ) -> Result<(), ModelError> {
+        self.decode_tensor_into(name, out)
+    }
+
+    /// Compatibility helper for callers that explicitly need `f32`.
+    pub fn decode_tensor_f32_into_by_handle(
+        &self,
+        handle: TensorHandle,
+        out: &mut Vec<f32>,
+    ) -> Result<(), ModelError> {
+        self.decode_tensor_into_by_handle(handle, out)
     }
 
     /// Iterates all tensor names in file order.
@@ -267,19 +305,27 @@ impl GgufModel {
     }
 
     /// Returns a GGUF KV entry by exact key.
-    pub fn kv_entry(&self, key: &str) -> Option<&GgufKvEntry> {
+    pub fn kv_entry(&self, key: impl AsRef<str>) -> Option<&GgufKvEntry> {
         self.kv_index
-            .get(key)
+            .get(key.as_ref())
             .and_then(|&index| self.report.kv_entries.get(index))
     }
 
     /// Returns a GGUF KV value by exact key.
-    pub fn kv_value(&self, key: &str) -> Option<&GgufValue> {
+    pub fn kv_value(&self, key: impl AsRef<str>) -> Option<&GgufValue> {
         self.kv_entry(key).map(|entry| &entry.value)
     }
 
+    /// Returns metadata value converted by [`TryFromGgufValue`].
+    pub fn kv_value_as<T>(&self, key: impl AsRef<str>) -> Option<T>
+    where
+        T: TryFromGgufValue,
+    {
+        self.kv_value(key).and_then(T::try_from_gguf)
+    }
+
     /// Returns a metadata string value by key when the key exists and is a string.
-    pub fn kv_string(&self, key: &str) -> Option<&str> {
+    pub fn kv_string(&self, key: impl AsRef<str>) -> Option<&str> {
         match self.kv_value(key) {
             Some(GgufValue::String(value)) => Some(value.as_str()),
             _ => None,
@@ -287,51 +333,28 @@ impl GgufModel {
     }
 
     /// Returns a metadata numeric value converted to `usize` when representable.
-    pub fn kv_usize(&self, key: &str) -> Option<usize> {
-        match self.kv_value(key)? {
-            GgufValue::U8(value) => Some(*value as usize),
-            GgufValue::I8(value) if *value >= 0 => Some(*value as usize),
-            GgufValue::U16(value) => Some(*value as usize),
-            GgufValue::I16(value) if *value >= 0 => Some(*value as usize),
-            GgufValue::U32(value) => Some(*value as usize),
-            GgufValue::I32(value) if *value >= 0 => Some(*value as usize),
-            GgufValue::U64(value) => usize::try_from(*value).ok(),
-            GgufValue::I64(value) if *value >= 0 => usize::try_from(*value as u64).ok(),
-            GgufValue::F32(value) if *value >= 0.0 && value.fract() == 0.0 => Some(*value as usize),
-            GgufValue::F64(value) if *value >= 0.0 && value.fract() == 0.0 => Some(*value as usize),
-            _ => None,
-        }
+    pub fn kv_usize(&self, key: impl AsRef<str>) -> Option<usize> {
+        self.kv_value_as(key)
     }
 
     /// Returns a metadata numeric value converted to `f32` when possible.
-    pub fn kv_f32(&self, key: &str) -> Option<f32> {
-        match self.kv_value(key)? {
-            GgufValue::F32(value) => Some(*value),
-            GgufValue::F64(value) => Some(*value as f32),
-            GgufValue::U8(value) => Some(*value as f32),
-            GgufValue::I8(value) => Some(*value as f32),
-            GgufValue::U16(value) => Some(*value as f32),
-            GgufValue::I16(value) => Some(*value as f32),
-            GgufValue::U32(value) => Some(*value as f32),
-            GgufValue::I32(value) => Some(*value as f32),
-            GgufValue::U64(value) => Some(*value as f32),
-            GgufValue::I64(value) => Some(*value as f32),
-            _ => None,
-        }
+    pub fn kv_f32(&self, key: impl AsRef<str>) -> Option<f32> {
+        self.kv_value_as(key)
     }
 
-    /// Returns the element count for an `f32` tensor without decoding payload.
-    pub fn tensor_f32_len(&self, name: &str) -> Result<usize, ModelError> {
+    /// Returns the scalar element count for a tensor payload.
+    pub fn tensor_len(&self, name: impl AsRef<str>) -> Result<usize, ModelError> {
+        let name = name.as_ref();
         let handle = self
             .find_tensor(name)
             .ok_or_else(|| ModelError::MissingTensor {
-                name: name.to_string(),
+                name: name.to_owned(),
             })?;
-        self.tensor_f32_len_by_handle(handle)
+        self.tensor_len_by_handle(handle)
     }
 
-    /// Returns the element count for an `f32` tensor by handle without decoding payload.
-    pub fn tensor_f32_len_by_handle(&self, handle: TensorHandle) -> Result<usize, ModelError> {
+    /// Returns the scalar element count by tensor handle.
+    pub fn tensor_len_by_handle(&self, handle: TensorHandle) -> Result<usize, ModelError> {
         let tensor = self.tensor_info_by_handle(handle);
         let payload = self.tensor_payload_internal(tensor)?;
         ggml_rs::tensor_element_count(tensor.ggml_type_raw, payload.len()).map_err(|source| {
@@ -344,6 +367,16 @@ impl GgufModel {
                 other => ModelError::ggml("tensor_element_count", other),
             }
         })
+    }
+
+    /// Compatibility helper for existing `f32`-named call sites.
+    pub fn tensor_f32_len(&self, name: impl AsRef<str>) -> Result<usize, ModelError> {
+        self.tensor_len(name)
+    }
+
+    /// Compatibility helper for existing `f32`-named call sites.
+    pub fn tensor_f32_len_by_handle(&self, handle: TensorHandle) -> Result<usize, ModelError> {
+        self.tensor_len_by_handle(handle)
     }
 
     fn tensor_payload_internal<'a>(

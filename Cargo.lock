@@ -299,6 +299,7 @@ version = "0.1.0"
 dependencies = [
  "clap",
  "ggml-rs",
+ "num-traits",
  "serde_json",
  "sha1",
  "sha2",

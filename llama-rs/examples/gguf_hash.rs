@@ -27,6 +27,8 @@ fn main() -> Result<(), ExampleError> {
 #[derive(Debug, Error)]
 enum ExampleError {
     #[error(transparent)]
+    Hash(#[from] llama_rs::GgufHashError),
+    #[error(transparent)]
     Llama(#[from] llama_rs::LlamaError),
     #[error(transparent)]
     Io(#[from] std::io::Error),

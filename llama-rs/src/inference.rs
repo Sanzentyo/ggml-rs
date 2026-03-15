@@ -8,11 +8,11 @@ use crate::backend::LlamaBackend;
 use crate::metadata::{LlamaModelMetadata, MetadataError, resolve_llama_metadata};
 use crate::model::{GgufModel, ModelError};
 use crate::naming::{LlamaLayerTensorNames, NamingError, resolve_llama_layer_tensor_names};
-use ggml_rs::{Context, Length, Shape2D};
-use std::error::Error as StdError;
-use std::fmt;
+use ggml_rs::{Context, GgmlElement, Length, Shape2D, Type};
+use num_traits::NumCast;
 use std::marker::PhantomData;
 use std::num::NonZeroUsize;
+use thiserror::Error;
 
 mod attention_ops;
 mod backend_runtime;
@@ -33,43 +33,43 @@ pub use stepwise_decode::{
 };
 pub use stepwise_plan::{DecodeStepBenchSet, DecodeStepPlan, DecodeStepPlanBuilder};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-/// Strongly typed non-zero input feature count.
-pub struct InFeatures(NonZeroUsize);
+macro_rules! define_non_zero_count {
+    ($(#[$meta:meta])* $name:ident, $error_ctor:expr) => {
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        $(#[$meta])*
+        pub struct $name(NonZeroUsize);
 
-impl InFeatures {
-    pub fn new(value: usize) -> Result<Self, InferenceError> {
-        NonZeroUsize::new(value)
-            .map(Self)
-            .ok_or(InferenceError::InvalidLinearShape {
-                in_features: value,
-                out_features: 0,
-            })
-    }
+        impl $name {
+            pub fn new(value: usize) -> Result<Self, InferenceError> {
+                NonZeroUsize::new(value)
+                    .map(Self)
+                    .ok_or_else(|| ($error_ctor)(value))
+            }
 
-    pub const fn get(self) -> usize {
-        self.0.get()
-    }
+            pub const fn get(self) -> usize {
+                self.0.get()
+            }
+        }
+    };
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-/// Strongly typed non-zero output feature count.
-pub struct OutFeatures(NonZeroUsize);
-
-impl OutFeatures {
-    pub fn new(value: usize) -> Result<Self, InferenceError> {
-        NonZeroUsize::new(value)
-            .map(Self)
-            .ok_or(InferenceError::InvalidLinearShape {
-                in_features: 0,
-                out_features: value,
-            })
+define_non_zero_count!(
+    /// Strongly typed non-zero input feature count.
+    InFeatures,
+    |value| InferenceError::InvalidLinearShape {
+        in_features: value,
+        out_features: 0,
     }
+);
 
-    pub const fn get(self) -> usize {
-        self.0.get()
+define_non_zero_count!(
+    /// Strongly typed non-zero output feature count.
+    OutFeatures,
+    |value| InferenceError::InvalidLinearShape {
+        in_features: 0,
+        out_features: value,
     }
-}
+);
 
 /// Marker: required builder field is not set yet.
 pub struct Missing;
@@ -167,34 +167,38 @@ impl LinearInferenceConfigBuilder<Present, Present> {
 
 #[derive(Debug, Clone)]
 /// Output payload and execution metadata.
-pub struct LinearInferenceReport {
+pub struct LinearInferenceReport<T = f32> {
     pub backend_name: String,
     pub in_features: usize,
     pub out_features: usize,
     pub repeats: usize,
-    pub output: Vec<f32>,
+    pub output: Vec<T>,
 }
 
 #[derive(Debug, Clone)]
 /// Pre-decoded linear weights for repeated inference calls.
-pub struct LinearWeights {
+pub struct LinearWeights<T = f32> {
     pub tensor_name: String,
     pub in_features: usize,
     pub out_features: usize,
-    values: Vec<f32>,
+    values: Vec<T>,
 }
 
-impl LinearWeights {
+impl<T> LinearWeights<T>
+where
+    T: GgmlElement + NumCast,
+{
     /// Decodes a GGUF tensor into reusable linear weights.
     pub fn from_model(
         model: &GgufModel,
-        tensor_name: &str,
+        tensor_name: impl AsRef<str>,
         config: LinearInferenceConfig,
     ) -> Result<Self, InferenceError> {
+        let tensor_name = tensor_name.as_ref();
         let expected_weights = config.expected_weight_len();
         let values = model
-            .tensor_f32_values(tensor_name)
-            .map_err(|source| InferenceError::model("GgufModel::tensor_f32_values", source))?;
+            .tensor_values::<T>(tensor_name)
+            .map_err(|source| InferenceError::model("GgufModel::tensor_values", source))?;
         if values.len() != expected_weights {
             return Err(InferenceError::InvalidWeightLength {
                 tensor_name: tensor_name.to_string(),
@@ -211,48 +215,28 @@ impl LinearWeights {
         })
     }
 
-    pub fn values(&self) -> &[f32] {
+    pub fn values(&self) -> &[T] {
         &self.values
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-/// Strongly typed non-zero hidden feature count for MLP-style block inference.
-pub struct HiddenFeatures(NonZeroUsize);
-
-impl HiddenFeatures {
-    pub fn new(value: usize) -> Result<Self, InferenceError> {
-        NonZeroUsize::new(value)
-            .map(Self)
-            .ok_or(InferenceError::InvalidMlpShape {
-                hidden_features: value,
-                ffn_features: 0,
-            })
+define_non_zero_count!(
+    /// Strongly typed non-zero hidden feature count for MLP-style block inference.
+    HiddenFeatures,
+    |value| InferenceError::InvalidMlpShape {
+        hidden_features: value,
+        ffn_features: 0,
     }
+);
 
-    pub const fn get(self) -> usize {
-        self.0.get()
+define_non_zero_count!(
+    /// Strongly typed non-zero FFN feature count for MLP-style block inference.
+    FfnFeatures,
+    |value| InferenceError::InvalidMlpShape {
+        hidden_features: 0,
+        ffn_features: value,
     }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-/// Strongly typed non-zero FFN feature count for MLP-style block inference.
-pub struct FfnFeatures(NonZeroUsize);
-
-impl FfnFeatures {
-    pub fn new(value: usize) -> Result<Self, InferenceError> {
-        NonZeroUsize::new(value)
-            .map(Self)
-            .ok_or(InferenceError::InvalidMlpShape {
-                hidden_features: 0,
-                ffn_features: value,
-            })
-    }
-
-    pub const fn get(self) -> usize {
-        self.0.get()
-    }
-}
+);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 /// Configuration for a minimal MLP block (`down(silu(gate(x)) * up(x))`).
@@ -292,18 +276,18 @@ impl MlpInferenceConfig {
 
 #[derive(Debug, Clone)]
 /// Pre-decoded MLP weights for repeated backend executions.
-pub struct MlpWeights {
+pub struct MlpWeights<T = f32> {
     pub gate_tensor_name: String,
     pub up_tensor_name: String,
     pub down_tensor_name: String,
     pub hidden_features: usize,
     pub ffn_features: usize,
-    gate_values: Vec<f32>,
-    up_values: Vec<f32>,
-    down_values: Vec<f32>,
+    gate_values: Vec<T>,
+    up_values: Vec<T>,
+    down_values: Vec<T>,
 }
 
-impl MlpWeights {
+impl MlpWeights<f32> {
     /// Builds deterministic synthetic MLP weights for runtime smoke checks.
     pub fn deterministic(config: MlpInferenceConfig) -> Self {
         let gate_values = (0..config.expected_gate_weight_len())
@@ -326,28 +310,32 @@ impl MlpWeights {
             down_values,
         }
     }
+}
 
+impl<T> MlpWeights<T>
+where
+    T: GgmlElement + NumCast,
+{
     /// Loads MLP weights from three GGUF tensors (`gate`, `up`, `down`).
     pub fn from_model(
         model: &GgufModel,
-        gate_tensor_name: &str,
-        up_tensor_name: &str,
-        down_tensor_name: &str,
+        gate_tensor_name: impl AsRef<str>,
+        up_tensor_name: impl AsRef<str>,
+        down_tensor_name: impl AsRef<str>,
         config: MlpInferenceConfig,
     ) -> Result<Self, InferenceError> {
+        let gate_tensor_name = gate_tensor_name.as_ref();
+        let up_tensor_name = up_tensor_name.as_ref();
+        let down_tensor_name = down_tensor_name.as_ref();
         let gate_values = model
-            .tensor_f32_values(gate_tensor_name)
-            .map_err(|source| {
-                InferenceError::model("GgufModel::tensor_f32_values(gate)", source)
-            })?;
+            .tensor_values::<T>(gate_tensor_name)
+            .map_err(|source| InferenceError::model("GgufModel::tensor_values(gate)", source))?;
         let up_values = model
-            .tensor_f32_values(up_tensor_name)
-            .map_err(|source| InferenceError::model("GgufModel::tensor_f32_values(up)", source))?;
+            .tensor_values::<T>(up_tensor_name)
+            .map_err(|source| InferenceError::model("GgufModel::tensor_values(up)", source))?;
         let down_values = model
-            .tensor_f32_values(down_tensor_name)
-            .map_err(|source| {
-                InferenceError::model("GgufModel::tensor_f32_values(down)", source)
-            })?;
+            .tensor_values::<T>(down_tensor_name)
+            .map_err(|source| InferenceError::model("GgufModel::tensor_values(down)", source))?;
 
         Self::from_raw(
             gate_tensor_name.to_string(),
@@ -367,9 +355,11 @@ impl MlpWeights {
         layer: &LlamaLayerTensorNames,
         hidden_features: usize,
     ) -> Result<Self, InferenceError> {
-        let gate_values = model.tensor_f32_values(&layer.ffn_gate).map_err(|source| {
-            InferenceError::model("GgufModel::tensor_f32_values(ffn_gate)", source)
-        })?;
+        let gate_values = model
+            .tensor_values::<T>(&layer.ffn_gate)
+            .map_err(|source| {
+                InferenceError::model("GgufModel::tensor_values(ffn_gate)", source)
+            })?;
         if hidden_features == 0 || gate_values.len() % hidden_features != 0 {
             return Err(InferenceError::InvalidMlpWeightShape {
                 tensor_name: layer.ffn_gate.clone(),
@@ -379,12 +369,14 @@ impl MlpWeights {
         }
         let ffn_features = gate_values.len() / hidden_features;
         let config = MlpInferenceConfig::new(hidden_features, ffn_features)?;
-        let up_values = model.tensor_f32_values(&layer.ffn_up).map_err(|source| {
-            InferenceError::model("GgufModel::tensor_f32_values(ffn_up)", source)
-        })?;
-        let down_values = model.tensor_f32_values(&layer.ffn_down).map_err(|source| {
-            InferenceError::model("GgufModel::tensor_f32_values(ffn_down)", source)
-        })?;
+        let up_values = model
+            .tensor_values::<T>(&layer.ffn_up)
+            .map_err(|source| InferenceError::model("GgufModel::tensor_values(ffn_up)", source))?;
+        let down_values = model
+            .tensor_values::<T>(&layer.ffn_down)
+            .map_err(|source| {
+                InferenceError::model("GgufModel::tensor_values(ffn_down)", source)
+            })?;
 
         Self::from_raw(
             layer.ffn_gate.clone(),
@@ -402,9 +394,9 @@ impl MlpWeights {
         gate_tensor_name: String,
         up_tensor_name: String,
         down_tensor_name: String,
-        gate_values: Vec<f32>,
-        up_values: Vec<f32>,
-        down_values: Vec<f32>,
+        gate_values: Vec<T>,
+        up_values: Vec<T>,
+        down_values: Vec<T>,
         config: MlpInferenceConfig,
     ) -> Result<Self, InferenceError> {
         let expected_gate = config.expected_gate_weight_len();
@@ -444,198 +436,118 @@ impl MlpWeights {
         })
     }
 
-    pub fn gate_values(&self) -> &[f32] {
+    pub fn gate_values(&self) -> &[T] {
         &self.gate_values
     }
 
-    pub fn up_values(&self) -> &[f32] {
+    pub fn up_values(&self) -> &[T] {
         &self.up_values
     }
 
-    pub fn down_values(&self) -> &[f32] {
+    pub fn down_values(&self) -> &[T] {
         &self.down_values
     }
 }
 
 #[derive(Debug, Clone)]
 /// Output payload and execution metadata for MLP block inference.
-pub struct MlpInferenceReport {
+pub struct MlpInferenceReport<T = f32> {
     pub backend_name: String,
     pub hidden_features: usize,
     pub ffn_features: usize,
     pub repeats: usize,
-    pub output: Vec<f32>,
+    pub output: Vec<T>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Error)]
 /// Errors surfaced by inference helpers.
 pub enum InferenceError {
+    #[error("{context}: {source}")]
     Model {
         context: &'static str,
+        #[source]
         source: ModelError,
     },
+    #[error("{context}: {source}")]
     Metadata {
         context: &'static str,
+        #[source]
         source: MetadataError,
     },
+    #[error("{context}: {source}")]
     Naming {
         context: &'static str,
+        #[source]
         source: NamingError,
     },
+    #[error("{context}: {source}")]
     Ggml {
         context: &'static str,
+        #[source]
         source: ggml_rs::Error,
     },
+    #[error("weight tensor `{tensor_name}` length mismatch: expected {expected}, got {actual}")]
     InvalidWeightLength {
         tensor_name: String,
         expected: usize,
         actual: usize,
     },
-    InvalidInputLength {
-        expected: usize,
-        actual: usize,
-    },
+    #[error("input length mismatch: expected {expected}, got {actual}")]
+    InvalidInputLength { expected: usize, actual: usize },
+    #[error("invalid linear shape: in_features={in_features}, out_features={out_features}")]
     InvalidLinearShape {
         in_features: usize,
         out_features: usize,
     },
+    #[error("invalid MLP shape: hidden_features={hidden_features}, ffn_features={ffn_features}")]
     InvalidMlpShape {
         hidden_features: usize,
         ffn_features: usize,
     },
+    #[error(
+        "cannot infer MLP shape from tensor `{tensor_name}`: hidden_features={hidden_features}, weight_len={weight_len}"
+    )]
     InvalidMlpWeightShape {
         tensor_name: String,
         hidden_features: usize,
         weight_len: usize,
     },
+    #[error(
+        "invalid attention shape: hidden_features={hidden_features}, sequence_length={sequence_length}"
+    )]
     InvalidAttentionShape {
         hidden_features: usize,
         sequence_length: usize,
     },
+    #[error(
+        "invalid attention layout: hidden_features={hidden_features}, query_head_count={query_head_count}, kv_head_count={kv_head_count}"
+    )]
     InvalidAttentionLayout {
         hidden_features: usize,
         query_head_count: usize,
         kv_head_count: usize,
     },
+    #[error(
+        "invalid attention weight tensor `{tensor_name}` length mismatch: expected {expected}, got {actual}"
+    )]
     InvalidAttentionWeightShape {
         tensor_name: String,
         expected: usize,
         actual: usize,
     },
+    #[error(
+        "invalid rope dimensions: rope_dimensions={rope_dimensions}, head_dimension={head_dimension}"
+    )]
     InvalidRopeDimensions {
         rope_dimensions: usize,
         head_dimension: usize,
     },
-    LayerNotFound {
-        layer: usize,
-    },
+    #[error("layer not found in resolved catalog: {layer}")]
+    LayerNotFound { layer: usize },
+    #[error("memory size overflow while building inference graph")]
     MemorySizeOverflow,
+    #[error("repeats must be greater than zero")]
     InvalidRepeats,
-}
-
-impl fmt::Display for InferenceError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Model { context, source } => write!(f, "{context}: {source}"),
-            Self::Metadata { context, source } => write!(f, "{context}: {source}"),
-            Self::Naming { context, source } => write!(f, "{context}: {source}"),
-            Self::Ggml { context, source } => write!(f, "{context}: {source}"),
-            Self::InvalidWeightLength {
-                tensor_name,
-                expected,
-                actual,
-            } => write!(
-                f,
-                "weight tensor `{tensor_name}` length mismatch: expected {expected}, got {actual}"
-            ),
-            Self::InvalidInputLength { expected, actual } => write!(
-                f,
-                "input length mismatch: expected {expected}, got {actual}"
-            ),
-            Self::InvalidLinearShape {
-                in_features,
-                out_features,
-            } => write!(
-                f,
-                "invalid linear shape: in_features={in_features}, out_features={out_features}"
-            ),
-            Self::InvalidMlpShape {
-                hidden_features,
-                ffn_features,
-            } => write!(
-                f,
-                "invalid MLP shape: hidden_features={hidden_features}, ffn_features={ffn_features}"
-            ),
-            Self::InvalidMlpWeightShape {
-                tensor_name,
-                hidden_features,
-                weight_len,
-            } => write!(
-                f,
-                "cannot infer MLP shape from tensor `{tensor_name}`: hidden_features={hidden_features}, weight_len={weight_len}"
-            ),
-            Self::InvalidAttentionShape {
-                hidden_features,
-                sequence_length,
-            } => write!(
-                f,
-                "invalid attention shape: hidden_features={hidden_features}, sequence_length={sequence_length}"
-            ),
-            Self::InvalidAttentionLayout {
-                hidden_features,
-                query_head_count,
-                kv_head_count,
-            } => write!(
-                f,
-                "invalid attention layout: hidden_features={hidden_features}, query_head_count={query_head_count}, kv_head_count={kv_head_count}"
-            ),
-            Self::InvalidAttentionWeightShape {
-                tensor_name,
-                expected,
-                actual,
-            } => write!(
-                f,
-                "invalid attention weight tensor `{tensor_name}` length mismatch: expected {expected}, got {actual}"
-            ),
-            Self::InvalidRopeDimensions {
-                rope_dimensions,
-                head_dimension,
-            } => write!(
-                f,
-                "invalid rope dimensions: rope_dimensions={rope_dimensions}, head_dimension={head_dimension}"
-            ),
-            Self::LayerNotFound { layer } => {
-                write!(f, "layer not found in resolved catalog: {layer}")
-            }
-            Self::MemorySizeOverflow => {
-                write!(f, "memory size overflow while building inference graph")
-            }
-            Self::InvalidRepeats => write!(f, "repeats must be greater than zero"),
-        }
-    }
-}
-
-impl StdError for InferenceError {
-    fn source(&self) -> Option<&(dyn StdError + 'static)> {
-        match self {
-            Self::Model { source, .. } => Some(source),
-            Self::Metadata { source, .. } => Some(source),
-            Self::Naming { source, .. } => Some(source),
-            Self::Ggml { source, .. } => Some(source),
-            Self::InvalidWeightLength { .. }
-            | Self::InvalidInputLength { .. }
-            | Self::InvalidLinearShape { .. }
-            | Self::InvalidMlpShape { .. }
-            | Self::InvalidMlpWeightShape { .. }
-            | Self::InvalidAttentionShape { .. }
-            | Self::InvalidAttentionLayout { .. }
-            | Self::InvalidAttentionWeightShape { .. }
-            | Self::InvalidRopeDimensions { .. }
-            | Self::LayerNotFound { .. }
-            | Self::MemorySizeOverflow
-            | Self::InvalidRepeats => None,
-        }
-    }
 }
 
 impl InferenceError {
@@ -660,34 +572,45 @@ impl InferenceError {
 ///
 /// `W` is loaded from a GGUF tensor and interpreted as shape
 /// `[in_features, out_features]` in ggml's `(cols, rows)` convention.
-pub fn linear_inference(
+pub fn linear_inference<T>(
     model: &GgufModel,
-    weight_tensor_name: &str,
-    input: &[f32],
+    weight_tensor_name: impl AsRef<str>,
+    input: impl AsRef<[T]>,
     config: LinearInferenceConfig,
     backend_kind: LlamaBackend,
-) -> Result<LinearInferenceReport, InferenceError> {
+) -> Result<LinearInferenceReport<T>, InferenceError>
+where
+    T: GgmlElement + NumCast,
+{
+    let input = input.as_ref();
     let weights = LinearWeights::from_model(model, weight_tensor_name, config)?;
     linear_inference_with_weights(&weights, input, backend_kind)
 }
 
 /// Runs one linear projection using pre-decoded reusable weights.
-pub fn linear_inference_with_weights(
-    weights: &LinearWeights,
-    input: &[f32],
+pub fn linear_inference_with_weights<T>(
+    weights: &LinearWeights<T>,
+    input: impl AsRef<[T]>,
     backend_kind: LlamaBackend,
-) -> Result<LinearInferenceReport, InferenceError> {
+) -> Result<LinearInferenceReport<T>, InferenceError>
+where
+    T: GgmlElement + NumCast,
+{
     linear_inference_with_weights_repeats(weights, input, backend_kind, 1)
 }
 
 /// Runs one linear projection using pre-decoded reusable weights and repeated
 /// backend execution on the same graph.
-pub fn linear_inference_with_weights_repeats(
-    weights: &LinearWeights,
-    input: &[f32],
+pub fn linear_inference_with_weights_repeats<T>(
+    weights: &LinearWeights<T>,
+    input: impl AsRef<[T]>,
     backend_kind: LlamaBackend,
     repeats: usize,
-) -> Result<LinearInferenceReport, InferenceError> {
+) -> Result<LinearInferenceReport<T>, InferenceError>
+where
+    T: GgmlElement + NumCast,
+{
+    let input = input.as_ref();
     if input.len() != weights.in_features {
         return Err(InferenceError::InvalidInputLength {
             expected: weights.in_features,
@@ -700,9 +623,9 @@ pub fn linear_inference_with_weights_repeats(
 
     let weight_shape = Shape2D::new(weights.in_features, weights.out_features);
     let input_shape = Shape2D::new(weights.in_features, 1);
-    let ctx_size = Context::recommended_backend_matmul_memory::<f32>(weight_shape, input_shape)
+    let ctx_size = Context::recommended_backend_matmul_memory::<T>(weight_shape, input_shape)
         .map_err(|source| {
-            InferenceError::ggml("Context::recommended_backend_matmul_memory::<f32>", source)
+            InferenceError::ggml("Context::recommended_backend_matmul_memory", source)
         })?;
     let runtime = DefaultBackendRuntimeBuilder.build_runtime(backend_kind, ctx_size)?;
     let backend = runtime.backend;
@@ -710,11 +633,11 @@ pub fn linear_inference_with_weights_repeats(
     let ctx = runtime.ctx;
 
     let w = ctx
-        .new_f32_tensor_2d_shape(weight_shape)
-        .map_err(|source| InferenceError::ggml("Context::new_f32_tensor_2d_shape<W>", source))?;
+        .new_tensor_2d_shape(Type::of::<T>(), weight_shape)
+        .map_err(|source| InferenceError::ggml("Context::new_tensor_2d_shape<W>", source))?;
     let x = ctx
-        .new_f32_tensor_2d_shape(input_shape)
-        .map_err(|source| InferenceError::ggml("Context::new_f32_tensor_2d_shape<X>", source))?;
+        .new_tensor_2d_shape(Type::of::<T>(), input_shape)
+        .map_err(|source| InferenceError::ggml("Context::new_tensor_2d_shape<X>", source))?;
     let y = ctx
         .mul_mat(&w, &x)
         .map_err(|source| InferenceError::ggml("Context::mul_mat", source))?;
@@ -740,7 +663,7 @@ pub fn linear_inference_with_weights_repeats(
     let output = graph
         .last_node()
         .map_err(|source| InferenceError::ggml("Graph::last_node", source))?
-        .read_data_backend::<f32>()
+        .read_data_backend::<T>()
         .map_err(|source| InferenceError::ggml("Tensor::read_data_backend", source))?;
 
     Ok(LinearInferenceReport {
@@ -753,15 +676,19 @@ pub fn linear_inference_with_weights_repeats(
 }
 
 /// Runs a minimal MLP block `down(silu(gate(x)) * up(x))` from GGUF tensors.
-pub fn mlp_inference(
+pub fn mlp_inference<T>(
     model: &GgufModel,
-    gate_tensor_name: &str,
-    up_tensor_name: &str,
-    down_tensor_name: &str,
-    input: &[f32],
+    gate_tensor_name: impl AsRef<str>,
+    up_tensor_name: impl AsRef<str>,
+    down_tensor_name: impl AsRef<str>,
+    input: impl AsRef<[T]>,
     config: MlpInferenceConfig,
     backend_kind: LlamaBackend,
-) -> Result<MlpInferenceReport, InferenceError> {
+) -> Result<MlpInferenceReport<T>, InferenceError>
+where
+    T: GgmlElement + NumCast,
+{
+    let input = input.as_ref();
     let weights = MlpWeights::from_model(
         model,
         gate_tensor_name,
@@ -774,64 +701,84 @@ pub fn mlp_inference(
 
 /// Resolves a transformer layer by index from GGUF tensor names and runs the
 /// minimal MLP block for that layer.
-pub fn mlp_inference_for_layer(
+pub fn mlp_inference_for_layer<T>(
     model: &GgufModel,
     layer: usize,
-    input: &[f32],
+    input: impl AsRef<[T]>,
     backend_kind: LlamaBackend,
-) -> Result<MlpInferenceReport, InferenceError> {
+) -> Result<MlpInferenceReport<T>, InferenceError>
+where
+    T: GgmlElement + NumCast,
+{
     mlp_inference_for_layer_repeats(model, layer, input, backend_kind, 1)
 }
 
 /// Resolves and decodes reusable MLP weights for one transformer layer.
-pub fn resolve_mlp_weights_for_layer(
+pub fn resolve_mlp_weights_for_layer<T>(
     model: &GgufModel,
     layer: usize,
     hidden_features: usize,
-) -> Result<MlpWeights, InferenceError> {
+) -> Result<MlpWeights<T>, InferenceError>
+where
+    T: GgmlElement + NumCast,
+{
     let layer_names = resolve_llama_layer_tensor_names(model, layer)
         .map_err(|source| InferenceError::naming("resolve_llama_layer_tensor_names", source))?;
     MlpWeights::from_model_layer(model, &layer_names, hidden_features)
 }
 
 /// Resolves and decodes reusable MLP weights using GGUF metadata-derived hidden width.
-pub fn resolve_mlp_weights_for_layer_auto(
+pub fn resolve_mlp_weights_for_layer_auto<T>(
     model: &GgufModel,
     layer: usize,
-) -> Result<MlpWeights, InferenceError> {
+) -> Result<MlpWeights<T>, InferenceError>
+where
+    T: GgmlElement + NumCast,
+{
     let dimensions = resolve_llama_layer_dimensions(model, layer)?;
     resolve_mlp_weights_for_layer(model, layer, dimensions.hidden_features)
 }
 
 /// Same as [`mlp_inference_for_layer`] with explicit repeated backend runs.
-pub fn mlp_inference_for_layer_repeats(
+pub fn mlp_inference_for_layer_repeats<T>(
     model: &GgufModel,
     layer: usize,
-    input: &[f32],
+    input: impl AsRef<[T]>,
     backend_kind: LlamaBackend,
     repeats: usize,
-) -> Result<MlpInferenceReport, InferenceError> {
+) -> Result<MlpInferenceReport<T>, InferenceError>
+where
+    T: GgmlElement + NumCast,
+{
+    let input = input.as_ref();
     let weights = resolve_mlp_weights_for_layer_auto(model, layer)?;
     mlp_inference_with_weights_repeats(&weights, input, backend_kind, repeats)
 }
 
 /// Runs a minimal MLP block using pre-decoded reusable weights.
-pub fn mlp_inference_with_weights(
-    weights: &MlpWeights,
-    input: &[f32],
+pub fn mlp_inference_with_weights<T>(
+    weights: &MlpWeights<T>,
+    input: impl AsRef<[T]>,
     backend_kind: LlamaBackend,
-) -> Result<MlpInferenceReport, InferenceError> {
+) -> Result<MlpInferenceReport<T>, InferenceError>
+where
+    T: GgmlElement + NumCast,
+{
     mlp_inference_with_weights_repeats(weights, input, backend_kind, 1)
 }
 
 /// Runs a minimal MLP block using pre-decoded reusable weights and repeated
 /// backend execution on a single graph.
-pub fn mlp_inference_with_weights_repeats(
-    weights: &MlpWeights,
-    input: &[f32],
+pub fn mlp_inference_with_weights_repeats<T>(
+    weights: &MlpWeights<T>,
+    input: impl AsRef<[T]>,
     backend_kind: LlamaBackend,
     repeats: usize,
-) -> Result<MlpInferenceReport, InferenceError> {
+) -> Result<MlpInferenceReport<T>, InferenceError>
+where
+    T: GgmlElement + NumCast,
+{
+    let input = input.as_ref();
     if input.len() != weights.hidden_features {
         return Err(InferenceError::InvalidInputLength {
             expected: weights.hidden_features,
@@ -844,7 +791,7 @@ pub fn mlp_inference_with_weights_repeats(
 
     let hidden = weights.hidden_features;
     let ffn = weights.ffn_features;
-    let ctx_size = recommended_mlp_backend_memory_bytes(hidden, ffn)?;
+    let ctx_size = recommended_mlp_backend_memory_bytes::<T>(hidden, ffn)?;
     let runtime = DefaultBackendRuntimeBuilder.build_runtime(backend_kind, ctx_size)?;
     let backend = runtime.backend;
     let backend_name = runtime.backend_name;
@@ -855,18 +802,18 @@ pub fn mlp_inference_with_weights_repeats(
     let down_shape = Shape2D::new(ffn, hidden);
     let input_shape = Shape2D::new(hidden, 1);
 
-    let w_gate = ctx.new_f32_tensor_2d_shape(gate_shape).map_err(|source| {
-        InferenceError::ggml("Context::new_f32_tensor_2d_shape<W_GATE>", source)
-    })?;
+    let w_gate = ctx
+        .new_tensor_2d_shape(Type::of::<T>(), gate_shape)
+        .map_err(|source| InferenceError::ggml("Context::new_tensor_2d_shape<W_GATE>", source))?;
     let w_up = ctx
-        .new_f32_tensor_2d_shape(up_shape)
-        .map_err(|source| InferenceError::ggml("Context::new_f32_tensor_2d_shape<W_UP>", source))?;
-    let w_down = ctx.new_f32_tensor_2d_shape(down_shape).map_err(|source| {
-        InferenceError::ggml("Context::new_f32_tensor_2d_shape<W_DOWN>", source)
-    })?;
+        .new_tensor_2d_shape(Type::of::<T>(), up_shape)
+        .map_err(|source| InferenceError::ggml("Context::new_tensor_2d_shape<W_UP>", source))?;
+    let w_down = ctx
+        .new_tensor_2d_shape(Type::of::<T>(), down_shape)
+        .map_err(|source| InferenceError::ggml("Context::new_tensor_2d_shape<W_DOWN>", source))?;
     let x = ctx
-        .new_f32_tensor_2d_shape(input_shape)
-        .map_err(|source| InferenceError::ggml("Context::new_f32_tensor_2d_shape<X>", source))?;
+        .new_tensor_2d_shape(Type::of::<T>(), input_shape)
+        .map_err(|source| InferenceError::ggml("Context::new_tensor_2d_shape<X>", source))?;
 
     let gate = ctx
         .mul_mat(&w_gate, &x)
@@ -912,7 +859,7 @@ pub fn mlp_inference_with_weights_repeats(
     let output = graph
         .last_node()
         .map_err(|source| InferenceError::ggml("Graph::last_node", source))?
-        .read_data_backend::<f32>()
+        .read_data_backend::<T>()
         .map_err(|source| InferenceError::ggml("Tensor::read_data_backend", source))?;
 
     Ok(MlpInferenceReport {
@@ -924,29 +871,23 @@ pub fn mlp_inference_with_weights_repeats(
     })
 }
 
-fn recommended_mlp_backend_memory_bytes(
+fn recommended_mlp_backend_memory_bytes<T: GgmlElement>(
     hidden_features: usize,
     ffn_features: usize,
 ) -> Result<ggml_rs::Bytes, InferenceError> {
-    let gate_matmul = Context::recommended_backend_matmul_memory::<f32>(
+    let gate_matmul = Context::recommended_backend_matmul_memory::<T>(
         Shape2D::new(hidden_features, ffn_features),
         Shape2D::new(hidden_features, 1),
     )
     .map_err(|source| {
-        InferenceError::ggml(
-            "Context::recommended_backend_matmul_memory::<f32>(gate)",
-            source,
-        )
+        InferenceError::ggml("Context::recommended_backend_matmul_memory(gate)", source)
     })?;
-    let down_matmul = Context::recommended_backend_matmul_memory::<f32>(
+    let down_matmul = Context::recommended_backend_matmul_memory::<T>(
         Shape2D::new(ffn_features, hidden_features),
         Shape2D::new(ffn_features, 1),
     )
     .map_err(|source| {
-        InferenceError::ggml(
-            "Context::recommended_backend_matmul_memory::<f32>(down)",
-            source,
-        )
+        InferenceError::ggml("Context::recommended_backend_matmul_memory(down)", source)
     })?;
 
     let total = gate_matmul
@@ -1077,8 +1018,8 @@ fn infer_hidden_features_from_query_weight(
     layer_names: &LlamaLayerTensorNames,
 ) -> Result<usize, InferenceError> {
     let q_len = model
-        .tensor_f32_len(&layer_names.attn_q)
-        .map_err(|source| InferenceError::model("GgufModel::tensor_f32_len(attn_q)", source))?;
+        .tensor_len(&layer_names.attn_q)
+        .map_err(|source| InferenceError::model("GgufModel::tensor_len(attn_q)", source))?;
     let hidden = (q_len as f64).sqrt() as usize;
     if hidden == 0 || hidden * hidden != q_len {
         return Err(InferenceError::InvalidAttentionWeightShape {
@@ -1096,8 +1037,8 @@ fn infer_projection_output_features(
     hidden_features: usize,
 ) -> Result<usize, InferenceError> {
     let weight_len = model
-        .tensor_f32_len(tensor_name)
-        .map_err(|source| InferenceError::model("GgufModel::tensor_f32_len(attn_proj)", source))?;
+        .tensor_len(tensor_name)
+        .map_err(|source| InferenceError::model("GgufModel::tensor_len(attn_proj)", source))?;
     if hidden_features == 0 || !weight_len.is_multiple_of(hidden_features) {
         return Err(InferenceError::InvalidAttentionWeightShape {
             tensor_name: tensor_name.to_string(),
@@ -1176,8 +1117,8 @@ fn infer_ffn_features(
     metadata_ffn_features: Option<usize>,
 ) -> Result<usize, InferenceError> {
     let gate_len = model
-        .tensor_f32_len(&layer_names.ffn_gate)
-        .map_err(|source| InferenceError::model("GgufModel::tensor_f32_len(ffn_gate)", source))?;
+        .tensor_len(&layer_names.ffn_gate)
+        .map_err(|source| InferenceError::model("GgufModel::tensor_len(ffn_gate)", source))?;
     if gate_len % hidden_features != 0 {
         return Err(InferenceError::InvalidMlpWeightShape {
             tensor_name: layer_names.ffn_gate.clone(),
@@ -1197,8 +1138,8 @@ fn infer_ffn_features(
     }
     for tensor_name in [&layer_names.ffn_up, &layer_names.ffn_down] {
         let weight_len = model
-            .tensor_f32_len(tensor_name)
-            .map_err(|source| InferenceError::model("GgufModel::tensor_f32_len(ffn)", source))?;
+            .tensor_len(tensor_name)
+            .map_err(|source| InferenceError::model("GgufModel::tensor_len(ffn)", source))?;
         if weight_len != expected {
             return Err(InferenceError::InvalidWeightLength {
                 tensor_name: tensor_name.clone(),
@@ -1236,8 +1177,8 @@ fn validate_attention_projection_lengths(
         .ok_or(InferenceError::MemorySizeOverflow)?;
 
     let q_len = model
-        .tensor_f32_len(&layer_names.attn_q)
-        .map_err(|source| InferenceError::model("GgufModel::tensor_f32_len(attn_q)", source))?;
+        .tensor_len(&layer_names.attn_q)
+        .map_err(|source| InferenceError::model("GgufModel::tensor_len(attn_q)", source))?;
     if q_len != expected_q {
         return Err(InferenceError::InvalidAttentionWeightShape {
             tensor_name: layer_names.attn_q.clone(),
@@ -1246,8 +1187,8 @@ fn validate_attention_projection_lengths(
         });
     }
     let k_len = model
-        .tensor_f32_len(&layer_names.attn_k)
-        .map_err(|source| InferenceError::model("GgufModel::tensor_f32_len(attn_k)", source))?;
+        .tensor_len(&layer_names.attn_k)
+        .map_err(|source| InferenceError::model("GgufModel::tensor_len(attn_k)", source))?;
     if k_len != expected_kv {
         return Err(InferenceError::InvalidAttentionWeightShape {
             tensor_name: layer_names.attn_k.clone(),
@@ -1256,8 +1197,8 @@ fn validate_attention_projection_lengths(
         });
     }
     let v_len = model
-        .tensor_f32_len(&layer_names.attn_v)
-        .map_err(|source| InferenceError::model("GgufModel::tensor_f32_len(attn_v)", source))?;
+        .tensor_len(&layer_names.attn_v)
+        .map_err(|source| InferenceError::model("GgufModel::tensor_len(attn_v)", source))?;
     if v_len != expected_kv {
         return Err(InferenceError::InvalidAttentionWeightShape {
             tensor_name: layer_names.attn_v.clone(),
@@ -1266,10 +1207,8 @@ fn validate_attention_projection_lengths(
         });
     }
     let o_len = model
-        .tensor_f32_len(&layer_names.attn_output)
-        .map_err(|source| {
-            InferenceError::model("GgufModel::tensor_f32_len(attn_output)", source)
-        })?;
+        .tensor_len(&layer_names.attn_output)
+        .map_err(|source| InferenceError::model("GgufModel::tensor_len(attn_output)", source))?;
     if o_len != expected_o {
         return Err(InferenceError::InvalidAttentionWeightShape {
             tensor_name: layer_names.attn_output.clone(),
@@ -1280,44 +1219,24 @@ fn validate_attention_projection_lengths(
     Ok(())
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-/// Strongly typed non-zero attention head count.
-pub struct AttentionHeadCount(NonZeroUsize);
-
-impl AttentionHeadCount {
-    pub fn new(value: usize) -> Result<Self, InferenceError> {
-        NonZeroUsize::new(value)
-            .map(Self)
-            .ok_or(InferenceError::InvalidAttentionLayout {
-                hidden_features: 0,
-                query_head_count: value,
-                kv_head_count: value,
-            })
+define_non_zero_count!(
+    /// Strongly typed non-zero attention head count.
+    AttentionHeadCount,
+    |value| InferenceError::InvalidAttentionLayout {
+        hidden_features: 0,
+        query_head_count: value,
+        kv_head_count: value,
     }
+);
 
-    pub const fn get(self) -> usize {
-        self.0.get()
+define_non_zero_count!(
+    /// Strongly typed non-zero attention head dimension.
+    AttentionHeadDimension,
+    |value| InferenceError::InvalidAttentionShape {
+        hidden_features: value,
+        sequence_length: 0,
     }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-/// Strongly typed non-zero attention head dimension.
-pub struct AttentionHeadDimension(NonZeroUsize);
-
-impl AttentionHeadDimension {
-    pub fn new(value: usize) -> Result<Self, InferenceError> {
-        NonZeroUsize::new(value)
-            .map(Self)
-            .ok_or(InferenceError::InvalidAttentionShape {
-                hidden_features: value,
-                sequence_length: 0,
-            })
-    }
-
-    pub const fn get(self) -> usize {
-        self.0.get()
-    }
-}
+);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 /// Attention topology expressed with explicit query/KV head counts.
@@ -1514,19 +1433,19 @@ impl AttentionInferenceConfig {
 
 #[derive(Debug, Clone)]
 /// Reusable attention projection weights (`q`, `k`, `v`, `o`).
-pub struct AttentionWeights {
+pub struct AttentionWeights<T = f32> {
     pub q_tensor_name: String,
     pub k_tensor_name: String,
     pub v_tensor_name: String,
     pub o_tensor_name: String,
     pub config: AttentionInferenceConfig,
-    q_values: Vec<f32>,
-    k_values: Vec<f32>,
-    v_values: Vec<f32>,
-    o_values: Vec<f32>,
+    q_values: Vec<T>,
+    k_values: Vec<T>,
+    v_values: Vec<T>,
+    o_values: Vec<T>,
 }
 
-impl AttentionWeights {
+impl AttentionWeights<f32> {
     /// Builds deterministic synthetic attention weights.
     pub fn deterministic(config: AttentionInferenceConfig) -> Self {
         let q_values = (0..config.expected_q_weight_len())
@@ -1553,26 +1472,31 @@ impl AttentionWeights {
             o_values,
         }
     }
+}
 
+impl<T> AttentionWeights<T>
+where
+    T: GgmlElement + NumCast,
+{
     /// Loads attention projection weights for one resolved transformer layer.
     pub fn from_model_layer(
         model: &GgufModel,
         layer: &LlamaLayerTensorNames,
         config: AttentionInferenceConfig,
     ) -> Result<Self, InferenceError> {
-        let q_values = model.tensor_f32_values(&layer.attn_q).map_err(|source| {
-            InferenceError::model("GgufModel::tensor_f32_values(attn_q)", source)
-        })?;
-        let k_values = model.tensor_f32_values(&layer.attn_k).map_err(|source| {
-            InferenceError::model("GgufModel::tensor_f32_values(attn_k)", source)
-        })?;
-        let v_values = model.tensor_f32_values(&layer.attn_v).map_err(|source| {
-            InferenceError::model("GgufModel::tensor_f32_values(attn_v)", source)
-        })?;
+        let q_values = model
+            .tensor_values::<T>(&layer.attn_q)
+            .map_err(|source| InferenceError::model("GgufModel::tensor_values(attn_q)", source))?;
+        let k_values = model
+            .tensor_values::<T>(&layer.attn_k)
+            .map_err(|source| InferenceError::model("GgufModel::tensor_values(attn_k)", source))?;
+        let v_values = model
+            .tensor_values::<T>(&layer.attn_v)
+            .map_err(|source| InferenceError::model("GgufModel::tensor_values(attn_v)", source))?;
         let o_values = model
-            .tensor_f32_values(&layer.attn_output)
+            .tensor_values::<T>(&layer.attn_output)
             .map_err(|source| {
-                InferenceError::model("GgufModel::tensor_f32_values(attn_output)", source)
+                InferenceError::model("GgufModel::tensor_values(attn_output)", source)
             })?;
 
         for (name, expected, actual) in [
@@ -1619,54 +1543,54 @@ impl AttentionWeights {
         })
     }
 
-    fn q_values(&self) -> &[f32] {
+    fn q_values(&self) -> &[T] {
         &self.q_values
     }
 
-    fn k_values(&self) -> &[f32] {
+    fn k_values(&self) -> &[T] {
         &self.k_values
     }
 
-    fn v_values(&self) -> &[f32] {
+    fn v_values(&self) -> &[T] {
         &self.v_values
     }
 
-    fn o_values(&self) -> &[f32] {
+    fn o_values(&self) -> &[T] {
         &self.o_values
     }
 }
 
 #[derive(Debug, Clone)]
 /// Output payload and execution metadata for attention inference.
-pub struct AttentionInferenceReport {
+pub struct AttentionInferenceReport<T = f32> {
     pub backend_name: String,
     pub hidden_features: usize,
     pub sequence_length: usize,
     pub repeats: usize,
-    pub output: Vec<f32>,
+    pub output: Vec<T>,
 }
 
 #[derive(Debug, Clone)]
 /// Output payload and execution metadata for decode-like attention proxy inference.
-pub struct AttentionDecodeProxyReport {
+pub struct AttentionDecodeProxyReport<T = f32> {
     pub backend_name: String,
     pub hidden_features: usize,
     pub query_length: usize,
     pub key_value_length: usize,
     pub repeats: usize,
-    pub output: Vec<f32>,
+    pub output: Vec<T>,
 }
 
 #[derive(Debug, Clone)]
 /// Reusable projected KV cache for decode-like attention proxy runs.
-pub struct AttentionDecodeCache {
+pub struct AttentionDecodeCache<T = f32> {
     key_value_length: usize,
     kv_features: usize,
-    projected_k_values: Vec<f32>,
-    projected_v_values: Vec<f32>,
+    projected_k_values: Vec<T>,
+    projected_v_values: Vec<T>,
 }
 
-impl AttentionDecodeCache {
+impl<T: Clone> AttentionDecodeCache<T> {
     pub const fn key_value_length(&self) -> usize {
         self.key_value_length
     }

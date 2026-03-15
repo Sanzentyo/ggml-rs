@@ -13,6 +13,10 @@ impl Type {
     pub(crate) const fn as_raw(self) -> c_int {
         self as c_int
     }
+
+    pub const fn of<T: GgmlType>() -> Self {
+        T::GGML_TYPE
+    }
 }
 
 impl TryFrom<c_int> for Type {
@@ -25,6 +29,19 @@ impl TryFrom<c_int> for Type {
             other => Err(Error::UnsupportedType(other)),
         }
     }
+}
+
+/// Type-level mapping between Rust element types and GGML tensor kinds.
+pub trait GgmlType {
+    const GGML_TYPE: Type;
+}
+
+impl GgmlType for f32 {
+    const GGML_TYPE: Type = Type::F32;
+}
+
+impl GgmlType for i32 {
+    const GGML_TYPE: Type = Type::I32;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
