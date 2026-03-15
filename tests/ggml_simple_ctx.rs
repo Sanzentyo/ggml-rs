@@ -26,8 +26,8 @@ fn matmul_simple_ctx_parity() -> Result<(), ggml_rs::Error> {
     let mem = Context::recommended_matmul_memory::<f32>(SHAPE_A, SHAPE_B)?;
     let ctx = Context::new_bytes(mem)?;
 
-    let a = ctx.new_f32_tensor_2d_shape(SHAPE_A)?;
-    let b = ctx.new_f32_tensor_2d_shape(SHAPE_B)?;
+    let a = ctx.new_tensor_2d::<f32>(SHAPE_A)?;
+    let b = ctx.new_tensor_2d::<f32>(SHAPE_B)?;
     a.write_data(&MATRIX_A)?;
     b.write_data(&MATRIX_B)?;
 

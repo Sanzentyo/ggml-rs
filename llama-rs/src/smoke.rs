@@ -106,11 +106,11 @@ pub fn backend_smoke(backend: LlamaBackend) -> Result<SmokeReport> {
         .map_err(|source| SmokeError::ggml("Context::new_no_alloc_bytes", source))?;
 
     let a = ctx
-        .new_f32_tensor_2d_typed::<AShape>()
-        .map_err(|source| SmokeError::ggml("Context::new_f32_tensor_2d_typed<A>", source))?;
+        .new_tensor_2d_typed::<f32, AShape>()
+        .map_err(|source| SmokeError::ggml("Context::new_tensor_2d_typed<f32, A>", source))?;
     let b = ctx
-        .new_f32_tensor_2d_typed::<BShape>()
-        .map_err(|source| SmokeError::ggml("Context::new_f32_tensor_2d_typed<B>", source))?;
+        .new_tensor_2d_typed::<f32, BShape>()
+        .map_err(|source| SmokeError::ggml("Context::new_tensor_2d_typed<f32, B>", source))?;
     let result = ctx
         .mul_mat(a.inner(), b.inner())
         .map_err(|source| SmokeError::ggml("Context::mul_mat", source))?;

@@ -8,6 +8,27 @@ Detailed entries migrated from `docs/llama-rs/WORKLOG.md` during worklog compact
 - MLP and attention layer examples are verified on CPU and Metal for synthetic fixtures.
 - Link-system parity tests (`mlp_cpp_parity`, `attention_parity`) pass after RoPE integration fixes.
 - Unified example argument parsing on `clap` derive + typed CLI structs across `llama-rs/examples` (including `gguf`, `idle`, `bench_attention_layer`, and `bench_attention_decode_cpp_compare`).
+- Removed remaining constructor-wrapper usage in `ggml-rs` call sites and switched to
+  generic constructor APIs:
+  - `new_tensor_typed::<T, N>(Dims<N>)`,
+  - `new_tensor_1d::<T>(Length)`,
+  - `new_tensor_2d::<T>(Shape2D)`,
+  - `new_tensor_3d::<T>(Shape3D)`,
+  - `new_tensor_4d::<T>(Shape4D)`.
+- Unified root `ggml-rs/examples` on clap derive argument parsing (including
+  `backend_matmul`, `bench_matmul`, `perf_metal`, synthetic GPT-J/Magika/MNIST/SAM/YOLO,
+  and `bench_upstream_suite`) and re-verified runtime CPU/Metal smoke:
+  - `target/benchmarks/review3_constructor_clap_runtime_smoke.txt`.
+- Added loop-reuse synthetic performance pass for vision/MNIST proxies by reusing
+  context/graph across `--synthetic-iters`:
+  - re-run artifacts:
+    - `target/benchmarks/vision_mnist/rust_mnist_eval_post_loopreuse.txt`,
+    - `target/benchmarks/vision_mnist/rust_mnist_train_post_loopreuse.txt`,
+    - `target/benchmarks/vision_mnist/rust_sam_post_loopreuse.txt`,
+    - `target/benchmarks/vision_mnist/rust_yolo_post_loopreuse.txt`,
+  - impact summary:
+    - `target/benchmarks/vision_mnist/loopreuse_impact.md`
+    - `post/pre` per-iter: `mnist-eval ~0.347`, `mnist-train ~0.914`, `sam ~0.282`, `yolo ~0.735`.
 - Refactored clap-unified example error surfaces to `thiserror`-based typed errors (while preserving the existing validation/error-policy behavior).
 - Re-verified the clap-unified runtime surfaces on CPU/Metal with `--features link-system` and recorded:
   - `target/benchmarks/llama_rs_clap_refactor_runtime_smoke.txt`.
@@ -33,6 +54,20 @@ Detailed entries migrated from `docs/llama-rs/WORKLOG.md` during worklog compact
   - checksum: `target/benchmarks/review3_decodeapi_step2_elyza_layers5_7_delta_checksum_check.md`.
   - means (`variant/base`): `no-mask ~1.018`, `no-position ~1.041` overall, checksum deltas `0.0`;
     defaults remain `mask_delta=true`, `position_delta=true`.
+- Added file-based lock helper (`cargo +nightly -Zscript scripts/agent_lock.rs -- ...`) and parallel subagent logging policy:
+  - lock protocol doc: `docs/llama-rs/KNOWLEDGE_BASE.md` (`cargo|cpp|bench` locks),
+  - subagent logs: `docs/llama-rs/worklog/subagents/{foundation,gpt2,gptj_magika,vision_mnist}.md`.
+- Executed parallel subagent implementation/validation for ggml upstream example reproduction:
+  - direct parity batch artifacts:
+    - `target/benchmarks/foundation_parity_report.{md,json}`,
+  - synthetic parity batches:
+    - `target/benchmarks/gpt2_parity_summary.{txt,json}`,
+    - `target/benchmarks/gptj_magika_synth_{parity_summary,perf_summary}.txt`,
+    - `target/benchmarks/vision_mnist/parity_perf_{summary.md,json}`,
+  - consolidated matrix:
+    - `docs/ggml-rs/EXAMPLE_PARITY_MATRIX.md`.
+  - consolidated rollout summary:
+    - `target/benchmarks/parallel_subagent_rollout_summary.md`.
 - Expanded `thiserror` rollout across remaining `llama-rs/examples` (`run()` + typed `ExampleError` boundary) and re-verified link-system runtime surfaces:
   - `target/benchmarks/llama_rs_thiserror_rollout_runtime_smoke.txt`.
 - Added stepwise warmup+bench reuse path to reduce repeated backend/context setup during layer sweeps:

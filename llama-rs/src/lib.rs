@@ -6,6 +6,7 @@ pub mod embedding;
 pub mod error;
 pub mod gguf;
 pub mod gguf_hash;
+pub mod gpt2_synthetic;
 pub mod idle;
 pub mod inference;
 pub mod metadata;
@@ -30,6 +31,10 @@ pub use error::{LlamaError, LlamaResult};
 pub use ggml_rs::{GgufArrayValue, GgufValue};
 pub use gguf::{GgufKvEntry, GgufReport, inspect_gguf};
 pub use gguf_hash::{GgufHashError, HashAlgorithm, HashOptions, HashRecord, hash_file};
+pub use gpt2_synthetic::{
+    QuantizeConfig, QuantizeReport, SyntheticConfig, SyntheticError, SyntheticReport, parse_kv_f64,
+    run_alloc, run_backend, run_batched, run_ctx, run_quantize, run_sched,
+};
 pub use idle::{
     IdleConfig, IdleError, IdlePauseReport, IdlePauseSchedule, IdleReport, IdleWeightsMode,
     PauseScheduleEmpty, PauseScheduleReady, idle_decode_proxy, idle_decode_proxy_from_path,

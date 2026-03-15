@@ -18,6 +18,7 @@
 //! Examples:
 //! - `cargo run --example simple_ctx --features link-system`
 //! - `cargo run --example backend_matmul --features link-system`
+//! - `cargo run --example perf_metal --features link-system`
 //! - `cargo run --example arithmetic_expr --features link-system`
 
 mod compute;
@@ -32,25 +33,31 @@ mod types;
 
 pub use compute::{
     Backend, BackendBuffer, Context, Graph, Tensor, decode_tensor_data_to, graph_overhead_bytes,
-    init_timing, tensor_element_count, tensor_overhead_bytes, type_size, with_context,
-    with_no_alloc_context,
+    graph_overhead_custom, init_timing, tensor_element_count, tensor_overhead_bytes, type_size,
+    with_context, with_no_alloc_context,
 };
 pub use error::{Error, Result};
 pub use gguf::{GgufArrayValue, GgufFile, GgufTensorInfo, GgufType, GgufValue, GgufWriter};
 pub use shape::{
-    Bytes, Cols, Dims, Length, Rows, Shape2D, Shape2DSpec, Shape3D, Shape4D, StaticShape2D,
-    TensorIndex, ThreadCount,
+    Bytes, Cols, Dims, Length, LengthSpec, Rows, Shape2D, Shape2DSpec, Shape3D, Shape3DSpec,
+    Shape4D, Shape4DSpec, StaticLength, StaticShape2D, StaticShape3D, StaticShape4D, TensorIndex,
+    ThreadCount,
 };
 pub use tensor_expr::{BackendElement, GgmlElement, TensorExpr};
-pub use typed_tensor::{Tensor2D, Tensor2DConst};
+pub use typed_tensor::{
+    Tensor1D, Tensor1DConst, Tensor2D, Tensor2DConst, Tensor3D, Tensor3DConst, Tensor4D,
+    Tensor4DConst,
+};
 pub use types::{BackendDeviceType, BackendKind, ComputeStatus, GgmlType, RopeExtParams, Type};
 
 pub mod prelude {
     pub use crate::{
         Backend, BackendBuffer, BackendDeviceType, BackendElement, BackendKind, Bytes, Cols,
         ComputeStatus, Context, Dims, GgmlElement, GgmlType, GgufArrayValue, GgufFile, GgufValue,
-        GgufWriter, Graph, Length, RopeExtParams, Rows, Shape2D, Shape2DSpec, Shape3D, Shape4D,
-        StaticShape2D, Tensor, Tensor2D, Tensor2DConst, TensorExpr, TensorIndex, ThreadCount, Type,
+        GgufWriter, Graph, Length, LengthSpec, RopeExtParams, Rows, Shape2D, Shape2DSpec, Shape3D,
+        Shape3DSpec, Shape4D, Shape4DSpec, StaticLength, StaticShape2D, StaticShape3D,
+        StaticShape4D, Tensor, Tensor1D, Tensor1DConst, Tensor2D, Tensor2DConst, Tensor3D,
+        Tensor3DConst, Tensor4D, Tensor4DConst, TensorExpr, TensorIndex, ThreadCount, Type,
         with_context, with_no_alloc_context,
     };
 }

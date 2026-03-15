@@ -204,6 +204,23 @@ impl From<Dims<4>> for Shape4D {
 /// Compile-time shape marker used by typed tensor wrappers.
 pub struct StaticShape2D<const COLS: usize, const ROWS: usize>;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+/// Compile-time length marker used by typed 1D tensor wrappers.
+pub struct StaticLength<const LEN: usize>;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+/// Compile-time shape marker used by typed 3D tensor wrappers.
+pub struct StaticShape3D<const NE0: usize, const NE1: usize, const NE2: usize>;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+/// Compile-time shape marker used by typed 4D tensor wrappers.
+pub struct StaticShape4D<const NE0: usize, const NE1: usize, const NE2: usize, const NE3: usize>;
+
+/// Trait implemented by compile-time length markers.
+pub trait LengthSpec {
+    const LENGTH: Length;
+}
+
 /// Trait implemented by static shape markers.
 ///
 /// It provides a `const` value that can be consumed by APIs expecting
@@ -212,6 +229,32 @@ pub trait Shape2DSpec {
     const SHAPE: Shape2D;
 }
 
+/// Trait implemented by static 3D shape markers.
+pub trait Shape3DSpec {
+    const SHAPE: Shape3D;
+}
+
+/// Trait implemented by static 4D shape markers.
+pub trait Shape4DSpec {
+    const SHAPE: Shape4D;
+}
+
+impl<const LEN: usize> LengthSpec for StaticLength<LEN> {
+    const LENGTH: Length = Length::new(LEN);
+}
+
 impl<const COLS: usize, const ROWS: usize> Shape2DSpec for StaticShape2D<COLS, ROWS> {
     const SHAPE: Shape2D = Shape2D::new(COLS, ROWS);
+}
+
+impl<const NE0: usize, const NE1: usize, const NE2: usize> Shape3DSpec
+    for StaticShape3D<NE0, NE1, NE2>
+{
+    const SHAPE: Shape3D = Shape3D::new(NE0, NE1, NE2);
+}
+
+impl<const NE0: usize, const NE1: usize, const NE2: usize, const NE3: usize> Shape4DSpec
+    for StaticShape4D<NE0, NE1, NE2, NE3>
+{
+    const SHAPE: Shape4D = Shape4D::new(NE0, NE1, NE2, NE3);
 }

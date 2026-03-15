@@ -12,7 +12,7 @@ fn scoped_context_helpers_work() -> Result<(), Error> {
     let mem = Context::recommended_matmul_memory::<f32>(lhs, rhs)?;
 
     let element_count = with_context(mem, |ctx| {
-        let tensor = ctx.new_f32_tensor_2d_shape(lhs)?;
+        let tensor = ctx.new_tensor_2d::<f32>(lhs)?;
         tensor.write_data(&[1.0, 2.0, 3.0, 4.0])?;
         Ok(tensor.element_count()?)
     })?;
@@ -21,7 +21,7 @@ fn scoped_context_helpers_work() -> Result<(), Error> {
     let no_alloc_mem = Context::recommended_backend_matmul_memory::<f32>(lhs, rhs)?;
     with_no_alloc_context(no_alloc_mem, |ctx| {
         let backend = Backend::new(BackendKind::Cpu)?;
-        let tensor = ctx.new_f32_tensor_2d_shape(lhs)?;
+        let tensor = ctx.new_tensor_2d::<f32>(lhs)?;
         let _buffer = ctx.allocate_tensors(&backend)?;
         tensor.write_data_backend(&[1.0, 2.0, 3.0, 4.0])?;
         let out = tensor.read_data_backend::<f32>()?;
@@ -42,7 +42,7 @@ fn nd_tensor_constructor_and_introspection() -> Result<(), Error> {
         assert_eq!(t3.shape_3d()?, Shape3D::new(4, 3, 2));
         assert_eq!(t3.shape_nd()?, vec![4, 3, 2]);
 
-        let t4 = ctx.new_tensor_4d_shape(Type::I32, Shape4D::new(5, 4, 3, 2))?;
+        let t4 = ctx.new_tensor_4d::<i32>(Shape4D::new(5, 4, 3, 2))?;
         assert_eq!(t4.rank()?, 4);
         assert_eq!(*t4.dims::<4>()?.as_array(), [5, 4, 3, 2]);
         assert_eq!(t4.shape_4d()?, Shape4D::new(5, 4, 3, 2));
@@ -54,7 +54,7 @@ fn nd_tensor_constructor_and_introspection() -> Result<(), Error> {
 fn reshape_view_permute_smoke() -> Result<(), Error> {
     let mem = Bytes::new(256 * 1024);
     with_context(mem, |ctx| {
-        let base = ctx.new_f32_tensor_2d_shape(Shape2D::new(6, 2))?;
+        let base = ctx.new_tensor_2d::<f32>(Shape2D::new(6, 2))?;
         base.write_data(&[0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0])?;
 
         let reshaped = ctx.reshape_3d(&base, 3, 2, 2)?;
@@ -64,7 +64,7 @@ fn reshape_view_permute_smoke() -> Result<(), Error> {
         assert_eq!(viewed.element_count()?, 4);
         assert_eq!(viewed.get_data::<f32>(TensorIndex::new(3))?, 3.0);
 
-        let tensor4 = ctx.new_tensor_4d_shape(Type::F32, Shape4D::new(3, 2, 2, 2))?;
+        let tensor4 = ctx.new_tensor_4d::<f32>(Shape4D::new(3, 2, 2, 2))?;
         let permuted = ctx.permute(&tensor4, 1, 0, 2, 3)?;
         assert_eq!(*permuted.dims::<4>()?.as_array(), [2, 3, 2, 2]);
         Ok(())
@@ -76,7 +76,7 @@ fn backend_roundtrip_and_bounds_checks() -> Result<(), Error> {
     let mem = Bytes::new(128 * 1024);
     with_no_alloc_context(mem, |ctx| {
         let backend = Backend::new(BackendKind::Cpu)?;
-        let tensor = ctx.new_i32_tensor_1d_len(Length::new(8))?;
+        let tensor = ctx.new_tensor_1d::<i32>(Length::new(8))?;
         let _buffer = ctx.allocate_tensors(&backend)?;
 
         let values = [10, 20, 30, 40, 50, 60, 70, 80];

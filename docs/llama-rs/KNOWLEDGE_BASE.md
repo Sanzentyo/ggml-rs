@@ -23,6 +23,21 @@ GGML_RS_LIBS=ggml,ggml-base,ggml-cpu,ggml-metal,ggml-blas
 DYLD_LIBRARY_PATH=vendor/ggml/build/src:vendor/ggml/build/src/ggml-metal:vendor/ggml/build/src/ggml-blas:$DYLD_LIBRARY_PATH
 ```
 
+## Parallel subagent lock protocol
+
+- File-based lock helper (Rust script): `cargo +nightly -Zscript scripts/agent_lock.rs -- <lock> <cmd ...>`.
+- Optional wrapper scripts:
+  - `./scripts/agent_lock.sh <lock> <cmd ...>`
+  - `./scripts/agent_lock.ps1 <lock> <cmd ...>`
+- Lock directory: `.agent-locks/` (created automatically).
+- Use named locks to prevent compile/bench interference across parallel agents:
+  - cargo/build/test: `cargo +nightly -Zscript scripts/agent_lock.rs -- cargo <cmd ...>`
+  - C++/cmake build: `cargo +nightly -Zscript scripts/agent_lock.rs -- cpp <cmd ...>`
+  - runtime bench/parity runs: `cargo +nightly -Zscript scripts/agent_lock.rs -- bench <cmd ...>`
+- Subagent progress logs must be appended per task under:
+  - `docs/llama-rs/worklog/subagents/<task>.md`
+  so agents can update docs continuously without clobbering shared files.
+
 ## llama.cpp comparison/reproduction setup (optional external checkout)
 
 ```bash
@@ -71,6 +86,26 @@ cmake --build "$LLAMA_CPP_DIR/build" --target llama-bench llama-gguf -j
 - `llama-rs/examples/resolve_tensor_names.rs`: can resolve canonical LLaMA tensor roles from GGUF names and report missing mappings.
 - `llama-rs/tests/mlp_cpp_parity.rs` (feature `link-system`): validates rust MLP CPU output against an equivalent C++ reference program.
 - `llama-rs/tests/attention_parity.rs` (feature `link-system`): validates attention output parity between CPU and Metal backends.
+- GPT-2 synthetic upstream-parity set is available:
+  - `llama-rs/examples/gpt2_{ctx,alloc,backend,sched,batched,quantize}.rs`
+  - shared module: `llama-rs/src/gpt2_synthetic.rs`
+  - C++ synthetic reference: `llama-rs/tests/cpp/gpt2_synthetic_reference.cpp`
+  - parity artifacts: `target/benchmarks/gpt2_parity_summary.{txt,json}`
+- Additional ggml-level synthetic parity examples were added for missing-asset targets:
+  - `examples/gptj_main_synth.rs`
+  - `examples/gptj_quantize_synth.rs`
+  - `examples/magika_main_synth.rs`
+  - `examples/mnist_eval.rs`
+  - `examples/mnist_train.rs`
+  - `examples/sam.rs`
+  - `examples/yolov3_tiny.rs`
+  - parity artifacts:
+    - `target/benchmarks/gptj_magika_synth_{parity_summary,perf_summary}.txt`
+    - `target/benchmarks/vision_mnist/parity_perf_summary.md`
+  - root-example clap/runtime refresh artifact:
+    - `target/benchmarks/review3_constructor_clap_runtime_smoke.txt`
+  - loop-reuse synthetic perf impact artifact:
+    - `target/benchmarks/vision_mnist/loopreuse_impact.md`
 
 ## Example CLI policy (clap unification)
 

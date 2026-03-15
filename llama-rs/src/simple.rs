@@ -92,11 +92,11 @@ pub fn simple_ctx() -> Result<SimpleReport, SimpleError> {
         .map_err(|source| SimpleError::ggml("Context::new_bytes", source))?;
 
     let a = ctx
-        .new_f32_tensor_2d_typed::<AShape>()
-        .map_err(|source| SimpleError::ggml("Context::new_f32_tensor_2d_typed<A>", source))?;
+        .new_tensor_2d_typed::<f32, AShape>()
+        .map_err(|source| SimpleError::ggml("Context::new_tensor_2d_typed<f32, A>", source))?;
     let b = ctx
-        .new_f32_tensor_2d_typed::<BShape>()
-        .map_err(|source| SimpleError::ggml("Context::new_f32_tensor_2d_typed<B>", source))?;
+        .new_tensor_2d_typed::<f32, BShape>()
+        .map_err(|source| SimpleError::ggml("Context::new_tensor_2d_typed<f32, B>", source))?;
     a.write_data(&MATRIX_A)
         .map_err(|source| SimpleError::ggml("TypedTensor2D::write_data<A>", source))?;
     b.write_data(&MATRIX_B)

@@ -3,14 +3,30 @@
 //! This example is intentionally configurable so local runs can be scoped and
 //! repeated without editing source code.
 
+use clap::{ArgAction, Parser};
 use std::fs;
 use std::process::Command;
 use std::time::Instant;
 
 const DEFAULT_BENCH_TARGETS: &[&str] = &["test-backend-ops", "test-quantize-perf"];
 
+#[derive(Debug, Parser)]
+#[command(name = "bench_upstream_suite")]
+struct Cli {
+    #[arg(value_name = "TARGET")]
+    targets: Vec<String>,
+    #[arg(long = "skip-build", action = ArgAction::SetTrue)]
+    skip_build: Option<bool>,
+    #[arg(long = "list-only", action = ArgAction::SetTrue)]
+    list_only: Option<bool>,
+    #[arg(long = "keep-going", action = ArgAction::SetTrue, conflicts_with = "fail_fast")]
+    keep_going: Option<bool>,
+    #[arg(long = "fail-fast", action = ArgAction::SetTrue, conflicts_with = "keep_going")]
+    fail_fast: Option<bool>,
+}
+
 fn main() {
-    let options = BenchOptions::from_env_and_args(std::env::args().skip(1).collect());
+    let options = BenchOptions::from_cli(Cli::parse());
     assert!(
         !options.targets.is_empty(),
         "no upstream benchmark targets selected"
@@ -81,44 +97,32 @@ struct BenchOptions {
 }
 
 impl BenchOptions {
-    fn from_env_and_args(args: Vec<String>) -> Self {
-        let mut cli_targets = Vec::new();
-        let mut cli_skip_build = None;
-        let mut cli_list_only = None;
-        let mut cli_keep_going = None;
-
-        for arg in args {
-            match arg.as_str() {
-                "--skip-build" => cli_skip_build = Some(true),
-                "--list-only" => cli_list_only = Some(true),
-                "--keep-going" => cli_keep_going = Some(true),
-                "--fail-fast" => cli_keep_going = Some(false),
-                _ if arg.starts_with("--") => {
-                    panic!(
-                        "unknown option `{arg}` (supported: --skip-build, --list-only, --keep-going, --fail-fast)"
-                    )
-                }
-                _ => cli_targets.push(arg),
-            }
-        }
-
+    fn from_cli(cli: Cli) -> Self {
         let build_dir = std::env::var("GGML_UPSTREAM_BUILD_DIR")
             .unwrap_or_else(|_| "target/vendor/ggml/build".to_string());
-        let skip_build = cli_skip_build.unwrap_or_else(|| env_flag("GGML_UPSTREAM_SKIP_BUILD"));
-        let list_only = cli_list_only.unwrap_or_else(|| env_flag("GGML_UPSTREAM_LIST_ONLY"));
-        let keep_going = cli_keep_going.unwrap_or_else(|| env_flag("GGML_UPSTREAM_KEEP_GOING"));
+        let skip_build = cli
+            .skip_build
+            .unwrap_or_else(|| env_flag("GGML_UPSTREAM_SKIP_BUILD"));
+        let list_only = cli
+            .list_only
+            .unwrap_or_else(|| env_flag("GGML_UPSTREAM_LIST_ONLY"));
+        let keep_going = match (cli.keep_going, cli.fail_fast) {
+            (Some(true), _) => true,
+            (_, Some(true)) => false,
+            _ => env_flag("GGML_UPSTREAM_KEEP_GOING"),
+        };
         let summary_path = std::env::var("GGML_UPSTREAM_SUMMARY_PATH").ok();
 
         // CLI target list takes precedence. Otherwise, apply include/exclude env
         // selection with stable defaults.
-        let targets = if cli_targets.is_empty() {
+        let targets = if cli.targets.is_empty() {
             selected_targets(
                 "GGML_UPSTREAM_BENCH_TARGETS",
                 "GGML_UPSTREAM_EXCLUDE_TARGETS",
                 DEFAULT_BENCH_TARGETS,
             )
         } else {
-            cli_targets
+            cli.targets
         };
 
         Self {

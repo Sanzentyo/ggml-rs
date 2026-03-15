@@ -9,7 +9,7 @@ fn cont_after_transpose_matches_reference() -> Result<(), ggml_rs::Error> {
     ggml_rs::init_timing();
 
     let ctx = Context::new(2 * 1024 * 1024)?;
-    let input = ctx.new_f32_tensor_1d_len(Length::new(2))?;
+    let input = ctx.new_tensor_1d::<f32>(Length::new(2))?;
     input.write_data(&[1.0, 2.0])?;
 
     let transposed = ctx.transpose(&input)?;

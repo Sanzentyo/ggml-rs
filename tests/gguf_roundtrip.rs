@@ -10,7 +10,7 @@ fn gguf_writer_roundtrip_kv_and_tensor_metadata() -> Result<(), ggml_rs::Error> 
 
     {
         let ctx = Context::new(2 * 1024 * 1024)?;
-        let tensor = ctx.new_f32_tensor_1d_len(Length::new(4))?;
+        let tensor = ctx.new_tensor_1d::<f32>(Length::new(4))?;
         tensor.set_name("tensor_roundtrip")?;
         tensor.write_data(&[1.0, 2.0, 3.0, 4.0])?;
 

@@ -22,6 +22,11 @@ path = "examples/backend_matmul.rs"
 required-features = ["link-system"]
 
 [[example]]
+name = "perf_metal"
+path = "examples/perf_metal.rs"
+required-features = ["link-system"]
+
+[[example]]
 name = "arithmetic_expr"
 path = "examples/arithmetic_expr.rs"
 required-features = ["link-system"]
@@ -35,7 +40,43 @@ required-features = ["link-system"]
 name = "bench_upstream_suite"
 path = "examples/bench_upstream_suite.rs"
 
+[[example]]
+name = "gptj_main_synth"
+path = "examples/gptj_main_synth.rs"
+required-features = ["link-system"]
+
+[[example]]
+name = "gptj_quantize_synth"
+path = "examples/gptj_quantize_synth.rs"
+required-features = ["link-system"]
+
+[[example]]
+name = "magika_main_synth"
+path = "examples/magika_main_synth.rs"
+required-features = ["link-system"]
+
+[[example]]
+name = "mnist_eval"
+path = "examples/mnist_eval.rs"
+required-features = ["link-system"]
+
+[[example]]
+name = "mnist_train"
+path = "examples/mnist_train.rs"
+required-features = ["link-system"]
+
+[[example]]
+name = "sam"
+path = "examples/sam.rs"
+required-features = ["link-system"]
+
+[[example]]
+name = "yolov3_tiny"
+path = "examples/yolov3_tiny.rs"
+required-features = ["link-system"]
+
 [dependencies]
+clap = { version = "4.5", features = ["derive"] }
 num-traits = "0.2"
 thiserror = "2"
 

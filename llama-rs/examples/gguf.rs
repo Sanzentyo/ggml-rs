@@ -1,5 +1,7 @@
 use clap::{Parser, ValueEnum};
-use ggml_rs::{Context, GgufArrayValue, GgufValue, GgufWriter, Length, Shape2D, Tensor, Type};
+use ggml_rs::{
+    Context, GgufArrayValue, GgufValue, GgufWriter, Length, Shape2D, Shape3D, Shape4D, Tensor,
+};
 use llama_rs::{GgufReport, inspect_gguf};
 use std::error::Error as StdError;
 use thiserror::Error;
@@ -302,10 +304,10 @@ fn build_fixture_tensors<'ctx>(ctx: &'ctx Context) -> ggml_rs::Result<Vec<Tensor
         }
 
         let tensor = match n_dims {
-            1 => ctx.new_f32_tensor_1d_len(Length::new(ne[0]))?,
-            2 => ctx.new_f32_tensor_2d_shape(Shape2D::new(ne[0], ne[1]))?,
-            3 => ctx.new_tensor_3d(Type::F32, ne[0], ne[1], ne[2])?,
-            4 => ctx.new_tensor_4d(Type::F32, ne[0], ne[1], ne[2], ne[3])?,
+            1 => ctx.new_tensor_1d::<f32>(Length::new(ne[0]))?,
+            2 => ctx.new_tensor_2d::<f32>(Shape2D::new(ne[0], ne[1]))?,
+            3 => ctx.new_tensor_3d::<f32>(Shape3D::new(ne[0], ne[1], ne[2]))?,
+            4 => ctx.new_tensor_4d::<f32>(Shape4D::new(ne[0], ne[1], ne[2], ne[3]))?,
             _ => unreachable!(),
         };
         fill_named_tensor(

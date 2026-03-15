@@ -8,7 +8,7 @@ use crate::backend::LlamaBackend;
 use crate::metadata::{LlamaModelMetadata, MetadataError, resolve_llama_metadata};
 use crate::model::{GgufModel, ModelError};
 use crate::naming::{LlamaLayerTensorNames, NamingError, resolve_llama_layer_tensor_names};
-use ggml_rs::{Context, GgmlElement, Length, Shape2D, Type};
+use ggml_rs::{Context, GgmlElement, Length, Shape2D};
 use num_traits::NumCast;
 use std::marker::PhantomData;
 use std::num::NonZeroUsize;
@@ -633,10 +633,10 @@ where
     let ctx = runtime.ctx;
 
     let w = ctx
-        .new_tensor_2d_shape(Type::of::<T>(), weight_shape)
+        .new_tensor_2d::<T>(weight_shape)
         .map_err(|source| InferenceError::ggml("Context::new_tensor_2d_shape<W>", source))?;
     let x = ctx
-        .new_tensor_2d_shape(Type::of::<T>(), input_shape)
+        .new_tensor_2d::<T>(input_shape)
         .map_err(|source| InferenceError::ggml("Context::new_tensor_2d_shape<X>", source))?;
     let y = ctx
         .mul_mat(&w, &x)
@@ -803,16 +803,16 @@ where
     let input_shape = Shape2D::new(hidden, 1);
 
     let w_gate = ctx
-        .new_tensor_2d_shape(Type::of::<T>(), gate_shape)
+        .new_tensor_2d::<T>(gate_shape)
         .map_err(|source| InferenceError::ggml("Context::new_tensor_2d_shape<W_GATE>", source))?;
     let w_up = ctx
-        .new_tensor_2d_shape(Type::of::<T>(), up_shape)
+        .new_tensor_2d::<T>(up_shape)
         .map_err(|source| InferenceError::ggml("Context::new_tensor_2d_shape<W_UP>", source))?;
     let w_down = ctx
-        .new_tensor_2d_shape(Type::of::<T>(), down_shape)
+        .new_tensor_2d::<T>(down_shape)
         .map_err(|source| InferenceError::ggml("Context::new_tensor_2d_shape<W_DOWN>", source))?;
     let x = ctx
-        .new_tensor_2d_shape(Type::of::<T>(), input_shape)
+        .new_tensor_2d::<T>(input_shape)
         .map_err(|source| InferenceError::ggml("Context::new_tensor_2d_shape<X>", source))?;
 
     let gate = ctx
@@ -1738,19 +1738,19 @@ pub fn attention_inference_with_weights_repeats(
     let kv_features = config.kv_features();
 
     let w_q = ctx
-        .new_f32_tensor_2d_shape(Shape2D::new(hidden_features, query_features))
+        .new_tensor_2d::<f32>(Shape2D::new(hidden_features, query_features))
         .map_err(|source| InferenceError::ggml("Context::new_f32_tensor_2d_shape<W_Q>", source))?;
     let w_k = ctx
-        .new_f32_tensor_2d_shape(Shape2D::new(hidden_features, kv_features))
+        .new_tensor_2d::<f32>(Shape2D::new(hidden_features, kv_features))
         .map_err(|source| InferenceError::ggml("Context::new_f32_tensor_2d_shape<W_K>", source))?;
     let w_v = ctx
-        .new_f32_tensor_2d_shape(Shape2D::new(hidden_features, kv_features))
+        .new_tensor_2d::<f32>(Shape2D::new(hidden_features, kv_features))
         .map_err(|source| InferenceError::ggml("Context::new_f32_tensor_2d_shape<W_V>", source))?;
     let w_o = ctx
-        .new_f32_tensor_2d_shape(Shape2D::new(query_features, hidden_features))
+        .new_tensor_2d::<f32>(Shape2D::new(query_features, hidden_features))
         .map_err(|source| InferenceError::ggml("Context::new_f32_tensor_2d_shape<W_O>", source))?;
     let x = ctx
-        .new_f32_tensor_2d_shape(Shape2D::new(hidden_features, sequence_length))
+        .new_tensor_2d::<f32>(Shape2D::new(hidden_features, sequence_length))
         .map_err(|source| InferenceError::ggml("Context::new_f32_tensor_2d_shape<X>", source))?;
 
     let q = ctx
@@ -1765,7 +1765,7 @@ pub fn attention_inference_with_weights_repeats(
 
     let positions = if matches!(config.rotary, RotaryEmbedding::Llama(_)) {
         Some(
-            ctx.new_i32_tensor_1d_len(Length::new(sequence_length))
+            ctx.new_tensor_1d::<i32>(Length::new(sequence_length))
                 .map_err(|source| InferenceError::ggml("Context::new_i32_tensor_1d_len", source))?,
         )
     } else {
@@ -1773,7 +1773,7 @@ pub fn attention_inference_with_weights_repeats(
     };
     let mask = if matches!(config.mask, AttentionMaskPolicy::Causal { .. }) {
         Some(
-            ctx.new_f32_tensor_2d_shape(Shape2D::new(sequence_length, sequence_length))
+            ctx.new_tensor_2d::<f32>(Shape2D::new(sequence_length, sequence_length))
                 .map_err(|source| {
                     InferenceError::ggml("Context::new_f32_tensor_2d_shape<CAUSAL_MASK>", source)
                 })?,
@@ -2030,21 +2030,21 @@ fn attention_decode_proxy_with_cache_repeats_inner(
     let query_features = config.query_features();
 
     let w_q = ctx
-        .new_f32_tensor_2d_shape(Shape2D::new(hidden_features, query_features))
+        .new_tensor_2d::<f32>(Shape2D::new(hidden_features, query_features))
         .map_err(|source| InferenceError::ggml("Context::new_f32_tensor_2d_shape<W_Q>", source))?;
     let w_o = ctx
-        .new_f32_tensor_2d_shape(Shape2D::new(query_features, hidden_features))
+        .new_tensor_2d::<f32>(Shape2D::new(query_features, hidden_features))
         .map_err(|source| InferenceError::ggml("Context::new_f32_tensor_2d_shape<W_O>", source))?;
     let x_q = ctx
-        .new_f32_tensor_2d_shape(Shape2D::new(hidden_features, query_length))
+        .new_tensor_2d::<f32>(Shape2D::new(hidden_features, query_length))
         .map_err(|source| InferenceError::ggml("Context::new_f32_tensor_2d_shape<X_Q>", source))?;
     let k = ctx
-        .new_f32_tensor_2d_shape(Shape2D::new(kv_features, key_value_length))
+        .new_tensor_2d::<f32>(Shape2D::new(kv_features, key_value_length))
         .map_err(|source| {
             InferenceError::ggml("Context::new_f32_tensor_2d_shape<K_CACHE>", source)
         })?;
     let v = ctx
-        .new_f32_tensor_2d_shape(Shape2D::new(kv_features, key_value_length))
+        .new_tensor_2d::<f32>(Shape2D::new(kv_features, key_value_length))
         .map_err(|source| {
             InferenceError::ggml("Context::new_f32_tensor_2d_shape<V_CACHE>", source)
         })?;
@@ -2055,12 +2055,12 @@ fn attention_decode_proxy_with_cache_repeats_inner(
 
     let (positions_q, positions_k) = if matches!(config.rotary, RotaryEmbedding::Llama(_)) {
         let positions_q = ctx
-            .new_i32_tensor_1d_len(Length::new(query_length))
+            .new_tensor_1d::<i32>(Length::new(query_length))
             .map_err(|source| {
                 InferenceError::ggml("Context::new_i32_tensor_1d_len<QUERY_POS>", source)
             })?;
         let positions_k = ctx
-            .new_i32_tensor_1d_len(Length::new(key_value_length))
+            .new_tensor_1d::<i32>(Length::new(key_value_length))
             .map_err(|source| {
                 InferenceError::ggml("Context::new_i32_tensor_1d_len<KV_POS>", source)
             })?;
@@ -2070,7 +2070,7 @@ fn attention_decode_proxy_with_cache_repeats_inner(
     };
     let mask = if matches!(config.mask, AttentionMaskPolicy::Causal { .. }) {
         Some(
-            ctx.new_f32_tensor_2d_shape(Shape2D::new(key_value_length, query_length))
+            ctx.new_tensor_2d::<f32>(Shape2D::new(key_value_length, query_length))
                 .map_err(|source| {
                     InferenceError::ggml("Context::new_f32_tensor_2d_shape<CAUSAL_MASK>", source)
                 })?,

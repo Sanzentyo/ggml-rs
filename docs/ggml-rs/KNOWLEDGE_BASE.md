@@ -80,6 +80,12 @@ git submodule update --init --recursive
     - `write_data_to_file(path)`
     - `write_metadata_to_file(path)`
   This allows fixture generation and round-trip checks without exposing unsafe pointers.
+- Tensor constructor wrappers were consolidated into generic APIs (`2026-03-15`):
+  - use `new_tensor_typed::<T, N>(Dims<N>)` for rank-generic paths,
+  - use semantic helpers `new_tensor_1d::<T>(Length)`, `new_tensor_2d::<T>(Shape2D)`,
+    `new_tensor_3d::<T>(Shape3D)`, `new_tensor_4d::<T>(Shape4D)` for common shapes.
+- Root synthetic parity examples are now clap-based and re-verified on CPU/Metal:
+  - artifact: `target/benchmarks/review3_constructor_clap_runtime_smoke.txt`.
 
 ## Error context policy
 
@@ -94,6 +100,7 @@ cargo fmt
 cargo clippy --workspace --all-targets
 cargo test --workspace
 cargo run --example backend_matmul --features link-system
+cargo run --example perf_metal --features link-system -- 256 16
 cargo run -p llama-rs --example backend_smoke --features link-system
 cargo run --example arithmetic_expr --features link-system
 ```
@@ -135,3 +142,4 @@ Bench-suite controls:
 Detailed runbook:
 
 - `docs/ggml-rs/SUITE_OPERATIONS.md`
+- `docs/ggml-rs/EXAMPLE_PARITY_MATRIX.md` (upstream example-by-example parity status)

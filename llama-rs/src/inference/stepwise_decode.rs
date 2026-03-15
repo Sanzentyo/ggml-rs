@@ -454,7 +454,7 @@ impl<'ctx> HeadOutputAssembler<'ctx> {
     ) -> Result<Self, InferenceError> {
         let head_output_staging = if matches!(mode, HeadOutputProjectionMode::FusedStaging) {
             Some(
-                ctx.new_f32_tensor_2d_shape(Shape2D::new(init.query_features, init.query_length))
+                ctx.new_tensor_2d::<f32>(Shape2D::new(init.query_features, init.query_length))
                     .map_err(|source| {
                         InferenceError::ggml(
                             "Context::new_f32_tensor_2d_shape<HEAD_OUTPUT_STAGING>",
@@ -1067,21 +1067,21 @@ fn execute_stepwise_sweep_internal(
     let query_features = config.query_features();
 
     let w_q = ctx
-        .new_f32_tensor_2d_shape(Shape2D::new(hidden_features, query_features))
+        .new_tensor_2d::<f32>(Shape2D::new(hidden_features, query_features))
         .map_err(|source| InferenceError::ggml("Context::new_f32_tensor_2d_shape<W_Q>", source))?;
     let w_o = ctx
-        .new_f32_tensor_2d_shape(Shape2D::new(query_features, hidden_features))
+        .new_tensor_2d::<f32>(Shape2D::new(query_features, hidden_features))
         .map_err(|source| InferenceError::ggml("Context::new_f32_tensor_2d_shape<W_O>", source))?;
     let x_q = ctx
-        .new_f32_tensor_2d_shape(Shape2D::new(hidden_features, query_length))
+        .new_tensor_2d::<f32>(Shape2D::new(hidden_features, query_length))
         .map_err(|source| InferenceError::ggml("Context::new_f32_tensor_2d_shape<X_Q>", source))?;
     let k = ctx
-        .new_f32_tensor_2d_shape(Shape2D::new(kv_features, key_value_length))
+        .new_tensor_2d::<f32>(Shape2D::new(kv_features, key_value_length))
         .map_err(|source| {
             InferenceError::ggml("Context::new_f32_tensor_2d_shape<K_CACHE>", source)
         })?;
     let v = ctx
-        .new_f32_tensor_2d_shape(Shape2D::new(kv_features, key_value_length))
+        .new_tensor_2d::<f32>(Shape2D::new(kv_features, key_value_length))
         .map_err(|source| {
             InferenceError::ggml("Context::new_f32_tensor_2d_shape<V_CACHE>", source)
         })?;
@@ -1092,12 +1092,12 @@ fn execute_stepwise_sweep_internal(
 
     let (positions_q, positions_k) = if matches!(config.rotary, RotaryEmbedding::Llama(_)) {
         let positions_q = ctx
-            .new_i32_tensor_1d_len(Length::new(query_length))
+            .new_tensor_1d::<i32>(Length::new(query_length))
             .map_err(|source| {
                 InferenceError::ggml("Context::new_i32_tensor_1d_len<QUERY_POS>", source)
             })?;
         let positions_k = ctx
-            .new_i32_tensor_1d_len(Length::new(key_value_length))
+            .new_tensor_1d::<i32>(Length::new(key_value_length))
             .map_err(|source| {
                 InferenceError::ggml("Context::new_i32_tensor_1d_len<KV_POS>", source)
             })?;
@@ -1106,7 +1106,7 @@ fn execute_stepwise_sweep_internal(
         (None, None)
     };
     let mask = Some(
-        ctx.new_f32_tensor_2d_shape(Shape2D::new(key_value_length, query_length))
+        ctx.new_tensor_2d::<f32>(Shape2D::new(key_value_length, query_length))
             .map_err(|source| {
                 InferenceError::ggml("Context::new_f32_tensor_2d_shape<CAUSAL_MASK>", source)
             })?,
@@ -1131,12 +1131,12 @@ fn execute_stepwise_sweep_internal(
     let (w_k, w_v, projected_k_step, projected_v_step, kv_cache_write_nodes) =
         if include_kv_projection {
             let w_k = ctx
-                .new_f32_tensor_2d_shape(Shape2D::new(hidden_features, kv_features))
+                .new_tensor_2d::<f32>(Shape2D::new(hidden_features, kv_features))
                 .map_err(|source| {
                     InferenceError::ggml("Context::new_f32_tensor_2d_shape<W_K>", source)
                 })?;
             let w_v = ctx
-                .new_f32_tensor_2d_shape(Shape2D::new(hidden_features, kv_features))
+                .new_tensor_2d::<f32>(Shape2D::new(hidden_features, kv_features))
                 .map_err(|source| {
                     InferenceError::ggml("Context::new_f32_tensor_2d_shape<W_V>", source)
                 })?;
@@ -1208,7 +1208,7 @@ fn execute_stepwise_sweep_internal(
                     }
                 } else {
                     let k_write_slot = ctx
-                        .new_f32_tensor_2d_shape(Shape2D::new(kv_features, query_length))
+                        .new_tensor_2d::<f32>(Shape2D::new(kv_features, query_length))
                         .map_err(|source| {
                             InferenceError::ggml(
                                 "Context::new_f32_tensor_2d_shape<K_WRITE_SLOT>",
@@ -1216,7 +1216,7 @@ fn execute_stepwise_sweep_internal(
                             )
                         })?;
                     let v_write_slot = ctx
-                        .new_f32_tensor_2d_shape(Shape2D::new(kv_features, query_length))
+                        .new_tensor_2d::<f32>(Shape2D::new(kv_features, query_length))
                         .map_err(|source| {
                             InferenceError::ggml(
                                 "Context::new_f32_tensor_2d_shape<V_WRITE_SLOT>",
@@ -1328,7 +1328,7 @@ fn execute_stepwise_sweep_internal(
 
         if let Some(precompute_graph) = static_kv_head_graph.as_mut() {
             let rotated_k_cached = ctx
-                .new_f32_tensor_2d_shape(Shape2D::new(config.head_dimension(), key_value_length))
+                .new_tensor_2d::<f32>(Shape2D::new(config.head_dimension(), key_value_length))
                 .map_err(|source| {
                     InferenceError::ggml(
                         "Context::new_f32_tensor_2d_shape<K_ROTATED_CACHED>",
@@ -1336,7 +1336,7 @@ fn execute_stepwise_sweep_internal(
                     )
                 })?;
             let transposed_v_cached = ctx
-                .new_f32_tensor_2d_shape(Shape2D::new(key_value_length, config.head_dimension()))
+                .new_tensor_2d::<f32>(Shape2D::new(key_value_length, config.head_dimension()))
                 .map_err(|source| {
                     InferenceError::ggml(
                         "Context::new_f32_tensor_2d_shape<V_TRANSPOSED_CACHED>",
@@ -1438,7 +1438,7 @@ fn execute_stepwise_sweep_internal(
         let mlp = if let Some(block_mlp_weights) = graph_block_mlp_weights {
             let ffn_features = block_mlp_weights.ffn_features;
             let w_down = ctx
-                .new_f32_tensor_2d_shape(Shape2D::new(ffn_features, hidden_features))
+                .new_tensor_2d::<f32>(Shape2D::new(ffn_features, hidden_features))
                 .map_err(|source| {
                     InferenceError::ggml("Context::new_f32_tensor_2d_shape<W_DOWN_BLOCK>", source)
                 })?;
@@ -1447,7 +1447,7 @@ fn execute_stepwise_sweep_internal(
                     .checked_mul(2)
                     .ok_or(InferenceError::MemorySizeOverflow)?;
                 let w_gate_up = ctx
-                    .new_f32_tensor_2d_shape(Shape2D::new(hidden_features, gate_up_features))
+                    .new_tensor_2d::<f32>(Shape2D::new(hidden_features, gate_up_features))
                     .map_err(|source| {
                         InferenceError::ggml(
                             "Context::new_f32_tensor_2d_shape<W_GATE_UP_BLOCK>",
@@ -1483,7 +1483,7 @@ fn execute_stepwise_sweep_internal(
                 (gate, up)
             } else {
                 let w_gate = ctx
-                    .new_f32_tensor_2d_shape(Shape2D::new(hidden_features, ffn_features))
+                    .new_tensor_2d::<f32>(Shape2D::new(hidden_features, ffn_features))
                     .map_err(|source| {
                         InferenceError::ggml(
                             "Context::new_f32_tensor_2d_shape<W_GATE_BLOCK>",
@@ -1491,7 +1491,7 @@ fn execute_stepwise_sweep_internal(
                         )
                     })?;
                 let w_up = ctx
-                    .new_f32_tensor_2d_shape(Shape2D::new(hidden_features, ffn_features))
+                    .new_tensor_2d::<f32>(Shape2D::new(hidden_features, ffn_features))
                     .map_err(|source| {
                         InferenceError::ggml("Context::new_f32_tensor_2d_shape<W_UP_BLOCK>", source)
                     })?;

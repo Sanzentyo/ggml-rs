@@ -1,5 +1,6 @@
 //! Safe CPU/Metal backend matmul parity example.
 
+use clap::{Parser, ValueEnum};
 use ggml_rs::{Backend, BackendKind, Context, Result, Shape2D, StaticShape2D, init_timing};
 
 const ROWS_A: usize = 4;
@@ -22,37 +23,43 @@ const EXPECTED: [f32; ROWS_A * ROWS_B] = [
 
 const TOLERANCE: f32 = 1e-4;
 
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum BackendArg {
+    Cpu,
+    Metal,
+}
+
+impl BackendArg {
+    const fn kind(self) -> BackendKind {
+        match self {
+            Self::Cpu => BackendKind::Cpu,
+            Self::Metal => BackendKind::Metal,
+        }
+    }
+}
+
+#[derive(Debug, Parser)]
+#[command(name = "backend_matmul")]
+struct Cli {
+    #[arg(value_enum)]
+    backends: Vec<BackendArg>,
+}
+
 fn main() -> Result<()> {
     init_timing();
     Backend::load_all();
 
-    let requested = parse_requested_backends(std::env::args().skip(1));
+    let cli = Cli::parse();
+    let requested = if cli.backends.is_empty() {
+        vec![BackendKind::Cpu, BackendKind::Metal]
+    } else {
+        cli.backends.into_iter().map(BackendArg::kind).collect()
+    };
     for backend_kind in requested {
         run_backend(backend_kind)?;
     }
 
     Ok(())
-}
-
-fn parse_requested_backends(args: impl Iterator<Item = String>) -> Vec<BackendKind> {
-    let mut parsed = Vec::new();
-
-    for arg in args {
-        match arg.as_str() {
-            "cpu" | "CPU" => parsed.push(BackendKind::Cpu),
-            "metal" | "METAL" | "Metal" => parsed.push(BackendKind::Metal),
-            unknown => {
-                eprintln!("unknown backend `{unknown}`, expected `cpu` or `metal`");
-                std::process::exit(2);
-            }
-        }
-    }
-
-    if parsed.is_empty() {
-        vec![BackendKind::Cpu, BackendKind::Metal]
-    } else {
-        parsed
-    }
 }
 
 fn run_backend(kind: BackendKind) -> Result<()> {
@@ -62,8 +69,8 @@ fn run_backend(kind: BackendKind) -> Result<()> {
     let ctx_size = Context::recommended_backend_matmul_memory::<f32>(SHAPE_A, SHAPE_B)?;
     let ctx = Context::new_no_alloc_bytes(ctx_size)?;
 
-    let a = ctx.new_f32_tensor_2d_typed::<AShape>()?;
-    let b = ctx.new_f32_tensor_2d_typed::<BShape>()?;
+    let a = ctx.new_tensor_2d_typed::<f32, AShape>()?;
+    let b = ctx.new_tensor_2d_typed::<f32, BShape>()?;
     let result = ctx.mul_mat(a.inner(), b.inner())?;
 
     // Build graph first, then allocate backend memory for all tensors in the context.
@@ -81,10 +88,11 @@ fn run_backend(kind: BackendKind) -> Result<()> {
     let output = graph.last_node()?;
     let values = output.read_data_backend::<f32>()?;
     assert_expected(&values, backend_name);
+    let checksum: f64 = values.iter().copied().map(f64::from).sum();
 
     let shape = output.shape()?;
     println!(
-        "[{backend_name}] mul mat ({} x {}) OK",
+        "[{backend_name}] mul mat ({} x {}) OK checksum={checksum:.6}",
         shape.cols.get(),
         shape.rows.get()
     );

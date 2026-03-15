@@ -14,10 +14,10 @@ fn main() -> Result<(), Box<dyn StdError>> {
     let mem = 1024 * 1024;
     let ctx = Context::new(mem)?;
 
-    let a = ctx.new_f32_tensor_1d_len(Length::new(LEN))?;
-    let b = ctx.new_f32_tensor_1d_len(Length::new(LEN))?;
-    let c = ctx.new_f32_tensor_1d_len(Length::new(LEN))?;
-    let d = ctx.new_f32_tensor_1d_len(Length::new(LEN))?;
+    let a = ctx.new_tensor_1d::<f32>(Length::new(LEN))?;
+    let b = ctx.new_tensor_1d::<f32>(Length::new(LEN))?;
+    let c = ctx.new_tensor_1d::<f32>(Length::new(LEN))?;
+    let d = ctx.new_tensor_1d::<f32>(Length::new(LEN))?;
 
     a.write_data(&A)?;
     b.write_data(&B)?;

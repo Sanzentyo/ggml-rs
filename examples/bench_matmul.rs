@@ -1,3 +1,4 @@
+use clap::{Parser, ValueEnum};
 use ggml_rs::{Backend, BackendKind, Context, Shape2D};
 use std::time::Instant;
 
@@ -8,44 +9,45 @@ const COLS_B: usize = 256;
 const SHAPE_A: Shape2D = Shape2D::new(COLS_A, ROWS_A);
 const SHAPE_B: Shape2D = Shape2D::new(COLS_B, ROWS_B);
 
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum BackendArg {
+    Cpu,
+    Metal,
+}
+
+impl BackendArg {
+    const fn kind(self) -> BackendKind {
+        match self {
+            Self::Cpu => BackendKind::Cpu,
+            Self::Metal => BackendKind::Metal,
+        }
+    }
+}
+
+#[derive(Debug, Parser)]
+#[command(name = "bench_matmul")]
+struct Cli {
+    #[arg(long = "iters", short = 'n', default_value_t = 30)]
+    iters: usize,
+    #[arg(value_enum)]
+    backends: Vec<BackendArg>,
+}
+
 fn main() -> Result<(), ggml_rs::Error> {
     ggml_rs::init_timing();
     Backend::load_all();
 
-    let (iters, backends) = parse_args(std::env::args().skip(1));
+    let mut cli = Cli::parse();
+    cli.iters = cli.iters.max(1);
+    let backends = if cli.backends.is_empty() {
+        vec![BackendKind::Cpu, BackendKind::Metal]
+    } else {
+        cli.backends.into_iter().map(BackendArg::kind).collect()
+    };
     for backend in backends {
-        run_bench(backend, iters)?;
+        run_bench(backend, cli.iters)?;
     }
     Ok(())
-}
-
-fn parse_args(args: impl Iterator<Item = String>) -> (usize, Vec<BackendKind>) {
-    let mut iters = 30usize;
-    let mut backends = Vec::new();
-
-    let mut pending_iters = false;
-    for arg in args {
-        if pending_iters {
-            if let Ok(value) = arg.parse::<usize>() {
-                iters = value.max(1);
-            }
-            pending_iters = false;
-            continue;
-        }
-
-        match arg.as_str() {
-            "--iters" | "-n" => pending_iters = true,
-            "cpu" | "CPU" => backends.push(BackendKind::Cpu),
-            "metal" | "METAL" | "Metal" => backends.push(BackendKind::Metal),
-            _ => {}
-        }
-    }
-
-    if backends.is_empty() {
-        (iters, vec![BackendKind::Cpu, BackendKind::Metal])
-    } else {
-        (iters, backends)
-    }
 }
 
 fn run_bench(kind: BackendKind, iters: usize) -> Result<(), ggml_rs::Error> {
@@ -55,8 +57,8 @@ fn run_bench(kind: BackendKind, iters: usize) -> Result<(), ggml_rs::Error> {
     let ctx_size = Context::recommended_backend_matmul_memory::<f32>(SHAPE_A, SHAPE_B)?;
     let ctx = Context::new_no_alloc_bytes(ctx_size)?;
 
-    let a = ctx.new_f32_tensor_2d_shape(SHAPE_A)?;
-    let b = ctx.new_f32_tensor_2d_shape(SHAPE_B)?;
+    let a = ctx.new_tensor_2d::<f32>(SHAPE_A)?;
+    let b = ctx.new_tensor_2d::<f32>(SHAPE_B)?;
     let result = ctx.mul_mat(&a, &b)?;
 
     let mut graph = ctx.new_graph()?;

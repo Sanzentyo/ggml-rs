@@ -113,3 +113,33 @@ required-features = ["link-system"]
 [[example]]
 name = "bench_compare_report"
 path = "examples/bench_compare_report.rs"
+
+[[example]]
+name = "gpt2_ctx"
+path = "examples/gpt2_ctx.rs"
+required-features = ["link-system"]
+
+[[example]]
+name = "gpt2_alloc"
+path = "examples/gpt2_alloc.rs"
+required-features = ["link-system"]
+
+[[example]]
+name = "gpt2_backend"
+path = "examples/gpt2_backend.rs"
+required-features = ["link-system"]
+
+[[example]]
+name = "gpt2_sched"
+path = "examples/gpt2_sched.rs"
+required-features = ["link-system"]
+
+[[example]]
+name = "gpt2_batched"
+path = "examples/gpt2_batched.rs"
+required-features = ["link-system"]
+
+[[example]]
+name = "gpt2_quantize"
+path = "examples/gpt2_quantize.rs"
+required-features = ["link-system"]

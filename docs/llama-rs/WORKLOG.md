@@ -50,3 +50,14 @@ Detailed logs live under `docs/llama-rs/worklog/`.
   both `no-mask-delta` and `no-position-delta` are slower (`~1.018` and
   `~1.041` variant/base overall), with checksum parity preserved (`0.0` deltas);
   defaults remain unchanged.
+- Ran a lock-coordinated parallel subagent pass for ggml upstream example parity
+  batches (`foundation`, `gpt2`, `gptj_magika`, `vision_mnist`) and logged
+  per-batch progress under `docs/llama-rs/worklog/subagents/`.
+- Removed remaining shape-wrapper constructor usage from in-repo call sites and
+  migrated to generic constructor APIs (`new_tensor_typed::<T, N>`, `new_tensor_*::<T>`).
+- Unified root `ggml-rs/examples` CLI parsing to clap derive (including
+  synthetic parity examples and upstream-suite harness) and re-verified runtime:
+  `target/benchmarks/review3_constructor_clap_runtime_smoke.txt`.
+- Added synthetic loop-reuse perf pass for vision/MNIST proxies (reuse graph/context
+  across `--synthetic-iters`) and captured impact:
+  `target/benchmarks/vision_mnist/loopreuse_impact.md`.

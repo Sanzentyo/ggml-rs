@@ -1,0 +1,23 @@
+# gptj/magika batch log
+
+- scope: `gpt-j`, `gpt-j-quantize`, `magika`
+- owner: parallel subagent
+- 2026-03-15: inspected upstream C++ targets (`gpt-j/main.cpp`, `gpt-j/quantize.cpp`, `magika/main.cpp`) and ggml-rs safe API surface.
+- 2026-03-15: confirmed local upstream ggml build has `gpt-j`, `gpt-j-quantize`, `magika` binaries; model assets for direct runtime parity are not present in-tree.
+- 2026-03-15: baseline locked cargo validation run executed (`fmt`, `clippy`, `test`); clippy currently fails on pre-existing dead-code warning in `src/compute.rs` (`graph_overhead_custom`), unrelated to GPTJ/Magika scope.
+- 2026-03-15: added Rust synthetic target implementations with safe ggml-rs APIs:
+  - `examples/gptj_main_synth.rs`
+  - `examples/gptj_quantize_synth.rs`
+  - `examples/magika_main_synth.rs`
+- 2026-03-15: added dedicated C++ synthetic reference parity runner:
+  - `tests/cpp/gptj_magika_synth_ref.cpp`
+- 2026-03-15: produced locked parity/perf artifacts under `target/benchmarks/`:
+  - `gptj_main_synth_{rust,cpp}.txt`
+  - `gptj_quantize_synth_{rust,cpp}.txt`
+  - `magika_main_synth_{rust,cpp}.txt`
+  - `*_parity.diff`, `gptj_magika_synth_parity_summary.txt`, `gptj_magika_synth_perf_summary.txt`
+- 2026-03-15: locked validation after implementation:
+  - `cargo fmt --all` ✅
+  - `cargo fmt -- --check examples/gptj_main_synth.rs examples/gptj_quantize_synth.rs examples/magika_main_synth.rs` ✅
+  - targeted clippy for new examples with `--features link-system` ✅
+  - targeted tests (`ggml_simple_ctx`, `ggml_tensor_ops`, `ggml_test_cont`) with `--features link-system` ✅

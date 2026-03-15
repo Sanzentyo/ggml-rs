@@ -20,8 +20,8 @@ fn main() -> Result<()> {
     let ctx_size = Context::recommended_matmul_memory::<f32>(SHAPE_A, SHAPE_B)?;
     let ctx = Context::new_bytes(ctx_size)?;
 
-    let a = ctx.new_f32_tensor_2d_typed::<AShape>()?;
-    let b = ctx.new_f32_tensor_2d_typed::<BShape>()?;
+    let a = ctx.new_tensor_2d_typed::<f32, AShape>()?;
+    let b = ctx.new_tensor_2d_typed::<f32, BShape>()?;
     a.write_data(&matrix_a)?;
     b.write_data(&matrix_b)?;
 

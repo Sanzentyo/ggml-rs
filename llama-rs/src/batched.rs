@@ -341,10 +341,10 @@ pub fn batched_matmul_with_workload(
         .map_err(|source| BatchedError::ggml("Context::new_no_alloc_bytes", source))?;
 
     let a = ctx
-        .new_f32_tensor_2d_shape(shape_a)
+        .new_tensor_2d::<f32>(shape_a)
         .map_err(|source| BatchedError::ggml("Context::new_f32_tensor_2d_shape<A>", source))?;
     let b = ctx
-        .new_f32_tensor_2d_shape(shape_b)
+        .new_tensor_2d::<f32>(shape_b)
         .map_err(|source| BatchedError::ggml("Context::new_f32_tensor_2d_shape<B>", source))?;
     let result = ctx
         .mul_mat(&a, &b)

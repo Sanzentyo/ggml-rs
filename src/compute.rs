@@ -152,6 +152,11 @@ pub fn graph_overhead_bytes() -> usize {
     unsafe { ffi::ggml_graph_overhead() }
 }
 
+/// Returns ggml graph metadata overhead for a custom graph capacity.
+pub fn graph_overhead_custom(size: usize, grads: bool) -> usize {
+    unsafe { ffi::ggml_graph_overhead_custom(size, grads) }
+}
+
 /// Creates a scoped context and executes the provided closure.
 ///
 /// The higher-ranked lifetime keeps all `Tensor<'ctx>` values scoped to the
@@ -321,6 +326,13 @@ impl Drop for Backend {
 pub struct BackendBuffer<'ctx> {
     raw: NonNull<ffi::ggml_backend_buffer>,
     _ctx: PhantomData<&'ctx Context>,
+}
+
+impl<'ctx> BackendBuffer<'ctx> {
+    /// Returns allocated backend buffer size in bytes.
+    pub fn size_bytes(&self) -> usize {
+        unsafe { ffi::ggml_backend_buffer_get_size(self.raw.as_ptr()) }
+    }
 }
 
 impl<'ctx> Drop for BackendBuffer<'ctx> {
@@ -495,57 +507,32 @@ impl Context {
             .map_err(|error| error.with_context("ggml_new_tensor"))
     }
 
-    /// Creates a 2D tensor using semantic shape newtypes.
-    pub fn new_tensor_2d_shape(&self, ty: Type, shape: Shape2D) -> Result<Tensor<'_>> {
-        self.new_tensor(ty, shape.dims())
-    }
-
-    pub fn new_f32_tensor_2d_shape(&self, shape: Shape2D) -> Result<Tensor<'_>> {
-        self.new_tensor_2d_shape(Type::F32, shape)
+    /// Creates a tensor for ranks `1..=4` from a generic element type.
+    pub fn new_tensor_typed<T: GgmlElement, const N: usize>(
+        &self,
+        dims: Dims<N>,
+    ) -> Result<Tensor<'_>> {
+        self.new_tensor(Type::of::<T>(), dims)
     }
 
     /// Creates a 1D tensor with semantic `Length`.
-    pub fn new_tensor_1d_len(&self, ty: Type, len: Length) -> Result<Tensor<'_>> {
-        self.new_tensor(ty, Dims::new([len.get()]))
+    pub fn new_tensor_1d<T: GgmlElement>(&self, len: Length) -> Result<Tensor<'_>> {
+        self.new_tensor_typed::<T, 1>(Dims::new([len.get()]))
     }
 
-    pub fn new_f32_tensor_1d_len(&self, len: Length) -> Result<Tensor<'_>> {
-        self.new_tensor_1d_len(Type::F32, len)
-    }
-
-    pub fn new_i32_tensor_1d_len(&self, len: Length) -> Result<Tensor<'_>> {
-        self.new_tensor_1d_len(Type::I32, len)
+    /// Creates a 2D tensor using semantic shape newtypes.
+    pub fn new_tensor_2d<T: GgmlElement>(&self, shape: Shape2D) -> Result<Tensor<'_>> {
+        self.new_tensor_typed::<T, 2>(shape.dims())
     }
 
     /// Creates a 3D tensor from semantic dimensions.
-    pub fn new_tensor_3d_shape(&self, ty: Type, shape: Shape3D) -> Result<Tensor<'_>> {
-        self.new_tensor(ty, shape.dims())
+    pub fn new_tensor_3d<T: GgmlElement>(&self, shape: Shape3D) -> Result<Tensor<'_>> {
+        self.new_tensor_typed::<T, 3>(shape.dims())
     }
 
     /// Creates a 4D tensor from semantic dimensions.
-    pub fn new_tensor_4d_shape(&self, ty: Type, shape: Shape4D) -> Result<Tensor<'_>> {
-        self.new_tensor(ty, shape.dims())
-    }
-
-    pub fn new_tensor_3d(
-        &self,
-        ty: Type,
-        ne0: usize,
-        ne1: usize,
-        ne2: usize,
-    ) -> Result<Tensor<'_>> {
-        self.new_tensor_3d_shape(ty, Shape3D::new(ne0, ne1, ne2))
-    }
-
-    pub fn new_tensor_4d(
-        &self,
-        ty: Type,
-        ne0: usize,
-        ne1: usize,
-        ne2: usize,
-        ne3: usize,
-    ) -> Result<Tensor<'_>> {
-        self.new_tensor_4d_shape(ty, Shape4D::new(ne0, ne1, ne2, ne3))
+    pub fn new_tensor_4d<T: GgmlElement>(&self, shape: Shape4D) -> Result<Tensor<'_>> {
+        self.new_tensor_typed::<T, 4>(shape.dims())
     }
 
     pub fn mul_mat<'ctx>(&'ctx self, a: &Tensor<'ctx>, b: &Tensor<'ctx>) -> Result<Tensor<'ctx>> {
@@ -822,6 +809,13 @@ impl Context {
         let raw = unsafe { ffi::ggml_new_graph(self.raw.as_ptr()) };
         self.wrap_graph(raw)
             .map_err(|error| error.with_context("ggml_new_graph"))
+    }
+
+    /// Creates a graph with explicit node capacity and grad tracking mode.
+    pub fn new_graph_custom(&self, size: usize, grads: bool) -> Result<Graph<'_>> {
+        let raw = unsafe { ffi::ggml_new_graph_custom(self.raw.as_ptr(), size, grads) };
+        self.wrap_graph(raw)
+            .map_err(|error| error.with_context("ggml_new_graph_custom"))
     }
 
     /// Wraps a tensor into expression form for operator-based composition.

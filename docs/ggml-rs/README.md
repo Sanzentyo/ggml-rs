@@ -23,6 +23,10 @@ centered on `Context`, `Tensor`, `Graph`, and `Backend`.
 - Shape-safe APIs with newtypes (`Shape2D`, `Length`, `TensorIndex`,
   `ThreadCount`, `Bytes`) and const-generic typed shapes
   (`StaticShape2D<const C, const R>` + `Tensor2D`).
+- Generic tensor-construction entrypoints:
+  `Context::new_tensor_typed::<T, N>(...)`, `new_tensor_1d::<T>(Length)`,
+  `new_tensor_2d::<T>(Shape2D)`, `new_tensor_3d::<T>(Shape3D)`,
+  `new_tensor_4d::<T>(Shape4D)`.
 
 ```rust
 use ggml_rs::prelude::*;
@@ -118,8 +122,21 @@ Detailed operations runbook:
 
 - `examples/simple_ctx.rs`: simple context-based matmul
 - `examples/backend_matmul.rs`: backend compute on CPU/Metal
+- `examples/perf_metal.rs`: Metal backend stress graph equivalent to upstream `perf-metal`
 - `examples/arithmetic_expr.rs`: expression-style tensor arithmetic
 - `examples/bench_matmul.rs`: end-to-end backend matmul benchmark
+- synthetic parity counterparts for upstream higher-level examples:
+  - `examples/gptj_main_synth.rs`
+  - `examples/gptj_quantize_synth.rs`
+  - `examples/magika_main_synth.rs`
+  - `examples/mnist_eval.rs`
+  - `examples/mnist_train.rs`
+  - `examples/sam.rs`
+  - `examples/yolov3_tiny.rs`
+
+Current upstream target coverage and parity state:
+
+- `docs/ggml-rs/EXAMPLE_PARITY_MATRIX.md`
 
 ## Suggested import
 
