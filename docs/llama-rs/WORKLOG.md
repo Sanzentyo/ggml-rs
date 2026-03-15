@@ -52,6 +52,34 @@ Detailed logs are split under `docs/llama-rs/worklog/` to keep this top-level fi
     - `new/base` avg_token vs phase-init-elision baseline: CPU `~1.013`, MTL0 `~1.000` (near-neutral; keep as cleanup/hardening).
 - Added block-MLP layer-loop cache in `bench_attention_layer` (`HashMap<(hidden_features, block_layer), (MlpWeights, block_mlp_real)>`) so repeated case/layer sweeps reuse resolved model-layer weights instead of re-decoding each time.
   - smoke (CPU+Metal, duplicated case to exercise cache path): `target/benchmarks/llama_rs_stepwise_layer_loop_reuse_cache_smoke.txt`.
+- Added stepwise setup-time instrumentation (`setup=... ms`) to separate one-time graph/context preparation cost from token compute cost in decode-stepwise output.
+  - baseline artifact for graph-level reuse planning:
+    - raw: `target/benchmarks/llama_rs_stepwise_graph_reuse_setup_baseline_elyza_layers5_7.txt`,
+    - summary: `target/benchmarks/llama_stepwise_graph_reuse_setup_baseline_elyza_layers5_7.md`,
+    - `block_layer=5..7` averages: setup `~456.6 ms` (CPU), `~462.3 ms` (MTL0) per call.
+- Added graph-level layer-sweep reuse path for stepwise decode benchmarking.
+  - new API/report:
+    - `run_attention_decode_stepwise_bench_sweep_with_cache_repeats_with_block_mlp`,
+    - `AttentionDecodeStepwiseBenchSweepReport`.
+  - `bench_attention_layer` now uses the shared-setup sweep path for decode-stepwise + model-backed multi-layer sweeps.
+  - output markers:
+    - `graph_reuse_sweep=true`,
+    - `setup_shared=... ms` (shared one-time setup),
+    - `setup=... ms` (amortized per-layer setup).
+  - runtime artifact: `target/benchmarks/llama_rs_stepwise_graph_reuse_layer_sweep_elyza_layers5_7.txt`.
+  - impact summary: `target/benchmarks/llama_stepwise_graph_reuse_layer_sweep_elyza_layers5_7_impact.md`.
+  - measured setup ratio (`new/base`): CPU `~0.315`, MTL0 `~0.309`, overall `~0.312`.
+- Added token-compute hotspot optimization for query-side RoPE application in stepwise decode:
+  - apply RoPE once on reshaped multi-head query tensor (`head_dim x n_heads x seq`) instead of per-head repeated RoPE nodes.
+  - runtime artifact:
+    - `target/benchmarks/llama_rs_stepwise_graph_reuse_layer_sweep_elyza_layers5_7_qrope_multihead.txt`.
+  - impact summary:
+    - `target/benchmarks/llama_stepwise_graph_reuse_qrope_multihead_elyza_layers5_7_impact.md`.
+  - measured post/base ratios:
+    - CPU: `avg_token ~1.001` (near-neutral),
+    - MTL0: `avg_token ~0.944` (improved),
+    - overall: `avg_token ~0.977` (improved),
+    - checksum parity: `max abs delta = 0.0`.
 - llama-bench proxy now includes `bench_attention_layer` (`HxQxKxS` cases) and uses explicit backend synchronization for benchmark timing stability.
 - llama.cpp baseline capture is now completed on CPU/Metal with six real GGUF models; results are recorded in `target/benchmarks/`.
 - llama-rs proxy comparison is now captured using metadata-derived MLP/attention shape sets from the same GGUF models.

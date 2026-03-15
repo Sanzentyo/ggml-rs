@@ -36,9 +36,10 @@ pub use idle::{
 };
 pub use inference::{
     AttentionDecodeCache, AttentionDecodeProxyReport, AttentionDecodeStepwiseBenchReport,
-    AttentionDecodeStepwiseConfig, AttentionDecodeStepwiseReport, AttentionHeadCount,
-    AttentionHeadDimension, AttentionInferenceConfig, AttentionInferenceReport, AttentionLayout,
-    AttentionMaskPolicy, AttentionWeights, FfnFeatures, HiddenFeatures, InFeatures, InferenceError,
+    AttentionDecodeStepwiseBenchSweepReport, AttentionDecodeStepwiseConfig,
+    AttentionDecodeStepwiseReport, AttentionHeadCount, AttentionHeadDimension,
+    AttentionInferenceConfig, AttentionInferenceReport, AttentionLayout, AttentionMaskPolicy,
+    AttentionWeights, FfnFeatures, HiddenFeatures, InFeatures, InferenceError,
     LinearInferenceConfig, LinearInferenceReport, LinearWeights, LlamaLayerDimensions,
     MetadataResolutionMode, MlpInferenceConfig, MlpInferenceReport, MlpWeights, OutFeatures,
     RopeConfig, RotaryEmbedding, build_attention_decode_cache, resolve_attention_weights_for_layer,
@@ -47,6 +48,7 @@ pub use inference::{
     run_attention_decode_proxy_with_cache, run_attention_decode_proxy_with_cache_repeats,
     run_attention_decode_proxy_with_cache_repeats_with_past,
     run_attention_decode_proxy_with_weights, run_attention_decode_proxy_with_weights_repeats,
+    run_attention_decode_stepwise_bench_sweep_with_cache_repeats_with_block_mlp,
     run_attention_decode_stepwise_bench_with_cache_repeats_with_block_mlp,
     run_attention_decode_stepwise_with_cache_repeats,
     run_attention_decode_stepwise_with_cache_repeats_with_block_mlp,

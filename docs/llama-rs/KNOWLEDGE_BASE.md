@@ -204,6 +204,28 @@ Post-clap+thiserror resume artifacts (same ELYZA slice):
   - impact: `target/benchmarks/llama_stepwise_backend_load_once_elyza_layers5_7_impact.md`
 - layer-loop reuse cache smoke (`bench_attention_layer` block-MLP cache path):
   - `target/benchmarks/llama_rs_stepwise_layer_loop_reuse_cache_smoke.txt`
+- graph-level reuse planning baseline (`setup` instrumentation):
+  - raw: `target/benchmarks/llama_rs_stepwise_graph_reuse_setup_baseline_elyza_layers5_7.txt`
+  - summary: `target/benchmarks/llama_stepwise_graph_reuse_setup_baseline_elyza_layers5_7.md`
+- graph-level layer-sweep reuse prototype (shared setup across `--block-mlp-layer-range`):
+  - runtime (CPU+Metal):
+    - `target/benchmarks/llama_rs_stepwise_graph_reuse_layer_sweep_elyza_layers5_7.txt`
+  - impact:
+    - `target/benchmarks/llama_stepwise_graph_reuse_layer_sweep_elyza_layers5_7_impact.md`
+  - stepwise output markers:
+    - `graph_reuse_sweep=true`,
+    - `setup_shared=... ms` (single setup per backend call),
+    - `setup=... ms` (amortized per-layer setup).
+- query-RoPE multi-head hotspot pass (on top of graph-reuse sweep):
+  - runtime (CPU+Metal):
+    - `target/benchmarks/llama_rs_stepwise_graph_reuse_layer_sweep_elyza_layers5_7_qrope_multihead.txt`
+  - impact:
+    - `target/benchmarks/llama_stepwise_graph_reuse_qrope_multihead_elyza_layers5_7_impact.md`
+  - measured post/base `avg_token`:
+    - CPU `~1.001` (near-neutral),
+    - MTL0 `~0.944` (improved),
+    - overall `~0.977` (improved),
+    - checksum parity: `max abs delta = 0.0`.
 
 Hotspot follow-up (`block_layer=5..7`, same profile lock):
 
@@ -475,7 +497,7 @@ Sample result:
 
 - CPU: `~4.18 ms/token`, checksum `2720587.859375`
 - Metal (`MTL0`): `~3.29 ms/token`, checksum `2720587.812500`
-- output line includes `stepwise=true`, `kv_start=...`, `steps=...`, and `avg_token=... ms`.
+- output line includes `stepwise=true`, `kv_start=...`, `steps=...`, `setup=... ms`, and `avg_token=... ms`.
 - optional `--decode-stepwise-kv-proj` enables per-step KV projection cost modeling in the persistent runner (`kv_proj=true` in output).
 - optional `--decode-stepwise-block` enables residual+RMSNorm+MLP-shaped block-scope cost modeling (`block=true` in output).
 - optional `--decode-stepwise-sync-step` inserts per-step backend synchronization (currently applied to Metal path in the benchmark runner).

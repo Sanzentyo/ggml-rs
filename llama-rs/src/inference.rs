@@ -680,7 +680,6 @@ pub fn run_linear_inference_with_weights_repeats(
         return Err(InferenceError::InvalidRepeats);
     }
 
-    let setup_start = Instant::now();
     ensure_backends_loaded();
     let backend = Backend::new(backend_kind.into())
         .map_err(|source| InferenceError::ggml("Backend::new", source))?;
@@ -1693,6 +1692,25 @@ impl AttentionDecodeStepwiseBenchReport {
     }
 }
 
+#[derive(Debug, Clone)]
+/// Batched stepwise decode benchmark reports sharing one setup path.
+pub struct AttentionDecodeStepwiseBenchSweepReport {
+    pub warmup_repeats_per_step: usize,
+    pub setup_duration: Duration,
+    pub entries: Vec<AttentionDecodeStepwiseBenchReport>,
+}
+
+impl AttentionDecodeStepwiseBenchSweepReport {
+    pub fn setup_ms(&self) -> f64 {
+        self.setup_duration.as_secs_f64() * 1000.0
+    }
+
+    pub fn amortized_setup_ms(&self) -> f64 {
+        let entry_count = self.entries.len().max(1);
+        self.setup_ms() / entry_count as f64
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 /// Configuration for stepwise decode-like proxy execution.
 pub struct AttentionDecodeStepwiseConfig {
@@ -2666,6 +2684,54 @@ pub fn run_attention_decode_stepwise_bench_with_cache_repeats_with_block_mlp(
     })
 }
 
+/// Bench-oriented stepwise layer sweep runner sharing one setup path.
+///
+/// This API reuses backend/context/graph allocation across all provided
+/// block-MLP weight sets and reports one shared setup duration.
+pub fn run_attention_decode_stepwise_bench_sweep_with_cache_repeats_with_block_mlp(
+    weights: &AttentionWeights,
+    query_input: &[f32],
+    cache: &AttentionDecodeCache,
+    backend_kind: LlamaBackend,
+    stepwise: AttentionDecodeStepwiseConfig,
+    warmup_repeats_per_step: usize,
+    block_mlp_weights: &[&MlpWeights],
+) -> Result<AttentionDecodeStepwiseBenchSweepReport, InferenceError> {
+    if block_mlp_weights.is_empty() {
+        return Err(InferenceError::InvalidInputLength {
+            expected: 1,
+            actual: 0,
+        });
+    }
+    let (executions, bench_durations, setup_duration) =
+        run_attention_decode_stepwise_bench_sweep_with_cache_repeats_with_block_mlp_internal(
+            weights,
+            query_input,
+            cache,
+            backend_kind,
+            stepwise,
+            warmup_repeats_per_step,
+            Some(block_mlp_weights),
+        )?;
+    let entries = executions
+        .into_iter()
+        .zip(bench_durations)
+        .map(
+            |(execution, bench_duration)| AttentionDecodeStepwiseBenchReport {
+                warmup_repeats_per_step,
+                setup_duration: Duration::ZERO,
+                bench_duration,
+                execution,
+            },
+        )
+        .collect();
+    Ok(AttentionDecodeStepwiseBenchSweepReport {
+        warmup_repeats_per_step,
+        setup_duration,
+        entries,
+    })
+}
+
 fn run_attention_decode_stepwise_with_cache_repeats_with_block_mlp_internal(
     weights: &AttentionWeights,
     query_input: &[f32],
@@ -2675,6 +2741,45 @@ fn run_attention_decode_stepwise_with_cache_repeats_with_block_mlp_internal(
     warmup_repeats_per_step: usize,
     block_mlp_weights: Option<&MlpWeights>,
 ) -> Result<(AttentionDecodeStepwiseReport, Duration, Duration), InferenceError> {
+    let block_mlp_weight_runs_storage = block_mlp_weights.map(|weights| vec![weights]);
+    let (mut reports, mut bench_durations, setup_duration) =
+        run_attention_decode_stepwise_bench_sweep_with_cache_repeats_with_block_mlp_internal(
+            weights,
+            query_input,
+            cache,
+            backend_kind,
+            stepwise,
+            warmup_repeats_per_step,
+            block_mlp_weight_runs_storage.as_deref(),
+        )?;
+    if reports.len() != 1 || bench_durations.len() != 1 {
+        return Err(InferenceError::InvalidInputLength {
+            expected: 1,
+            actual: reports.len().max(bench_durations.len()),
+        });
+    }
+    let report = reports.pop().ok_or(InferenceError::InvalidInputLength {
+        expected: 1,
+        actual: 0,
+    })?;
+    let bench_duration = bench_durations
+        .pop()
+        .ok_or(InferenceError::InvalidInputLength {
+            expected: 1,
+            actual: 0,
+        })?;
+    Ok((report, bench_duration, setup_duration))
+}
+
+fn run_attention_decode_stepwise_bench_sweep_with_cache_repeats_with_block_mlp_internal(
+    weights: &AttentionWeights,
+    query_input: &[f32],
+    cache: &AttentionDecodeCache,
+    backend_kind: LlamaBackend,
+    stepwise: AttentionDecodeStepwiseConfig,
+    warmup_repeats_per_step: usize,
+    block_mlp_weight_runs: Option<&[&MlpWeights]>,
+) -> Result<(Vec<AttentionDecodeStepwiseReport>, Vec<Duration>, Duration), InferenceError> {
     let key_value_start = stepwise.key_value_start;
     let steps = stepwise.steps;
     let past_start = stepwise.past_start;
@@ -2730,13 +2835,36 @@ fn run_attention_decode_stepwise_with_cache_repeats_with_block_mlp_internal(
     }
     let hidden_features = config.hidden_features();
     let query_length = config.sequence_length();
-    if let Some(block_mlp_weights) = block_mlp_weights
-        && block_mlp_weights.hidden_features != hidden_features
-    {
+    let run_block_mlp_weights: Vec<Option<&MlpWeights>> =
+        if let Some(weight_runs) = block_mlp_weight_runs {
+            weight_runs.iter().copied().map(Some).collect()
+        } else {
+            vec![None]
+        };
+    let has_block_mlp_weights = run_block_mlp_weights.iter().any(Option::is_some);
+    let has_missing_block_mlp_weights = run_block_mlp_weights.iter().any(Option::is_none);
+    if has_block_mlp_weights && has_missing_block_mlp_weights {
         return Err(InferenceError::InvalidInputLength {
-            expected: hidden_features,
-            actual: block_mlp_weights.hidden_features,
+            expected: 1,
+            actual: 0,
         });
+    }
+    let graph_block_mlp_weights = run_block_mlp_weights.iter().flatten().copied().next();
+    if let Some(graph_block_mlp_weights) = graph_block_mlp_weights {
+        for block_mlp_weights in run_block_mlp_weights.iter().flatten() {
+            if block_mlp_weights.hidden_features != hidden_features {
+                return Err(InferenceError::InvalidInputLength {
+                    expected: hidden_features,
+                    actual: block_mlp_weights.hidden_features,
+                });
+            }
+            if block_mlp_weights.ffn_features != graph_block_mlp_weights.ffn_features {
+                return Err(InferenceError::InvalidInputLength {
+                    expected: graph_block_mlp_weights.ffn_features,
+                    actual: block_mlp_weights.ffn_features,
+                });
+            }
+        }
     }
     let key_value_length = cache.key_value_length();
     let cache_kv_features = cache.kv_features();
@@ -2783,6 +2911,7 @@ fn run_attention_decode_stepwise_with_cache_repeats_with_block_mlp_internal(
         });
     }
 
+    let setup_start = Instant::now();
     ensure_backends_loaded();
     let backend = Backend::new(backend_kind.into())
         .map_err(|source| InferenceError::ggml("Backend::new", source))?;
@@ -3100,6 +3229,15 @@ fn run_attention_decode_stepwise_with_cache_repeats_with_block_mlp_internal(
         }
     }
 
+    let q_heads_source = apply_rotary_multi_head_if_enabled_with_sequence(
+        &ctx,
+        &q,
+        positions_q.as_ref(),
+        config,
+        config.query_head_count(),
+        query_length,
+    )?;
+
     for head in 0..config.query_head_count() {
         let query_offset = head
             .checked_mul(config.head_dimension())
@@ -3109,21 +3247,13 @@ fn run_attention_decode_stepwise_with_cache_repeats_with_block_mlp_internal(
 
         let q_head = ctx
             .view_2d(
-                &q,
+                &q_heads_source,
                 config.head_dimension(),
                 query_length,
                 q_row_stride,
                 query_offset,
             )
             .map_err(|source| InferenceError::ggml("Context::view_2d(Q_HEAD)", source))?;
-
-        let q_head = apply_rotary_if_enabled_with_sequence(
-            &ctx,
-            &q_head,
-            positions_q.as_ref(),
-            config,
-            query_length,
-        )?;
         let k_head =
             rotated_k_heads
                 .get(kv_head)
@@ -3237,7 +3367,7 @@ fn run_attention_decode_stepwise_with_cache_repeats_with_block_mlp_internal(
         let norm = ctx
             .rms_norm(&residual, 1e-5)
             .map_err(|source| InferenceError::ggml("Context::rms_norm(block)", source))?;
-        let mlp = if let Some(block_mlp_weights) = block_mlp_weights {
+        let mlp = if let Some(block_mlp_weights) = graph_block_mlp_weights {
             let ffn_features = block_mlp_weights.ffn_features;
             let w_down = ctx
                 .new_f32_tensor_2d_shape(Shape2D::new(ffn_features, hidden_features))
@@ -3402,44 +3532,61 @@ fn run_attention_decode_stepwise_with_cache_repeats_with_block_mlp_internal(
         w_v.set_f32_backend(weights.v_values())
             .map_err(|source| InferenceError::ggml("Tensor::set_f32_backend<W_V>", source))?;
     }
-    if let Some(block_mlp_weights) = block_mlp_weights {
-        if let Some((w_gate, w_up, w_down)) = block_mlp_split_tensors.as_ref() {
-            w_gate
-                .set_f32_backend(block_mlp_weights.gate_values())
-                .map_err(|source| {
-                    InferenceError::ggml("Tensor::set_f32_backend<W_GATE_BLOCK>", source)
-                })?;
-            w_up.set_f32_backend(block_mlp_weights.up_values())
-                .map_err(|source| {
-                    InferenceError::ggml("Tensor::set_f32_backend<W_UP_BLOCK>", source)
-                })?;
-            w_down
-                .set_f32_backend(block_mlp_weights.down_values())
-                .map_err(|source| {
-                    InferenceError::ggml("Tensor::set_f32_backend<W_DOWN_BLOCK>", source)
-                })?;
-        } else if let Some((w_gate_up, w_down)) = block_mlp_fused_tensors.as_ref() {
-            let mut gate_up_values = Vec::with_capacity(
-                block_mlp_weights
-                    .gate_values()
-                    .len()
-                    .checked_add(block_mlp_weights.up_values().len())
-                    .ok_or(InferenceError::MemorySizeOverflow)?,
-            );
-            gate_up_values.extend_from_slice(block_mlp_weights.gate_values());
-            gate_up_values.extend_from_slice(block_mlp_weights.up_values());
-            w_gate_up
-                .set_f32_backend(&gate_up_values)
-                .map_err(|source| {
-                    InferenceError::ggml("Tensor::set_f32_backend<W_GATE_UP_BLOCK>", source)
-                })?;
-            w_down
-                .set_f32_backend(block_mlp_weights.down_values())
-                .map_err(|source| {
-                    InferenceError::ggml("Tensor::set_f32_backend<W_DOWN_BLOCK>", source)
-                })?;
-        }
-    }
+    let upload_block_mlp_weights =
+        |block_mlp_weights: Option<&MlpWeights>| -> Result<(), InferenceError> {
+            if let Some((w_gate, w_up, w_down)) = block_mlp_split_tensors.as_ref() {
+                let block_mlp_weights =
+                    block_mlp_weights.ok_or(InferenceError::InvalidInputLength {
+                        expected: 1,
+                        actual: 0,
+                    })?;
+                w_gate
+                    .set_f32_backend(block_mlp_weights.gate_values())
+                    .map_err(|source| {
+                        InferenceError::ggml("Tensor::set_f32_backend<W_GATE_BLOCK>", source)
+                    })?;
+                w_up.set_f32_backend(block_mlp_weights.up_values())
+                    .map_err(|source| {
+                        InferenceError::ggml("Tensor::set_f32_backend<W_UP_BLOCK>", source)
+                    })?;
+                w_down
+                    .set_f32_backend(block_mlp_weights.down_values())
+                    .map_err(|source| {
+                        InferenceError::ggml("Tensor::set_f32_backend<W_DOWN_BLOCK>", source)
+                    })?;
+            } else if let Some((w_gate_up, w_down)) = block_mlp_fused_tensors.as_ref() {
+                let block_mlp_weights =
+                    block_mlp_weights.ok_or(InferenceError::InvalidInputLength {
+                        expected: 1,
+                        actual: 0,
+                    })?;
+                let mut gate_up_values = Vec::with_capacity(
+                    block_mlp_weights
+                        .gate_values()
+                        .len()
+                        .checked_add(block_mlp_weights.up_values().len())
+                        .ok_or(InferenceError::MemorySizeOverflow)?,
+                );
+                gate_up_values.extend_from_slice(block_mlp_weights.gate_values());
+                gate_up_values.extend_from_slice(block_mlp_weights.up_values());
+                w_gate_up
+                    .set_f32_backend(&gate_up_values)
+                    .map_err(|source| {
+                        InferenceError::ggml("Tensor::set_f32_backend<W_GATE_UP_BLOCK>", source)
+                    })?;
+                w_down
+                    .set_f32_backend(block_mlp_weights.down_values())
+                    .map_err(|source| {
+                        InferenceError::ggml("Tensor::set_f32_backend<W_DOWN_BLOCK>", source)
+                    })?;
+            } else if block_mlp_weights.is_some() {
+                return Err(InferenceError::InvalidInputLength {
+                    expected: 0,
+                    actual: 1,
+                });
+            }
+            Ok(())
+        };
     x_q.set_f32_backend(query_input)
         .map_err(|source| InferenceError::ggml("Tensor::set_f32_backend<X_Q>", source))?;
     if let Some(positions_k) = positions_k.as_ref() {
@@ -3604,30 +3751,31 @@ fn run_attention_decode_stepwise_with_cache_repeats_with_block_mlp_internal(
     };
 
     let setup_duration = setup_start.elapsed();
+    let mut executions = Vec::with_capacity(run_block_mlp_weights.len());
+    let mut bench_durations = Vec::with_capacity(run_block_mlp_weights.len());
+    for block_mlp_weights in run_block_mlp_weights {
+        upload_block_mlp_weights(block_mlp_weights)?;
+        run_phase(warmup_repeats_per_step, true)?;
+        let bench_needs_kv_reset = warmup_repeats_per_step == 0 || step_specific_kv_cache_writes;
+        let bench_start = Instant::now();
+        run_phase(repeats_per_step, bench_needs_kv_reset)?;
+        let bench_duration = bench_start.elapsed();
 
-    run_phase(warmup_repeats_per_step, true)?;
-    let bench_needs_kv_reset = warmup_repeats_per_step == 0 || step_specific_kv_cache_writes;
-    let bench_start = Instant::now();
-    run_phase(repeats_per_step, bench_needs_kv_reset)?;
-    let bench_duration = bench_start.elapsed();
-
-    let output = y
-        .to_vec_f32_backend()
-        .map_err(|source| InferenceError::ggml("Tensor::to_vec_f32_backend<Y>", source))?;
-
-    Ok((
-        AttentionDecodeStepwiseReport {
-            backend_name,
+        let output = y
+            .to_vec_f32_backend()
+            .map_err(|source| InferenceError::ggml("Tensor::to_vec_f32_backend<Y>", source))?;
+        executions.push(AttentionDecodeStepwiseReport {
+            backend_name: backend_name.clone(),
             hidden_features,
             query_length,
             key_value_start,
             steps,
             repeats_per_step,
             output,
-        },
-        bench_duration,
-        setup_duration,
-    ))
+        });
+        bench_durations.push(bench_duration);
+    }
+    Ok((executions, bench_durations, setup_duration))
 }
 
 /// Runs decode-like attention proxy where query length and KV length can differ.
@@ -3761,6 +3909,69 @@ fn concat_tensors_balanced<'ctx>(
         query_head_count: 0,
         kv_head_count: 0,
     })
+}
+
+fn apply_rotary_multi_head_if_enabled_with_sequence<'ctx>(
+    ctx: &'ctx Context,
+    tensor: &ggml_rs::Tensor<'ctx>,
+    positions: Option<&ggml_rs::Tensor<'ctx>>,
+    config: AttentionInferenceConfig,
+    head_count: usize,
+    sequence_length: usize,
+) -> Result<ggml_rs::Tensor<'ctx>, InferenceError> {
+    match (config.rotary, positions) {
+        (RotaryEmbedding::Disabled, _) => Ok(*tensor),
+        (RotaryEmbedding::Llama(params), Some(positions)) => {
+            let rope_dimensions = params.dimensions.get();
+            if rope_dimensions > config.head_dimension() {
+                return Err(InferenceError::InvalidRopeDimensions {
+                    rope_dimensions,
+                    head_dimension: config.head_dimension(),
+                });
+            }
+            let n_dims =
+                i32::try_from(rope_dimensions).map_err(|_| InferenceError::MemorySizeOverflow)?;
+            let n_ctx_orig = params
+                .original_context
+                .and_then(|value| i32::try_from(value.get()).ok())
+                .unwrap_or(0);
+            let rope_params = RopeExtParams {
+                n_dims,
+                n_ctx_orig,
+                freq_base: params.base,
+                freq_scale: params.scale,
+                ..RopeExtParams::default()
+            };
+            let contiguous = ctx
+                .cont(tensor)
+                .map_err(|source| InferenceError::ggml("Context::cont(rope_multi_head)", source))?;
+            let reshaped = ctx
+                .reshape_3d(
+                    &contiguous,
+                    config.head_dimension(),
+                    head_count,
+                    sequence_length,
+                )
+                .map_err(|source| {
+                    InferenceError::ggml("Context::reshape_3d(rope_multi_head)", source)
+                })?;
+            let rotated = ctx
+                .rope_ext(&reshaped, positions, None, rope_params)
+                .map_err(|source| InferenceError::ggml("Context::rope_ext(multi_head)", source))?;
+            let total_features = config
+                .head_dimension()
+                .checked_mul(head_count)
+                .ok_or(InferenceError::MemorySizeOverflow)?;
+            ctx.reshape_2d(&rotated, total_features, sequence_length)
+                .map_err(|source| {
+                    InferenceError::ggml("Context::reshape_2d(rope_multi_head)", source)
+                })
+        }
+        (RotaryEmbedding::Llama(_), None) => Err(InferenceError::InvalidAttentionShape {
+            hidden_features: config.hidden_features(),
+            sequence_length,
+        }),
+    }
 }
 
 fn apply_rotary_if_enabled_with_sequence<'ctx>(

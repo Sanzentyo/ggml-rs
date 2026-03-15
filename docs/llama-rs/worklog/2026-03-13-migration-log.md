@@ -29,6 +29,26 @@
   - new API: `run_attention_decode_stepwise_bench_with_cache_repeats_with_block_mlp`,
   - `bench_attention_layer` now executes warmup+bench in one persistent stepwise allocation path for `--decode-steps`,
   - runtime smoke artifact: `target/benchmarks/llama_rs_stepwise_backend_context_reuse_smoke.txt`.
+- Added graph-level layer-sweep reuse path for model-backed decode-stepwise benchmarking:
+  - new API/report:
+    - `run_attention_decode_stepwise_bench_sweep_with_cache_repeats_with_block_mlp`,
+    - `AttentionDecodeStepwiseBenchSweepReport`,
+  - `bench_attention_layer` now emits `graph_reuse_sweep=true` with:
+    - `setup_shared=... ms` (one shared setup per backend call),
+    - `setup=... ms` (amortized per-layer setup),
+  - CPU/Metal runtime artifact:
+    - `target/benchmarks/llama_rs_stepwise_graph_reuse_layer_sweep_elyza_layers5_7.txt`,
+  - impact summary:
+    - `target/benchmarks/llama_stepwise_graph_reuse_layer_sweep_elyza_layers5_7_impact.md`,
+    - setup ratio (`new/base`): CPU `~0.315`, MTL0 `~0.309`, overall `~0.312`.
+- Added query-RoPE multi-head optimization for stepwise token compute:
+  - replaced per-head query RoPE nodes with one multi-head RoPE transform path,
+  - runtime artifact:
+    - `target/benchmarks/llama_rs_stepwise_graph_reuse_layer_sweep_elyza_layers5_7_qrope_multihead.txt`,
+  - impact summary:
+    - `target/benchmarks/llama_stepwise_graph_reuse_qrope_multihead_elyza_layers5_7_impact.md`,
+    - post/base `avg_token`: CPU `~1.001`, MTL0 `~0.944`, overall `~0.977`,
+    - checksum parity: `max abs delta = 0.0`.
 - Re-validated `llama-rs/examples/backend_smoke.rs` on CPU and Metal after the GGUF write-path expansion.
 - Expanded `ggml-rs` safe op surface for llama runtime needs: `add`, `mul`, `silu`, `rms_norm`, `scale`, `get_rows`, `repeat`, `cpy`, `cont`, `reshape_*`, `view_*`, `permute`, `diag_mask_inf`, `soft_max(_ext)`, `rope_ext`.
 - Added tensor naming (`set_name` / `name`) and backend `i32` tensor transfer helpers.
@@ -912,6 +932,16 @@
     - `cargo test --workspace`
     - runtime cache-path smoke (duplicated case, CPU+Metal):
       - `target/benchmarks/llama_rs_stepwise_layer_loop_reuse_cache_smoke.txt`.
+- Graph-level reuse planning baseline:
+  - added stepwise setup-time instrumentation (`setup=... ms`) in benchmark output to separate per-call preparation cost from token compute cost.
+  - ELYZA baseline (`block_layer=5..7`, same lock):
+    - raw:
+      - `target/benchmarks/llama_rs_stepwise_graph_reuse_setup_baseline_elyza_layers5_7.txt`
+    - summary:
+      - `target/benchmarks/llama_stepwise_graph_reuse_setup_baseline_elyza_layers5_7.md`
+    - setup averages:
+      - CPU `~456.606 ms/call`,
+      - MTL0 `~462.302 ms/call`.
 
 ## Next concrete steps
 

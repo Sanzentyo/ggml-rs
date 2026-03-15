@@ -7,11 +7,12 @@ use llama_rs::{
     LlamaLayerTensorNames, MlpInferenceConfig, MlpWeights, RopeConfig, RotaryEmbedding,
     build_attention_decode_cache, resolve_mlp_weights_for_layer_auto, resolve_transformer_metadata,
     run_attention_decode_proxy_with_cache_repeats,
+    run_attention_decode_stepwise_bench_sweep_with_cache_repeats_with_block_mlp,
     run_attention_decode_stepwise_bench_with_cache_repeats_with_block_mlp,
     run_attention_decode_stepwise_with_cache_repeats_with_block_mlp,
     run_attention_inference_with_weights_repeats,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, hash_map::Entry};
 use std::error::Error as StdError;
 use std::str::FromStr;
 use std::time::Instant;
@@ -116,22 +117,157 @@ fn main() -> Result<(), ExampleError> {
             .decode_kv_length
             .map(|_| build_attention_decode_cache(&weights, &key_value_input, decode_cache_length))
             .transpose()?;
-        for block_layer in block_layers.iter().copied() {
-            let block_mlp_weights = if let Some(model) = block_mlp_model.as_ref() {
+        if let Some(model) = block_mlp_model.as_ref() {
+            for block_layer in block_layers.iter().copied() {
                 let cache_key = (case.hidden_features, block_layer);
-                if !block_mlp_cache.contains_key(&cache_key) {
+                if let Entry::Vacant(entry) = block_mlp_cache.entry(cache_key) {
                     let resolved = resolve_block_mlp_weights_for_layer(
                         model,
                         block_layer,
                         case.hidden_features,
                     )?;
-                    block_mlp_cache.insert(cache_key, resolved);
+                    entry.insert(resolved);
                 }
-                block_mlp_cache.get(&cache_key)
-            } else {
-                None
-            };
+            }
+        }
+        let block_mlp_layers: Vec<(usize, Option<&(MlpWeights, bool)>)> = block_layers
+            .iter()
+            .copied()
+            .map(|block_layer| {
+                let block_mlp_weights = if block_mlp_model.is_some() {
+                    block_mlp_cache.get(&(case.hidden_features, block_layer))
+                } else {
+                    None
+                };
+                (block_layer, block_mlp_weights)
+            })
+            .collect();
 
+        if let Some(step_count) = parsed.decode_steps
+            && parsed.decode_kv_length.is_some()
+            && block_mlp_layers.len() > 1
+            && block_mlp_model.is_some()
+        {
+            let cache = decode_cache
+                .as_ref()
+                .ok_or("decode cache must be initialized when --decode-kv is set")?;
+            for backend in parsed.backends.iter().copied() {
+                let layer_repeat =
+                    model_layer_repeat.unwrap_or_else(|| parsed.layer_repeat_for_backend(backend));
+                let preflight_done = match backend {
+                    LlamaBackend::Cpu => &mut preflight_cpu_done,
+                    LlamaBackend::Metal => &mut preflight_metal_done,
+                };
+                let first_block_mlp_weights = block_mlp_layers
+                    .first()
+                    .and_then(|(_, weights)| weights.as_ref().map(|entry| &entry.0));
+                if !*preflight_done {
+                    let _ = run_attention_decode_stepwise_with_cache_repeats_with_block_mlp(
+                        &weights,
+                        &query_input,
+                        cache,
+                        backend,
+                        build_stepwise_config(
+                            &parsed,
+                            backend,
+                            key_value_length,
+                            step_count,
+                            1,
+                            layer_repeat,
+                        ),
+                        first_block_mlp_weights,
+                    )?;
+                    *preflight_done = true;
+                }
+                let sweep_weights: Vec<&MlpWeights> = block_mlp_layers
+                    .iter()
+                    .map(|(_, weights)| {
+                        weights
+                            .as_ref()
+                            .map(|entry| &entry.0)
+                            .ok_or_else(|| ExampleError::from("missing block-mlp weights"))
+                    })
+                    .collect::<Result<_, _>>()?;
+                let sweep_report =
+                    run_attention_decode_stepwise_bench_sweep_with_cache_repeats_with_block_mlp(
+                        &weights,
+                        &query_input,
+                        cache,
+                        backend,
+                        build_stepwise_config(
+                            &parsed,
+                            backend,
+                            key_value_length,
+                            step_count,
+                            parsed.bench_iters,
+                            layer_repeat,
+                        ),
+                        parsed.warmup_iters,
+                        &sweep_weights,
+                    )?;
+                if sweep_report.entries.len() != block_mlp_layers.len() {
+                    return Err(format!(
+                        "stepwise sweep result count mismatch: expected {}, got {}",
+                        block_mlp_layers.len(),
+                        sweep_report.entries.len()
+                    )
+                    .into());
+                }
+                let setup_shared_ms = sweep_report.setup_ms();
+                let setup_amortized_ms = sweep_report.amortized_setup_ms();
+                for ((block_layer, block_mlp_weights), bench_report) in
+                    block_mlp_layers.iter().zip(sweep_report.entries.iter())
+                {
+                    let report = &bench_report.execution;
+                    let avg_ms = bench_report.avg_token_ms();
+                    let checksum: f64 = report
+                        .output
+                        .iter()
+                        .take(16)
+                        .map(|value| f64::from(*value))
+                        .sum();
+                    println!(
+                        "[{}] attn decode stepwise bench hidden={} heads={}/{} q_seq={} kv_start={} steps={} past_start={} cache_reuse=true stepwise=true kv_proj={} kv_write={} kv_write_cache={} block={} block_mlp_real={} block_layer={} sync_step={} readback_step={} position_delta={} mask_delta={} mask_host_elide={} outproj_fused={} kvhead_static_precompute={} head_concat_balanced={} head_stage_buf={} block_gateup_fused={} profile={} layer_repeat={} rope={} warmup={} iters={} graph_reuse_sweep=true setup={:.3} ms setup_shared={:.3} ms avg_token={:.3} ms checksum={:.6}",
+                        report.backend_name,
+                        case.hidden_features,
+                        case.query_head_count,
+                        case.kv_head_count,
+                        case.sequence_length,
+                        key_value_length,
+                        step_count,
+                        parsed.causal_past_tokens,
+                        parsed.decode_stepwise_kv_projection,
+                        parsed.decode_stepwise_kv_cache_write,
+                        parsed.decode_stepwise_kv_cache_write_to_cache,
+                        parsed.decode_stepwise_block_scope,
+                        block_mlp_weights.as_ref().is_some_and(|entry| entry.1),
+                        block_layer,
+                        parsed.decode_stepwise_sync_step,
+                        parsed.decode_stepwise_readback_step,
+                        parsed.decode_stepwise_position_deltas,
+                        parsed.decode_stepwise_mask_deltas,
+                        parsed.decode_stepwise_mask_host_buffer_elision,
+                        parsed.decode_stepwise_fuse_output_projection,
+                        parsed.decode_stepwise_static_kv_head_precompute,
+                        parsed.decode_stepwise_balanced_head_concat,
+                        parsed.decode_stepwise_head_output_staging_buffer,
+                        parsed.decode_stepwise_fuse_block_gate_up,
+                        stepwise_profile_label(&parsed, layer_repeat),
+                        layer_repeat,
+                        parsed.rope,
+                        parsed.warmup_iters,
+                        parsed.bench_iters,
+                        setup_amortized_ms,
+                        setup_shared_ms,
+                        avg_ms,
+                        checksum
+                    );
+                }
+            }
+            continue;
+        }
+
+        for (block_layer, block_mlp_weights) in block_mlp_layers.iter().copied() {
             for backend in parsed.backends.iter().copied() {
                 let layer_repeat =
                     model_layer_repeat.unwrap_or_else(|| parsed.layer_repeat_for_backend(backend));
@@ -181,6 +317,7 @@ fn main() -> Result<(), ExampleError> {
                                 block_mlp_weights.as_ref().map(|entry| &entry.0),
                             )?;
                         let report = &bench_report.execution;
+                        let setup_ms = bench_report.setup_ms();
                         let avg_ms = bench_report.avg_token_ms();
                         let checksum: f64 = report
                             .output
@@ -190,7 +327,7 @@ fn main() -> Result<(), ExampleError> {
                             .sum();
 
                         println!(
-                            "[{}] attn decode stepwise bench hidden={} heads={}/{} q_seq={} kv_start={} steps={} past_start={} cache_reuse=true stepwise=true kv_proj={} kv_write={} kv_write_cache={} block={} block_mlp_real={} block_layer={} sync_step={} readback_step={} position_delta={} mask_delta={} mask_host_elide={} outproj_fused={} kvhead_static_precompute={} head_concat_balanced={} head_stage_buf={} block_gateup_fused={} profile={} layer_repeat={} rope={} warmup={} iters={} avg_token={:.3} ms checksum={:.6}",
+                            "[{}] attn decode stepwise bench hidden={} heads={}/{} q_seq={} kv_start={} steps={} past_start={} cache_reuse=true stepwise=true kv_proj={} kv_write={} kv_write_cache={} block={} block_mlp_real={} block_layer={} sync_step={} readback_step={} position_delta={} mask_delta={} mask_host_elide={} outproj_fused={} kvhead_static_precompute={} head_concat_balanced={} head_stage_buf={} block_gateup_fused={} profile={} layer_repeat={} rope={} warmup={} iters={} setup={:.3} ms avg_token={:.3} ms checksum={:.6}",
                             report.backend_name,
                             case.hidden_features,
                             case.query_head_count,
@@ -220,6 +357,7 @@ fn main() -> Result<(), ExampleError> {
                             parsed.rope,
                             parsed.warmup_iters,
                             parsed.bench_iters,
+                            setup_ms,
                             avg_ms,
                             checksum
                         );
