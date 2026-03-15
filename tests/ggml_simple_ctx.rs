@@ -28,15 +28,15 @@ fn matmul_simple_ctx_parity() -> Result<(), ggml_rs::Error> {
 
     let a = ctx.new_f32_tensor_2d_shape(SHAPE_A)?;
     let b = ctx.new_f32_tensor_2d_shape(SHAPE_B)?;
-    a.set_f32(&MATRIX_A)?;
-    b.set_f32(&MATRIX_B)?;
+    a.write_data(&MATRIX_A)?;
+    b.write_data(&MATRIX_B)?;
 
     let result = ctx.mul_mat(&a, &b)?;
     let mut graph = ctx.new_graph()?;
     graph.build_forward_expand(&result);
     ctx.compute_with_threads(&mut graph, ThreadCount::new(1))?;
 
-    let out = graph.last_node()?.to_vec_f32()?;
+    let out = graph.last_node()?.read_data::<f32>()?;
     assert_eq!(out.len(), EXPECTED.len());
     for (actual, expected) in out.iter().zip(EXPECTED) {
         assert!((actual - expected).abs() <= 1e-4);

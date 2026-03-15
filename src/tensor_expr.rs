@@ -1,4 +1,4 @@
-use crate::{Context, Error, Result, Tensor, TensorIndex, Type};
+use crate::{Context, Error, Result, Tensor, TensorIndex, Type, ffi};
 use std::ops::{Add, Div, Mul, Sub};
 
 /// Element types allowed for backend tensor transfer helpers.
@@ -7,6 +7,39 @@ pub trait BackendElement: Copy + Default {}
 impl BackendElement for f32 {}
 
 impl BackendElement for i32 {}
+
+/// Internal host accessor contract used by fast generic tensor host I/O.
+///
+/// Kept crate-private on purpose so `GgmlElement` remains a high-level public
+/// trait and does not leak raw-pointer FFI requirements to external users.
+pub(crate) trait HostElement: GgmlElement {
+    fn set_1d_raw(raw: *mut ffi::ggml_tensor, index: i32, value: Self);
+    fn get_1d_raw(raw: *mut ffi::ggml_tensor, index: i32) -> Self;
+}
+
+impl HostElement for f32 {
+    fn set_1d_raw(raw: *mut ffi::ggml_tensor, index: i32, value: Self) {
+        unsafe {
+            ffi::ggml_set_f32_1d(raw, index, value);
+        }
+    }
+
+    fn get_1d_raw(raw: *mut ffi::ggml_tensor, index: i32) -> Self {
+        unsafe { ffi::ggml_get_f32_1d(raw, index) }
+    }
+}
+
+impl HostElement for i32 {
+    fn set_1d_raw(raw: *mut ffi::ggml_tensor, index: i32, value: Self) {
+        unsafe {
+            ffi::ggml_set_i32_1d(raw, index, value);
+        }
+    }
+
+    fn get_1d_raw(raw: *mut ffi::ggml_tensor, index: i32) -> Self {
+        unsafe { ffi::ggml_get_i32_1d(raw, index) }
+    }
+}
 
 /// Element types that map to ggml tensor types and typed tensor I/O helpers.
 pub trait GgmlElement: BackendElement {
@@ -27,15 +60,15 @@ impl GgmlElement for f32 {
     const GGML_TYPE: Type = Type::F32;
 
     fn write_data(tensor: &Tensor<'_>, values: &[Self]) -> Result<()> {
-        tensor.set_f32(values)
+        tensor.write_host_data(values)
     }
 
     fn read_data(tensor: &Tensor<'_>) -> Result<Vec<Self>> {
-        tensor.to_vec_f32()
+        tensor.read_host_data()
     }
 
     fn get_data(tensor: &Tensor<'_>, index: TensorIndex) -> Result<Self> {
-        tensor.get_f32_at(index)
+        tensor.read_host_at(index)
     }
 }
 
@@ -43,21 +76,15 @@ impl GgmlElement for i32 {
     const GGML_TYPE: Type = Type::I32;
 
     fn write_data(tensor: &Tensor<'_>, values: &[Self]) -> Result<()> {
-        tensor.set_i32_backend(values)
+        tensor.write_host_data(values)
     }
 
     fn read_data(tensor: &Tensor<'_>) -> Result<Vec<Self>> {
-        tensor.to_vec_i32_backend()
+        tensor.read_host_data()
     }
 
     fn get_data(tensor: &Tensor<'_>, index: TensorIndex) -> Result<Self> {
-        let index = index.get();
-        let values = tensor.to_vec_i32_backend()?;
-        let len = values.len();
-        if index >= len {
-            return Err(Error::IndexOutOfBounds { index, len });
-        }
-        Ok(values[index])
+        tensor.read_host_at(index)
     }
 }
 

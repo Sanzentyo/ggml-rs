@@ -8,7 +8,7 @@ use crate::backend::LlamaBackend;
 use crate::metadata::{LlamaModelMetadata, MetadataError, resolve_llama_metadata};
 use crate::model::{GgufModel, ModelError};
 use crate::naming::{LlamaLayerTensorNames, NamingError, resolve_llama_layer_tensor_names};
-use ggml_rs::{Context, Shape2D};
+use ggml_rs::{Context, Length, Shape2D};
 use std::error::Error as StdError;
 use std::fmt;
 use std::marker::PhantomData;
@@ -727,10 +727,10 @@ pub fn linear_inference_with_weights_repeats(
         .allocate_tensors(&backend)
         .map_err(|source| InferenceError::ggml("Context::allocate_tensors", source))?;
 
-    w.set_f32_backend(weights.values())
-        .map_err(|source| InferenceError::ggml("Tensor::set_f32_backend<W>", source))?;
-    x.set_f32_backend(input)
-        .map_err(|source| InferenceError::ggml("Tensor::set_f32_backend<X>", source))?;
+    w.write_data_backend(weights.values())
+        .map_err(|source| InferenceError::ggml("Tensor::write_data_backend<W>", source))?;
+    x.write_data_backend(input)
+        .map_err(|source| InferenceError::ggml("Tensor::write_data_backend<X>", source))?;
     for _ in 0..repeats {
         backend
             .compute(&mut graph)
@@ -740,8 +740,8 @@ pub fn linear_inference_with_weights_repeats(
     let output = graph
         .last_node()
         .map_err(|source| InferenceError::ggml("Graph::last_node", source))?
-        .to_vec_f32_backend()
-        .map_err(|source| InferenceError::ggml("Tensor::to_vec_f32_backend", source))?;
+        .read_data_backend::<f32>()
+        .map_err(|source| InferenceError::ggml("Tensor::read_data_backend", source))?;
 
     Ok(LinearInferenceReport {
         backend_name,
@@ -893,15 +893,15 @@ pub fn mlp_inference_with_weights_repeats(
         .map_err(|source| InferenceError::ggml("Context::allocate_tensors", source))?;
 
     w_gate
-        .set_f32_backend(weights.gate_values())
-        .map_err(|source| InferenceError::ggml("Tensor::set_f32_backend<W_GATE>", source))?;
-    w_up.set_f32_backend(weights.up_values())
-        .map_err(|source| InferenceError::ggml("Tensor::set_f32_backend<W_UP>", source))?;
+        .write_data_backend(weights.gate_values())
+        .map_err(|source| InferenceError::ggml("Tensor::write_data_backend<W_GATE>", source))?;
+    w_up.write_data_backend(weights.up_values())
+        .map_err(|source| InferenceError::ggml("Tensor::write_data_backend<W_UP>", source))?;
     w_down
-        .set_f32_backend(weights.down_values())
-        .map_err(|source| InferenceError::ggml("Tensor::set_f32_backend<W_DOWN>", source))?;
-    x.set_f32_backend(input)
-        .map_err(|source| InferenceError::ggml("Tensor::set_f32_backend<X>", source))?;
+        .write_data_backend(weights.down_values())
+        .map_err(|source| InferenceError::ggml("Tensor::write_data_backend<W_DOWN>", source))?;
+    x.write_data_backend(input)
+        .map_err(|source| InferenceError::ggml("Tensor::write_data_backend<X>", source))?;
 
     for _ in 0..repeats {
         backend
@@ -912,8 +912,8 @@ pub fn mlp_inference_with_weights_repeats(
     let output = graph
         .last_node()
         .map_err(|source| InferenceError::ggml("Graph::last_node", source))?
-        .to_vec_f32_backend()
-        .map_err(|source| InferenceError::ggml("Tensor::to_vec_f32_backend", source))?;
+        .read_data_backend::<f32>()
+        .map_err(|source| InferenceError::ggml("Tensor::read_data_backend", source))?;
 
     Ok(MlpInferenceReport {
         backend_name,
@@ -1841,8 +1841,8 @@ pub fn attention_inference_with_weights_repeats(
 
     let positions = if matches!(config.rotary, RotaryEmbedding::Llama(_)) {
         Some(
-            ctx.new_i32_tensor_1d(sequence_length)
-                .map_err(|source| InferenceError::ggml("Context::new_i32_tensor_1d", source))?,
+            ctx.new_i32_tensor_1d_len(Length::new(sequence_length))
+                .map_err(|source| InferenceError::ggml("Context::new_i32_tensor_1d_len", source))?,
         )
     } else {
         None
@@ -1975,24 +1975,26 @@ pub fn attention_inference_with_weights_repeats(
         .allocate_tensors(&backend)
         .map_err(|source| InferenceError::ggml("Context::allocate_tensors", source))?;
 
-    w_q.set_f32_backend(weights.q_values())
-        .map_err(|source| InferenceError::ggml("Tensor::set_f32_backend<W_Q>", source))?;
-    w_k.set_f32_backend(weights.k_values())
-        .map_err(|source| InferenceError::ggml("Tensor::set_f32_backend<W_K>", source))?;
-    w_v.set_f32_backend(weights.v_values())
-        .map_err(|source| InferenceError::ggml("Tensor::set_f32_backend<W_V>", source))?;
-    w_o.set_f32_backend(weights.o_values())
-        .map_err(|source| InferenceError::ggml("Tensor::set_f32_backend<W_O>", source))?;
-    x.set_f32_backend(input)
-        .map_err(|source| InferenceError::ggml("Tensor::set_f32_backend<X>", source))?;
+    w_q.write_data_backend(weights.q_values())
+        .map_err(|source| InferenceError::ggml("Tensor::write_data_backend<W_Q>", source))?;
+    w_k.write_data_backend(weights.k_values())
+        .map_err(|source| InferenceError::ggml("Tensor::write_data_backend<W_K>", source))?;
+    w_v.write_data_backend(weights.v_values())
+        .map_err(|source| InferenceError::ggml("Tensor::write_data_backend<W_V>", source))?;
+    w_o.write_data_backend(weights.o_values())
+        .map_err(|source| InferenceError::ggml("Tensor::write_data_backend<W_O>", source))?;
+    x.write_data_backend(input)
+        .map_err(|source| InferenceError::ggml("Tensor::write_data_backend<X>", source))?;
 
     if let Some(positions) = positions {
         let positions_values: Result<Vec<i32>, InferenceError> = (0..sequence_length)
             .map(|index| i32::try_from(index).map_err(|_| InferenceError::MemorySizeOverflow))
             .collect();
         positions
-            .set_i32_backend(&positions_values?)
-            .map_err(|source| InferenceError::ggml("Tensor::set_i32_backend<POSITIONS>", source))?;
+            .write_data_backend(&positions_values?)
+            .map_err(|source| {
+                InferenceError::ggml("Tensor::write_data_backend<POSITIONS>", source)
+            })?;
     }
     if let Some(mask) = mask {
         let mask_values = build_causal_mask_values(
@@ -2003,8 +2005,8 @@ pub fn attention_inference_with_weights_repeats(
                 AttentionMaskPolicy::Causal { past_tokens } => past_tokens,
             },
         );
-        mask.set_f32_backend(&mask_values).map_err(|source| {
-            InferenceError::ggml("Tensor::set_f32_backend<CAUSAL_MASK>", source)
+        mask.write_data_backend(&mask_values).map_err(|source| {
+            InferenceError::ggml("Tensor::write_data_backend<CAUSAL_MASK>", source)
         })?;
     }
 
@@ -2017,8 +2019,8 @@ pub fn attention_inference_with_weights_repeats(
     let output = graph
         .last_node()
         .map_err(|source| InferenceError::ggml("Graph::last_node", source))?
-        .to_vec_f32_backend()
-        .map_err(|source| InferenceError::ggml("Tensor::to_vec_f32_backend", source))?;
+        .read_data_backend::<f32>()
+        .map_err(|source| InferenceError::ggml("Tensor::read_data_backend", source))?;
 
     Ok(AttentionInferenceReport {
         backend_name,
@@ -2128,12 +2130,16 @@ fn attention_decode_proxy_with_cache_repeats_inner(
         .map_err(|source| InferenceError::ggml("Context::mul_mat(Q)", source))?;
 
     let (positions_q, positions_k) = if matches!(config.rotary, RotaryEmbedding::Llama(_)) {
-        let positions_q = ctx.new_i32_tensor_1d(query_length).map_err(|source| {
-            InferenceError::ggml("Context::new_i32_tensor_1d<QUERY_POS>", source)
-        })?;
+        let positions_q = ctx
+            .new_i32_tensor_1d_len(Length::new(query_length))
+            .map_err(|source| {
+                InferenceError::ggml("Context::new_i32_tensor_1d_len<QUERY_POS>", source)
+            })?;
         let positions_k = ctx
-            .new_i32_tensor_1d(key_value_length)
-            .map_err(|source| InferenceError::ggml("Context::new_i32_tensor_1d<KV_POS>", source))?;
+            .new_i32_tensor_1d_len(Length::new(key_value_length))
+            .map_err(|source| {
+                InferenceError::ggml("Context::new_i32_tensor_1d_len<KV_POS>", source)
+            })?;
         (Some(positions_q), Some(positions_k))
     } else {
         (None, None)
@@ -2265,16 +2271,16 @@ fn attention_decode_proxy_with_cache_repeats_inner(
         .allocate_tensors(&backend)
         .map_err(|source| InferenceError::ggml("Context::allocate_tensors", source))?;
 
-    w_q.set_f32_backend(weights.q_values())
-        .map_err(|source| InferenceError::ggml("Tensor::set_f32_backend<W_Q>", source))?;
-    w_o.set_f32_backend(weights.o_values())
-        .map_err(|source| InferenceError::ggml("Tensor::set_f32_backend<W_O>", source))?;
-    x_q.set_f32_backend(query_input)
-        .map_err(|source| InferenceError::ggml("Tensor::set_f32_backend<X_Q>", source))?;
-    k.set_f32_backend(&cache.projected_k_values)
-        .map_err(|source| InferenceError::ggml("Tensor::set_f32_backend<K_CACHE>", source))?;
-    v.set_f32_backend(&cache.projected_v_values)
-        .map_err(|source| InferenceError::ggml("Tensor::set_f32_backend<V_CACHE>", source))?;
+    w_q.write_data_backend(weights.q_values())
+        .map_err(|source| InferenceError::ggml("Tensor::write_data_backend<W_Q>", source))?;
+    w_o.write_data_backend(weights.o_values())
+        .map_err(|source| InferenceError::ggml("Tensor::write_data_backend<W_O>", source))?;
+    x_q.write_data_backend(query_input)
+        .map_err(|source| InferenceError::ggml("Tensor::write_data_backend<X_Q>", source))?;
+    k.write_data_backend(&cache.projected_k_values)
+        .map_err(|source| InferenceError::ggml("Tensor::write_data_backend<K_CACHE>", source))?;
+    v.write_data_backend(&cache.projected_v_values)
+        .map_err(|source| InferenceError::ggml("Tensor::write_data_backend<V_CACHE>", source))?;
 
     if let Some(positions_q) = positions_q {
         let positions_values: Result<Vec<i32>, InferenceError> = (0..query_length)
@@ -2286,22 +2292,24 @@ fn attention_decode_proxy_with_cache_repeats_inner(
             })
             .collect();
         positions_q
-            .set_i32_backend(&positions_values?)
-            .map_err(|source| InferenceError::ggml("Tensor::set_i32_backend<QUERY_POS>", source))?;
+            .write_data_backend(&positions_values?)
+            .map_err(|source| {
+                InferenceError::ggml("Tensor::write_data_backend<QUERY_POS>", source)
+            })?;
     }
     if let Some(positions_k) = positions_k {
         let positions_values: Result<Vec<i32>, InferenceError> = (0..key_value_length)
             .map(|index| i32::try_from(index).map_err(|_| InferenceError::MemorySizeOverflow))
             .collect();
         positions_k
-            .set_i32_backend(&positions_values?)
-            .map_err(|source| InferenceError::ggml("Tensor::set_i32_backend<KV_POS>", source))?;
+            .write_data_backend(&positions_values?)
+            .map_err(|source| InferenceError::ggml("Tensor::write_data_backend<KV_POS>", source))?;
     }
     if let Some(mask) = mask {
         let mask_values =
             build_causal_mask_values(query_length, key_value_length, causal_past_tokens);
-        mask.set_f32_backend(&mask_values).map_err(|source| {
-            InferenceError::ggml("Tensor::set_f32_backend<CAUSAL_MASK>", source)
+        mask.write_data_backend(&mask_values).map_err(|source| {
+            InferenceError::ggml("Tensor::write_data_backend<CAUSAL_MASK>", source)
         })?;
     }
 
@@ -2314,8 +2322,8 @@ fn attention_decode_proxy_with_cache_repeats_inner(
     let output = graph
         .last_node()
         .map_err(|source| InferenceError::ggml("Graph::last_node", source))?
-        .to_vec_f32_backend()
-        .map_err(|source| InferenceError::ggml("Tensor::to_vec_f32_backend", source))?;
+        .read_data_backend::<f32>()
+        .map_err(|source| InferenceError::ggml("Tensor::read_data_backend", source))?;
 
     Ok(AttentionDecodeProxyReport {
         backend_name,

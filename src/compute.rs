@@ -2,6 +2,7 @@
 
 use crate::ffi;
 use crate::num_ext::{CheckedFieldOps, TryIntoChecked};
+use crate::tensor_expr::HostElement;
 use crate::{
     BackendDeviceType, BackendElement, BackendKind, Bytes, Cols, ComputeStatus, Error, GgmlElement,
     Length, Result, RopeExtParams, Rows, Shape2D, TensorExpr, TensorIndex, ThreadCount, Type,
@@ -386,60 +387,6 @@ impl Context {
         Self::recommended_matmul_memory_impl(lhs, rhs, T::GGML_TYPE, true)
     }
 
-    /// Returns a conservative memory estimate for `f32` matmul on context path.
-    pub fn recommended_matmul_memory_f32(
-        rows_a: usize,
-        cols_a: usize,
-        rows_b: usize,
-        cols_b: usize,
-    ) -> Result<usize> {
-        Ok(Self::recommended_matmul_memory_f32_shapes_bytes(
-            Shape2D::new(cols_a, rows_a),
-            Shape2D::new(cols_b, rows_b),
-        )?
-        .get())
-    }
-
-    /// Returns a conservative memory estimate for `f32` matmul using shape newtypes.
-    pub fn recommended_matmul_memory_f32_shapes(lhs: Shape2D, rhs: Shape2D) -> Result<usize> {
-        Ok(Self::recommended_matmul_memory_f32_shapes_bytes(lhs, rhs)?.get())
-    }
-
-    /// Compatibility wrapper around typed `recommended_matmul_memory::<f32>`.
-    pub fn recommended_matmul_memory_f32_shapes_bytes(lhs: Shape2D, rhs: Shape2D) -> Result<Bytes> {
-        Self::recommended_matmul_memory::<f32>(lhs, rhs)
-    }
-
-    /// Returns a conservative memory estimate for backend no-alloc matmul context.
-    pub fn recommended_backend_matmul_memory_f32(
-        rows_a: usize,
-        cols_a: usize,
-        rows_b: usize,
-        cols_b: usize,
-    ) -> Result<usize> {
-        Ok(Self::recommended_backend_matmul_memory_f32_shapes_bytes(
-            Shape2D::new(cols_a, rows_a),
-            Shape2D::new(cols_b, rows_b),
-        )?
-        .get())
-    }
-
-    /// Returns a conservative backend memory estimate using shape newtypes.
-    pub fn recommended_backend_matmul_memory_f32_shapes(
-        lhs: Shape2D,
-        rhs: Shape2D,
-    ) -> Result<usize> {
-        Ok(Self::recommended_backend_matmul_memory_f32_shapes_bytes(lhs, rhs)?.get())
-    }
-
-    /// Compatibility wrapper around typed `recommended_backend_matmul_memory::<f32>`.
-    pub fn recommended_backend_matmul_memory_f32_shapes_bytes(
-        lhs: Shape2D,
-        rhs: Shape2D,
-    ) -> Result<Bytes> {
-        Self::recommended_backend_matmul_memory::<f32>(lhs, rhs)
-    }
-
     /// Allocates backend storage for all tensors currently owned by this context.
     pub fn allocate_tensors<'ctx>(&'ctx self, backend: &Backend) -> Result<BackendBuffer<'ctx>> {
         let raw =
@@ -452,11 +399,6 @@ impl Context {
             raw,
             _ctx: PhantomData,
         })
-    }
-
-    /// Creates a 2D tensor with raw `usize` dimensions.
-    pub fn new_tensor_2d(&self, ty: Type, cols: usize, rows: usize) -> Result<Tensor<'_>> {
-        self.new_tensor_2d_shape(ty, Shape2D::new(cols, rows))
     }
 
     /// Creates a 2D tensor using semantic shape newtypes.
@@ -478,17 +420,8 @@ impl Context {
             .map_err(|error| error.with_context("ggml_new_tensor_2d"))
     }
 
-    pub fn new_f32_tensor_2d(&self, cols: usize, rows: usize) -> Result<Tensor<'_>> {
-        self.new_tensor_2d(Type::F32, cols, rows)
-    }
-
     pub fn new_f32_tensor_2d_shape(&self, shape: Shape2D) -> Result<Tensor<'_>> {
         self.new_tensor_2d_shape(Type::F32, shape)
-    }
-
-    /// Creates a 1D tensor with raw `usize` length.
-    pub fn new_tensor_1d(&self, ty: Type, len: usize) -> Result<Tensor<'_>> {
-        self.new_tensor_1d_len(ty, Length::new(len))
     }
 
     /// Creates a 1D tensor with semantic `Length`.
@@ -502,16 +435,8 @@ impl Context {
             .map_err(|error| error.with_context("ggml_new_tensor_1d"))
     }
 
-    pub fn new_f32_tensor_1d(&self, len: usize) -> Result<Tensor<'_>> {
-        self.new_tensor_1d_len(Type::F32, Length::new(len))
-    }
-
     pub fn new_f32_tensor_1d_len(&self, len: Length) -> Result<Tensor<'_>> {
         self.new_tensor_1d_len(Type::F32, len)
-    }
-
-    pub fn new_i32_tensor_1d(&self, len: usize) -> Result<Tensor<'_>> {
-        self.new_tensor_1d_len(Type::I32, Length::new(len))
     }
 
     pub fn new_i32_tensor_1d_len(&self, len: Length) -> Result<Tensor<'_>> {
@@ -1001,7 +926,7 @@ impl<'ctx> Tensor<'ctx> {
 
     /// Writes backend values with an element type inferred from the slice.
     pub fn write_data_backend<T: BackendElement>(&self, values: &[T]) -> Result<()> {
-        self.set_backend_slice(values)
+        self.write_backend_slice(values)
     }
 
     /// Writes backend values at the provided element offset.
@@ -1010,7 +935,7 @@ impl<'ctx> Tensor<'ctx> {
         element_offset: usize,
         values: &[T],
     ) -> Result<()> {
-        self.set_backend_slice_at(element_offset, values)
+        self.write_backend_slice_at(element_offset, values)
     }
 
     /// Reads all host values using typed tensor I/O dispatch.
@@ -1020,7 +945,7 @@ impl<'ctx> Tensor<'ctx> {
 
     /// Reads all backend values for the requested element type.
     pub fn read_data_backend<T: BackendElement>(&self) -> Result<Vec<T>> {
-        self.to_vec_backend()
+        self.read_backend_vec()
     }
 
     /// Reads one element using typed tensor I/O dispatch.
@@ -1028,8 +953,8 @@ impl<'ctx> Tensor<'ctx> {
         T::get_data(self, index)
     }
 
-    /// Writes host `f32` values through context tensor APIs.
-    pub fn set_f32(&self, values: &[f32]) -> Result<()> {
+    /// Writes host values through context tensor APIs.
+    pub(crate) fn write_host_data<T: HostElement>(&self, values: &[T]) -> Result<()> {
         let expected = self.element_count()?;
         if values.len() != expected {
             return Err(Error::LengthMismatch {
@@ -1039,14 +964,14 @@ impl<'ctx> Tensor<'ctx> {
         }
 
         if expected >= CONTIGUOUS_BULK_COPY_MIN_ELEMS {
-            let expected_nbytes = expected.checked_mul_checked(std::mem::size_of::<f32>())?;
+            let expected_nbytes = expected.checked_mul_checked(std::mem::size_of::<T>())?;
             if expected_nbytes == self.nbytes()
-                && let Some(dst) = self.contiguous_data_ptr::<f32>()
+                && let Some(dst) = self.contiguous_data_ptr::<T>()
             {
                 unsafe {
                     // SAFETY:
                     // - `dst` points to contiguous tensor storage returned by ggml.
-                    // - Byte-size compatibility was validated above, so `expected` `f32`s fit.
+                    // - Byte-size compatibility was validated above, so `expected` elements fit.
                     // - Source and destination do not overlap (`values` is caller-owned host slice).
                     ptr::copy_nonoverlapping(values.as_ptr(), dst.as_ptr(), expected);
                 }
@@ -1058,24 +983,14 @@ impl<'ctx> Tensor<'ctx> {
             let index = (index)
                 .try_into_checked()
                 .map_err(|source| Error::int_conversion("tensor index", source))?;
-            unsafe {
-                ffi::ggml_set_f32_1d(self.raw.as_ptr(), index, value);
-            }
+            T::set_1d_raw(self.raw.as_ptr(), index, value);
         }
 
         Ok(())
     }
 
-    pub fn set_f32_backend(&self, values: &[f32]) -> Result<()> {
-        self.write_data_backend(values)
-    }
-
-    pub fn set_f32_backend_at(&self, element_offset: usize, values: &[f32]) -> Result<()> {
-        self.write_data_backend_at(element_offset, values)
-    }
-
     /// Writes host values through backend tensor APIs.
-    pub fn set_backend_slice<T: BackendElement>(&self, values: &[T]) -> Result<()> {
+    fn write_backend_slice<T: BackendElement>(&self, values: &[T]) -> Result<()> {
         let expected = self.element_count()?;
         if values.len() != expected {
             return Err(Error::LengthMismatch {
@@ -1099,7 +1014,7 @@ impl<'ctx> Tensor<'ctx> {
     }
 
     /// Writes a backend slice into a contiguous tensor region.
-    pub fn set_backend_slice_at<T: BackendElement>(
+    fn write_backend_slice_at<T: BackendElement>(
         &self,
         element_offset: usize,
         values: &[T],
@@ -1135,20 +1050,8 @@ impl<'ctx> Tensor<'ctx> {
         Ok(())
     }
 
-    pub fn set_i32_backend(&self, values: &[i32]) -> Result<()> {
-        self.write_data_backend(values)
-    }
-
-    pub fn set_i32_backend_at(&self, element_offset: usize, values: &[i32]) -> Result<()> {
-        self.write_data_backend_at(element_offset, values)
-    }
-
-    /// Reads a single `f32` element with bounds checking.
-    pub fn get_f32(&self, index: usize) -> Result<f32> {
-        self.get_f32_at(TensorIndex::new(index))
-    }
-
-    pub fn get_f32_at(&self, index: TensorIndex) -> Result<f32> {
+    /// Reads one host element with bounds checking.
+    pub(crate) fn read_host_at<T: HostElement>(&self, index: TensorIndex) -> Result<T> {
         let index = index.get();
         let len = self.element_count()?;
         if index >= len {
@@ -1158,21 +1061,21 @@ impl<'ctx> Tensor<'ctx> {
         let index = (index)
             .try_into_checked()
             .map_err(|source| Error::int_conversion("tensor index", source))?;
-        Ok(unsafe { ffi::ggml_get_f32_1d(self.raw.as_ptr(), index) })
+        Ok(T::get_1d_raw(self.raw.as_ptr(), index))
     }
 
-    /// Reads all values through context tensor APIs.
-    pub fn to_vec_f32(&self) -> Result<Vec<f32>> {
+    /// Reads all host values through context tensor APIs.
+    pub(crate) fn read_host_data<T: HostElement>(&self) -> Result<Vec<T>> {
         let len = self.element_count()?;
         if len >= CONTIGUOUS_BULK_COPY_MIN_ELEMS {
-            let expected_nbytes = len.checked_mul_checked(std::mem::size_of::<f32>())?;
+            let expected_nbytes = len.checked_mul_checked(std::mem::size_of::<T>())?;
             if expected_nbytes == self.nbytes()
-                && let Some(src) = self.contiguous_data_ptr::<f32>()
+                && let Some(src) = self.contiguous_data_ptr::<T>()
             {
                 let mut out = Vec::with_capacity(len);
                 unsafe {
                     // SAFETY:
-                    // - `src` points to contiguous tensor storage of `len` `f32` elements.
+                    // - `src` points to contiguous tensor storage of `len` elements.
                     // - `out` has capacity for `len` elements; `copy_nonoverlapping` initializes them.
                     // - We set length after initializing all elements.
                     ptr::copy_nonoverlapping(src.as_ptr(), out.as_mut_ptr(), len);
@@ -1188,22 +1091,14 @@ impl<'ctx> Tensor<'ctx> {
             let index = (index)
                 .try_into_checked()
                 .map_err(|source| Error::int_conversion("tensor index", source))?;
-            out.push(unsafe { ffi::ggml_get_f32_1d(self.raw.as_ptr(), index) });
+            out.push(T::get_1d_raw(self.raw.as_ptr(), index));
         }
 
         Ok(out)
     }
 
-    pub fn to_vec_f32_backend(&self) -> Result<Vec<f32>> {
-        self.read_data_backend()
-    }
-
-    pub fn to_vec_i32_backend(&self) -> Result<Vec<i32>> {
-        self.read_data_backend()
-    }
-
     /// Reads all values through backend tensor APIs.
-    pub fn to_vec_backend<T: BackendElement>(&self) -> Result<Vec<T>> {
+    fn read_backend_vec<T: BackendElement>(&self) -> Result<Vec<T>> {
         let len = self.element_count()?;
         let expected_nbytes = self.expected_nbytes_for::<T>()?;
         let actual_nbytes = self.nbytes();

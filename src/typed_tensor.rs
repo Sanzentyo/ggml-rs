@@ -33,32 +33,16 @@ impl<'ctx, S: Shape2DSpec> Tensor2D<'ctx, S> {
         self.inner
     }
 
-    pub fn set_f32(&self, values: &[f32]) -> Result<()> {
-        self.inner.set_f32(values)
-    }
-
     pub fn write_data<T: GgmlElement>(&self, values: &[T]) -> Result<()> {
         self.inner.write_data(values)
-    }
-
-    pub fn set_f32_backend(&self, values: &[f32]) -> Result<()> {
-        self.inner.set_f32_backend(values)
     }
 
     pub fn write_data_backend<T: GgmlElement>(&self, values: &[T]) -> Result<()> {
         self.inner.write_data_backend(values)
     }
 
-    pub fn to_vec_f32(&self) -> Result<Vec<f32>> {
-        self.inner.to_vec_f32()
-    }
-
     pub fn read_data<T: GgmlElement>(&self) -> Result<Vec<T>> {
         self.inner.read_data()
-    }
-
-    pub fn to_vec_f32_backend(&self) -> Result<Vec<f32>> {
-        self.inner.to_vec_f32_backend()
     }
 
     pub fn get_data<T: GgmlElement>(&self, index: TensorIndex) -> Result<T> {

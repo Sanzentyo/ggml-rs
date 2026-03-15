@@ -123,10 +123,10 @@ pub fn backend_smoke(backend: LlamaBackend) -> Result<SmokeReport> {
     let _buffer = ctx
         .allocate_tensors(&backend)
         .map_err(|source| SmokeError::ggml("Context::allocate_tensors", source))?;
-    a.set_f32_backend(&MATRIX_A)
-        .map_err(|source| SmokeError::ggml("TypedTensor2D::set_f32_backend<A>", source))?;
-    b.set_f32_backend(&MATRIX_B)
-        .map_err(|source| SmokeError::ggml("TypedTensor2D::set_f32_backend<B>", source))?;
+    a.write_data_backend(&MATRIX_A)
+        .map_err(|source| SmokeError::ggml("Tensor2D::write_data_backend<A>", source))?;
+    b.write_data_backend(&MATRIX_B)
+        .map_err(|source| SmokeError::ggml("Tensor2D::write_data_backend<B>", source))?;
     backend
         .compute(&mut graph)
         .map_err(|source| SmokeError::ggml("Backend::compute", source))?;
@@ -135,8 +135,8 @@ pub fn backend_smoke(backend: LlamaBackend) -> Result<SmokeReport> {
         .last_node()
         .map_err(|source| SmokeError::ggml("Graph::last_node", source))?;
     let values = output
-        .to_vec_f32_backend()
-        .map_err(|source| SmokeError::ggml("Tensor::to_vec_f32_backend", source))?;
+        .read_data_backend::<f32>()
+        .map_err(|source| SmokeError::ggml("Tensor::read_data_backend", source))?;
     assert_expected(&values)?;
     let shape = output
         .shape()

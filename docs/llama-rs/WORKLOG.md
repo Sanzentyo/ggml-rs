@@ -708,3 +708,55 @@ Detailed logs are split under `docs/llama-rs/worklog/` to keep this top-level fi
     - overall `~0.999`,
   - interpretation:
     - no measurable regression from review2 refactor in the active stepwise hotspot slice.
+- Follow-up: completed full compatibility-wrapper cleanup in `ggml-rs` public API:
+  - removed remaining scalar-specific tensor I/O aliases and old `*_f32*` memory helper surface,
+  - removed 1D/2D raw convenience constructors in favor of semantic newtype APIs (`Length`, `Shape2D`),
+  - migrated all in-tree call sites (`ggml-rs` examples/tests + `llama-rs` inference/example paths).
+- Validation after cleanup:
+  - `cargo fmt --all`,
+  - `cargo clippy --workspace --all-targets`,
+  - `cargo test --workspace`,
+  - runtime smoke (`--features link-system`, CPU+Metal):
+    - `target/benchmarks/review2_cleanup_runtime_smoke.txt`.
+- Step `1` guard rerun after cleanup (ELYZA `block_layer=5..7`):
+  - raw:
+    - `target/benchmarks/review2_postclean_step1_elyza_layers5_7.txt`,
+  - impact:
+    - `target/benchmarks/review2_postclean_step1_elyza_layers5_7_impact.md`,
+  - mean `post/base`:
+    - CPU `~1.013`,
+    - MTL0 `~0.998`,
+    - overall `~1.005`,
+  - checksum deltas: all `0.0`.
+- Follow-up API polish (Rust-generic host I/O internals):
+  - generalized tensor host-side internals from `f32`-specific methods to type-driven helpers:
+    - `Tensor::write_host_data<T>()`,
+    - `Tensor::read_host_data<T>()`,
+    - `Tensor::read_host_at<T>()`,
+  - introduced internal `HostElement` trait (`f32` + `i32`) for direct ggml 1D host accessor dispatch,
+  - updated `GgmlElement` implementations to use generic host helpers for both `f32` and `i32`.
+- Verification after generic host-I/O refactor:
+  - `cargo fmt --all`,
+  - `cargo clippy --workspace --all-targets`,
+  - `cargo test --workspace`,
+  - runtime smoke (`--features link-system`, CPU+Metal):
+    - `target/benchmarks/review2_generic_host_io_runtime_smoke.txt`.
+- Step `1` guard rerun after generic host-I/O refactor (ELYZA `block_layer=5..7`):
+  - raw:
+    - `target/benchmarks/review2_generic_host_io_step1_elyza_layers5_7.txt`,
+  - impact:
+    - `target/benchmarks/review2_generic_host_io_step1_elyza_layers5_7_impact.md`,
+  - mean `post/base`:
+    - CPU `~1.002`,
+    - MTL0 `~1.009`,
+    - overall `~1.006`,
+  - checksum deltas: all `0.0`.
+- Continued step `1` per-layer loop on top of the generic host-I/O pass:
+  - refreshed ELYZA layer sweep (`block_layer=0..7`):
+    - raw: `target/benchmarks/review2_generic_host_io_step1_elyza_layers0_7.txt`,
+    - summary:
+      - `target/benchmarks/review2_generic_host_io_step1_elyza_layers0_7_summary.md`,
+      - `target/benchmarks/review2_generic_host_io_step1_elyza_layers0_7_summary.csv`.
+  - current hotspot snapshot (this run):
+    - CPU max: `layer=0` (`30.048 ms/token`),
+    - MTL0 max: `layer=7` (`19.965 ms/token`).

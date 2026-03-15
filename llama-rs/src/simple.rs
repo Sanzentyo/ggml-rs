@@ -97,10 +97,10 @@ pub fn simple_ctx() -> Result<SimpleReport, SimpleError> {
     let b = ctx
         .new_f32_tensor_2d_typed::<BShape>()
         .map_err(|source| SimpleError::ggml("Context::new_f32_tensor_2d_typed<B>", source))?;
-    a.set_f32(&MATRIX_A)
-        .map_err(|source| SimpleError::ggml("TypedTensor2D::set_f32<A>", source))?;
-    b.set_f32(&MATRIX_B)
-        .map_err(|source| SimpleError::ggml("TypedTensor2D::set_f32<B>", source))?;
+    a.write_data(&MATRIX_A)
+        .map_err(|source| SimpleError::ggml("TypedTensor2D::write_data<A>", source))?;
+    b.write_data(&MATRIX_B)
+        .map_err(|source| SimpleError::ggml("TypedTensor2D::write_data<B>", source))?;
 
     let result = ctx
         .mul_mat(a.inner(), b.inner())
@@ -116,8 +116,8 @@ pub fn simple_ctx() -> Result<SimpleReport, SimpleError> {
         .last_node()
         .map_err(|source| SimpleError::ggml("Graph::last_node", source))?;
     let values = output
-        .to_vec_f32()
-        .map_err(|source| SimpleError::ggml("Tensor::to_vec_f32", source))?;
+        .read_data::<f32>()
+        .map_err(|source| SimpleError::ggml("Tensor::read_data", source))?;
     assert_expected(&values)?;
     let shape = output
         .shape()

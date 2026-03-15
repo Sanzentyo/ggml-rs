@@ -2,6 +2,7 @@
 
 When modifying Rust code in this repository, follow these defaults:
 
+- First read `.github/INTRODUCTION.md` for the currently locked execution priority (worktree policy, review-driven refactor order, and objective lock).
 - Prefer ADT-centered APIs over long procedural `run_*` entrypoints.
 - Build execution flows with typed plans/builders and type-state where required fields exist.
 - Prefer static dispatch (`enum`/generics/traits) over dynamic dispatch when behavior is known at compile time.

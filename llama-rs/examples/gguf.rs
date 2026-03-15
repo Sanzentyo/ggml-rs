@@ -1,5 +1,5 @@
 use clap::{Parser, ValueEnum};
-use ggml_rs::{Context, GgufArrayValue, GgufValue, GgufWriter, Tensor, Type};
+use ggml_rs::{Context, GgufArrayValue, GgufValue, GgufWriter, Length, Shape2D, Tensor, Type};
 use llama_rs::{GgufReport, inspect_gguf};
 use std::error::Error as StdError;
 use thiserror::Error;
@@ -302,8 +302,8 @@ fn build_fixture_tensors<'ctx>(ctx: &'ctx Context) -> ggml_rs::Result<Vec<Tensor
         }
 
         let tensor = match n_dims {
-            1 => ctx.new_f32_tensor_1d(ne[0])?,
-            2 => ctx.new_f32_tensor_2d(ne[0], ne[1])?,
+            1 => ctx.new_f32_tensor_1d_len(Length::new(ne[0]))?,
+            2 => ctx.new_f32_tensor_2d_shape(Shape2D::new(ne[0], ne[1]))?,
             3 => ctx.new_tensor_3d(Type::F32, ne[0], ne[1], ne[2])?,
             4 => ctx.new_tensor_4d(Type::F32, ne[0], ne[1], ne[2], ne[3])?,
             _ => unreachable!(),
@@ -322,7 +322,7 @@ fn build_fixture_tensors<'ctx>(ctx: &'ctx Context) -> ggml_rs::Result<Vec<Tensor
 fn fill_named_tensor(tensor: Tensor<'_>, name: &str, fill: f32) -> ggml_rs::Result<()> {
     tensor.set_name(name)?;
     let values = vec![fill; tensor.element_count()?];
-    tensor.set_f32(&values)
+    tensor.write_data(&values)
 }
 
 fn validate_fixture_report(report: &GgufReport) -> Result<(), Box<dyn StdError>> {

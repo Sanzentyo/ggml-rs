@@ -138,10 +138,10 @@ pub fn backend_matmul_bench(
         .map(|index| (index % 17) as f32 * 0.0625)
         .collect();
 
-    a.set_f32_backend(&data_a)
-        .map_err(|source| BenchError::ggml("Tensor::set_f32_backend<A>", source))?;
-    b.set_f32_backend(&data_b)
-        .map_err(|source| BenchError::ggml("Tensor::set_f32_backend<B>", source))?;
+    a.write_data_backend(&data_a)
+        .map_err(|source| BenchError::ggml("Tensor::write_data_backend<A>", source))?;
+    b.write_data_backend(&data_b)
+        .map_err(|source| BenchError::ggml("Tensor::write_data_backend<B>", source))?;
 
     for _ in 0..config.warmup_iters {
         backend
@@ -167,8 +167,8 @@ pub fn backend_matmul_bench(
     let values = graph
         .last_node()
         .map_err(|source| BenchError::ggml("Graph::last_node", source))?
-        .to_vec_f32_backend()
-        .map_err(|source| BenchError::ggml("Tensor::to_vec_f32_backend", source))?;
+        .read_data_backend::<f32>()
+        .map_err(|source| BenchError::ggml("Tensor::read_data_backend", source))?;
     let checksum = values.iter().take(16).map(|value| f64::from(*value)).sum();
 
     Ok(MatmulBenchReport {

@@ -1,6 +1,6 @@
 #![cfg(feature = "link-system")]
 
-use ggml_rs::{Context, GgufArrayValue, GgufFile, GgufValue, GgufWriter};
+use ggml_rs::{Context, GgufArrayValue, GgufFile, GgufValue, GgufWriter, Length};
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -10,9 +10,9 @@ fn gguf_writer_roundtrip_kv_and_tensor_metadata() -> Result<(), ggml_rs::Error> 
 
     {
         let ctx = Context::new(2 * 1024 * 1024)?;
-        let tensor = ctx.new_f32_tensor_1d(4)?;
+        let tensor = ctx.new_f32_tensor_1d_len(Length::new(4))?;
         tensor.set_name("tensor_roundtrip")?;
-        tensor.set_f32(&[1.0, 2.0, 3.0, 4.0])?;
+        tensor.write_data(&[1.0, 2.0, 3.0, 4.0])?;
 
         let mut writer = GgufWriter::new()?;
         let kv_entries = vec![

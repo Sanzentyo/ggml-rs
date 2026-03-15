@@ -358,14 +358,15 @@ pub fn batched_matmul_with_workload(
         .allocate_tensors(&backend)
         .map_err(|source| BatchedError::ggml("Context::allocate_tensors", source))?;
 
-    b.set_f32_backend(workload.matrix_b())
-        .map_err(|source| BatchedError::ggml("Tensor::set_f32_backend<B>", source))?;
+    b.write_data_backend(workload.matrix_b())
+        .map_err(|source| BatchedError::ggml("Tensor::write_data_backend<B>", source))?;
 
     // Warm up with one full batch pass so first-run backend setup does not
     // dominate steady-state measurements.
     for input in workload.batch_inputs() {
-        a.set_f32_backend(input)
-            .map_err(|source| BatchedError::ggml("Tensor::set_f32_backend<A>(warmup)", source))?;
+        a.write_data_backend(input).map_err(|source| {
+            BatchedError::ggml("Tensor::write_data_backend<A>(warmup)", source)
+        })?;
         backend
             .compute(&mut graph)
             .map_err(|source| BatchedError::ggml("Backend::compute(warmup)", source))?;
@@ -378,8 +379,8 @@ pub fn batched_matmul_with_workload(
     let start = Instant::now();
     for _ in 0..config.repeats.get() {
         for input in workload.batch_inputs() {
-            a.set_f32_backend(input).map_err(|source| {
-                BatchedError::ggml("Tensor::set_f32_backend<A>(batch)", source)
+            a.write_data_backend(input).map_err(|source| {
+                BatchedError::ggml("Tensor::write_data_backend<A>(batch)", source)
             })?;
             backend
                 .compute(&mut graph)
@@ -391,8 +392,8 @@ pub fn batched_matmul_with_workload(
                 let values = graph
                     .last_node()
                     .map_err(|source| BatchedError::ggml("Graph::last_node", source))?
-                    .to_vec_f32_backend()
-                    .map_err(|source| BatchedError::ggml("Tensor::to_vec_f32_backend", source))?;
+                    .read_data_backend::<f32>()
+                    .map_err(|source| BatchedError::ggml("Tensor::read_data_backend", source))?;
                 checksum += values
                     .iter()
                     .take(4)

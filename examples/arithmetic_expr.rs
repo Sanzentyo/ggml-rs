@@ -1,4 +1,4 @@
-use ggml_rs::Context;
+use ggml_rs::{Context, Length};
 use std::error::Error as StdError;
 
 const LEN: usize = 4;
@@ -14,10 +14,10 @@ fn main() -> Result<(), Box<dyn StdError>> {
     let mem = 1024 * 1024;
     let ctx = Context::new(mem)?;
 
-    let a = ctx.new_f32_tensor_1d(LEN)?;
-    let b = ctx.new_f32_tensor_1d(LEN)?;
-    let c = ctx.new_f32_tensor_1d(LEN)?;
-    let d = ctx.new_f32_tensor_1d(LEN)?;
+    let a = ctx.new_f32_tensor_1d_len(Length::new(LEN))?;
+    let b = ctx.new_f32_tensor_1d_len(Length::new(LEN))?;
+    let c = ctx.new_f32_tensor_1d_len(Length::new(LEN))?;
+    let d = ctx.new_f32_tensor_1d_len(Length::new(LEN))?;
 
     a.write_data(&A)?;
     b.write_data(&B)?;

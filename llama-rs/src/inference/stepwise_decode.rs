@@ -10,7 +10,7 @@ use super::{
     recommended_attention_backend_memory_bytes_for_lengths,
 };
 use crate::backend::{LlamaBackend, ensure_backends_loaded};
-use ggml_rs::{Backend, Context, Shape2D};
+use ggml_rs::{Backend, Context, Length, Shape2D};
 use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone)]
@@ -682,8 +682,8 @@ impl SequenceStateUpdater for DeltaSequenceStateUpdater {
                     self.key_value_length,
                     past_start,
                 );
-                mask.set_f32_backend(mask_values).map_err(|source| {
-                    InferenceError::ggml("Tensor::set_f32_backend<CAUSAL_MASK>", source)
+                mask.write_data_backend(mask_values).map_err(|source| {
+                    InferenceError::ggml("Tensor::write_data_backend<CAUSAL_MASK>", source)
                 })?;
             } else if let Some(initial_mask_values) = self.initial_mask_values.as_mut() {
                 fill_causal_mask_values(
@@ -692,9 +692,9 @@ impl SequenceStateUpdater for DeltaSequenceStateUpdater {
                     self.key_value_length,
                     past_start,
                 );
-                mask.set_f32_backend(initial_mask_values)
+                mask.write_data_backend(initial_mask_values)
                     .map_err(|source| {
-                        InferenceError::ggml("Tensor::set_f32_backend<CAUSAL_MASK>", source)
+                        InferenceError::ggml("Tensor::write_data_backend<CAUSAL_MASK>", source)
                     })?;
             }
         }
@@ -711,9 +711,9 @@ impl SequenceStateUpdater for DeltaSequenceStateUpdater {
                 let position = i32::try_from(step_past_tokens)
                     .map_err(|_| InferenceError::MemorySizeOverflow)?;
                 positions_q
-                    .set_i32_backend_at(0, &[position])
+                    .write_data_backend_at(0, &[position])
                     .map_err(|source| {
-                        InferenceError::ggml("Tensor::set_i32_backend_at<QUERY_POS>", source)
+                        InferenceError::ggml("Tensor::write_data_backend_at<QUERY_POS>", source)
                     })?;
             } else if let Some(values) = self.step_positions_q_values.as_mut() {
                 for (index, value) in values.iter_mut().enumerate() {
@@ -723,8 +723,8 @@ impl SequenceStateUpdater for DeltaSequenceStateUpdater {
                     *value =
                         i32::try_from(position).map_err(|_| InferenceError::MemorySizeOverflow)?;
                 }
-                positions_q.set_i32_backend(values).map_err(|source| {
-                    InferenceError::ggml("Tensor::set_i32_backend<QUERY_POS>", source)
+                positions_q.write_data_backend(values).map_err(|source| {
+                    InferenceError::ggml("Tensor::write_data_backend<QUERY_POS>", source)
                 })?;
             }
         }
@@ -745,10 +745,10 @@ impl SequenceStateUpdater for DeltaSequenceStateUpdater {
                         if let Some(mask_values) = self.step_mask_values.as_mut() {
                             mask_values[newly_visible_key] = 0.0;
                         }
-                        mask.set_f32_backend_at(newly_visible_key, &[0.0_f32])
+                        mask.write_data_backend_at(newly_visible_key, &[0.0_f32])
                             .map_err(|source| {
                                 InferenceError::ggml(
-                                    "Tensor::set_f32_backend_at<CAUSAL_MASK>",
+                                    "Tensor::write_data_backend_at<CAUSAL_MASK>",
                                     source,
                                 )
                             })?;
@@ -761,8 +761,8 @@ impl SequenceStateUpdater for DeltaSequenceStateUpdater {
                     self.key_value_length,
                     step_past_tokens,
                 );
-                mask.set_f32_backend(mask_values).map_err(|source| {
-                    InferenceError::ggml("Tensor::set_f32_backend<CAUSAL_MASK>", source)
+                mask.write_data_backend(mask_values).map_err(|source| {
+                    InferenceError::ggml("Tensor::write_data_backend<CAUSAL_MASK>", source)
                 })?;
             }
         }
@@ -1091,12 +1091,16 @@ fn execute_stepwise_sweep_internal(
         .map_err(|source| InferenceError::ggml("Context::mul_mat(Q)", source))?;
 
     let (positions_q, positions_k) = if matches!(config.rotary, RotaryEmbedding::Llama(_)) {
-        let positions_q = ctx.new_i32_tensor_1d(query_length).map_err(|source| {
-            InferenceError::ggml("Context::new_i32_tensor_1d<QUERY_POS>", source)
-        })?;
+        let positions_q = ctx
+            .new_i32_tensor_1d_len(Length::new(query_length))
+            .map_err(|source| {
+                InferenceError::ggml("Context::new_i32_tensor_1d_len<QUERY_POS>", source)
+            })?;
         let positions_k = ctx
-            .new_i32_tensor_1d(key_value_length)
-            .map_err(|source| InferenceError::ggml("Context::new_i32_tensor_1d<KV_POS>", source))?;
+            .new_i32_tensor_1d_len(Length::new(key_value_length))
+            .map_err(|source| {
+                InferenceError::ggml("Context::new_i32_tensor_1d_len<KV_POS>", source)
+            })?;
         (Some(positions_q), Some(positions_k))
     } else {
         (None, None)
@@ -1554,17 +1558,17 @@ fn execute_stepwise_sweep_internal(
         .allocate_tensors(&backend)
         .map_err(|source| InferenceError::ggml("Context::allocate_tensors", source))?;
 
-    w_q.set_f32_backend(weights.q_values())
-        .map_err(|source| InferenceError::ggml("Tensor::set_f32_backend<W_Q>", source))?;
-    w_o.set_f32_backend(weights.o_values())
-        .map_err(|source| InferenceError::ggml("Tensor::set_f32_backend<W_O>", source))?;
+    w_q.write_data_backend(weights.q_values())
+        .map_err(|source| InferenceError::ggml("Tensor::write_data_backend<W_Q>", source))?;
+    w_o.write_data_backend(weights.o_values())
+        .map_err(|source| InferenceError::ggml("Tensor::write_data_backend<W_O>", source))?;
     if let Some(w_k) = w_k.as_ref() {
-        w_k.set_f32_backend(weights.k_values())
-            .map_err(|source| InferenceError::ggml("Tensor::set_f32_backend<W_K>", source))?;
+        w_k.write_data_backend(weights.k_values())
+            .map_err(|source| InferenceError::ggml("Tensor::write_data_backend<W_K>", source))?;
     }
     if let Some(w_v) = w_v.as_ref() {
-        w_v.set_f32_backend(weights.v_values())
-            .map_err(|source| InferenceError::ggml("Tensor::set_f32_backend<W_V>", source))?;
+        w_v.write_data_backend(weights.v_values())
+            .map_err(|source| InferenceError::ggml("Tensor::write_data_backend<W_V>", source))?;
     }
     let upload_block_mlp_weights =
         |block_mlp_weights: Option<&MlpWeights>| -> Result<(), InferenceError> {
@@ -1575,18 +1579,18 @@ fn execute_stepwise_sweep_internal(
                         actual: 0,
                     })?;
                 w_gate
-                    .set_f32_backend(block_mlp_weights.gate_values())
+                    .write_data_backend(block_mlp_weights.gate_values())
                     .map_err(|source| {
-                        InferenceError::ggml("Tensor::set_f32_backend<W_GATE_BLOCK>", source)
+                        InferenceError::ggml("Tensor::write_data_backend<W_GATE_BLOCK>", source)
                     })?;
-                w_up.set_f32_backend(block_mlp_weights.up_values())
+                w_up.write_data_backend(block_mlp_weights.up_values())
                     .map_err(|source| {
-                        InferenceError::ggml("Tensor::set_f32_backend<W_UP_BLOCK>", source)
+                        InferenceError::ggml("Tensor::write_data_backend<W_UP_BLOCK>", source)
                     })?;
                 w_down
-                    .set_f32_backend(block_mlp_weights.down_values())
+                    .write_data_backend(block_mlp_weights.down_values())
                     .map_err(|source| {
-                        InferenceError::ggml("Tensor::set_f32_backend<W_DOWN_BLOCK>", source)
+                        InferenceError::ggml("Tensor::write_data_backend<W_DOWN_BLOCK>", source)
                     })?;
             } else if let Some((w_gate_up, w_down)) = block_mlp_fused_tensors.as_ref() {
                 let block_mlp_weights =
@@ -1604,14 +1608,14 @@ fn execute_stepwise_sweep_internal(
                 gate_up_values.extend_from_slice(block_mlp_weights.gate_values());
                 gate_up_values.extend_from_slice(block_mlp_weights.up_values());
                 w_gate_up
-                    .set_f32_backend(&gate_up_values)
+                    .write_data_backend(&gate_up_values)
                     .map_err(|source| {
-                        InferenceError::ggml("Tensor::set_f32_backend<W_GATE_UP_BLOCK>", source)
+                        InferenceError::ggml("Tensor::write_data_backend<W_GATE_UP_BLOCK>", source)
                     })?;
                 w_down
-                    .set_f32_backend(block_mlp_weights.down_values())
+                    .write_data_backend(block_mlp_weights.down_values())
                     .map_err(|source| {
-                        InferenceError::ggml("Tensor::set_f32_backend<W_DOWN_BLOCK>", source)
+                        InferenceError::ggml("Tensor::write_data_backend<W_DOWN_BLOCK>", source)
                     })?;
             } else if block_mlp_weights.is_some() {
                 return Err(InferenceError::InvalidInputLength {
@@ -1621,15 +1625,15 @@ fn execute_stepwise_sweep_internal(
             }
             Ok(())
         };
-    x_q.set_f32_backend(query_input)
-        .map_err(|source| InferenceError::ggml("Tensor::set_f32_backend<X_Q>", source))?;
+    x_q.write_data_backend(query_input)
+        .map_err(|source| InferenceError::ggml("Tensor::write_data_backend<X_Q>", source))?;
     if let Some(positions_k) = positions_k.as_ref() {
         let positions_values: Result<Vec<i32>, InferenceError> = (0..key_value_length)
             .map(|index| i32::try_from(index).map_err(|_| InferenceError::MemorySizeOverflow))
             .collect();
         positions_k
-            .set_i32_backend(&positions_values?)
-            .map_err(|source| InferenceError::ggml("Tensor::set_i32_backend<KV_POS>", source))?;
+            .write_data_backend(&positions_values?)
+            .map_err(|source| InferenceError::ggml("Tensor::write_data_backend<KV_POS>", source))?;
     }
 
     let incremental_position_update = use_position_deltas
@@ -1657,13 +1661,13 @@ fn execute_stepwise_sweep_internal(
                 .ok_or(InferenceError::MemorySizeOverflow)?;
 
             if reset_kv_state {
-                k.set_f32_backend(&cache.projected_k_values)
+                k.write_data_backend(&cache.projected_k_values)
                     .map_err(|source| {
-                        InferenceError::ggml("Tensor::set_f32_backend<K_CACHE>", source)
+                        InferenceError::ggml("Tensor::write_data_backend<K_CACHE>", source)
                     })?;
-                v.set_f32_backend(&cache.projected_v_values)
+                v.write_data_backend(&cache.projected_v_values)
                     .map_err(|source| {
-                        InferenceError::ggml("Tensor::set_f32_backend<V_CACHE>", source)
+                        InferenceError::ggml("Tensor::write_data_backend<V_CACHE>", source)
                     })?;
 
                 if let Some(precompute_graph) = static_kv_head_graph.as_mut() {
@@ -1695,8 +1699,8 @@ fn execute_stepwise_sweep_internal(
                         .map_err(|source| InferenceError::ggml("Backend::synchronize", source))?;
                 }
                 if readback_per_step {
-                    let _ = y.to_vec_f32_backend().map_err(|source| {
-                        InferenceError::ggml("Tensor::to_vec_f32_backend<Y_STEP>", source)
+                    let _ = y.read_data_backend::<f32>().map_err(|source| {
+                        InferenceError::ggml("Tensor::read_data_backend<Y_STEP>", source)
                     })?;
                 }
             }
@@ -1716,8 +1720,8 @@ fn execute_stepwise_sweep_internal(
         let bench_duration = bench_start.elapsed();
 
         let output = y
-            .to_vec_f32_backend()
-            .map_err(|source| InferenceError::ggml("Tensor::to_vec_f32_backend<Y>", source))?;
+            .read_data_backend::<f32>()
+            .map_err(|source| InferenceError::ggml("Tensor::read_data_backend<Y>", source))?;
         executions.push(AttentionDecodeStepwiseReport {
             backend_name: backend_name.clone(),
             hidden_features,
