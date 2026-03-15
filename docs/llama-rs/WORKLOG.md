@@ -697,3 +697,14 @@ Detailed logs are split under `docs/llama-rs/worklog/` to keep this top-level fi
   - `target/benchmarks/review2_bench_matmul_master_vs_refactor.md`,
   - `target/benchmarks/review2_llamars_bench_matmul_master_vs_refactor.md`,
   - both show no regression signal in this pass (sampled ratios stay within expected run-to-run noise envelope, with several improvements).
+- Step `1` resumed after review2 merge:
+  - captured post-merge hotspot slice run (ELYZA `block_layer=5..7`):
+    - `target/benchmarks/review2_postmerge_step1_elyza_layers5_7.txt`,
+  - compared against pre-review2 baseline:
+    - `target/benchmarks/review2_postmerge_step1_elyza_layers5_7_impact.md`,
+  - mean `post/base`:
+    - CPU `~1.002`,
+    - MTL0 `~0.997`,
+    - overall `~0.999`,
+  - interpretation:
+    - no measurable regression from review2 refactor in the active stepwise hotspot slice.
