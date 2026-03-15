@@ -656,3 +656,18 @@ Detailed logs are split under `docs/llama-rs/worklog/` to keep this top-level fi
     - overall `~1.002`.
 - Policy for this pass:
   - keep `head_stage_buf=false` as default (near-neutral to slight regression on the current hotspot slice).
+- Rechecked `mask_host_elide` after graph-builder/schedule passes on ELYZA layers `5..7`:
+  - base:
+    - `target/benchmarks/llama_rs_stepwise_post_graphbuilder_elyza_layers5_7.txt`,
+  - variant(on):
+    - `target/benchmarks/llama_rs_stepwise_post_graphbuilder_elyza_layers5_7_maskhost_on.txt`,
+  - impact:
+    - `target/benchmarks/llama_stepwise_post_graphbuilder_elyza_layers5_7_maskhost_impact.md`,
+  - checksum check:
+    - `target/benchmarks/llama_stepwise_post_graphbuilder_elyza_layers5_7_maskhost_checksum_check.md` (`max abs delta = 0.0`),
+  - means (`on/base`):
+    - CPU `~1.018`,
+    - MTL0 `~0.998`,
+    - overall `~1.008`.
+- Policy for this pass:
+  - keep `mask_host_elide=false` as default (CPU-side regression dominates on the current hotspot slice).
