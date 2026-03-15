@@ -86,14 +86,8 @@ pub struct SimpleReport {
 }
 
 pub fn simple_ctx() -> Result<SimpleReport, SimpleError> {
-    let ctx_size = Context::recommended_matmul_memory_f32_shapes_bytes(SHAPE_A, SHAPE_B).map_err(
-        |source| {
-            SimpleError::ggml(
-                "Context::recommended_matmul_memory_f32_shapes_bytes",
-                source,
-            )
-        },
-    )?;
+    let ctx_size = Context::recommended_matmul_memory::<f32>(SHAPE_A, SHAPE_B)
+        .map_err(|source| SimpleError::ggml("Context::recommended_matmul_memory::<f32>", source))?;
     let ctx = Context::new_bytes(ctx_size)
         .map_err(|source| SimpleError::ggml("Context::new_bytes", source))?;
 

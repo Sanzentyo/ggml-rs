@@ -98,14 +98,10 @@ pub fn backend_smoke(backend: LlamaBackend) -> Result<SmokeReport> {
         .map_err(|source| SmokeError::ggml("Backend::name", source))?
         .to_string();
 
-    let ctx_size =
-        ggml_rs::Context::recommended_backend_matmul_memory_f32_shapes_bytes(SHAPE_A, SHAPE_B)
-            .map_err(|source| {
-                SmokeError::ggml(
-                    "Context::recommended_backend_matmul_memory_f32_shapes_bytes",
-                    source,
-                )
-            })?;
+    let ctx_size = ggml_rs::Context::recommended_backend_matmul_memory::<f32>(SHAPE_A, SHAPE_B)
+        .map_err(|source| {
+            SmokeError::ggml("Context::recommended_backend_matmul_memory::<f32>", source)
+        })?;
     let ctx = ggml_rs::Context::new_no_alloc_bytes(ctx_size)
         .map_err(|source| SmokeError::ggml("Context::new_no_alloc_bytes", source))?;
 

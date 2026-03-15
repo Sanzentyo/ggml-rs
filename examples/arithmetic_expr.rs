@@ -19,10 +19,10 @@ fn main() -> Result<(), Box<dyn StdError>> {
     let c = ctx.new_f32_tensor_1d(LEN)?;
     let d = ctx.new_f32_tensor_1d(LEN)?;
 
-    a.set_f32(&A)?;
-    b.set_f32(&B)?;
-    c.set_f32(&C)?;
-    d.set_f32(&D)?;
+    a.write_data(&A)?;
+    b.write_data(&B)?;
+    c.write_data(&C)?;
+    d.write_data(&D)?;
 
     let expr = ((ctx.expr(a) + ctx.expr(b))? * ctx.expr(c))? / ctx.expr(d);
     let out = expr?.into_tensor();
@@ -31,7 +31,7 @@ fn main() -> Result<(), Box<dyn StdError>> {
     graph.build_forward_expand(&out);
     ctx.compute(&mut graph, 1)?;
 
-    let values = out.to_vec_f32()?;
+    let values = out.read_data::<f32>()?;
     let expected = expected_values();
     for (index, (actual, expected)) in values.iter().zip(expected.iter()).enumerate() {
         let delta = (actual - expected).abs();

@@ -14,7 +14,12 @@ centered on `Context`, `Tensor`, `Graph`, and `Backend`.
   `Backend::synchronize()` for stable benchmark timing/readback boundaries.
 - Expression API via `TensorExpr` with operator overloading (`+`, `-`, `*`,
   `/`) that still returns `Result<_>`.
-- Typed backend I/O through `BackendElement`.
+- Typed tensor I/O through `GgmlElement` (`Tensor::write_data`,
+  `Tensor::read_data`, `Tensor::get_data`) plus backend-slice traits
+  (`BackendElement`).
+- Unified typed memory estimation through
+  `Context::recommended_matmul_memory::<T>(...)` and
+  `Context::recommended_backend_matmul_memory::<T>(...)`.
 - Shape-safe APIs with newtypes (`Shape2D`, `Length`, `TensorIndex`,
   `ThreadCount`, `Bytes`) and const-generic typed shapes
   (`StaticShape2D<const C, const R>` + `Tensor2D`).
@@ -33,7 +38,8 @@ let out = expr?.into_tensor();
 - `src/types.rs`: `Type`, `BackendKind`, `BackendDeviceType`, `ComputeStatus`, `RopeExtParams`
 - `src/num_ext.rs`: checked conversion/arithmetic helpers
 - `src/gguf.rs`: safe GGUF inspection and writing helpers (`GgufFile`, `GgufWriter`)
-- `src/tensor_expr.rs`: expression wrapper and operator impls
+- `src/tensor_expr.rs`: expression wrapper, element traits (`BackendElement`,
+  `GgmlElement`) and operator impls
 - `src/typed_tensor.rs`: typed tensor wrappers (`Tensor2D`, `Tensor2DConst`)
 - `src/compute.rs`: context/backend/tensor/graph implementations
 - `src/ffi.rs`: minimal C FFI declarations

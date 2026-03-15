@@ -59,7 +59,7 @@ fn run_backend(kind: BackendKind) -> Result<()> {
     let backend = Backend::new(kind)?;
     let backend_name = backend.name()?;
 
-    let ctx_size = Context::recommended_backend_matmul_memory_f32_shapes_bytes(SHAPE_A, SHAPE_B)?;
+    let ctx_size = Context::recommended_backend_matmul_memory::<f32>(SHAPE_A, SHAPE_B)?;
     let ctx = Context::new_no_alloc_bytes(ctx_size)?;
 
     let a = ctx.new_f32_tensor_2d_typed::<AShape>()?;
@@ -72,14 +72,14 @@ fn run_backend(kind: BackendKind) -> Result<()> {
 
     // Backend transfer APIs move host slices into backend-owned tensor storage.
     let _buffer = ctx.allocate_tensors(&backend)?;
-    a.set_f32_backend(&MATRIX_A)?;
-    b.set_f32_backend(&MATRIX_B)?;
+    a.write_data_backend(&MATRIX_A)?;
+    b.write_data_backend(&MATRIX_B)?;
 
     backend.compute(&mut graph)?;
 
     // `graph.last_node()` is the result tensor of this simple single-op graph.
     let output = graph.last_node()?;
-    let values = output.to_vec_f32_backend()?;
+    let values = output.read_data_backend::<f32>()?;
     assert_expected(&values, backend_name);
 
     let shape = output.shape()?;
