@@ -84,6 +84,9 @@ git submodule update --init --recursive
   - use `new_tensor_typed::<T, N>(Dims<N>)` for rank-generic paths,
   - use semantic helpers `new_tensor_1d::<T>(Length)`, `new_tensor_2d::<T>(Shape2D)`,
     `new_tensor_3d::<T>(Shape3D)`, `new_tensor_4d::<T>(Shape4D)` for common shapes.
+- Typed-shape wrappers were expanded to rank-complete generic forms (`2026-03-15`):
+  - wrappers: `Tensor1D/2D/3D/4D` and const aliases `Tensor1DConst..Tensor4DConst`,
+  - constructor helpers: `new_tensor_1d_typed::<T, S>()` ... `new_tensor_4d_typed::<T, S>()`.
 - Root synthetic parity examples are now clap-based and re-verified on CPU/Metal:
   - artifact: `target/benchmarks/review3_constructor_clap_runtime_smoke.txt`.
 

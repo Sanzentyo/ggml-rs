@@ -862,11 +862,64 @@ Detailed entries migrated from `docs/llama-rs/WORKLOG.md` during worklog compact
       - `target/benchmarks/review2_generic_host_io_step1_models6_maskhost_impact.md`
     - checksum parity:
       - `target/benchmarks/review2_generic_host_io_step1_models6_maskhost_checksum_check.md`
-  - means (`on/base`):
-    - CPU `~1.001`
-    - MTL0 `~1.004`
-    - overall `~1.002`
-  - checksum deltas:
-    - `max abs delta = 0.0`
-  - decision:
-    - keep `mask_host_elide=false` default under the current lock (small overall regression).
+- means (`on/base`):
+  - CPU `~1.001`
+  - MTL0 `~1.004`
+  - overall `~1.002`
+- checksum deltas:
+  - `max abs delta = 0.0`
+- decision:
+  - keep `mask_host_elide=false` default under the current lock (small overall regression).
+
+## Typed-tensor/API polish + GPT synthetic continuation
+
+- Rustified `ggml-rs` typed tensor surface:
+  - rewrote `src/typed_tensor.rs` to generic rank-complete wrappers:
+    - `Tensor1D/2D/3D/4D` + `Tensor1DConst..Tensor4DConst`,
+  - added typed constructors:
+    - `new_tensor_1d_typed::<T, S>()` ... `new_tensor_4d_typed::<T, S>()`,
+  - removed remaining scalar-specific typed constructor variants in call sites.
+- Public export/prelude sync:
+  - updated `src/lib.rs` re-exports for new shape/spec traits and typed tensor wrappers.
+- Lock-script hardening:
+  - `scripts/agent_lock.rs` now strips an optional leading `--` argument from `cargo -Zscript` invocation style.
+  - smoke:
+    - `./scripts/agent_lock.sh cargo cargo --version`,
+    - `./scripts/agent_lock.sh bench echo lock-script-ok`.
+- Step `1` continuation (GPT synthetic perf track):
+  - investigated GPT2/GPTJ synthetic loop hotspots.
+  - trialed full `run_ctx` reuse in `llama-rs/src/gpt2_synthetic.rs`; measured regression and reverted to baseline flow.
+    - trial impact artifact:
+      - `target/benchmarks/review4_gpt2_ctx_loopreuse_trial_impact.md` (`trial/base ~1.944`).
+  - implemented low-risk reuse in `examples/gptj_main_synth.rs`:
+    - build context/weights/graph once with fixed token capacity (`prompt_len + n_predict`),
+    - per-step update only token buffer + compute + current-position readback.
+  - parity-config result (`seed=17`, `n_predict=6`):
+    - baseline: `target/benchmarks/gptj_main_synth_rust.txt` (`elapsed_us=1064`),
+    - post: `target/benchmarks/review4_gptj_main_synth_post.txt` (`elapsed_us=985`),
+    - impact: `target/benchmarks/review4_gptj_main_synth_impact.md` (`post/base ~0.926`),
+    - generated tokens and checksum remained identical.
+- Validation and runtime:
+  - `cargo fmt --all`
+  - `cargo clippy --workspace --all-targets`
+  - `cargo test --workspace`
+  - `cargo check --workspace --all-targets --features link-system`
+  - runtime smoke (`--features link-system`, CPU/Metal):
+    - `target/benchmarks/review4_runtime_smoke_post_perfpass.txt`.
+
+## Step2 follow-up (`uv` model assets + real-model CPU/Metal smoke)
+
+- Used `uv` Python workflow to verify required six real GGUF assets under `target/models/*`:
+  - command style: `uv run python - <<'PY' ...`,
+  - artifact: `target/benchmarks/review4_model_asset_uv_check.txt`,
+  - result: `missing_count=0` (`present_count=6`).
+- Cleared the model-acquisition blocker based on confirmed local asset presence.
+- Re-ran real-model runtime smoke (`llama-rs/examples/idle`) on both backends:
+  - Qwen3.5-4B (`target/models/qwen3_5_4b_q4_k_m/...`) and
+  - ELYZA 8B (`target/models/elyza_llama3_jp_8b_q4_k_m/...`),
+  - command profile:
+    - `--layer 0 --decode-kv 64 --iters 1 --pauses 0 cpu metal`,
+  - artifact:
+    - `target/benchmarks/review4_idle_realmodel_cpu_metal_smoke.txt`.
+- Outcome:
+  - CPU and Metal execution succeeded with real model assets in both runs.

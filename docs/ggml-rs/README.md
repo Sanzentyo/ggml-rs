@@ -22,7 +22,8 @@ centered on `Context`, `Tensor`, `Graph`, and `Backend`.
   `Context::recommended_backend_matmul_memory::<T>(...)`.
 - Shape-safe APIs with newtypes (`Shape2D`, `Length`, `TensorIndex`,
   `ThreadCount`, `Bytes`) and const-generic typed shapes
-  (`StaticShape2D<const C, const R>` + `Tensor2D`).
+  (`StaticLength`, `StaticShape2D`, `StaticShape3D`, `StaticShape4D`) plus
+  typed wrappers (`Tensor1D`, `Tensor2D`, `Tensor3D`, `Tensor4D`).
 - Generic tensor-construction entrypoints:
   `Context::new_tensor_typed::<T, N>(...)`, `new_tensor_1d::<T>(Length)`,
   `new_tensor_2d::<T>(Shape2D)`, `new_tensor_3d::<T>(Shape3D)`,
@@ -44,7 +45,7 @@ let out = expr?.into_tensor();
 - `src/gguf.rs`: safe GGUF inspection and writing helpers (`GgufFile`, `GgufWriter`)
 - `src/tensor_expr.rs`: expression wrapper, element traits (`BackendElement`,
   `GgmlElement`) and operator impls
-- `src/typed_tensor.rs`: typed tensor wrappers (`Tensor2D`, `Tensor2DConst`)
+- `src/typed_tensor.rs`: typed tensor wrappers (`Tensor1D..Tensor4D` and const aliases)
 - `src/compute.rs`: context/backend/tensor/graph implementations
 - `src/ffi.rs`: minimal C FFI declarations
 - `src/lib.rs`: public façade and re-exports

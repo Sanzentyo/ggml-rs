@@ -693,6 +693,11 @@ from huggingface_hub import hf_hub_download
 PY
 ```
 
+Latest inventory verification (`uv`):
+
+- `target/benchmarks/review4_model_asset_uv_check.txt`
+- confirmed six required GGUF assets are present (`missing_count=0`).
+
 Baseline run profile used in this session:
 
 ```bash

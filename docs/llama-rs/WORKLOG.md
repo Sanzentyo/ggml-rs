@@ -61,3 +61,16 @@ Detailed logs live under `docs/llama-rs/worklog/`.
 - Added synthetic loop-reuse perf pass for vision/MNIST proxies (reuse graph/context
   across `--synthetic-iters`) and captured impact:
   `target/benchmarks/vision_mnist/loopreuse_impact.md`.
+- Expanded `ggml-rs` typed tensor API to rank-complete generic wrappers
+  (`Tensor1D..Tensor4D` + const aliases) and updated call sites to
+  `new_tensor_2d_typed::<f32, S>()`-style constructors.
+- Continued step `1` with GPT synthetic focus:
+  - tested GPT2 ctx full-reuse candidate and rejected it due measured regression,
+    see `target/benchmarks/review4_gpt2_ctx_loopreuse_trial_impact.md`,
+  - improved `gptj_main_synth` by reusing graph/weights with fixed token-capacity;
+    parity-config timing moved `1064us -> 985us` (`~0.926` post/base) with
+    identical generated tokens/checksum (`target/benchmarks/review4_gptj_main_synth_impact.md`).
+- Continued step `2` with `uv`-based model asset verification:
+  - `target/benchmarks/review4_model_asset_uv_check.txt` confirmed all six required GGUF files (`missing_count=0`),
+  - real-model CPU/Metal idle smoke re-run succeeded for Qwen3.5 and ELYZA:
+    `target/benchmarks/review4_idle_realmodel_cpu_metal_smoke.txt`.

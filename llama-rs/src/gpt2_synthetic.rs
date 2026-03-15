@@ -162,20 +162,18 @@ pub fn run_ctx(config: SyntheticConfig) -> Result<SyntheticReport, SyntheticErro
         let lhs = make_lhs_batch(config.n_embd, active_batch, config.seed, step);
         let ctx = Context::new_bytes(ctx_size)
             .map_err(|source| SyntheticError::ggml("Context::new_bytes", source))?;
-
-        let lhs_tensor = ctx.new_tensor_2d::<f32>(shape_lhs).map_err(|source| {
-            SyntheticError::ggml("Context::new_f32_tensor_2d_shape<A>", source)
-        })?;
-        let rhs_tensor = ctx.new_tensor_2d::<f32>(shape_rhs).map_err(|source| {
-            SyntheticError::ggml("Context::new_f32_tensor_2d_shape<B>", source)
-        })?;
+        let lhs_tensor = ctx
+            .new_tensor_2d::<f32>(shape_lhs)
+            .map_err(|source| SyntheticError::ggml("Context::new_tensor_2d<f32, A>", source))?;
+        let rhs_tensor = ctx
+            .new_tensor_2d::<f32>(shape_rhs)
+            .map_err(|source| SyntheticError::ggml("Context::new_tensor_2d<f32, B>", source))?;
         lhs_tensor
             .write_data(&lhs)
             .map_err(|source| SyntheticError::ggml("Tensor::write_data<A>", source))?;
         rhs_tensor
             .write_data(&rhs)
             .map_err(|source| SyntheticError::ggml("Tensor::write_data<B>", source))?;
-
         let logits = ctx
             .mul_mat(&rhs_tensor, &lhs_tensor)
             .map_err(|source| SyntheticError::ggml("Context::mul_mat", source))?;
@@ -346,10 +344,10 @@ fn run_backend_for_steps(
         .map_err(|source| SyntheticError::ggml("Context::new_no_alloc_bytes", source))?;
     let lhs_tensor = ctx
         .new_tensor_2d::<f32>(shape_lhs)
-        .map_err(|source| SyntheticError::ggml("Context::new_f32_tensor_2d_shape<A>", source))?;
+        .map_err(|source| SyntheticError::ggml("Context::new_tensor_2d<f32, A>", source))?;
     let rhs_tensor = ctx
         .new_tensor_2d::<f32>(shape_rhs)
-        .map_err(|source| SyntheticError::ggml("Context::new_f32_tensor_2d_shape<B>", source))?;
+        .map_err(|source| SyntheticError::ggml("Context::new_tensor_2d<f32, B>", source))?;
     let logits = ctx
         .mul_mat(&rhs_tensor, &lhs_tensor)
         .map_err(|source| SyntheticError::ggml("Context::mul_mat", source))?;

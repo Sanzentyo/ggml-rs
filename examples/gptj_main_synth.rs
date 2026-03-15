@@ -96,45 +96,6 @@ fn tokenize_prompt(prompt: &str) -> Vec<i32> {
     tokens
 }
 
-fn evaluate_logits(weights: &GptjSynthWeights, tokens: &[i32]) -> AppResult<Vec<f32>> {
-    let ctx = Context::new_bytes(Bytes::new(CONTEXT_BYTES))?;
-
-    let token_tensor = ctx.new_tensor_1d::<i32>(Length::new(tokens.len()))?;
-    token_tensor.write_data(tokens)?;
-
-    let token_embedding = ctx.new_tensor_2d::<f32>(Shape2D::new(GPTJ_EMBED, GPTJ_VOCAB))?;
-    let proj_weight = ctx.new_tensor_2d::<f32>(Shape2D::new(GPTJ_EMBED, GPTJ_EMBED))?;
-    let proj_bias = ctx.new_tensor_1d::<f32>(Length::new(GPTJ_EMBED))?;
-    let head_weight = ctx.new_tensor_2d::<f32>(Shape2D::new(GPTJ_EMBED, GPTJ_VOCAB))?;
-    let head_bias = ctx.new_tensor_1d::<f32>(Length::new(GPTJ_VOCAB))?;
-
-    token_embedding.write_data(&weights.token_embedding)?;
-    proj_weight.write_data(&weights.proj_weight)?;
-    proj_bias.write_data(&weights.proj_bias)?;
-    head_weight.write_data(&weights.head_weight)?;
-    head_bias.write_data(&weights.head_bias)?;
-
-    let embeddings = ctx.get_rows(&token_embedding, &token_tensor)?;
-    let hidden_linear = ctx.mul_mat(&proj_weight, &embeddings)?;
-    let hidden_bias = ctx.repeat(&proj_bias, &hidden_linear)?;
-    let hidden = ctx.add(&hidden_linear, &hidden_bias)?;
-    let hidden = ctx.silu(&hidden)?;
-
-    let logits_linear = ctx.mul_mat(&head_weight, &hidden)?;
-    let logits_bias = ctx.repeat(&head_bias, &logits_linear)?;
-    let logits = ctx.add(&logits_linear, &logits_bias)?;
-
-    let mut graph = ctx.new_graph()?;
-    graph.build_forward_expand(&logits);
-    ctx.compute(&mut graph, 1)?;
-
-    let full_logits = graph.last_node()?.read_data::<f32>()?;
-    let start = GPTJ_VOCAB
-        .checked_mul(tokens.len().saturating_sub(1))
-        .ok_or_else(|| AppError::InvalidArgument("logit indexing overflow".into()))?;
-    Ok(full_logits[start..start + GPTJ_VOCAB].to_vec())
-}
-
 fn top_k(values: &[f32], k: usize) -> Vec<(usize, f32)> {
     let mut order: Vec<usize> = (0..values.len()).collect();
     order.sort_by(|lhs, rhs| {
@@ -195,13 +156,54 @@ fn main() -> AppResult<()> {
 
     let mut tokens = tokenize_prompt(&args.prompt);
     let prompt_len = tokens.len();
+    let max_tokens = prompt_len
+        .checked_add(n_predict)
+        .ok_or_else(|| AppError::InvalidArgument("token count overflow".into()))?;
+
+    let ctx = Context::new_bytes(Bytes::new(CONTEXT_BYTES))?;
+    let token_tensor = ctx.new_tensor_1d::<i32>(Length::new(max_tokens))?;
+    let token_embedding = ctx.new_tensor_2d::<f32>(Shape2D::new(GPTJ_EMBED, GPTJ_VOCAB))?;
+    let proj_weight = ctx.new_tensor_2d::<f32>(Shape2D::new(GPTJ_EMBED, GPTJ_EMBED))?;
+    let proj_bias = ctx.new_tensor_1d::<f32>(Length::new(GPTJ_EMBED))?;
+    let head_weight = ctx.new_tensor_2d::<f32>(Shape2D::new(GPTJ_EMBED, GPTJ_VOCAB))?;
+    let head_bias = ctx.new_tensor_1d::<f32>(Length::new(GPTJ_VOCAB))?;
+
+    token_embedding.write_data(&weights.token_embedding)?;
+    proj_weight.write_data(&weights.proj_weight)?;
+    proj_bias.write_data(&weights.proj_bias)?;
+    head_weight.write_data(&weights.head_weight)?;
+    head_bias.write_data(&weights.head_bias)?;
+
+    let embeddings = ctx.get_rows(&token_embedding, &token_tensor)?;
+    let hidden_linear = ctx.mul_mat(&proj_weight, &embeddings)?;
+    let hidden_bias = ctx.repeat(&proj_bias, &hidden_linear)?;
+    let hidden = ctx.add(&hidden_linear, &hidden_bias)?;
+    let hidden = ctx.silu(&hidden)?;
+
+    let logits_linear = ctx.mul_mat(&head_weight, &hidden)?;
+    let logits_bias = ctx.repeat(&head_bias, &logits_linear)?;
+    let logits = ctx.add(&logits_linear, &logits_bias)?;
+
+    let mut graph = ctx.new_graph()?;
+    graph.build_forward_expand(&logits);
+
+    let mut token_buffer = vec![0_i32; max_tokens];
+    token_buffer[..tokens.len()].copy_from_slice(&tokens);
     let started = Instant::now();
 
     let mut generated = Vec::with_capacity(n_predict);
     let mut final_logits = vec![0.0f32; GPTJ_VOCAB];
 
     for _ in 0..n_predict {
-        final_logits = evaluate_logits(&weights, &tokens)?;
+        token_buffer[..tokens.len()].copy_from_slice(&tokens);
+        token_tensor.write_data(&token_buffer)?;
+        ctx.compute(&mut graph, 1)?;
+
+        let full_logits = graph.last_node()?.read_data::<f32>()?;
+        let start = GPTJ_VOCAB
+            .checked_mul(tokens.len().saturating_sub(1))
+            .ok_or_else(|| AppError::InvalidArgument("logit indexing overflow".into()))?;
+        final_logits = full_logits[start..start + GPTJ_VOCAB].to_vec();
         let next = argmax(&final_logits) as i32;
         tokens.push(next);
         generated.push(next);
