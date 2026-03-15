@@ -13,6 +13,7 @@ use std::os::raw::c_int;
 use std::ptr::{self, NonNull};
 
 const SIMPLE_CONTEXT_SLACK_BYTES: usize = 1024;
+const CONTIGUOUS_BULK_COPY_MIN_ELEMS: usize = 256;
 
 /// Initializes ggml global timing infrastructure.
 pub fn init_timing() {
@@ -38,7 +39,9 @@ pub fn tensor_element_count(ggml_type_raw: c_int, payload_bytes: usize) -> Resul
     let ggml_type = resolve_ggml_type(ggml_type_raw)?;
     let block_size = unsafe { ffi::ggml_blck_size(ggml_type) }
         .try_into_checked()
-        .map_err(|source| Error::int_conversion("ggml_blck_size", source))?;
+        .map_err(|source: std::num::TryFromIntError| {
+            Error::int_conversion("ggml_blck_size", source)
+        })?;
     let type_size = unsafe { ffi::ggml_type_size(ggml_type) };
     if block_size == 0 || type_size == 0 {
         return Err(Error::UnsupportedType(ggml_type_raw));
@@ -83,7 +86,9 @@ pub fn decode_tensor_data_to_f32(
     if element_count == 0 {
         return Ok(());
     }
-    out.resize(element_count, 0.0);
+    if out.capacity() < element_count {
+        out.reserve(element_count - out.capacity());
+    }
 
     if unsafe { ffi::ggml_is_quantized(ggml_type) } {
         unsafe { ffi::ggml_quantize_init(ggml_type) };
@@ -93,7 +98,14 @@ pub fn decode_tensor_data_to_f32(
         .try_into_checked()
         .map_err(|source| Error::int_conversion("decode_tensor_data_to_f32(k)", source))?;
     unsafe {
-        to_float(payload.as_ptr().cast(), out.as_mut_ptr(), k);
+        // SAFETY:
+        // - `out` is cleared above, so all capacity is spare and writable.
+        // - Capacity is ensured to be at least `element_count`.
+        // - `to_float` writes exactly `k == element_count` `f32` values into `dst`.
+        // - We set the vector length only after `to_float` completes.
+        let dst = out.spare_capacity_mut().as_mut_ptr().cast::<f32>();
+        to_float(payload.as_ptr().cast(), dst, k);
+        out.set_len(element_count);
     }
     Ok(())
 }
@@ -912,6 +924,18 @@ impl<'ctx> Tensor<'ctx> {
         unsafe { ffi::ggml_nbytes(self.raw.as_ptr()) }
     }
 
+    fn is_contiguous(&self) -> bool {
+        unsafe { ffi::ggml_is_contiguous(self.raw.as_ptr()) as i32 != 0 }
+    }
+
+    fn contiguous_data_ptr<T>(&self) -> Option<NonNull<T>> {
+        if !self.is_contiguous() {
+            return None;
+        }
+        let raw = unsafe { ffi::ggml_get_data(self.raw.as_ptr()) }.cast::<T>();
+        NonNull::new(raw)
+    }
+
     fn expected_nbytes_for<T: BackendElement>(&self) -> Result<usize> {
         let elements = self.element_count()?;
         elements.checked_mul_checked(std::mem::size_of::<T>())
@@ -957,6 +981,22 @@ impl<'ctx> Tensor<'ctx> {
                 expected,
                 actual: values.len(),
             });
+        }
+
+        if expected >= CONTIGUOUS_BULK_COPY_MIN_ELEMS {
+            let expected_nbytes = expected.checked_mul_checked(std::mem::size_of::<f32>())?;
+            if expected_nbytes == self.nbytes()
+                && let Some(dst) = self.contiguous_data_ptr::<f32>()
+            {
+                unsafe {
+                    // SAFETY:
+                    // - `dst` points to contiguous tensor storage returned by ggml.
+                    // - Byte-size compatibility was validated above, so `expected` `f32`s fit.
+                    // - Source and destination do not overlap (`values` is caller-owned host slice).
+                    ptr::copy_nonoverlapping(values.as_ptr(), dst.as_ptr(), expected);
+                }
+                return Ok(());
+            }
         }
 
         for (index, value) in values.iter().copied().enumerate() {
@@ -1069,6 +1109,24 @@ impl<'ctx> Tensor<'ctx> {
     /// Reads all values through context tensor APIs.
     pub fn to_vec_f32(&self) -> Result<Vec<f32>> {
         let len = self.element_count()?;
+        if len >= CONTIGUOUS_BULK_COPY_MIN_ELEMS {
+            let expected_nbytes = len.checked_mul_checked(std::mem::size_of::<f32>())?;
+            if expected_nbytes == self.nbytes()
+                && let Some(src) = self.contiguous_data_ptr::<f32>()
+            {
+                let mut out = Vec::with_capacity(len);
+                unsafe {
+                    // SAFETY:
+                    // - `src` points to contiguous tensor storage of `len` `f32` elements.
+                    // - `out` has capacity for `len` elements; `copy_nonoverlapping` initializes them.
+                    // - We set length after initializing all elements.
+                    ptr::copy_nonoverlapping(src.as_ptr(), out.as_mut_ptr(), len);
+                    out.set_len(len);
+                }
+                return Ok(out);
+            }
+        }
+
         let mut out = Vec::with_capacity(len);
 
         for index in 0..len {
@@ -1101,14 +1159,19 @@ impl<'ctx> Tensor<'ctx> {
             });
         }
 
-        let mut out = vec![T::default(); len];
+        let mut out = Vec::<T>::with_capacity(len);
         unsafe {
+            // SAFETY:
+            // - `out` has capacity for `len` elements matching `expected_nbytes`.
+            // - ggml writes exactly `expected_nbytes` bytes into the destination buffer.
+            // - Length is set only after the backend write completes.
             ffi::ggml_backend_tensor_get(
                 self.raw.as_ptr(),
                 out.as_mut_ptr().cast(),
                 0,
                 expected_nbytes,
             );
+            out.set_len(len);
         }
         Ok(out)
     }

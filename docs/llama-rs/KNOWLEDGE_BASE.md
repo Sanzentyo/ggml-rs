@@ -1021,6 +1021,8 @@ What it does:
 - builds and runs `llama-rs/tests/cpp/attention_decode_proxy_reference.cpp` (ggml C++ reference),
 - runs `llama-rs` decode-proxy path with the same deterministic graph and shape cases,
 - reports `rust_avg`, `cpp_avg`, `rust/cpp`, and checksum deltas.
+- C++ include resolution respects `GGML_RS_GGML_INCLUDE_DIR` when set, then falls back to
+  `target/vendor/ggml/include` from the workspace.
 
 Artifacts:
 

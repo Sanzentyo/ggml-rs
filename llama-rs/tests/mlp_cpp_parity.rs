@@ -64,8 +64,11 @@ fn compile_cpp_reference() -> Result<PathBuf, Box<dyn Error>> {
     let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
     let source = manifest_dir.join("tests/cpp/mlp_reference.cpp");
     let ggml_root = ggml_root_dir();
-    let ggml_include = ggml_root.join("include");
-    let ggml_src = ggml_root.join("src");
+    let ggml_include = ggml_include_dir(&ggml_root);
+    let ggml_src = ggml_include
+        .parent()
+        .map(|parent| parent.join("src"))
+        .unwrap_or_else(|| ggml_root.join("src"));
     let ggml_lib = ggml_lib_dir(&ggml_root);
     let output = std::env::temp_dir().join(format!(
         "mlp_reference_{}_{}",
@@ -104,6 +107,12 @@ fn ggml_root_dir() -> PathBuf {
     std::env::var("GGML_CPP_REFERENCE_GGML_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|_| workspace_root().join("target/vendor/ggml"))
+}
+
+fn ggml_include_dir(ggml_root: &Path) -> PathBuf {
+    std::env::var_os("GGML_RS_GGML_INCLUDE_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| ggml_root.join("include"))
 }
 
 fn workspace_root() -> PathBuf {
