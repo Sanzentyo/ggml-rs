@@ -39,15 +39,15 @@ pub use gguf::{GgufArrayValue, GgufFile, GgufTensorInfo, GgufType, GgufValue, Gg
 pub use shape::{
     Bytes, Cols, Length, Rows, Shape2D, Shape2DSpec, StaticShape2D, TensorIndex, ThreadCount,
 };
-pub use tensor_expr::{BackendElement, TensorExpr};
+pub use tensor_expr::{BackendElement, GgmlElement, TensorExpr};
 pub use typed_tensor::{Tensor2D, Tensor2DConst};
 pub use types::{BackendDeviceType, BackendKind, ComputeStatus, RopeExtParams, Type};
 
 pub mod prelude {
     pub use crate::{
         Backend, BackendBuffer, BackendDeviceType, BackendElement, BackendKind, Bytes, Cols,
-        ComputeStatus, Context, GgufArrayValue, GgufFile, GgufValue, GgufWriter, Graph, Length,
-        RopeExtParams, Rows, Shape2D, Shape2DSpec, StaticShape2D, Tensor, Tensor2D, Tensor2DConst,
-        TensorExpr, TensorIndex, ThreadCount, Type,
+        ComputeStatus, Context, GgmlElement, GgufArrayValue, GgufFile, GgufValue, GgufWriter,
+        Graph, Length, RopeExtParams, Rows, Shape2D, Shape2DSpec, StaticShape2D, Tensor, Tensor2D,
+        Tensor2DConst, TensorExpr, TensorIndex, ThreadCount, Type,
     };
 }

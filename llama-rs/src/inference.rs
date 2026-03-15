@@ -700,14 +700,10 @@ pub fn linear_inference_with_weights_repeats(
 
     let weight_shape = Shape2D::new(weights.in_features, weights.out_features);
     let input_shape = Shape2D::new(weights.in_features, 1);
-    let ctx_size =
-        Context::recommended_backend_matmul_memory_f32_shapes_bytes(weight_shape, input_shape)
-            .map_err(|source| {
-                InferenceError::ggml(
-                    "Context::recommended_backend_matmul_memory_f32_shapes_bytes",
-                    source,
-                )
-            })?;
+    let ctx_size = Context::recommended_backend_matmul_memory::<f32>(weight_shape, input_shape)
+        .map_err(|source| {
+            InferenceError::ggml("Context::recommended_backend_matmul_memory::<f32>", source)
+        })?;
     let runtime = DefaultBackendRuntimeBuilder.build_runtime(backend_kind, ctx_size)?;
     let backend = runtime.backend;
     let backend_name = runtime.backend_name;
@@ -932,23 +928,23 @@ fn recommended_mlp_backend_memory_bytes(
     hidden_features: usize,
     ffn_features: usize,
 ) -> Result<ggml_rs::Bytes, InferenceError> {
-    let gate_matmul = Context::recommended_backend_matmul_memory_f32_shapes_bytes(
+    let gate_matmul = Context::recommended_backend_matmul_memory::<f32>(
         Shape2D::new(hidden_features, ffn_features),
         Shape2D::new(hidden_features, 1),
     )
     .map_err(|source| {
         InferenceError::ggml(
-            "Context::recommended_backend_matmul_memory_f32_shapes_bytes(gate)",
+            "Context::recommended_backend_matmul_memory::<f32>(gate)",
             source,
         )
     })?;
-    let down_matmul = Context::recommended_backend_matmul_memory_f32_shapes_bytes(
+    let down_matmul = Context::recommended_backend_matmul_memory::<f32>(
         Shape2D::new(ffn_features, hidden_features),
         Shape2D::new(ffn_features, 1),
     )
     .map_err(|source| {
         InferenceError::ggml(
-            "Context::recommended_backend_matmul_memory_f32_shapes_bytes(down)",
+            "Context::recommended_backend_matmul_memory::<f32>(down)",
             source,
         )
     })?;
@@ -2376,53 +2372,53 @@ fn recommended_attention_backend_memory_bytes_for_lengths(
     let kv_features = config.kv_features();
     let head_dimension = config.head_dimension();
 
-    let q_projection = Context::recommended_backend_matmul_memory_f32_shapes_bytes(
+    let q_projection = Context::recommended_backend_matmul_memory::<f32>(
         Shape2D::new(hidden_features, query_features),
         Shape2D::new(hidden_features, query_length),
     )
     .map_err(|source| {
         InferenceError::ggml(
-            "Context::recommended_backend_matmul_memory_f32_shapes_bytes(q_projection)",
+            "Context::recommended_backend_matmul_memory::<f32>(q_projection)",
             source,
         )
     })?;
-    let kv_projection = Context::recommended_backend_matmul_memory_f32_shapes_bytes(
+    let kv_projection = Context::recommended_backend_matmul_memory::<f32>(
         Shape2D::new(hidden_features, kv_features),
         Shape2D::new(hidden_features, key_value_length),
     )
     .map_err(|source| {
         InferenceError::ggml(
-            "Context::recommended_backend_matmul_memory_f32_shapes_bytes(kv_projection)",
+            "Context::recommended_backend_matmul_memory::<f32>(kv_projection)",
             source,
         )
     })?;
-    let score_matmul = Context::recommended_backend_matmul_memory_f32_shapes_bytes(
+    let score_matmul = Context::recommended_backend_matmul_memory::<f32>(
         Shape2D::new(head_dimension, key_value_length),
         Shape2D::new(head_dimension, query_length),
     )
     .map_err(|source| {
         InferenceError::ggml(
-            "Context::recommended_backend_matmul_memory_f32_shapes_bytes(score)",
+            "Context::recommended_backend_matmul_memory::<f32>(score)",
             source,
         )
     })?;
-    let value_matmul = Context::recommended_backend_matmul_memory_f32_shapes_bytes(
+    let value_matmul = Context::recommended_backend_matmul_memory::<f32>(
         Shape2D::new(key_value_length, head_dimension),
         Shape2D::new(key_value_length, query_length),
     )
     .map_err(|source| {
         InferenceError::ggml(
-            "Context::recommended_backend_matmul_memory_f32_shapes_bytes(value)",
+            "Context::recommended_backend_matmul_memory::<f32>(value)",
             source,
         )
     })?;
-    let output_projection = Context::recommended_backend_matmul_memory_f32_shapes_bytes(
+    let output_projection = Context::recommended_backend_matmul_memory::<f32>(
         Shape2D::new(head_dimension, hidden_features),
         Shape2D::new(head_dimension, query_length),
     )
     .map_err(|source| {
         InferenceError::ggml(
-            "Context::recommended_backend_matmul_memory_f32_shapes_bytes(output_projection)",
+            "Context::recommended_backend_matmul_memory::<f32>(output_projection)",
             source,
         )
     })?;

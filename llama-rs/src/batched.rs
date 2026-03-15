@@ -333,12 +333,9 @@ pub fn batched_matmul_with_workload(
 
     let shape_a = Shape2D::new(config.cols_a, config.rows_a);
     let shape_b = Shape2D::new(config.cols_b, config.rows_b);
-    let ctx_size = Context::recommended_backend_matmul_memory_f32_shapes_bytes(shape_a, shape_b)
-        .map_err(|source| {
-            BatchedError::ggml(
-                "Context::recommended_backend_matmul_memory_f32_shapes_bytes",
-                source,
-            )
+    let ctx_size =
+        Context::recommended_backend_matmul_memory::<f32>(shape_a, shape_b).map_err(|source| {
+            BatchedError::ggml("Context::recommended_backend_matmul_memory::<f32>", source)
         })?;
     let ctx = Context::new_no_alloc_bytes(ctx_size)
         .map_err(|source| BatchedError::ggml("Context::new_no_alloc_bytes", source))?;

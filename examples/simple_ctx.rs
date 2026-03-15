@@ -17,13 +17,13 @@ fn main() -> Result<()> {
     let matrix_a: [f32; ROWS_A * COLS_A] = [2.0, 8.0, 5.0, 1.0, 4.0, 2.0, 8.0, 6.0];
     let matrix_b: [f32; ROWS_B * COLS_B] = [10.0, 5.0, 9.0, 9.0, 5.0, 4.0];
 
-    let ctx_size = Context::recommended_matmul_memory_f32_shapes_bytes(SHAPE_A, SHAPE_B)?;
+    let ctx_size = Context::recommended_matmul_memory::<f32>(SHAPE_A, SHAPE_B)?;
     let ctx = Context::new_bytes(ctx_size)?;
 
     let a = ctx.new_f32_tensor_2d_typed::<AShape>()?;
     let b = ctx.new_f32_tensor_2d_typed::<BShape>()?;
-    a.set_f32(&matrix_a)?;
-    b.set_f32(&matrix_b)?;
+    a.write_data(&matrix_a)?;
+    b.write_data(&matrix_b)?;
 
     // Legacy context execution path mirrors upstream simple-ctx behavior.
     let result = ctx.mul_mat(a.inner(), b.inner())?;
@@ -32,7 +32,7 @@ fn main() -> Result<()> {
     ctx.compute(&mut graph, 1)?;
 
     let output = graph.last_node()?;
-    let values = output.to_vec_f32()?;
+    let values = output.read_data::<f32>()?;
     let shape = output.shape()?;
     let cols = shape.cols.get();
     let rows = shape.rows.get();

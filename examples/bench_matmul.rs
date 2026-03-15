@@ -52,7 +52,7 @@ fn run_bench(kind: BackendKind, iters: usize) -> Result<(), ggml_rs::Error> {
     let backend = Backend::new(kind)?;
     let backend_name = backend.name()?.to_string();
 
-    let ctx_size = Context::recommended_backend_matmul_memory_f32_shapes_bytes(SHAPE_A, SHAPE_B)?;
+    let ctx_size = Context::recommended_backend_matmul_memory::<f32>(SHAPE_A, SHAPE_B)?;
     let ctx = Context::new_no_alloc_bytes(ctx_size)?;
 
     let a = ctx.new_f32_tensor_2d_shape(SHAPE_A)?;
@@ -69,8 +69,8 @@ fn run_bench(kind: BackendKind, iters: usize) -> Result<(), ggml_rs::Error> {
     let data_b: Vec<f32> = (0..(ROWS_B * COLS_B))
         .map(|i| (i % 17) as f32 * 0.0625)
         .collect();
-    a.set_f32_backend(&data_a)?;
-    b.set_f32_backend(&data_b)?;
+    a.write_data_backend(&data_a)?;
+    b.write_data_backend(&data_b)?;
 
     for _ in 0..3 {
         backend.compute(&mut graph)?;
@@ -83,7 +83,7 @@ fn run_bench(kind: BackendKind, iters: usize) -> Result<(), ggml_rs::Error> {
     let elapsed = start.elapsed();
     let avg_ms = elapsed.as_secs_f64() * 1000.0 / iters as f64;
 
-    let out = graph.last_node()?.to_vec_f32_backend()?;
+    let out = graph.last_node()?.read_data_backend::<f32>()?;
     let checksum: f64 = out.iter().take(16).map(|v| f64::from(*v)).sum();
 
     println!(

@@ -3,8 +3,8 @@
 use crate::ffi;
 use crate::num_ext::{CheckedFieldOps, TryIntoChecked};
 use crate::{
-    BackendDeviceType, BackendElement, BackendKind, Bytes, Cols, ComputeStatus, Error, Length,
-    Result, RopeExtParams, Rows, Shape2D, TensorExpr, TensorIndex, ThreadCount, Type,
+    BackendDeviceType, BackendElement, BackendKind, Bytes, Cols, ComputeStatus, Error, GgmlElement,
+    Length, Result, RopeExtParams, Rows, Shape2D, TensorExpr, TensorIndex, ThreadCount, Type,
 };
 use std::ffi::{CStr, CString};
 use std::marker::PhantomData;
@@ -337,6 +337,55 @@ impl Context {
         })
     }
 
+    fn recommended_matmul_memory_impl(
+        lhs: Shape2D,
+        rhs: Shape2D,
+        element_type: Type,
+        backend_only: bool,
+    ) -> Result<Bytes> {
+        ensure_matmul_compatible(lhs.cols.get(), rhs.cols.get())?;
+
+        let tensors_overhead = 3usize.checked_mul_checked(tensor_overhead_bytes())?;
+        let graph_and_slack =
+            graph_overhead_bytes().checked_add_checked(SIMPLE_CONTEXT_SLACK_BYTES)?;
+
+        if backend_only {
+            let total = tensors_overhead.checked_add_checked(graph_and_slack)?;
+            return Ok(Bytes::new(total));
+        }
+
+        // Keep this estimate conservative so examples and tests can reuse the
+        // same helper without needing backend-specific tuning.
+        let matrix_a_elements = lhs.rows.get().checked_mul_checked(lhs.cols.get())?;
+        let matrix_b_elements = rhs.rows.get().checked_mul_checked(rhs.cols.get())?;
+        let matrix_result_elements = lhs.rows.get().checked_mul_checked(rhs.rows.get())?;
+        let element_size = type_size(element_type);
+
+        let matrix_a_bytes = matrix_a_elements.checked_mul_checked(element_size)?;
+        let matrix_b_bytes = matrix_b_elements.checked_mul_checked(element_size)?;
+        let matrix_result_bytes = matrix_result_elements.checked_mul_checked(element_size)?;
+
+        let total = matrix_a_bytes
+            .checked_add_checked(matrix_b_bytes)?
+            .checked_add_checked(matrix_result_bytes)?
+            .checked_add_checked(tensors_overhead)?
+            .checked_add_checked(graph_and_slack)?;
+        Ok(Bytes::new(total))
+    }
+
+    /// Returns a conservative memory estimate for typed matmul on context path.
+    pub fn recommended_matmul_memory<T: GgmlElement>(lhs: Shape2D, rhs: Shape2D) -> Result<Bytes> {
+        Self::recommended_matmul_memory_impl(lhs, rhs, T::GGML_TYPE, false)
+    }
+
+    /// Returns a conservative memory estimate for typed matmul on backend path.
+    pub fn recommended_backend_matmul_memory<T: GgmlElement>(
+        lhs: Shape2D,
+        rhs: Shape2D,
+    ) -> Result<Bytes> {
+        Self::recommended_matmul_memory_impl(lhs, rhs, T::GGML_TYPE, true)
+    }
+
     /// Returns a conservative memory estimate for `f32` matmul on context path.
     pub fn recommended_matmul_memory_f32(
         rows_a: usize,
@@ -356,31 +405,9 @@ impl Context {
         Ok(Self::recommended_matmul_memory_f32_shapes_bytes(lhs, rhs)?.get())
     }
 
-    /// Returns a conservative memory estimate as `Bytes`.
+    /// Compatibility wrapper around typed `recommended_matmul_memory::<f32>`.
     pub fn recommended_matmul_memory_f32_shapes_bytes(lhs: Shape2D, rhs: Shape2D) -> Result<Bytes> {
-        ensure_matmul_compatible(lhs.cols.get(), rhs.cols.get())?;
-
-        // Keep this estimate conservative so examples and tests can reuse the
-        // same helper without needing backend-specific tuning.
-        let matrix_a_elements = lhs.rows.get().checked_mul_checked(lhs.cols.get())?;
-        let matrix_b_elements = rhs.rows.get().checked_mul_checked(rhs.cols.get())?;
-        let matrix_result_elements = lhs.rows.get().checked_mul_checked(rhs.rows.get())?;
-
-        let matrix_a_bytes = matrix_a_elements.checked_mul_checked(type_size(Type::F32))?;
-        let matrix_b_bytes = matrix_b_elements.checked_mul_checked(type_size(Type::F32))?;
-        let matrix_result_bytes =
-            matrix_result_elements.checked_mul_checked(type_size(Type::F32))?;
-
-        let tensors_overhead = 3usize.checked_mul_checked(tensor_overhead_bytes())?;
-        let graph_and_slack =
-            graph_overhead_bytes().checked_add_checked(SIMPLE_CONTEXT_SLACK_BYTES)?;
-
-        let total = matrix_a_bytes
-            .checked_add_checked(matrix_b_bytes)?
-            .checked_add_checked(matrix_result_bytes)?
-            .checked_add_checked(tensors_overhead)?
-            .checked_add_checked(graph_and_slack)?;
-        Ok(Bytes::new(total))
+        Self::recommended_matmul_memory::<f32>(lhs, rhs)
     }
 
     /// Returns a conservative memory estimate for backend no-alloc matmul context.
@@ -405,18 +432,12 @@ impl Context {
         Ok(Self::recommended_backend_matmul_memory_f32_shapes_bytes(lhs, rhs)?.get())
     }
 
-    /// Returns a conservative backend memory estimate as `Bytes`.
+    /// Compatibility wrapper around typed `recommended_backend_matmul_memory::<f32>`.
     pub fn recommended_backend_matmul_memory_f32_shapes_bytes(
         lhs: Shape2D,
         rhs: Shape2D,
     ) -> Result<Bytes> {
-        ensure_matmul_compatible(lhs.cols.get(), rhs.cols.get())?;
-
-        let tensors_overhead = 3usize.checked_mul_checked(tensor_overhead_bytes())?;
-        let graph_and_slack =
-            graph_overhead_bytes().checked_add_checked(SIMPLE_CONTEXT_SLACK_BYTES)?;
-        let total = tensors_overhead.checked_add_checked(graph_and_slack)?;
-        Ok(Bytes::new(total))
+        Self::recommended_backend_matmul_memory::<f32>(lhs, rhs)
     }
 
     /// Allocates backend storage for all tensors currently owned by this context.
@@ -973,6 +994,40 @@ impl<'ctx> Tensor<'ctx> {
         Ok(cstr.to_str()?.to_owned())
     }
 
+    /// Writes host values using typed tensor I/O dispatch.
+    pub fn write_data<T: GgmlElement>(&self, values: &[T]) -> Result<()> {
+        T::write_data(self, values)
+    }
+
+    /// Writes backend values with an element type inferred from the slice.
+    pub fn write_data_backend<T: BackendElement>(&self, values: &[T]) -> Result<()> {
+        self.set_backend_slice(values)
+    }
+
+    /// Writes backend values at the provided element offset.
+    pub fn write_data_backend_at<T: BackendElement>(
+        &self,
+        element_offset: usize,
+        values: &[T],
+    ) -> Result<()> {
+        self.set_backend_slice_at(element_offset, values)
+    }
+
+    /// Reads all host values using typed tensor I/O dispatch.
+    pub fn read_data<T: GgmlElement>(&self) -> Result<Vec<T>> {
+        T::read_data(self)
+    }
+
+    /// Reads all backend values for the requested element type.
+    pub fn read_data_backend<T: BackendElement>(&self) -> Result<Vec<T>> {
+        self.to_vec_backend()
+    }
+
+    /// Reads one element using typed tensor I/O dispatch.
+    pub fn get_data<T: GgmlElement>(&self, index: TensorIndex) -> Result<T> {
+        T::get_data(self, index)
+    }
+
     /// Writes host `f32` values through context tensor APIs.
     pub fn set_f32(&self, values: &[f32]) -> Result<()> {
         let expected = self.element_count()?;
@@ -1012,11 +1067,11 @@ impl<'ctx> Tensor<'ctx> {
     }
 
     pub fn set_f32_backend(&self, values: &[f32]) -> Result<()> {
-        self.set_backend_slice(values)
+        self.write_data_backend(values)
     }
 
     pub fn set_f32_backend_at(&self, element_offset: usize, values: &[f32]) -> Result<()> {
-        self.set_backend_slice_at(element_offset, values)
+        self.write_data_backend_at(element_offset, values)
     }
 
     /// Writes host values through backend tensor APIs.
@@ -1081,11 +1136,11 @@ impl<'ctx> Tensor<'ctx> {
     }
 
     pub fn set_i32_backend(&self, values: &[i32]) -> Result<()> {
-        self.set_backend_slice(values)
+        self.write_data_backend(values)
     }
 
     pub fn set_i32_backend_at(&self, element_offset: usize, values: &[i32]) -> Result<()> {
-        self.set_backend_slice_at(element_offset, values)
+        self.write_data_backend_at(element_offset, values)
     }
 
     /// Reads a single `f32` element with bounds checking.
@@ -1140,11 +1195,11 @@ impl<'ctx> Tensor<'ctx> {
     }
 
     pub fn to_vec_f32_backend(&self) -> Result<Vec<f32>> {
-        self.to_vec_backend()
+        self.read_data_backend()
     }
 
     pub fn to_vec_i32_backend(&self) -> Result<Vec<i32>> {
-        self.to_vec_backend()
+        self.read_data_backend()
     }
 
     /// Reads all values through backend tensor APIs.

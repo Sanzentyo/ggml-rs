@@ -23,7 +23,7 @@ const EXPECTED: [f32; ROWS_A * ROWS_B] = [
 fn matmul_simple_ctx_parity() -> Result<(), ggml_rs::Error> {
     ggml_rs::init_timing();
 
-    let mem = Context::recommended_matmul_memory_f32_shapes_bytes(SHAPE_A, SHAPE_B)?;
+    let mem = Context::recommended_matmul_memory::<f32>(SHAPE_A, SHAPE_B)?;
     let ctx = Context::new_bytes(mem)?;
 
     let a = ctx.new_f32_tensor_2d_shape(SHAPE_A)?;

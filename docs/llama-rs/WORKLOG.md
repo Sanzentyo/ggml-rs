@@ -671,3 +671,29 @@ Detailed logs are split under `docs/llama-rs/worklog/` to keep this top-level fi
     - overall `~1.008`.
 - Policy for this pass:
   - keep `mask_host_elide=false` as default (CPU-side regression dominates on the current hotspot slice).
+
+## Review2 worktree refactor pass
+
+- Added review2-focused API unification in `ggml-rs` while preserving existing behavior:
+  - new generic memory APIs:
+    - `Context::recommended_matmul_memory::<T>(lhs, rhs) -> Result<Bytes>`,
+    - `Context::recommended_backend_matmul_memory::<T>(lhs, rhs) -> Result<Bytes>`,
+  - legacy `*_f32*_shapes*_bytes` helpers kept as compatibility wrappers.
+- Added typed tensor I/O dispatch API:
+  - `GgmlElement` trait (`f32`, `i32`) and generic methods on `Tensor`:
+    - `write_data`, `write_data_backend`, `write_data_backend_at`,
+    - `read_data`, `read_data_backend`, `get_data`.
+  - updated ggml examples to exercise the new generic surface.
+- Migrated llama-rs memory-sizing call sites to the generic helpers (`::<f32>`).
+- Validation completed in review2 worktree:
+  - `cargo fmt --all`,
+  - `cargo clippy --workspace --all-targets`,
+  - `cargo test --workspace`,
+  - runtime smoke:
+    - `examples/simple_ctx`,
+    - `examples/backend_matmul` (CPU + Metal),
+    - `llama-rs/examples/backend_smoke` (CPU + Metal).
+- Regression guard snapshots (`master` vs `review2`):
+  - `target/benchmarks/review2_bench_matmul_master_vs_refactor.md`,
+  - `target/benchmarks/review2_llamars_bench_matmul_master_vs_refactor.md`,
+  - both show no regression signal in this pass (sampled ratios stay within expected run-to-run noise envelope, with several improvements).
