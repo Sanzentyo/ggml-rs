@@ -595,3 +595,7 @@ Detailed logs are split under `docs/llama-rs/worklog/` to keep this top-level fi
   - Candidate B complete:
     - introduced head-output projection mode ADT + assembler (`per-head`, `fused concat`, `fused staging`),
     - runtime smoke artifact: `target/benchmarks/llama_rs_head_output_mode_adt_smoke.txt`.
+  - Candidate C complete:
+    - introduced `StepwiseGraphBuilder` + `KvPolicyStepwiseGraphBuilder` and `StepwiseGraphBuildInput`,
+    - centralized stepwise graph construction (graph count, prereq nodes, KV write wiring) under one ADT-driven builder,
+    - runtime smoke artifact: `target/benchmarks/llama_rs_stepwise_graph_builder_adt_smoke.txt`.

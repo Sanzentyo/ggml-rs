@@ -301,6 +301,68 @@ impl KvCacheWriteStrategy for StepSpecificKvCacheWriteStrategy {
     }
 }
 
+struct StepwiseGraphBuildInput<'ctx> {
+    steps: usize,
+    y: &'ctx ggml_rs::Tensor<'ctx>,
+    projected_k_step: Option<&'ctx ggml_rs::Tensor<'ctx>>,
+    projected_v_step: Option<&'ctx ggml_rs::Tensor<'ctx>>,
+    head_prereq_nodes: &'ctx [ggml_rs::Tensor<'ctx>],
+    kv_cache_write_nodes: &'ctx KvCacheWriteNodes<'ctx>,
+}
+
+trait StepwiseGraphBuilder {
+    fn build_graphs<'ctx>(
+        &self,
+        ctx: &'ctx Context,
+        input: StepwiseGraphBuildInput<'ctx>,
+    ) -> Result<Vec<ggml_rs::Graph<'ctx>>, InferenceError>;
+}
+
+struct KvPolicyStepwiseGraphBuilder<'strategy> {
+    kv_cache_write_strategy: &'strategy dyn KvCacheWriteStrategy,
+}
+
+impl<'strategy> KvPolicyStepwiseGraphBuilder<'strategy> {
+    fn new(kv_cache_write_strategy: &'strategy dyn KvCacheWriteStrategy) -> Self {
+        Self {
+            kv_cache_write_strategy,
+        }
+    }
+}
+
+impl StepwiseGraphBuilder for KvPolicyStepwiseGraphBuilder<'_> {
+    fn build_graphs<'ctx>(
+        &self,
+        ctx: &'ctx Context,
+        input: StepwiseGraphBuildInput<'ctx>,
+    ) -> Result<Vec<ggml_rs::Graph<'ctx>>, InferenceError> {
+        let graph_count = self.kv_cache_write_strategy.graph_count(input.steps);
+        let mut graphs = Vec::with_capacity(graph_count);
+        for graph_step in 0..graph_count {
+            let mut graph = ctx
+                .new_graph()
+                .map_err(|source| InferenceError::ggml("Context::new_graph", source))?;
+            for head_output_write in input.head_prereq_nodes {
+                graph.build_forward_expand(head_output_write);
+            }
+            graph.build_forward_expand(input.y);
+            if let Some(projected_k_step) = input.projected_k_step {
+                graph.build_forward_expand(projected_k_step);
+            }
+            if let Some(projected_v_step) = input.projected_v_step {
+                graph.build_forward_expand(projected_v_step);
+            }
+            self.kv_cache_write_strategy.expand_graph_nodes(
+                &mut graph,
+                graph_step,
+                input.kv_cache_write_nodes,
+            );
+            graphs.push(graph);
+        }
+        Ok(graphs)
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 enum HeadOutputProjectionMode {
     PerHead,
@@ -1448,25 +1510,17 @@ fn execute_stepwise_sweep_internal(
         y_attention
     };
 
-    let graph_count = kv_cache_write_strategy.graph_count(steps);
-    let mut graphs = Vec::with_capacity(graph_count);
-    for graph_step in 0..graph_count {
-        let mut graph = ctx
-            .new_graph()
-            .map_err(|source| InferenceError::ggml("Context::new_graph", source))?;
-        for head_output_write in head_output_assembler.graph_prereq_nodes() {
-            graph.build_forward_expand(head_output_write);
-        }
-        graph.build_forward_expand(&y);
-        if let Some(projected_k_step) = projected_k_step.as_ref() {
-            graph.build_forward_expand(projected_k_step);
-        }
-        if let Some(projected_v_step) = projected_v_step.as_ref() {
-            graph.build_forward_expand(projected_v_step);
-        }
-        kv_cache_write_strategy.expand_graph_nodes(&mut graph, graph_step, &kv_cache_write_nodes);
-        graphs.push(graph);
-    }
+    let mut graphs = KvPolicyStepwiseGraphBuilder::new(kv_cache_write_strategy).build_graphs(
+        &ctx,
+        StepwiseGraphBuildInput {
+            steps,
+            y: &y,
+            projected_k_step: projected_k_step.as_ref(),
+            projected_v_step: projected_v_step.as_ref(),
+            head_prereq_nodes: head_output_assembler.graph_prereq_nodes(),
+            kv_cache_write_nodes: &kv_cache_write_nodes,
+        },
+    )?;
     let _buffer = ctx
         .allocate_tensors(&backend)
         .map_err(|source| InferenceError::ggml("Context::allocate_tensors", source))?;
