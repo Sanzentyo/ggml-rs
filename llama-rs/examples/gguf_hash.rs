@@ -5,10 +5,10 @@ use std::error::Error as StdError;
 use thiserror::Error;
 
 fn main() -> Result<(), ExampleError> {
-    let options = CliOptions::from_cli(Cli::parse());
-    let records = hash_file(&options.input, &options.hash_options)?;
+    let cli = Cli::parse();
+    let records = hash_file(&cli.input, &cli.hash_options())?;
 
-    if let Some(manifest) = &options.check_manifest {
+    if let Some(manifest) = cli.check_manifest.as_deref() {
         verify_manifest(manifest, &records)?;
     } else {
         for record in &records {
@@ -36,29 +36,22 @@ enum ExampleError {
     Boxed(#[from] Box<dyn StdError>),
 }
 
-#[derive(Debug, Clone)]
-struct CliOptions {
-    input: String,
-    hash_options: HashOptions,
-    check_manifest: Option<String>,
-}
-
-impl CliOptions {
-    fn from_cli(cli: Cli) -> Self {
+impl Cli {
+    fn hash_options(&self) -> HashOptions {
         let mut selected = Vec::new();
-        if cli.xxh64 {
+        if self.xxh64 {
             selected.push(HashAlgorithm::Xxh64);
         }
-        if cli.sha1 {
+        if self.sha1 {
             selected.push(HashAlgorithm::Sha1);
         }
-        if cli.sha256 {
+        if self.sha256 {
             selected.push(HashAlgorithm::Sha256);
         }
-        if cli.uuid {
+        if self.uuid {
             selected.push(HashAlgorithm::Uuid);
         }
-        if cli.all {
+        if self.all {
             selected.extend([
                 HashAlgorithm::Xxh64,
                 HashAlgorithm::Sha1,
@@ -71,13 +64,9 @@ impl CliOptions {
         selected.sort_unstable_by_key(|algo| algo.as_label());
         selected.dedup();
 
-        Self {
-            input: cli.input,
-            hash_options: HashOptions {
-                algorithms: selected,
-                include_layers: !cli.no_layer,
-            },
-            check_manifest: cli.check_manifest,
+        HashOptions {
+            algorithms: selected,
+            include_layers: !self.no_layer,
         }
     }
 }

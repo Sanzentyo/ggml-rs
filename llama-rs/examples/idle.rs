@@ -8,29 +8,18 @@ use thiserror::Error;
 
 const USAGE: &str = "usage: cargo run -p llama-rs --example idle --features link-system -- <model.gguf> [--layer N] [--decode-kv N] [--past N] [--iters N] [--pauses a,b,c] [cpu|metal ...]";
 
-#[derive(Debug, Clone)]
-struct ParsedArgs {
-    model_path: String,
-    layer: usize,
-    decode_kv: usize,
-    past: usize,
-    iters: usize,
-    pauses_ms: Vec<u64>,
-    backends: Vec<LlamaBackend>,
-}
-
 fn main() -> Result<(), ExampleError> {
     ggml_rs::init_timing();
-    let args = ParsedArgs::from_cli(Cli::parse());
-    let model = GgufModel::open(&args.model_path)?;
-    let pauses = IdlePauseSchedule::<PauseScheduleEmpty>::from_vec(args.pauses_ms)?;
+    let cli = Cli::parse();
+    let model = GgufModel::open(&cli.model_path)?;
+    let pauses = IdlePauseSchedule::<PauseScheduleEmpty>::from_vec(cli.pauses_ms.clone())?;
 
-    for backend in args.backends {
+    for backend in cli.resolved_backends() {
         let config = IdleConfig::new(
-            args.layer,
-            args.decode_kv,
-            args.past,
-            args.iters,
+            cli.layer,
+            cli.decode_kv,
+            cli.resolved_past(),
+            cli.iters,
             pauses.clone(),
         )?;
         let report = idle_decode_proxy(&model, backend, config)?;
@@ -68,22 +57,18 @@ enum ExampleError {
     Boxed(#[from] Box<dyn StdError>),
 }
 
-impl ParsedArgs {
-    fn from_cli(cli: Cli) -> Self {
-        let backends = if cli.backends.is_empty() {
+impl Cli {
+    fn resolved_backends(&self) -> Vec<LlamaBackend> {
+        if self.backends.is_empty() {
             vec![LlamaBackend::Cpu, LlamaBackend::Metal]
         } else {
-            cli.backends.into_iter().map(|backend| backend.0).collect()
-        };
-        Self {
-            model_path: cli.model_path,
-            layer: cli.layer,
-            decode_kv: cli.decode_kv,
-            past: cli.past.unwrap_or_else(|| cli.decode_kv.saturating_sub(1)),
-            iters: cli.iters,
-            pauses_ms: cli.pauses_ms,
-            backends,
+            self.backends.iter().map(|backend| backend.0).collect()
         }
+    }
+
+    fn resolved_past(&self) -> usize {
+        self.past
+            .unwrap_or_else(|| self.decode_kv.saturating_sub(1))
     }
 }
 

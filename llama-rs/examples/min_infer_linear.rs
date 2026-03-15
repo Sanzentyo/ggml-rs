@@ -15,17 +15,18 @@ fn main() -> Result<(), ExampleError> {
 fn run() -> Result<(), Box<dyn StdError>> {
     ggml_rs::init_timing();
 
-    let parsed = ParsedArgs::from_cli(Cli::parse())?;
-    let model = GgufModel::open(&parsed.path)?;
-    let weights = LinearWeights::from_model(&model, &parsed.weight_tensor, parsed.config)?;
-    let input = make_input(parsed.config.in_features());
+    let cli = Cli::parse();
+    let model = GgufModel::open(&cli.path)?;
+    let config = cli.linear_config()?;
+    let input = make_input(config.in_features());
+    let weights = LinearWeights::from_model(&model, &cli.weight_tensor, config)?;
     let report =
-        linear_inference_with_weights_repeats(&weights, &input, parsed.backend, parsed.repeats)?;
+        linear_inference_with_weights_repeats(&weights, &input, cli.backend.into(), cli.repeats)?;
 
     let preview: Vec<f32> = report.output.iter().copied().take(8).collect();
     println!(
         "[{}] linear inference OK: in={} out={} repeats={} preview={preview:?}",
-        report.backend_name, report.in_features, report.out_features, parsed.repeats
+        report.backend_name, report.in_features, report.out_features, cli.repeats
     );
     Ok(())
 }
@@ -33,29 +34,6 @@ fn run() -> Result<(), Box<dyn StdError>> {
 #[derive(Debug, Error)]
 #[error(transparent)]
 struct ExampleError(#[from] Box<dyn StdError>);
-
-struct ParsedArgs {
-    path: String,
-    weight_tensor: String,
-    config: LinearInferenceConfig,
-    backend: LlamaBackend,
-    repeats: usize,
-}
-
-impl ParsedArgs {
-    fn from_cli(cli: Cli) -> Result<Self, Box<dyn StdError>> {
-        Ok(Self {
-            path: cli.path,
-            weight_tensor: cli.weight_tensor,
-            config: LinearInferenceConfig::builder()
-                .in_features(cli.input_cols)?
-                .out_features(cli.output_rows)?
-                .build(),
-            backend: cli.backend.into(),
-            repeats: cli.repeats,
-        })
-    }
-}
 
 #[derive(Debug, Clone, Parser)]
 #[command(about = "Minimal linear inference from GGUF weights", version, long_about = None)]
@@ -76,6 +54,15 @@ struct Cli {
     /// Backend to run.
     #[arg(value_enum, default_value_t = BackendArg::Cpu)]
     backend: BackendArg,
+}
+
+impl Cli {
+    fn linear_config(&self) -> Result<LinearInferenceConfig, Box<dyn StdError>> {
+        Ok(LinearInferenceConfig::builder()
+            .in_features(self.input_cols)?
+            .out_features(self.output_rows)?
+            .build())
+    }
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]

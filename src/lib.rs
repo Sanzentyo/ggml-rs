@@ -31,9 +31,9 @@ mod typed_tensor;
 mod types;
 
 pub use compute::{
-    Backend, BackendBuffer, Context, Graph, Tensor, decode_tensor_data_to,
-    decode_tensor_data_to_f32, graph_overhead_bytes, init_timing, tensor_element_count,
-    tensor_overhead_bytes, type_size, with_context, with_no_alloc_context,
+    Backend, BackendBuffer, Context, Graph, Tensor, decode_tensor_data_to, graph_overhead_bytes,
+    init_timing, tensor_element_count, tensor_overhead_bytes, type_size, with_context,
+    with_no_alloc_context,
 };
 pub use error::{Error, Result};
 pub use gguf::{GgufArrayValue, GgufFile, GgufTensorInfo, GgufType, GgufValue, GgufWriter};

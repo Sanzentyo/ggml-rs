@@ -429,7 +429,7 @@ Sample result (`tensor_2`, `--in 6 --out 6`):
 ## Model API notes
 
 - `GgufModel::find_tensor` returns an opaque `TensorHandle` for type-safe repeated lookup.
-- Handle-based accessors (`tensor_info_by_handle`, `tensor_payload_by_handle`, `decode_tensor_f32_into_by_handle`) avoid repeated string lookups in hot paths.
+- Handle-based accessors (`tensor_info_by_handle`, `tensor_payload_by_handle`, `decode_tensor_by_handle::<T>`) avoid repeated string lookups in hot paths.
 - `GgufModel::kv_value` exposes typed GGUF metadata values (`GgufValue`) for architecture-aware config parsing.
 - `resolve_transformer_metadata(_from_kv)` parses `{architecture}.*` metadata namespaces (e.g. llama/mistral prefixes).
 - `resolve_llama_layer_tensor_names` resolves one layer directly (not only full-catalog resolution).
@@ -592,7 +592,7 @@ Sample result:
 - stepwise output includes `mask_host_elide=<true|false>` to keep this A/B condition explicit in artifacts.
 - stepwise output includes `head_stage_buf=<true|false>` to keep this A/B condition explicit in artifacts.
 - stepwise output includes `block_gateup_fused=<true|false>` to keep this A/B condition explicit in artifacts.
-- quantized GGUF block-MLP tensors are now decoded through GGML type-traits (`to_float`) in `GgufModel::tensor_f32_values`, so q4/q5/q6 models can report `block_mlp_real=true`.
+- quantized GGUF block-MLP tensors are decoded through GGML type-traits (`to_float`) in `GgufModel::tensor_values::<T>`, so q4/q5/q6 models can report `block_mlp_real=true`.
 - benchmark runner uses persistent graph/tensor allocations across all decode steps and only updates causal-mask/query-position tensors per step.
 - benchmark runner also performs one untimed backend preflight per backend to reduce first-case kernel compile bias.
 - in `--decode-steps` mode, warmup and measured iterations now share one persistent stepwise allocation path (`DecodeStepPlan::bench`) to avoid duplicate setup in benchmark sweeps.

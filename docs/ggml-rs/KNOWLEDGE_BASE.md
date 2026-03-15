@@ -54,10 +54,10 @@ git submodule update --init --recursive
 - For benchmark timing, call `Backend::synchronize()` after compute loops to
   ensure queued backend work is fully completed before measuring/reporting.
 - Quantized tensor decode helpers are available in safe API:
-  - `decode_tensor_data_to_f32(ggml_type_raw, payload, out)`
+  - `decode_tensor_data_to::<T>(ggml_type_raw, payload) -> Vec<T>`
   - `tensor_element_count(ggml_type_raw, payload_bytes)`
   These use GGML type traits (`ggml_get_type_traits`) and are useful for GGUF
-  model paths that need f32 views over quantized payloads.
+  model paths that need typed views over quantized payloads.
 - Backend tensors support partial safe writes through typed APIs:
   - `Tensor::write_data_backend_at::<f32>(offset, values)`
   - `Tensor::write_data_backend_at::<i32>(offset, values)`

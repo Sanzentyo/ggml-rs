@@ -15,15 +15,14 @@ fn run() -> Result<(), Box<dyn StdError>> {
     ggml_rs::init_timing();
 
     let cli = Cli::parse();
-    let parsed = ParsedArgs::from_cli(cli);
-    let config = MlpInferenceConfig::new(parsed.hidden_features, parsed.ffn_features)?;
+    let config = MlpInferenceConfig::new(cli.hidden_features, cli.ffn_features)?;
     let weights = MlpWeights::deterministic(config);
-    let input: Vec<f32> = (0..parsed.hidden_features)
+    let input: Vec<f32> = (0..cli.hidden_features)
         .map(|index| ((index + 3) % 19) as f32 * 0.125)
         .collect();
 
-    for backend in parsed.backends {
-        let report = mlp_inference_with_weights_repeats(&weights, &input, backend, parsed.repeats)?;
+    for backend in cli.resolved_backends() {
+        let report = mlp_inference_with_weights_repeats(&weights, &input, backend, cli.repeats)?;
         let preview_len = report.output.len().min(8);
         println!(
             "[{}] mlp hidden={} ffn={} repeats={} preview={:?}",
@@ -42,30 +41,6 @@ fn run() -> Result<(), Box<dyn StdError>> {
 #[error(transparent)]
 struct ExampleError(#[from] Box<dyn StdError>);
 
-#[derive(Debug)]
-struct ParsedArgs {
-    hidden_features: usize,
-    ffn_features: usize,
-    repeats: usize,
-    backends: Vec<LlamaBackend>,
-}
-
-impl ParsedArgs {
-    fn from_cli(cli: Cli) -> Self {
-        let backends = if cli.backends.is_empty() {
-            vec![BackendArg::Cpu, BackendArg::Metal]
-        } else {
-            cli.backends
-        };
-        Self {
-            hidden_features: cli.hidden_features,
-            ffn_features: cli.ffn_features,
-            repeats: cli.repeats,
-            backends: backends.into_iter().map(Into::into).collect(),
-        }
-    }
-}
-
 #[derive(Debug, Clone, Parser)]
 #[command(about = "Minimal deterministic MLP inference", version, long_about = None)]
 struct Cli {
@@ -77,6 +52,16 @@ struct Cli {
     repeats: usize,
     #[arg(value_enum)]
     backends: Vec<BackendArg>,
+}
+
+impl Cli {
+    fn resolved_backends(&self) -> Vec<LlamaBackend> {
+        if self.backends.is_empty() {
+            vec![LlamaBackend::Cpu, LlamaBackend::Metal]
+        } else {
+            self.backends.iter().copied().map(Into::into).collect()
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]

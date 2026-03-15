@@ -227,17 +227,11 @@ impl GgufModel {
     where
         T: GgmlElement + NumCast,
     {
-        let mut values = Vec::new();
-        self.decode_tensor_into(name, &mut values)?;
-        Ok(values)
+        self.decode_tensor(name)
     }
 
-    /// Decodes a tensor into caller-owned output storage.
-    pub fn decode_tensor_into<T>(
-        &self,
-        name: impl AsRef<str>,
-        out: &mut Vec<T>,
-    ) -> Result<(), ModelError>
+    /// Decodes a tensor into caller-selected element type.
+    pub fn decode_tensor<T>(&self, name: impl AsRef<str>) -> Result<Vec<T>, ModelError>
     where
         T: GgmlElement + NumCast,
     {
@@ -247,21 +241,17 @@ impl GgufModel {
             .ok_or_else(|| ModelError::MissingTensor {
                 name: name.to_owned(),
             })?;
-        self.decode_tensor_into_by_handle(handle, out)
+        self.decode_tensor_by_handle(handle)
     }
 
-    /// Decodes a tensor handle into caller-owned output storage.
-    pub fn decode_tensor_into_by_handle<T>(
-        &self,
-        handle: TensorHandle,
-        out: &mut Vec<T>,
-    ) -> Result<(), ModelError>
+    /// Decodes a tensor by handle into caller-selected element type.
+    pub fn decode_tensor_by_handle<T>(&self, handle: TensorHandle) -> Result<Vec<T>, ModelError>
     where
         T: GgmlElement + NumCast,
     {
         let tensor = self.tensor_info_by_handle(handle);
         let payload = self.tensor_payload_internal(tensor)?;
-        ggml_rs::decode_tensor_data_to::<T>(tensor.ggml_type_raw, payload, out).map_err(|source| {
+        ggml_rs::decode_tensor_data_to::<T>(tensor.ggml_type_raw, payload).map_err(|source| {
             match source {
                 ggml_rs::Error::UnsupportedType(_) => ModelError::UnsupportedTensorType {
                     tensor_name: tensor.name.clone(),
@@ -271,29 +261,6 @@ impl GgufModel {
                 other => ModelError::ggml("decode_tensor_data_to", other),
             }
         })
-    }
-
-    /// Compatibility helper for callers that explicitly need `f32`.
-    pub fn tensor_f32_values(&self, name: impl AsRef<str>) -> Result<Vec<f32>, ModelError> {
-        self.tensor_values(name)
-    }
-
-    /// Compatibility helper for callers that explicitly need `f32`.
-    pub fn decode_tensor_f32_into(
-        &self,
-        name: impl AsRef<str>,
-        out: &mut Vec<f32>,
-    ) -> Result<(), ModelError> {
-        self.decode_tensor_into(name, out)
-    }
-
-    /// Compatibility helper for callers that explicitly need `f32`.
-    pub fn decode_tensor_f32_into_by_handle(
-        &self,
-        handle: TensorHandle,
-        out: &mut Vec<f32>,
-    ) -> Result<(), ModelError> {
-        self.decode_tensor_into_by_handle(handle, out)
     }
 
     /// Iterates all tensor names in file order.
@@ -367,16 +334,6 @@ impl GgufModel {
                 other => ModelError::ggml("tensor_element_count", other),
             }
         })
-    }
-
-    /// Compatibility helper for existing `f32`-named call sites.
-    pub fn tensor_f32_len(&self, name: impl AsRef<str>) -> Result<usize, ModelError> {
-        self.tensor_len(name)
-    }
-
-    /// Compatibility helper for existing `f32`-named call sites.
-    pub fn tensor_f32_len_by_handle(&self, handle: TensorHandle) -> Result<usize, ModelError> {
-        self.tensor_len_by_handle(handle)
     }
 
     fn tensor_payload_internal<'a>(

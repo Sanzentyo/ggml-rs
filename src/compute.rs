@@ -66,18 +66,11 @@ pub fn tensor_element_count(ggml_type_raw: c_int, payload_bytes: usize) -> Resul
         .map_err(|source| source.with_context("tensor_element_count"))
 }
 
-/// Decodes GGML tensor payload bytes into `f32` values using GGML type traits.
-///
-/// This supports both plain and quantized GGML tensor types as long as the
-/// local GGML build exposes a `to_float` converter for the provided type.
-pub fn decode_tensor_data_to_f32(
-    ggml_type_raw: c_int,
-    payload: &[u8],
-    out: &mut Vec<f32>,
-) -> Result<()> {
+/// Decodes GGML tensor payload bytes into `f32` values via GGML type traits.
+fn decode_tensor_data_to_float(ggml_type_raw: c_int, payload: &[u8]) -> Result<Vec<f32>> {
     let ggml_type = resolve_ggml_type(ggml_type_raw)?;
     let element_count = tensor_element_count(ggml_type_raw, payload.len())
-        .map_err(|source| source.with_context("decode_tensor_data_to_f32"))?;
+        .map_err(|source| source.with_context("decode_tensor_data_to_float"))?;
 
     let type_traits =
         NonNull::new(unsafe { ffi::ggml_get_type_traits(ggml_type) as *mut ffi::ggml_type_traits })
@@ -85,13 +78,11 @@ pub fn decode_tensor_data_to_f32(
     let to_float =
         unsafe { type_traits.as_ref().to_float }.ok_or(Error::UnsupportedType(ggml_type_raw))?;
 
-    out.clear();
     if element_count == 0 {
-        return Ok(());
+        return Ok(Vec::new());
     }
-    if out.capacity() < element_count {
-        out.reserve(element_count - out.capacity());
-    }
+
+    let mut out = Vec::with_capacity(element_count);
 
     if unsafe { ffi::ggml_is_quantized(ggml_type) } {
         unsafe { ffi::ggml_quantize_init(ggml_type) };
@@ -99,18 +90,17 @@ pub fn decode_tensor_data_to_f32(
 
     let k = element_count
         .try_into_checked()
-        .map_err(|source| Error::int_conversion("decode_tensor_data_to_f32(k)", source))?;
+        .map_err(|source| Error::int_conversion("decode_tensor_data_to_float(k)", source))?;
     unsafe {
         // SAFETY:
-        // - `out` is cleared above, so all capacity is spare and writable.
-        // - Capacity is ensured to be at least `element_count`.
+        // - `out` is newly allocated with capacity `element_count`.
         // - `to_float` writes exactly `k == element_count` `f32` values into `dst`.
         // - We set the vector length only after `to_float` completes.
         let dst = out.spare_capacity_mut().as_mut_ptr().cast::<f32>();
         to_float(payload.as_ptr().cast(), dst, k);
         out.set_len(element_count);
     }
-    Ok(())
+    Ok(out)
 }
 
 /// Decodes GGML tensor payload bytes into caller-selected element type `T`.
@@ -118,45 +108,38 @@ pub fn decode_tensor_data_to_f32(
 /// For matching plain tensor types (`f32`, `i32`) this performs a direct copy.
 /// For other GGML element types (including quantized payloads), values are
 /// decoded through GGML's `to_float` conversion and then cast to `T`.
-pub fn decode_tensor_data_to<T>(
-    ggml_type_raw: c_int,
-    payload: &[u8],
-    out: &mut Vec<T>,
-) -> Result<()>
+pub fn decode_tensor_data_to<T>(ggml_type_raw: c_int, payload: &[u8]) -> Result<Vec<T>>
 where
     T: GgmlElement + NumCast,
 {
     let element_count = tensor_element_count(ggml_type_raw, payload.len())?;
     let expected_nbytes = element_count.checked_mul_checked(std::mem::size_of::<T>())?;
 
-    out.clear();
     if element_count == 0 {
-        return Ok(());
-    }
-    if out.capacity() < element_count {
-        out.reserve(element_count - out.capacity());
+        return Ok(Vec::new());
     }
 
     if ggml_type_raw == T::GGML_TYPE as c_int && payload.len() == expected_nbytes {
+        let mut out = Vec::with_capacity(element_count);
         unsafe {
             // SAFETY:
-            // - `out` has reserved capacity for `element_count` elements.
+            // - `out` has capacity for `element_count` elements.
             // - `payload.len()` matches exactly `element_count * size_of::<T>()`.
             // - Source payload bytes are read-only and copied into owned `out` storage.
             let dst = out.spare_capacity_mut().as_mut_ptr().cast::<T>();
             ptr::copy_nonoverlapping(payload.as_ptr().cast::<T>(), dst, element_count);
             out.set_len(element_count);
         }
-        return Ok(());
+        return Ok(out);
     }
 
-    let mut decoded = Vec::new();
-    decode_tensor_data_to_f32(ggml_type_raw, payload, &mut decoded)?;
+    let decoded = decode_tensor_data_to_float(ggml_type_raw, payload)?;
+    let mut out = Vec::with_capacity(decoded.len());
     for value in decoded {
         let casted = NumCast::from(value).ok_or(Error::UnsupportedType(ggml_type_raw))?;
         out.push(casted);
     }
-    Ok(())
+    Ok(out)
 }
 
 /// Returns ggml's internal per-tensor metadata overhead in bytes.

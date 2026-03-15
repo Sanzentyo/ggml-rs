@@ -17,31 +17,31 @@ fn main() -> Result<(), ExampleError> {
 fn run() -> Result<(), Box<dyn StdError>> {
     ggml_rs::init_timing();
 
-    let parsed = ParsedArgs::from_cli(Cli::parse());
-    let model = GgufModel::open(&parsed.model_path)?;
-    let dimensions = resolve_llama_layer_dimensions(&model, parsed.layer)?;
+    let cli = Cli::parse();
+    let model = GgufModel::open(&cli.model_path)?;
+    let dimensions = resolve_llama_layer_dimensions(&model, cli.layer)?;
     let mut weights =
-        resolve_attention_weights_for_layer_auto(&model, parsed.layer, parsed.sequence_length)?;
-    if parsed.no_rope {
+        resolve_attention_weights_for_layer_auto(&model, cli.layer, cli.sequence_length)?;
+    if cli.no_rope {
         weights.config = weights.config.with_rotary(RotaryEmbedding::Disabled);
     }
-    if parsed.causal {
+    if cli.causal {
         weights.config = weights
             .config
             .with_mask(AttentionMaskPolicy::Causal { past_tokens: 0 });
     }
-    let input: Vec<f32> = (0..(weights.config.hidden_features() * parsed.sequence_length))
+    let input: Vec<f32> = (0..(weights.config.hidden_features() * cli.sequence_length))
         .map(|index| ((index + 3) % 29) as f32 * 0.0625)
         .collect();
 
-    for backend in parsed.backends {
+    for backend in cli.resolved_backends() {
         let report =
-            attention_inference_with_weights_repeats(&weights, &input, backend, parsed.repeats)?;
+            attention_inference_with_weights_repeats(&weights, &input, backend, cli.repeats)?;
         let preview_len = report.output.len().min(8);
         println!(
             "[{}] attn layer={} hidden={} seq={} repeats={} preview={:?}",
             report.backend_name,
-            parsed.layer,
+            cli.layer,
             report.hidden_features,
             report.sequence_length,
             report.repeats,
@@ -59,36 +59,6 @@ fn run() -> Result<(), Box<dyn StdError>> {
 #[derive(Debug, Error)]
 #[error(transparent)]
 struct ExampleError(#[from] Box<dyn StdError>);
-
-#[derive(Debug)]
-struct ParsedArgs {
-    model_path: PathBuf,
-    layer: usize,
-    sequence_length: usize,
-    repeats: usize,
-    causal: bool,
-    no_rope: bool,
-    backends: Vec<LlamaBackend>,
-}
-
-impl ParsedArgs {
-    fn from_cli(cli: Cli) -> Self {
-        let backends = if cli.backends.is_empty() {
-            vec![BackendArg::Cpu, BackendArg::Metal]
-        } else {
-            cli.backends
-        };
-        Self {
-            model_path: cli.model_path,
-            layer: cli.layer,
-            sequence_length: cli.sequence_length,
-            repeats: cli.repeats,
-            causal: cli.causal,
-            no_rope: cli.no_rope,
-            backends: backends.into_iter().map(Into::into).collect(),
-        }
-    }
-}
 
 #[derive(Debug, Clone, Parser)]
 #[command(
@@ -110,6 +80,16 @@ struct Cli {
     no_rope: bool,
     #[arg(value_enum)]
     backends: Vec<BackendArg>,
+}
+
+impl Cli {
+    fn resolved_backends(&self) -> Vec<LlamaBackend> {
+        if self.backends.is_empty() {
+            vec![LlamaBackend::Cpu, LlamaBackend::Metal]
+        } else {
+            self.backends.iter().copied().map(Into::into).collect()
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]

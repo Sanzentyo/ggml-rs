@@ -12,22 +12,24 @@ fn main() -> Result<(), ExampleError> {
 
 fn run() -> Result<(), Box<dyn StdError>> {
     ggml_rs::init_timing();
-    let parsed = ParsedArgs::from_cli(Cli::parse())?;
+    let cli = Cli::parse();
+    let cases = cli.parse_cases()?;
+    let backends = cli.resolved_backends();
 
-    for &(hidden_features, ffn_features) in &parsed.cases {
+    for &(hidden_features, ffn_features) in &cases {
         let config = MlpInferenceConfig::new(hidden_features, ffn_features)?;
         let weights = MlpWeights::deterministic(config);
         let input: Vec<f32> = (0..hidden_features)
             .map(|index| ((index + 5) % 19) as f32 * 0.125)
             .collect();
 
-        for backend in parsed.backends.iter().copied() {
-            mlp_inference_with_weights_repeats(&weights, &input, backend, parsed.warmup_iters)?;
+        for backend in backends.iter().copied() {
+            mlp_inference_with_weights_repeats(&weights, &input, backend, cli.warmup_iters)?;
             let start = Instant::now();
             let report =
-                mlp_inference_with_weights_repeats(&weights, &input, backend, parsed.bench_iters)?;
+                mlp_inference_with_weights_repeats(&weights, &input, backend, cli.bench_iters)?;
             let elapsed = start.elapsed();
-            let avg_ms = elapsed.as_secs_f64() * 1000.0 / parsed.bench_iters as f64;
+            let avg_ms = elapsed.as_secs_f64() * 1000.0 / cli.bench_iters as f64;
             let checksum: f64 = report
                 .output
                 .iter()
@@ -39,8 +41,8 @@ fn run() -> Result<(), Box<dyn StdError>> {
                 report.backend_name,
                 report.hidden_features,
                 report.ffn_features,
-                parsed.warmup_iters,
-                parsed.bench_iters,
+                cli.warmup_iters,
+                cli.bench_iters,
                 avg_ms,
                 checksum
             );
@@ -53,37 +55,6 @@ fn run() -> Result<(), Box<dyn StdError>> {
 #[derive(Debug, Error)]
 #[error(transparent)]
 struct ExampleError(#[from] Box<dyn StdError>);
-
-#[derive(Debug)]
-struct ParsedArgs {
-    cases: Vec<(usize, usize)>,
-    warmup_iters: usize,
-    bench_iters: usize,
-    backends: Vec<LlamaBackend>,
-}
-
-impl ParsedArgs {
-    fn from_cli(cli: Cli) -> Result<Self, Box<dyn StdError>> {
-        if cli.bench_iters == 0 {
-            return Err("--iters must be greater than zero".into());
-        }
-        let cases = match cli.cases.as_deref() {
-            Some(value) => parse_cases_arg(value)?,
-            None => vec![(cli.hidden_features, cli.ffn_features)],
-        };
-        let backends = if cli.backends.is_empty() {
-            vec![BackendArg::Cpu, BackendArg::Metal]
-        } else {
-            cli.backends
-        };
-        Ok(Self {
-            cases,
-            warmup_iters: cli.warmup_iters,
-            bench_iters: cli.bench_iters,
-            backends: backends.into_iter().map(Into::into).collect(),
-        })
-    }
-}
 
 #[derive(Debug, Clone, Parser)]
 #[command(about = "Benchmark deterministic MLP layer workload", version, long_about = None)]
@@ -100,6 +71,26 @@ struct Cli {
     bench_iters: usize,
     #[arg(value_enum)]
     backends: Vec<BackendArg>,
+}
+
+impl Cli {
+    fn parse_cases(&self) -> Result<Vec<(usize, usize)>, Box<dyn StdError>> {
+        if self.bench_iters == 0 {
+            return Err("--iters must be greater than zero".into());
+        }
+        match self.cases.as_deref() {
+            Some(value) => parse_cases_arg(value),
+            None => Ok(vec![(self.hidden_features, self.ffn_features)]),
+        }
+    }
+
+    fn resolved_backends(&self) -> Vec<LlamaBackend> {
+        if self.backends.is_empty() {
+            vec![LlamaBackend::Cpu, LlamaBackend::Metal]
+        } else {
+            self.backends.iter().copied().map(Into::into).collect()
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]

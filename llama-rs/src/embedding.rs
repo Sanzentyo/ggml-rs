@@ -54,10 +54,9 @@ pub fn summarize_embedding_tensor(
     model: &GgufModel,
     tensor_name: &str,
 ) -> Result<EmbeddingStats, EmbeddingError> {
-    let mut values = Vec::new();
-    model
-        .decode_tensor_into::<f32>(tensor_name, &mut values)
-        .map_err(|source| EmbeddingError::model("GgufModel::decode_tensor_into", source))?;
+    let values = model
+        .tensor_values::<f32>(tensor_name)
+        .map_err(|source| EmbeddingError::model("GgufModel::tensor_values", source))?;
     if values.is_empty() {
         return Err(EmbeddingError::EmptyTensor {
             tensor_name: tensor_name.to_string(),

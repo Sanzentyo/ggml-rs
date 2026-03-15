@@ -16,26 +16,24 @@ fn main() -> Result<(), ExampleError> {
 fn run() -> Result<(), Box<dyn StdError>> {
     ggml_rs::init_timing();
 
-    let parsed = ParsedArgs::from_cli(Cli::parse());
-    let model = GgufModel::open(&parsed.model_path)?;
-    let dimensions = resolve_llama_layer_dimensions(&model, parsed.layer)?;
-    let weights = match parsed.hidden_features {
-        Some(hidden_features) => {
-            resolve_mlp_weights_for_layer(&model, parsed.layer, hidden_features)?
-        }
-        None => resolve_mlp_weights_for_layer_auto(&model, parsed.layer)?,
+    let cli = Cli::parse();
+    let model = GgufModel::open(&cli.model_path)?;
+    let dimensions = resolve_llama_layer_dimensions(&model, cli.layer)?;
+    let weights = match cli.hidden_features {
+        Some(hidden_features) => resolve_mlp_weights_for_layer(&model, cli.layer, hidden_features)?,
+        None => resolve_mlp_weights_for_layer_auto(&model, cli.layer)?,
     };
     let input: Vec<f32> = (0..weights.hidden_features)
         .map(|index| ((index + 5) % 19) as f32 * 0.125)
         .collect();
 
-    for backend in parsed.backends {
-        let report = mlp_inference_with_weights_repeats(&weights, &input, backend, parsed.repeats)?;
+    for backend in cli.resolved_backends() {
+        let report = mlp_inference_with_weights_repeats(&weights, &input, backend, cli.repeats)?;
         let preview_len = report.output.len().min(8);
         println!(
             "[{}] layer={} hidden={} ffn={} repeats={} preview={:?}",
             report.backend_name,
-            parsed.layer,
+            cli.layer,
             report.hidden_features,
             report.ffn_features,
             report.repeats,
@@ -50,32 +48,6 @@ fn run() -> Result<(), Box<dyn StdError>> {
 #[derive(Debug, Error)]
 #[error(transparent)]
 struct ExampleError(#[from] Box<dyn StdError>);
-
-#[derive(Debug)]
-struct ParsedArgs {
-    model_path: PathBuf,
-    layer: usize,
-    hidden_features: Option<usize>,
-    repeats: usize,
-    backends: Vec<LlamaBackend>,
-}
-
-impl ParsedArgs {
-    fn from_cli(cli: Cli) -> Self {
-        let backends = if cli.backends.is_empty() {
-            vec![BackendArg::Cpu, BackendArg::Metal]
-        } else {
-            cli.backends
-        };
-        Self {
-            model_path: cli.model_path,
-            layer: cli.layer,
-            hidden_features: cli.hidden_features,
-            repeats: cli.repeats,
-            backends: backends.into_iter().map(Into::into).collect(),
-        }
-    }
-}
 
 #[derive(Debug, Clone, Parser)]
 #[command(
@@ -93,6 +65,16 @@ struct Cli {
     repeats: usize,
     #[arg(value_enum)]
     backends: Vec<BackendArg>,
+}
+
+impl Cli {
+    fn resolved_backends(&self) -> Vec<LlamaBackend> {
+        if self.backends.is_empty() {
+            vec![LlamaBackend::Cpu, LlamaBackend::Metal]
+        } else {
+            self.backends.iter().copied().map(Into::into).collect()
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
