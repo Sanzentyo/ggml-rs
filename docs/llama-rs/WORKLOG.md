@@ -43,3 +43,10 @@ Detailed logs live under `docs/llama-rs/worklog/`.
   - `block_gateup_fused`: kept default-off (CPU regression signal),
   - `head_stage_buf`: kept default-off (CPU regression signal),
   - `mask_host_elide`: 6-model balanced sweep on the current lock shows slight aggregate regression; keep default-off and use explicit A/B only.
+- Decode ownership refactor (`Result<Vec<T>>`) is now documented with assembly
+  cut/judgement artifacts (`review3_decode_asm_snippets|compare|judgement.md`);
+  current decision remains to keep the ownership API as default.
+- Latest post-review3 step2 delta-toggle recheck on ELYZA (`layers 5..7`) shows
+  both `no-mask-delta` and `no-position-delta` are slower (`~1.018` and
+  `~1.041` variant/base overall), with checksum parity preserved (`0.0` deltas);
+  defaults remain unchanged.

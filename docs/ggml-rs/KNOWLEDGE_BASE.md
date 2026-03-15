@@ -58,6 +58,14 @@ git submodule update --init --recursive
   - `tensor_element_count(ggml_type_raw, payload_bytes)`
   These use GGML type traits (`ggml_get_type_traits`) and are useful for GGUF
   model paths that need typed views over quantized payloads.
+- Decode API ownership refactor was assembly-verified (`2026-03-15`):
+  - focused snippets: `target/benchmarks/review3_decode_asm_snippets.md`
+  - before/after line-count summary: `target/benchmarks/review3_decode_asm_compare.md`
+  - final judgement: `target/benchmarks/review3_decode_asm_judgement.md`
+  - max-opt helper line count moved `122 -> 115` (`after/before ~0.943`), and
+    the release caller fast path remains contiguous copy (`__rust_alloc + memcpy`)
+    for native payloads.
+  - policy: keep ownership-returning decode API as default (`Result<Vec<T>>`).
 - Backend tensors support partial safe writes through typed APIs:
   - `Tensor::write_data_backend_at::<f32>(offset, values)`
   - `Tensor::write_data_backend_at::<i32>(offset, values)`

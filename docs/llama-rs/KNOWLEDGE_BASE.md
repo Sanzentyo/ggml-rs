@@ -430,6 +430,13 @@ Sample result (`tensor_2`, `--in 6 --out 6`):
 
 - `GgufModel::find_tensor` returns an opaque `TensorHandle` for type-safe repeated lookup.
 - Handle-based accessors (`tensor_info_by_handle`, `tensor_payload_by_handle`, `decode_tensor_by_handle::<T>`) avoid repeated string lookups in hot paths.
+- `decode_tensor_by_handle::<T>` is ownership-first (`Result<Vec<T>>`) and was
+  verified at assembly level after refactor:
+  - snippets: `target/benchmarks/review3_decode_asm_snippets.md`
+  - compare summary: `target/benchmarks/review3_decode_asm_compare.md`
+  - judgement: `target/benchmarks/review3_decode_asm_judgement.md`
+  - release fast path for native payloads remains `__rust_alloc + memcpy`
+    (no additional per-element conversion loop).
 - `GgufModel::kv_value` exposes typed GGUF metadata values (`GgufValue`) for architecture-aware config parsing.
 - `resolve_transformer_metadata(_from_kv)` parses `{architecture}.*` metadata namespaces (e.g. llama/mistral prefixes).
 - `resolve_llama_layer_tensor_names` resolves one layer directly (not only full-catalog resolution).
@@ -899,6 +906,13 @@ Variant note:
 - On this host, larger step windows (`16`/`32`) yielded more stable Metal advantage than `steps=8` for the model-shaped set.
 - Canonical parity reporting keeps `--decode-steps 16` as default (balance between stability and avoiding extra amortization drift); use `steps=32` as a sensitivity check.
 - `--decode-stepwise-no-mask-delta` can disable the delta-update path for matched A/B checks; in-session A/B stayed near parity on model-shaped stepwise (`on/off ~1.001` overall, CPU `~1.009`, MTL0 `~0.991`).
+- Post-review3 decode-step2 recheck on ELYZA hotspot slice (`block_layer=5..7`, `decode-kv=129`, `steps=8`) showed both delta toggles slower:
+  - artifacts:
+    - `target/benchmarks/review3_decodeapi_step2_elyza_layers5_7_delta_{base,nomask,nopos}.txt`
+    - `target/benchmarks/review3_decodeapi_step2_elyza_layers5_7_delta_impact.md`
+    - `target/benchmarks/review3_decodeapi_step2_elyza_layers5_7_delta_checksum_check.md`
+  - means (`variant/base`): `no-mask ~1.018`, `no-position ~1.041`, checksum deltas `0.0`.
+  - policy remains `mask_delta=true` and `position_delta=true` by default.
 - `--decode-stepwise-kv-proj` increased measured `ms/token` in most sampled cases (~`+4%` to `+12%` on CPU and mostly positive on Metal in the matched run), but did not close the proxy/cpp gap by itself.
 - Adding `--decode-stepwise-kv-cache-write` on top of block+kv+real-MLP nudged MTL0 proxy/cpp (`~0.252 -> ~0.256`) while keeping total drift small (mostly within ~`±3%` per case in the matched run).
 - `--decode-stepwise-block --decode-stepwise-kv-proj` substantially increases modeled cost; in the current 6-model set average proxy/cpp ratio moved to ~`0.89x` (CPU) and ~`0.36x` (Metal), so Metal-side gap remains the primary next target.

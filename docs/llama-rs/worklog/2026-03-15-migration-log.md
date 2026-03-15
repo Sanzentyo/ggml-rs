@@ -25,6 +25,14 @@ Detailed entries migrated from `docs/llama-rs/WORKLOG.md` during worklog compact
 - Stability rerun (`r=3` median) for the same delta toggles:
   - `target/benchmarks/llama_stepwise_resume_after_clap_elyza_layers2_7_delta_stability_r3.md`
   - `no-mask/base ~0.998`, `no-pos/base ~0.999` overall (near-neutral), so defaults stay unchanged.
+- Post-review3 decode-API continuation pass on ELYZA (`block_layer=5..7`, `decode-kv=129`, `steps=8`) rechecked delta toggles under the latest lock:
+  - base: `target/benchmarks/review3_decodeapi_step2_elyza_layers5_7_delta_base.txt`,
+  - no-mask: `target/benchmarks/review3_decodeapi_step2_elyza_layers5_7_delta_nomask.txt`,
+  - no-position: `target/benchmarks/review3_decodeapi_step2_elyza_layers5_7_delta_nopos.txt`,
+  - impact: `target/benchmarks/review3_decodeapi_step2_elyza_layers5_7_delta_impact.md`,
+  - checksum: `target/benchmarks/review3_decodeapi_step2_elyza_layers5_7_delta_checksum_check.md`.
+  - means (`variant/base`): `no-mask ~1.018`, `no-position ~1.041` overall, checksum deltas `0.0`;
+    defaults remain `mask_delta=true`, `position_delta=true`.
 - Expanded `thiserror` rollout across remaining `llama-rs/examples` (`run()` + typed `ExampleError` boundary) and re-verified link-system runtime surfaces:
   - `target/benchmarks/llama_rs_thiserror_rollout_runtime_smoke.txt`.
 - Added stepwise warmup+bench reuse path to reduce repeated backend/context setup during layer sweeps:
@@ -193,7 +201,14 @@ Detailed entries migrated from `docs/llama-rs/WORKLOG.md` during worklog compact
 - Added Rust-idiomatic stepwise config construction helpers (`AttentionDecodeStepwiseConfig::new(...).with_*`) and centralized benchmark wiring in `bench_attention_layer`.
 - Reduced stepwise hot-loop host churn by reusing per-step `QUERY_POS`/`CAUSAL_MASK` buffers (in-place fill) instead of allocating vectors every step.
 - Re-validated after refactor with `cargo fmt`, `cargo clippy -p llama-rs --all-targets`, `cargo test -p llama-rs`, plus CPU/Metal runtime benchmarks (`target/benchmarks/rust_style_perf_stepwise_{base,block_kv}.txt`).
-- Added quantized GGUF dequant decode path via GGML type traits (`decode_tensor_data_to_f32` / `tensor_element_count`) and wired `GgufModel` tensor decode to use it.
+- Added quantized GGUF dequant decode path via GGML type traits (`decode_tensor_data_to::<T>` / `tensor_element_count`) and wired `GgufModel` tensor decode to use it.
+- Added deep decode-API assembly inspection artifacts for the ownership refactor:
+  - focused sections: `target/benchmarks/review3_decode_asm_snippets.md`,
+  - before/after summary: `target/benchmarks/review3_decode_asm_compare.md`,
+  - final judgement: `target/benchmarks/review3_decode_asm_judgement.md`.
+  - key finding: release `decode_tensor_by_handle` keeps the contiguous
+    `__rust_alloc + memcpy` fast path for native payloads, with no new
+    per-element conversion overhead on that path.
 - Verified Qwen3.5 `Q4_K_M` block-MLP run with `block_mlp_real=true` on both CPU and Metal and captured control-vs-real comparison (`target/benchmarks/rust_style_quantized_realmlp_qwen35_comparison.md`).
 - Completed 6-model `--block-mlp-model` sweep and generated updated calibration/impact artifacts:
   - `target/benchmarks/llama_rs_bench_attention_decode_stepwise_block_kvproj_realmlp_s16_models.txt`,
