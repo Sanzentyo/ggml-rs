@@ -1,0 +1,822 @@
+# 2026-03-15 migration log
+
+Detailed entries migrated from `docs/llama-rs/WORKLOG.md` during worklog compaction.
+
+## Detailed summary
+
+- Metadata-driven auto-resolution path is validated with explicit `resolution_mode` output (`FullMetadata` / `TensorHeuristic`).
+- MLP and attention layer examples are verified on CPU and Metal for synthetic fixtures.
+- Link-system parity tests (`mlp_cpp_parity`, `attention_parity`) pass after RoPE integration fixes.
+- Unified example argument parsing on `clap` derive + typed CLI structs across `llama-rs/examples` (including `gguf`, `idle`, `bench_attention_layer`, and `bench_attention_decode_cpp_compare`).
+- Refactored clap-unified example error surfaces to `thiserror`-based typed errors (while preserving the existing validation/error-policy behavior).
+- Re-verified the clap-unified runtime surfaces on CPU/Metal with `--features link-system` and recorded:
+  - `target/benchmarks/llama_rs_clap_refactor_runtime_smoke.txt`.
+- Resumed step `1` (layer-by-layer optimization loop) on ELYZA (`block_layer=0..7`) with the current lock (`outproj_fused_layerx5 + static_kv + kv_proj + kv_write + block`) and recorded:
+  - raw: `target/benchmarks/llama_rs_stepwise_resume_after_clap_elyza_layers0_7.txt`
+  - summary: `target/benchmarks/llama_stepwise_resume_after_clap_elyza_layers0_7_summary.{csv,md}`
+- Hotspot A/B results on `block_layer=2..7`:
+  - `mask_host_elide`: regression (`~1.008` on/base),
+  - `head_stage_buf`: near-neutral (`~1.000` on/base),
+  - `block_gateup_fused`: near-neutral (`~1.000` on/base),
+  - `head_concat_balanced`: regression (`~1.010` on/base).
+- Delta toggle recheck on the same hotspot window:
+  - `--decode-stepwise-no-mask-delta`: `~0.994` variant/base,
+  - `--decode-stepwise-no-position-delta`: `~0.994` variant/base.
+- Stability rerun (`r=3` median) for the same delta toggles:
+  - `target/benchmarks/llama_stepwise_resume_after_clap_elyza_layers2_7_delta_stability_r3.md`
+  - `no-mask/base ~0.998`, `no-pos/base ~0.999` overall (near-neutral), so defaults stay unchanged.
+- Expanded `thiserror` rollout across remaining `llama-rs/examples` (`run()` + typed `ExampleError` boundary) and re-verified link-system runtime surfaces:
+  - `target/benchmarks/llama_rs_thiserror_rollout_runtime_smoke.txt`.
+- Added stepwise warmup+bench reuse path to reduce repeated backend/context setup during layer sweeps:
+  - new API: `run_attention_decode_stepwise_bench_with_cache_repeats_with_block_mlp`,
+  - `bench_attention_layer` now uses the new API in `--decode-steps` mode,
+  - runtime smoke: `target/benchmarks/llama_rs_stepwise_backend_context_reuse_smoke.txt`.
+- Added phase-init elision on top of the warmup+bench reuse path (skip redundant KV/precompute reinit between warmup and bench when cache writes do not mutate persistent KV tensors):
+  - runtime smoke: `target/benchmarks/llama_rs_stepwise_phase_init_elision_smoke.txt`,
+  - ELYZA `block_layer=5..7` remeasure and impact:
+    - raw: `target/benchmarks/llama_rs_stepwise_phase_init_elision_elyza_layers5_7.txt`,
+    - summary: `target/benchmarks/llama_stepwise_phase_init_elision_elyza_layers5_7_impact.md`,
+    - `new/base` avg_token: CPU `~0.629`, MTL0 `~0.549` (baseline from `llama_rs_stepwise_resume_after_clap_elyza_layers0_7.txt` subset).
+- Added one-time backend loader guard (`ensure_backends_loaded`) across `llama-rs` runtime paths (`bench`, `batched`, `smoke`, `inference`) to remove repeated `Backend::load_all()` calls.
+  - validation/remeasure:
+    - raw: `target/benchmarks/llama_rs_stepwise_backend_load_once_elyza_layers5_7.txt`,
+    - impact: `target/benchmarks/llama_stepwise_backend_load_once_elyza_layers5_7_impact.md`,
+    - `new/base` avg_token vs phase-init-elision baseline: CPU `~1.013`, MTL0 `~1.000` (near-neutral; keep as cleanup/hardening).
+- Added block-MLP layer-loop cache in `bench_attention_layer` (`HashMap<(hidden_features, block_layer), (MlpWeights, block_mlp_real)>`) so repeated case/layer sweeps reuse resolved model-layer weights instead of re-decoding each time.
+  - smoke (CPU+Metal, duplicated case to exercise cache path): `target/benchmarks/llama_rs_stepwise_layer_loop_reuse_cache_smoke.txt`.
+- Added stepwise setup-time instrumentation (`setup=... ms`) to separate one-time graph/context preparation cost from token compute cost in decode-stepwise output.
+  - baseline artifact for graph-level reuse planning:
+    - raw: `target/benchmarks/llama_rs_stepwise_graph_reuse_setup_baseline_elyza_layers5_7.txt`,
+    - summary: `target/benchmarks/llama_stepwise_graph_reuse_setup_baseline_elyza_layers5_7.md`,
+    - `block_layer=5..7` averages: setup `~456.6 ms` (CPU), `~462.3 ms` (MTL0) per call.
+- Added graph-level layer-sweep reuse path for stepwise decode benchmarking.
+  - new API/report:
+    - `run_attention_decode_stepwise_bench_sweep_with_cache_repeats_with_block_mlp`,
+    - `AttentionDecodeStepwiseBenchSweepReport`.
+  - `bench_attention_layer` now uses the shared-setup sweep path for decode-stepwise + model-backed multi-layer sweeps.
+  - output markers:
+    - `graph_reuse_sweep=true`,
+    - `setup_shared=... ms` (shared one-time setup),
+    - `setup=... ms` (amortized per-layer setup).
+  - runtime artifact: `target/benchmarks/llama_rs_stepwise_graph_reuse_layer_sweep_elyza_layers5_7.txt`.
+  - impact summary: `target/benchmarks/llama_stepwise_graph_reuse_layer_sweep_elyza_layers5_7_impact.md`.
+  - measured setup ratio (`new/base`): CPU `~0.315`, MTL0 `~0.309`, overall `~0.312`.
+- Added token-compute hotspot optimization for query-side RoPE application in stepwise decode:
+  - apply RoPE once on reshaped multi-head query tensor (`head_dim x n_heads x seq`) instead of per-head repeated RoPE nodes.
+  - runtime artifact:
+    - `target/benchmarks/llama_rs_stepwise_graph_reuse_layer_sweep_elyza_layers5_7_qrope_multihead.txt`.
+  - impact summary:
+    - `target/benchmarks/llama_stepwise_graph_reuse_qrope_multihead_elyza_layers5_7_impact.md`.
+  - measured post/base ratios:
+    - CPU: `avg_token ~1.001` (near-neutral),
+    - MTL0: `avg_token ~0.944` (improved),
+    - overall: `avg_token ~0.977` (improved),
+    - checksum parity: `max abs delta = 0.0`.
+- Ran CPU-side follow-up check (`head_stage_buf=true`) after the qrope pass:
+  - impact: `target/benchmarks/llama_stepwise_headstage_after_qrope_refactor_smoke_impact.md`,
+  - sampled ratio (`variant/base`): CPU `~1.022`, MTL0 `~0.995`, overall `~1.011`,
+  - decision: keep `head_stage_buf=false`.
+- Started user-requested refactor pass toward ADT/type-state/trait modularization:
+  - added `llama-rs/src/inference/stepwise_plan.rs`:
+    - `StepwiseBenchPlan` ADT,
+    - type-state builder (`backend/config` required before `build()`),
+    - trait-based static dispatch (`StepwiseBlockMlpRunSet`) for single vs sweep runs.
+  - updated `bench_attention_layer` to run stepwise benchmarks via `StepwiseBenchPlan` instead of direct `run_*_bench*` calls.
+  - split helper ops from `inference.rs` into `llama-rs/src/inference/attention_ops.rs`.
+  - fixed option precedence so explicit decode-stepwise toggles override profile presets.
+  - runtime smoke artifacts:
+    - `target/benchmarks/llama_rs_stepwise_refactor_plan_smoke.txt`,
+    - `target/benchmarks/llama_rs_refactor_profile_override_smoke.txt`,
+    - `target/benchmarks/llama_rs_refactor_attention_ops_smoke.txt`.
+- Continued the same refactor by extracting stepwise decode core from `inference.rs`:
+  - added `llama-rs/src/inference/stepwise_decode.rs` and moved:
+    - `AttentionDecodeStepwiseConfig`,
+    - `AttentionDecodeStepwiseReport`,
+    - stepwise bench reports and all `run_attention_decode_stepwise_*` runners.
+  - `llama-rs/src/inference.rs` now re-exports stepwise public APIs through the new module.
+  - re-validated full workspace (`fmt`, `clippy`, `test`) and runtime CPU/Metal smoke:
+    - `target/benchmarks/llama_rs_stepwise_refactor_stepwisecore_smoke.txt`.
+- Completed ADT-first API naming pass to remove long `run_*` public entrypoints across `llama-rs`:
+  - stepwise plan rename:
+    - `StepwiseBenchPlan` -> `DecodeStepPlan`,
+    - `StepwiseBenchPlanBuilder` -> `DecodeStepPlanBuilder`,
+    - `StepwiseBlockMlpRunSet` -> `DecodeStepBenchSet`,
+  - stepwise benchmarks and preflight now route through `DecodeStepPlan::{bench, execute_single}`.
+  - crate-wide `run_*` public function prefixes were removed (linear/mlp/attention/decode/batched/smoke/simple/idle), and examples/tests were updated accordingly.
+- Added repository-level Rust policy file for auto-loaded guidance:
+  - `.github/copilot-instructions.md` (ADT-first, type-state, static dispatch, validation/runbook defaults).
+- Runtime re-validation after ADT + naming migration:
+  - `target/benchmarks/llama_rs_stepwise_decodeplan_smoke.txt`,
+  - `target/benchmarks/llama_rs_stepwise_decodeplan_cppcompare_smoke.txt`.
+- Final post-rename runtime recheck (CPU/Metal):
+  - `target/benchmarks/llama_rs_backend_smoke_decodeplan_postrename.txt`,
+  - `target/benchmarks/llama_rs_stepwise_decodeplan_postrename_smoke.txt`.
+- Continued ADT consolidation for decode-proxy execution:
+  - added `llama-rs/src/inference/decode_proxy_plan.rs` with:
+    - `AttentionDecodePlan` + type-state builder,
+    - trait-based static dispatch (`AttentionDecodeSource`),
+    - source ADTs (`AttentionDecodeCacheInput`, `AttentionDecodeWeightsInput`).
+  - migrated decode-proxy call sites in:
+    - `bench_attention_layer`,
+    - `bench_attention_decode_cpp_compare`,
+    - `idle`.
+  - reduced duplicated decode proxy public variants from `lib.rs` export surface and kept shared execution internals private.
+- Runtime re-validation for the decode-proxy ADT pass (CPU/Metal, link-system):
+  - `target/benchmarks/llama_rs_decode_proxy_plan_smoke_cpu_metal.txt`,
+  - `target/benchmarks/llama_rs_backend_smoke_decode_proxy_plan_postrefactor.txt`.
+- Reduced function-heavy attention helper code by introducing trait-driven attention ops in `llama-rs/src/inference/attention_ops.rs`:
+  - `RotaryApplier` + `LlamaRotaryApplier` (single-head and multi-head RoPE application),
+  - `HeadConcatStrategy` with concrete `LeftFoldHeadConcat` and `BalancedHeadConcat`,
+  - `HeadConcatMetadata` for typed concat error context.
+- Migrated attention call sites to the new trait APIs:
+  - `llama-rs/src/inference.rs`,
+  - `llama-rs/src/inference/stepwise_decode.rs`.
+- Re-validated after the attention-ops trait refactor:
+  - `cargo fmt --all`,
+  - `cargo clippy --workspace --all-targets`,
+  - `cargo test --workspace`,
+  - runtime smoke (CPU/Metal, link-system):
+    - `target/benchmarks/llama_rs_attention_ops_trait_refactor_smoke_cpu_metal.txt`.
+- User-directed sequential trait-first refactor policy (`1 -> 2 -> 3`) executed and recorded for resume safety:
+  1. Backend/context lifecycle abstraction:
+     - added `llama-rs/src/inference/backend_runtime.rs`,
+     - `BackendRuntimeBuilder` + `DefaultBackendRuntimeBuilder`,
+     - migrated backend/context setup in linear/MLP/attention/decode paths.
+  2. Stepwise sequence state abstraction:
+     - added `SequenceStateUpdater` + `DeltaSequenceStateUpdater` in `stepwise_decode.rs`,
+     - migrated mask/position delta update branches to trait-backed methods.
+  3. Decode projection/cache abstraction:
+     - added `llama-rs/src/inference/projection_ops.rs`,
+     - `TensorProjector` + `F32MatmulProjector`,
+     - `DecodeCacheBuilder` + `StandardDecodeCacheBuilder`,
+     - routed `build_attention_decode_cache` through trait-based builder.
+- Runtime smoke artifacts for each sequential stage (CPU/Metal, link-system):
+  - `target/benchmarks/llama_rs_backend_runtime_trait_refactor_smoke_cpu_metal.txt`,
+  - `target/benchmarks/llama_rs_sequence_state_trait_refactor_smoke_cpu_metal.txt`,
+  - `target/benchmarks/llama_rs_projection_trait_refactor_smoke_cpu_metal.txt`.
+- llama-bench proxy now includes `bench_attention_layer` (`HxQxKxS` cases) and uses explicit backend synchronization for benchmark timing stability.
+- llama.cpp baseline capture is now completed on CPU/Metal with six real GGUF models; results are recorded in `target/benchmarks/`.
+- llama-rs proxy comparison is now captured using metadata-derived MLP/attention shape sets from the same GGUF models.
+- Added `bench_compare_report` automation to generate a consolidated markdown comparison report from benchmark artifacts.
+- Added decode-like attention proxy mode (`q_seq != kv_seq`) with reusable projected KV cache for more direct comparison with llama.cpp decode-profile behavior.
+- Added stepwise decode-growth benchmark mode (`--decode-steps`) and a persistent stepwise runner (single backend/context/graph allocation with per-step mask/position updates). Decode report now includes a dedicated stepwise section (`ms/token`).
+- Added `llama.cpp` decode (`0/128`) vs persistent-stepwise calibration artifact: `target/benchmarks/llama_stepwise_vs_cpp_calibration.md`.
+- Added per-backend untimed preflight in `bench_attention_layer` to reduce first-case kernel compile bias; validated with reordered-case runs.
+- Added step-window variant sweep artifact (`steps=8/16/32`): `target/benchmarks/llama_stepwise_variant_sweep.md`.
+- Refreshed canonical stepwise snapshot (`target/benchmarks/llama_rs_bench_attention_decode_stepwise_models.txt`) from `steps=16` and regenerated calibration table to keep parity artifacts aligned with the default policy.
+- Added safe GGUF write support to `ggml-rs` (`GgufWriter`) and new `llama-rs/examples/gguf` read/write parity flow (`w` / `r --check`).
+- Added feature-gated integration coverage (`tests/gguf_roundtrip.rs`) for GGUF typed KV + tensor metadata round-trip.
+- Added GGUF writer usability APIs: `set_values`, `remove_key`, `write_data_to_file`, and `write_metadata_to_file`.
+- Re-validated CPU/Metal runtime execution with `llama-rs/examples/backend_smoke` after GGUF write-path expansion.
+- Added `llama-rs/examples/idle` (decode-proxy idle timing path) with state-typed pause schedule (`IdlePauseSchedule<PauseScheduleReady>`), then validated CPU/Metal on `Llama-3-ELYZA-JP-8B-q4_k_m`.
+- Returned to stepwise optimization loop and captured refreshed layerwise profile on ELYZA (`block_layer=0..7`):
+  - raw: `target/benchmarks/llama_rs_stepwise_resume_elyza_layers0_7.txt`,
+  - ranked summary: `target/benchmarks/llama_stepwise_resume_elyza_layers0_7_summary.md`.
+- Added optional decode-stepwise KV projection cost modeling (`--decode-stepwise-kv-proj`) to include per-step `Wk/Wv` projection kernels in the persistent runner benchmark graph.
+- Verified KV-projection mode on real CPU + Metal runs and added artifacts:
+  - benchmark output: `target/benchmarks/llama_rs_bench_attention_decode_stepwise_kvproj_s16_models.txt`,
+  - calibration table: `target/benchmarks/llama_stepwise_vs_cpp_calibration_kvproj.md`,
+  - matched-env impact table: `target/benchmarks/llama_stepwise_kvproj_impact.md`.
+- Added optional block-scope mode (`--decode-stepwise-block`) with residual + RMSNorm + MLP-shaped compute on top of stepwise attention proxy, then validated CPU/Metal runtime and generated:
+  - `target/benchmarks/llama_rs_bench_attention_decode_stepwise_block_kvproj_s16_models.txt`,
+  - `target/benchmarks/llama_stepwise_vs_cpp_calibration_block_kvproj.md`,
+  - `target/benchmarks/llama_stepwise_block_scope_impact.md`.
+- Added optional stepwise sync/readback controls (`--decode-stepwise-sync-step`, `--decode-stepwise-readback-step`) and captured sync-mode calibration artifacts:
+  - `target/benchmarks/llama_rs_bench_attention_decode_stepwise_block_kvproj_sync_s16_models.txt`,
+  - `target/benchmarks/llama_stepwise_vs_cpp_calibration_block_kvproj_sync.md`,
+  - `target/benchmarks/llama_stepwise_sync_step_impact.md`.
+- Current takeaway: scheduling-level controls alone are insufficient for Metal-side parity; topology/kernel composition alignment remains the main gap.
+- Added model-derived block-MLP wiring options for stepwise block mode:
+  - `--block-mlp-model <gguf> --block-mlp-layer <n>`,
+  - relaxed MLP-name resolver and quantized fallback (`block_mlp_real=false`) using real metadata shape + deterministic values.
+- Verified one-case Qwen3.5 run and generated `target/benchmarks/llama_stepwise_realmlp_qwen35_calibration.md`.
+- Added Rust-idiomatic stepwise config construction helpers (`AttentionDecodeStepwiseConfig::new(...).with_*`) and centralized benchmark wiring in `bench_attention_layer`.
+- Reduced stepwise hot-loop host churn by reusing per-step `QUERY_POS`/`CAUSAL_MASK` buffers (in-place fill) instead of allocating vectors every step.
+- Re-validated after refactor with `cargo fmt`, `cargo clippy -p llama-rs --all-targets`, `cargo test -p llama-rs`, plus CPU/Metal runtime benchmarks (`target/benchmarks/rust_style_perf_stepwise_{base,block_kv}.txt`).
+- Added quantized GGUF dequant decode path via GGML type traits (`decode_tensor_data_to_f32` / `tensor_element_count`) and wired `GgufModel` tensor decode to use it.
+- Verified Qwen3.5 `Q4_K_M` block-MLP run with `block_mlp_real=true` on both CPU and Metal and captured control-vs-real comparison (`target/benchmarks/rust_style_quantized_realmlp_qwen35_comparison.md`).
+- Completed 6-model `--block-mlp-model` sweep and generated updated calibration/impact artifacts:
+  - `target/benchmarks/llama_rs_bench_attention_decode_stepwise_block_kvproj_realmlp_s16_models.txt`,
+  - `target/benchmarks/llama_stepwise_vs_cpp_calibration_block_kvproj_realmlp.md`,
+  - `target/benchmarks/llama_stepwise_block_realmlp_impact.md`.
+- Added an apples-to-apples decode comparator so Rust/C++ run the same graph before optimization work:
+  - C++ reference: `llama-rs/tests/cpp/attention_decode_proxy_reference.cpp`,
+  - runner: `llama-rs/examples/bench_attention_decode_cpp_compare.rs`,
+  - outputs: `target/benchmarks/llama_attention_decode_samework_cpp_vs_rust.{txt,md}`.
+- Extended the same-workload comparator with a stepwise mode (`--stepwise-start/--stepwise-steps/--past`) and validated CPU + Metal:
+  - command: `bench_attention_decode_cpp_compare --decode-kv 143 --stepwise-start 128 --stepwise-steps 16 --past 127 --warmup 2 --iters 10 cpu metal`,
+  - outputs: `target/benchmarks/llama_attention_decode_stepwise_samework_cpp_vs_rust.{txt,md}`,
+  - snapshot: `CPU avg rust/cpp ~0.727`, `MTL0 avg rust/cpp ~0.669`, `max checksum_rel ~8.9e-5`.
+- Added backend partial tensor-write APIs (`set_f32_backend_at` / `set_i32_backend_at`) and applied stepwise mask delta updates in `run_attention_decode_stepwise_with_cache_repeats_with_block_mlp`.
+  - pre/post impact artifact: `target/benchmarks/llama_attention_decode_stepwise_samework_maskdelta_impact.md`,
+  - measured `rust_avg_ms/token` post/pre: `~0.805` overall (`CPU ~0.804`, `MTL0 ~0.806`).
+- Added explicit stepwise mask-delta A/B toggle (`--decode-stepwise-no-mask-delta`) for matched measurements.
+  - artifact: `target/benchmarks/llama_stepwise_models_maskdelta_on_vs_off.md`,
+  - A/B summary: `on/off ~1.001` overall (`CPU ~1.009`, `MTL0 ~0.991`).
+- Re-ran 6-model block+kv+real-MLP calibration after the mask-delta pass.
+  - sweep: `target/benchmarks/llama_rs_bench_attention_decode_stepwise_block_kvproj_realmlp_s16_models_maskdelta.txt`,
+  - calibration: `target/benchmarks/llama_stepwise_vs_cpp_calibration_block_kvproj_realmlp_maskdelta.md`,
+  - old/new impact: `target/benchmarks/llama_stepwise_vs_cpp_calibration_block_kvproj_realmlp_maskdelta_impact.md`,
+  - average proxy/cpp moved from `0.310 -> 0.306` (CPU), `0.257 -> 0.252` (MTL0).
+- Added optional KV-write fidelity nodes (`--decode-stepwise-kv-cache-write`, gated by `--decode-stepwise-kv-proj`) and ran a 6-model matched sweep.
+  - sweep: `target/benchmarks/llama_rs_bench_attention_decode_stepwise_block_kvproj_kvwrite_realmlp_s16_models.txt`,
+  - calibration: `target/benchmarks/llama_stepwise_vs_cpp_calibration_block_kvproj_kvwrite_realmlp_maskdelta.md`,
+  - impact vs block+kv+real-MLP mask-delta base: `target/benchmarks/llama_stepwise_vs_cpp_calibration_block_kvproj_kvwrite_realmlp_maskdelta_impact.md`,
+  - average proxy/cpp moved from `0.252 -> 0.256` on MTL0 (overall `0.279 -> 0.281`) with small per-case drift.
+- Added configurable stepwise layer-repeat fidelity (`--decode-stepwise-layer-repeat <n>`) and benchmark support for model-derived repeat count (`--decode-stepwise-layer-repeat-model`).
+  - 6-model sweeps:
+    - `target/benchmarks/llama_rs_bench_attention_decode_stepwise_block_kvproj_kvwrite_realmlp_layerx3_s16_models.txt`,
+    - `target/benchmarks/llama_rs_bench_attention_decode_stepwise_block_kvproj_kvwrite_realmlp_layerx4_s16_models.txt`,
+  - calibrations:
+    - `target/benchmarks/llama_stepwise_vs_cpp_calibration_block_kvproj_kvwrite_realmlp_layerrepeat3_maskdelta.md`,
+    - `target/benchmarks/llama_stepwise_vs_cpp_calibration_block_kvproj_kvwrite_realmlp_layerrepeat4_maskdelta.md`,
+  - condition comparison:
+    - `target/benchmarks/llama_stepwise_vs_cpp_calibration_block_kvproj_kvwrite_realmlp_layerrepeat_impact.md`,
+  - result summary:
+    - `layer_repeat=3` reached near-parity (`CPU ~0.941`, `MTL0 ~0.965`, overall `~0.953`),
+    - `layer_repeat=4` overshot (`CPU ~1.363`, `MTL0 ~1.152`, overall `~1.258`).
+- Added KV-write cache-view fidelity mode (`--decode-stepwise-kv-cache-write-to-cache`) and evaluated it on the same 6-model `layer_repeat=3` setup.
+  - sweep:
+    - `target/benchmarks/llama_rs_bench_attention_decode_stepwise_block_kvproj_kvwritecache_realmlp_layerx3_s16_models.txt`,
+  - calibration:
+    - `target/benchmarks/llama_stepwise_vs_cpp_calibration_block_kvproj_kvwritecache_realmlp_layerrepeat3_maskdelta.md`,
+  - impact vs `layer_repeat=3` baseline:
+    - `target/benchmarks/llama_stepwise_vs_cpp_calibration_block_kvproj_kvwritecache_realmlp_layerrepeat3_impact.md`,
+  - summary:
+    - average proxy/cpp moved from `0.953 -> 0.717` (CPU `0.941 -> 0.820`, MTL0 `0.965 -> 0.615`), so this variant is not adopted as default.
+- Per user request, ran noise-reduction reruns (same condition, `r=3`, `iters=15`) and generated stable-median artifacts.
+  - `layer_repeat=3` stability + calibration artifacts:
+    - `target/benchmarks/llama_rs_bench_attention_decode_stepwise_block_kvproj_kvwrite_realmlp_layerx3_s16_models_r3_i15_raw.txt`,
+    - `target/benchmarks/llama_rs_bench_attention_decode_stepwise_block_kvproj_kvwrite_realmlp_layerx3_s16_models_r3_i15_median.txt`,
+    - `target/benchmarks/llama_stepwise_layerx3_stability_r3_i15.md`,
+    - `target/benchmarks/llama_stepwise_vs_cpp_calibration_block_kvproj_kvwrite_realmlp_layerrepeat3_maskdelta_stable.md`,
+    - `target/benchmarks/llama_stepwise_vs_cpp_calibration_block_kvproj_kvwrite_realmlp_layerrepeat3_stable_impact.md`.
+  - `layer_repeat=4` stability + calibration artifacts:
+    - `target/benchmarks/llama_rs_bench_attention_decode_stepwise_block_kvproj_kvwrite_realmlp_layerx4_s16_models_r3_i15_raw.txt`,
+    - `target/benchmarks/llama_rs_bench_attention_decode_stepwise_block_kvproj_kvwrite_realmlp_layerx4_s16_models_r3_i15_median.txt`,
+    - `target/benchmarks/llama_stepwise_layerx4_stability_r3_i15.md`,
+    - `target/benchmarks/llama_stepwise_vs_cpp_calibration_block_kvproj_kvwrite_realmlp_layerrepeat4_maskdelta_stable.md`,
+    - `target/benchmarks/llama_stepwise_vs_cpp_calibration_block_kvproj_kvwrite_realmlp_layerrepeat3_vs_4_stable_impact.md`.
+  - stable-median summary:
+    - `layer_repeat=3`: CPU `~0.869`, MTL0 `~0.634`, overall `~0.751`,
+    - `layer_repeat=4`: CPU `~1.140`, MTL0 `~0.802`, overall `~0.971`.
+- Reframed optimization policy to layer-by-layer measurement first, and extended `bench_attention_layer` with layer sweep support:
+  - new CLI option: `--block-mlp-layer-range <start:end>`,
+  - output now includes `block_layer=<n>` for stepwise block runs.
+- Captured first per-layer profile artifacts under the current decode-stepwise condition (`layer_repeat=3`, block+kv+kvwrite):
+  - Qwen3.5-4B:
+    - raw: `target/benchmarks/llama_rs_bench_attention_decode_stepwise_qwen35_layers0_31_layerx3.txt`,
+    - summary/data: `target/benchmarks/llama_stepwise_qwen35_layers0_31_layerx3_profile.{md,csv}`,
+    - stats: CPU mean/std `~12.607/0.104`, MTL0 mean/std `~9.053/0.076` ms/token.
+  - Qwen3-8B:
+    - raw: `target/benchmarks/llama_rs_bench_attention_decode_stepwise_qwen3_8b_layers0_35_layerx3.txt`,
+    - summary/data: `target/benchmarks/llama_stepwise_qwen3_8b_layers0_35_layerx3_profile.{md,csv}`,
+    - stats: CPU mean/std `~23.824/0.169`, MTL0 mean/std `~16.342/0.091` ms/token.
+  - cross-model summary:
+    - `target/benchmarks/llama_stepwise_layerwise_profile_summary_layerx3.md`.
+- Added experimental host-buffer elision toggle for incremental mask updates in stepwise mode:
+  - config/API: `AttentionDecodeStepwiseConfig::with_mask_host_buffer_elision(bool)`,
+  - benchmark CLI:
+    - `--decode-stepwise-elide-mask-host-buffer` (enable),
+    - `--decode-stepwise-keep-mask-host-buffer` (explicitly disable),
+  - stepwise output now includes `mask_host_elide=<true|false>`.
+- Hardened the incremental mask-delta path implementation:
+  - removed the unnecessary host-buffer mutation dependency from the elision path,
+  - removed the previous unsafe host write from this path.
+- Ran sampled A/B experiments (order-balanced true->false and false->true):
+  - Qwen3.5 sampled layers impact:
+    - `target/benchmarks/llama_stepwise_mask_host_elide_ab_qwen35_layers_sample_impact.md`,
+  - Qwen3-8B sampled layers impact:
+    - `target/benchmarks/llama_stepwise_mask_host_elide_ab_qwen3_8b_layers_sample_impact.md`,
+  - cross-model summary:
+    - `target/benchmarks/llama_stepwise_mask_host_elide_sampled_impact.md`.
+- Ran user-requested full 6-model validation sweep for `mask_host_elide` with balanced ordering:
+  - base (`mask_host_elide=false`):
+    - `target/benchmarks/llama_rs_bench_attention_decode_stepwise_block_kvproj_kvwrite_realmlp_layerx3_s16_models_maskhost_base_balanced.txt`,
+  - elide (`mask_host_elide=true`):
+    - `target/benchmarks/llama_rs_bench_attention_decode_stepwise_block_kvproj_kvwrite_realmlp_layerx3_s16_models_maskhost_elide_balanced.txt`,
+  - impact summary:
+    - `target/benchmarks/llama_stepwise_mask_host_elide_full_sweep_impact.md`.
+- Current policy after full sweep:
+  - backend averages improved slightly (`CPU ~0.951`, `MTL0 ~0.983`), but direction remains model-sensitive, so `mask_host_elide` stays opt-in (default off).
+- Added stability reruns for the same full-sweep condition (`r=3` total including baseline run):
+  - run2 raw:
+    - `target/benchmarks/llama_rs_bench_attention_decode_stepwise_block_kvproj_kvwrite_realmlp_layerx3_s16_models_maskhost_{base,elide}_balanced_r2.txt`,
+  - run3 raw:
+    - `target/benchmarks/llama_rs_bench_attention_decode_stepwise_block_kvproj_kvwrite_realmlp_layerx3_s16_models_maskhost_{base,elide}_balanced_r3.txt`,
+  - stability summary:
+    - `target/benchmarks/llama_stepwise_mask_host_elide_full_sweep_stability_r3.md`.
+- Stability (`r=3` median) policy check:
+  - backend averages: CPU `~0.937`, MTL0 `~0.995` (`elide/base`),
+  - model-level direction remains mixed, so default policy is unchanged (`mask_host_elide=false`, opt-in only).
+- Implemented next common hot-path optimization in attention decode:
+  - cache rotated K heads and transposed/contiguous V heads per KV head once, then reuse them across grouped query heads (instead of recomputing per query head).
+- Post-change 6-model sweep (default `mask_host_elide=false`):
+  - raw:
+    - `target/benchmarks/llama_rs_bench_attention_decode_stepwise_block_kvproj_kvwrite_realmlp_layerx3_s16_models_kvheadcache_post.txt`,
+  - stability reruns:
+    - `target/benchmarks/llama_rs_bench_attention_decode_stepwise_block_kvproj_kvwrite_realmlp_layerx3_s16_models_kvheadcache_post_r2.txt`,
+    - `target/benchmarks/llama_rs_bench_attention_decode_stepwise_block_kvproj_kvwrite_realmlp_layerx3_s16_models_kvheadcache_post_r3.txt`,
+    - `target/benchmarks/llama_stepwise_kvhead_cache_stability_r3.md`,
+  - stable impact vs pre-change `r=3` baseline:
+    - `target/benchmarks/llama_stepwise_kvhead_cache_impact_vs_maskhost_base_r3_median_stable.md`,
+    - averages: CPU `~0.840`, MTL0 `~0.935` (`post/base`).
+- Correctness guard:
+  - checksum parity report:
+    - `target/benchmarks/llama_stepwise_kvhead_cache_checksum_check.md`,
+  - sampled 6-model check stayed exact (`max abs delta = 0.0`).
+- Updated stable `llama.cpp` calibration after KV-head cache optimization:
+  - calibration:
+    - `target/benchmarks/llama_stepwise_vs_cpp_calibration_block_kvproj_kvwrite_realmlp_layerrepeat3_maskdelta_kvheadcache_stable.md`,
+  - old/new calibration impact:
+    - `target/benchmarks/llama_stepwise_vs_cpp_calibration_block_kvproj_kvwrite_realmlp_layerrepeat3_maskdelta_kvheadcache_stable_impact.md`,
+  - averages:
+    - CPU proxy/cpp `0.869 -> 0.777`,
+    - MTL0 proxy/cpp `0.634 -> 0.630`,
+    - overall `0.752 -> 0.704`.
+- Added layer-repeat=3 mask-delta A/B artifact:
+  - `target/benchmarks/llama_stepwise_models_layerx3_maskdelta_on_vs_off.md`,
+  - sampled rerun summary: overall `on/off ~0.965` (`CPU ~0.981`, `MTL0 ~0.949`).
+- Performed release-asm spot checks for the mask update hotspot:
+  - command: `cargo rustc -p llama-rs --lib --release -- -C codegen-units=1 --emit=asm`,
+  - `fill_causal_mask_values` is vectorized,
+  - stepwise delta path lowers to `Tensor::set_f32_backend_at` branch with no steady-state allocator calls in the success loop.
+- Started the next hot-path pass on attention output projection with an opt-in fused mode:
+  - `AttentionDecodeStepwiseConfig::with_fused_output_projection(bool)` (default `false`),
+  - benchmark CLI:
+    - `--decode-stepwise-fuse-output-proj`,
+    - `--decode-stepwise-no-fuse-output-proj`,
+    - `--decode-stepwise-profile-outproj-fused-layerx5` (preset: `outproj_fused=true` + `layer_repeat=5`),
+  - stepwise output now includes `outproj_fused=<true|false>`.
+- Added safe `Context::concat` wrapper in `ggml-rs` and wired fused mode to:
+  - concatenate per-head attention outputs (`dim=0`) and execute one `W_O * HEADS` matmul.
+- CPU/Metal runtime smoke A/B completed (`4096x32x8x1`, `decode-kv=128`, `steps=16`, `layer_repeat=3`):
+  - raw: `target/benchmarks/llama_stepwise_outproj_fuse_smoke_ab.txt`,
+  - impact: `target/benchmarks/llama_stepwise_outproj_fuse_smoke_impact.md`,
+  - sample ratio (`fused/base`): CPU `~1.051`, MTL0 `~0.963`.
+- Ran full 6-model balanced-order sweep for `outproj_fused` on/off:
+  - base: `target/benchmarks/llama_rs_bench_attention_decode_stepwise_block_kvproj_kvwrite_realmlp_layerx3_s16_models_outproj_base_balanced.txt`,
+  - fused: `target/benchmarks/llama_rs_bench_attention_decode_stepwise_block_kvproj_kvwrite_realmlp_layerx3_s16_models_outproj_fused_balanced.txt`,
+  - impact: `target/benchmarks/llama_stepwise_outproj_fuse_full_sweep_impact.md`,
+  - average `fused/base`: CPU `~0.884`, MTL0 `~0.941`, overall `~0.912`.
+- Added `r=3` stability reruns for the same full-sweep condition:
+  - run2:
+    - `target/benchmarks/llama_rs_bench_attention_decode_stepwise_block_kvproj_kvwrite_realmlp_layerx3_s16_models_outproj_base_balanced_r2.txt`,
+    - `target/benchmarks/llama_rs_bench_attention_decode_stepwise_block_kvproj_kvwrite_realmlp_layerx3_s16_models_outproj_fused_balanced_r2.txt`,
+  - run3:
+    - `target/benchmarks/llama_rs_bench_attention_decode_stepwise_block_kvproj_kvwrite_realmlp_layerx3_s16_models_outproj_base_balanced_r3.txt`,
+    - `target/benchmarks/llama_rs_bench_attention_decode_stepwise_block_kvproj_kvwrite_realmlp_layerx3_s16_models_outproj_fused_balanced_r3.txt`,
+  - stability summary:
+    - `target/benchmarks/llama_stepwise_outproj_fuse_full_sweep_stability_r3.md`,
+  - stable median `fused/base` averages: CPU `~0.885`, MTL0 `~0.940`, overall `~0.913`.
+- Updated stable calibration vs `llama.cpp` for the fused medians:
+  - calibration:
+    - `target/benchmarks/llama_stepwise_vs_cpp_calibration_block_kvproj_kvwrite_realmlp_layerrepeat3_maskdelta_kvheadcache_outprojfuse_stable.md`,
+  - old/new impact:
+    - `target/benchmarks/llama_stepwise_vs_cpp_calibration_block_kvproj_kvwrite_realmlp_layerrepeat3_maskdelta_kvheadcache_outprojfuse_stable_impact.md`,
+  - averages moved:
+    - CPU proxy/cpp `0.777 -> 0.693`,
+    - MTL0 proxy/cpp `0.630 -> 0.595`,
+    - overall `0.704 -> 0.644`.
+- Current policy:
+  - `outproj_fused` remains default-off (opt-in) in this pass because it is a strong speedup but increases parity drift against the current `layer_repeat=3` calibration target.
+- Ran parity-retune sweeps for `outproj_fused` with `layer_repeat=4/5/6`:
+  - `target/benchmarks/llama_rs_bench_attention_decode_stepwise_block_kvproj_kvwrite_realmlp_layerx4_s16_models_outprojfused.txt`,
+  - `target/benchmarks/llama_rs_bench_attention_decode_stepwise_block_kvproj_kvwrite_realmlp_layerx5_s16_models_outprojfused.txt`,
+  - `target/benchmarks/llama_rs_bench_attention_decode_stepwise_block_kvproj_kvwrite_realmlp_layerx6_s16_models_outprojfused.txt`,
+  - comparison: `target/benchmarks/llama_stepwise_outproj_fused_layerrepeat456_calibration.md`.
+- Retune snapshot:
+  - overall avg proxy/cpp:
+    - `repeat4 ~0.807`,
+    - `repeat5 ~0.985`,
+    - `repeat6 ~1.156`,
+  - best overall parity distance in this pass: `layer_repeat=5`.
+- Added `layer_repeat=5` stability reruns (`r=3`) for `outproj_fused`:
+  - `target/benchmarks/llama_rs_bench_attention_decode_stepwise_block_kvproj_kvwrite_realmlp_layerx5_s16_models_outprojfused_r2.txt`,
+  - `target/benchmarks/llama_rs_bench_attention_decode_stepwise_block_kvproj_kvwrite_realmlp_layerx5_s16_models_outprojfused_r3.txt`,
+  - stability table: `target/benchmarks/llama_stepwise_outproj_fused_layerx5_stability_r3.md`.
+- Stable calibration with `outproj_fused + layer_repeat=5`:
+  - `target/benchmarks/llama_stepwise_vs_cpp_calibration_block_kvproj_kvwrite_realmlp_layerrepeat5_outprojfuse_stable.md`,
+  - `target/benchmarks/llama_stepwise_vs_cpp_calibration_block_kvproj_kvwrite_realmlp_layerrepeat5_outprojfuse_stable_impact.md`,
+  - averages:
+    - CPU proxy/cpp `~1.073`,
+    - MTL0 proxy/cpp `~0.908`,
+    - overall `~0.991`.
+- Profile smoke check:
+  - `target/benchmarks/llama_stepwise_profile_outprojfused_layerx5_smoke.txt` confirms CPU+Metal runtime with `profile=outproj_fused_layerx5` output tagging.
+- Added backend-balanced preset profile wiring:
+  - new CLI flag: `--decode-stepwise-profile-outproj-fused-balanced`,
+  - preset behavior:
+    - CPU uses `layer_repeat=5`,
+    - Metal uses `layer_repeat=6`,
+    - `outproj_fused=true`,
+  - output tag: `profile=outproj_fused_balanced_cpu5_mtl6`.
+- Profile smoke check:
+  - `target/benchmarks/llama_stepwise_profile_outprojfused_balanced_smoke.txt` confirms CPU+Metal runtime and per-backend repeat selection.
+- Captured full 6-model calibration run for the balanced preset:
+  - run:
+    - `target/benchmarks/llama_rs_bench_attention_decode_stepwise_block_kvproj_kvwrite_realmlp_profile_outprojfused_balanced_s16_models.txt`,
+  - calibration:
+    - `target/benchmarks/llama_stepwise_vs_cpp_calibration_block_kvproj_kvwrite_realmlp_profile_outprojfused_balanced.md`,
+  - impact vs prior references:
+    - `target/benchmarks/llama_stepwise_vs_cpp_calibration_block_kvproj_kvwrite_realmlp_profile_outprojfused_balanced_impact.md`,
+  - averages:
+    - CPU proxy/cpp `~1.076`,
+    - MTL0 proxy/cpp `~1.063`,
+    - overall `~1.070`.
+- User selected the near-overall parity track (`outproj_fused_layerx5`) as the active canonical profile for continued optimization.
+- Implemented a new hot-path optimization in stepwise decode:
+  - precompute static per-KV-head transforms (`RoPE(K)`, `transpose+cont(V)`) once and reuse them,
+  - API: `AttentionDecodeStepwiseConfig::with_static_kv_head_view_precompute(bool)`,
+  - benchmark flags:
+    - `--decode-stepwise-static-kv-head-precompute`,
+    - `--decode-stepwise-no-static-kv-head-precompute`,
+  - stepwise output now includes `kvhead_static_precompute=<true|false>`.
+- CPU/Metal representative A/B (Qwen3.5, layer0, `outproj_fused_layerx5`) shows consistent speedup:
+  - raw: `target/benchmarks/llama_stepwise_profile_layerx5_statickvhead_ab_qwen35_layer0.txt`,
+  - impact: `target/benchmarks/llama_stepwise_profile_layerx5_statickvhead_ab_qwen35_layer0_impact.md`,
+  - `on/off`: CPU `~0.961`, MTL0 `~0.983`.
+- Full 6-model CPU/Metal A/B sweep under `outproj_fused_layerx5`:
+  - on: `target/benchmarks/llama_rs_bench_attention_decode_stepwise_block_kvproj_kvwrite_realmlp_profile_outprojfused_layerx5_statickv_on_s16_models.txt`,
+  - off: `target/benchmarks/llama_rs_bench_attention_decode_stepwise_block_kvproj_kvwrite_realmlp_profile_outprojfused_layerx5_statickv_off_s16_models.txt`,
+  - impact: `target/benchmarks/llama_stepwise_profile_outprojfused_layerx5_statickv_impact.md`,
+  - averages (`on/off`): CPU `~0.933`, MTL0 `~0.964`, overall `~0.949`.
+- Checksum parity remained exact across all 6 models:
+  - `target/benchmarks/llama_stepwise_profile_outprojfused_layerx5_statickv_checksum_check.md` (`max abs delta = 0.0`).
+- Calibration refresh using the same cpp reference:
+  - `target/benchmarks/llama_stepwise_vs_cpp_calibration_block_kvproj_kvwrite_realmlp_layerrepeat5_outprojfuse_statickv.md`,
+  - `target/benchmarks/llama_stepwise_vs_cpp_calibration_block_kvproj_kvwrite_realmlp_layerrepeat5_outprojfuse_statickv_impact.md`,
+  - averages moved:
+    - CPU proxy/cpp `~1.073 -> ~1.016`,
+    - MTL0 proxy/cpp `~0.908 -> ~0.889`,
+    - overall `~0.991 -> ~0.953`.
+- Re-evaluated the balanced preset under the new static-KV baseline:
+  - run: `target/benchmarks/llama_rs_bench_attention_decode_stepwise_block_kvproj_kvwrite_realmlp_profile_outprojfused_balanced_statickv_s16_models.txt`,
+  - calibration: `target/benchmarks/llama_stepwise_vs_cpp_calibration_block_kvproj_kvwrite_realmlp_profile_outprojfused_balanced_statickv.md`,
+  - impact: `target/benchmarks/llama_stepwise_vs_cpp_calibration_block_kvproj_kvwrite_realmlp_profile_outprojfused_balanced_statickv_impact.md`,
+  - averages moved (`prior balanced -> balanced + static KV`):
+    - CPU proxy/cpp `~1.076 -> ~1.025`,
+    - MTL0 proxy/cpp `~1.063 -> ~1.041`,
+    - overall `~1.070 -> ~1.033`.
+- Current interpretation:
+  - `outproj_fused_layerx5 + static_kv` remains the user-selected active optimization track,
+  - balanced + static-KV is now a nearer-to-1.0 calibration alternative than the previous balanced run.
+- Ran next hotspot experiment on fused-output head concatenation strategy:
+  - added balanced-concat option for fused output projection:
+    - API: `AttentionDecodeStepwiseConfig::with_balanced_head_concat(bool)`,
+    - CLI:
+      - `--decode-stepwise-balanced-head-concat`,
+      - `--decode-stepwise-no-balanced-head-concat`,
+    - stepwise output now includes `head_concat_balanced=<true|false>`.
+- Representative A/B (Qwen3.5 layer0, `outproj_fused_layerx5`, static-KV on):
+  - raw: `target/benchmarks/llama_stepwise_profile_layerx5_balancedconcat_ab_qwen35_layer0.txt`,
+  - impact: `target/benchmarks/llama_stepwise_profile_layerx5_balancedconcat_ab_qwen35_layer0_impact.md`,
+  - `on/off`: CPU `~1.012`, MTL0 `~1.003` (no clear win).
+- Full 6-model A/B (`outproj_fused_layerx5`, static-KV on):
+  - on: `target/benchmarks/llama_rs_bench_attention_decode_stepwise_block_kvproj_kvwrite_realmlp_profile_outprojfused_layerx5_statickv_balancedconcat_on_s16_models.txt`,
+  - off: `target/benchmarks/llama_rs_bench_attention_decode_stepwise_block_kvproj_kvwrite_realmlp_profile_outprojfused_layerx5_statickv_balancedconcat_off_s16_models.txt`,
+  - impact: `target/benchmarks/llama_stepwise_profile_outprojfused_layerx5_statickv_balancedconcat_impact.md`,
+  - averages (`on/off`): CPU `~1.000`, MTL0 `~0.983`, overall `~0.992`,
+  - checksum parity remained exact (`max abs delta = 0.0`).
+- Policy for this pass:
+  - keep `head_concat_balanced=false` as default (marginal/mixed impact),
+  - keep the switch available for explicit A/B and future retests.
+- Ran next hotspot experiment on QUERY_POS updates for incremental decode:
+  - added position-delta toggle for stepwise path:
+    - API: `AttentionDecodeStepwiseConfig::with_position_deltas(bool)`,
+    - CLI:
+      - `--decode-stepwise-position-delta`,
+      - `--decode-stepwise-no-position-delta`,
+    - stepwise output now includes `position_delta=<true|false>`.
+- Representative A/B (Qwen3.5 layer0, `outproj_fused_layerx5`, static-KV on):
+  - raw: `target/benchmarks/llama_stepwise_profile_layerx5_positiondelta_ab_qwen35_layer0.txt`,
+  - impact: `target/benchmarks/llama_stepwise_profile_layerx5_positiondelta_ab_qwen35_layer0_impact.md`,
+  - `on/off`: CPU `~0.997`, MTL0 `~0.977`.
+- Full 6-model A/B (`outproj_fused_layerx5`, static-KV on):
+  - on: `target/benchmarks/llama_rs_bench_attention_decode_stepwise_block_kvproj_kvwrite_realmlp_profile_outprojfused_layerx5_statickv_positiondelta_on_s16_models.txt`,
+  - off: `target/benchmarks/llama_rs_bench_attention_decode_stepwise_block_kvproj_kvwrite_realmlp_profile_outprojfused_layerx5_statickv_positiondelta_off_s16_models.txt`,
+  - impact: `target/benchmarks/llama_stepwise_profile_outprojfused_layerx5_statickv_positiondelta_impact.md`,
+  - averages (`on/off`): CPU `~0.990`, MTL0 `~1.001`, overall `~0.995`,
+  - checksum parity remained exact (`max abs delta = 0.0`).
+- Policy for this pass:
+  - keep `position_delta=true` as default (small but positive overall impact),
+  - keep the toggle for explicit A/B and future stability checks.
+- Ran next hotspot experiment on fused-output head staging:
+  - added head-staging toggle for stepwise fused output projection:
+    - API: `AttentionDecodeStepwiseConfig::with_head_output_staging_buffer(bool)`,
+    - CLI:
+      - `--decode-stepwise-head-stage-buffer`,
+      - `--decode-stepwise-no-head-stage-buffer`,
+    - stepwise output now includes `head_stage_buf=<true|false>`.
+- Targeted hotspot A/B (ELYZA, `block_layer=5..7`, profile `outproj_fused_layerx5`, static-KV on):
+  - base: `target/benchmarks/llama_rs_stepwise_elyza_layers5_7_headstage_base.txt`,
+  - on: `target/benchmarks/llama_rs_stepwise_elyza_layers5_7_headstage_on.txt`,
+  - impact: `target/benchmarks/llama_stepwise_profile_layerx5_headstage_ab_elyza_layers5_7_impact.md`,
+  - result (`on/base`): CPU `~1.009`, MTL0 `~1.000`, overall `~1.005` (no speed win),
+  - checksum parity: `target/benchmarks/llama_stepwise_profile_layerx5_headstage_ab_elyza_layers5_7_checksum_check.md` (`max abs delta = 0.0`).
+- Policy for this pass:
+  - keep `head_stage_buf=false` as default,
+  - keep the switch available for focused re-tests on future hotspot slices.
+- Ran next hotspot experiment on block-MLP gate/up projection fusion:
+  - added fused gate/up toggle for stepwise block mode:
+    - API: `AttentionDecodeStepwiseConfig::with_fused_block_gate_up_projection(bool)`,
+    - CLI:
+      - `--decode-stepwise-fuse-block-gate-up`,
+      - `--decode-stepwise-no-fuse-block-gate-up`,
+    - stepwise output now includes `block_gateup_fused=<true|false>`.
+- Targeted hotspot A/B (ELYZA, `block_layer=5..7`, profile `outproj_fused_layerx5`, static-KV on):
+  - base: `target/benchmarks/llama_rs_stepwise_elyza_layers5_7_blockgateup_base.txt`,
+  - on: `target/benchmarks/llama_rs_stepwise_elyza_layers5_7_blockgateup_on.txt`,
+  - impact: `target/benchmarks/llama_stepwise_profile_layerx5_blockgateup_ab_elyza_layers5_7_impact.md`,
+  - result (`on/base`): CPU `~1.013`, MTL0 `~1.012`, overall `~1.012` (regression),
+  - checksum parity: `target/benchmarks/llama_stepwise_profile_layerx5_blockgateup_ab_elyza_layers5_7_checksum_check.md` (`max abs delta = 0.0`).
+- Policy for this pass:
+  - keep `block_gateup_fused=false` as default,
+  - keep the switch available for focused re-tests on future hotspot slices.
+- Refactored argument processing in `bench_attention_layer` before next example expansion:
+  - replaced pending-flag state-machine parsing with iterator-driven `next_arg(...)` flow,
+  - kept the existing CLI surface and post-parse validation rules,
+  - reduced parser branching complexity and improved maintainability.
+- Re-validated parser refactor:
+  - `cargo fmt --all`
+  - `cargo clippy --workspace --all-targets`
+  - `cargo test --workspace`
+  - runtime parser smoke with complex options:
+    - `target/benchmarks/llama_rs_parser_refactor_smoke.txt`.
+- Hardened `idle` for mixed-architecture GGUF models (Qwen follow-up):
+  - changed `resolve_llama_layer_tensor_names_from_names` to resolve only the requested layer (instead of resolving every detected layer first), so mixed layer dialects do not fail at layer `0` when probing another layer.
+  - made `resolve_llama_layer_dimensions` treat non-llama architecture metadata as tensor-heuristic fallback instead of hard failure (`UnsupportedArchitecture` no longer aborts this resolver path).
+  - added naming regression test `resolves_requested_layer_even_when_other_layers_are_incomplete` to lock layer-scoped behavior for mixed-layer models.
+  - added `idle` fallback policy:
+    - try requested layer + detected layer scan for real attention weights (`weights_mode=ModelLayer`),
+    - if none resolve on non-llama metadata, run with metadata-derived deterministic attention weights (`weights_mode=MetadataDeterministic`).
+  - `IdleReport` now includes `requested_layer` and `weights_mode`; `examples/idle` output includes both fields.
+- Validation for the qwen idle pass:
+  - `cargo fmt --all`
+  - `cargo clippy --workspace --all-targets`
+  - `cargo test --workspace`
+  - runtime:
+    - `target/benchmarks/llama_rs_idle_qwen35_cpu_metal_fallback.txt` (Qwen3.5 CPU/Metal, deterministic metadata fallback),
+    - `target/benchmarks/llama_rs_idle_elyza_cpu_metal_post_qwen_fix.txt` (ELYZA CPU/Metal, real model-layer weights unchanged).
+- Tightened GGUF residual compatibility in `llama-rs/examples/gguf`:
+  - expanded mode surface to `w | r0 | r1 | r`:
+    - `r0`: metadata-only read pass (`gguf_ex_read_0`-style),
+    - `r1`: tensor-data preview pass (`gguf_ex_read_1`-style) with `--check|--no-check`,
+    - `r`: combined `r0 + r1`.
+  - added shared tensor payload slicing helper to keep bounds checks centralized for preview + validation paths.
+- Validation for GGUF mode compatibility:
+  - `cargo fmt --all`
+  - `cargo clippy --workspace --all-targets`
+  - `cargo test --workspace`
+  - runtime combined artifact:
+    - `target/benchmarks/llama_rs_gguf_mode_parity_r0_r1.txt`.
+
+## Latest continuation (review1 merge + trait queue resume)
+
+- Merged review1 worktree performance/hardening pass into `master`:
+  - `src/compute.rs` tensor I/O fast paths and allocation cleanup,
+  - C++ reference include resolution now honors `GGML_RS_GGML_INCLUDE_DIR` in:
+    - `llama-rs/examples/bench_attention_decode_cpp_compare.rs`,
+    - `llama-rs/tests/mlp_cpp_parity.rs`.
+- Added targeted tensor I/O perf evidence:
+  - `target/benchmarks/review1_tensorio_microbench_summary.md`.
+- Resumed trait/ADT queue in `stepwise_decode`:
+  - Candidate A complete:
+    - introduced `KvCacheWriteStrategy` abstraction (`shared` vs `step-specific`),
+    - runtime smoke artifact: `target/benchmarks/llama_rs_kv_write_strategy_trait_smoke.txt`.
+  - Candidate B complete:
+    - introduced head-output projection mode ADT + assembler (`per-head`, `fused concat`, `fused staging`),
+    - runtime smoke artifact: `target/benchmarks/llama_rs_head_output_mode_adt_smoke.txt`.
+  - Candidate C complete:
+    - introduced `StepwiseGraphBuilder` + `KvPolicyStepwiseGraphBuilder` and `StepwiseGraphBuildInput`,
+    - centralized stepwise graph construction (graph count, prereq nodes, KV write wiring) under one ADT-driven builder,
+    - runtime smoke artifact: `target/benchmarks/llama_rs_stepwise_graph_builder_adt_smoke.txt`.
+- Continued stepwise execution-loop cleanup after Candidate C:
+  - added `StepGraphSchedule` to precompute per-step graph indices once and reuse them across warmup/bench loops.
+  - runtime smoke artifact:
+    - `target/benchmarks/llama_rs_stepwise_graph_schedule_smoke.txt`.
+- Refreshed layer hotspot profile on the active lock (`outproj_fused_layerx5`, ELYZA layers `5..7`):
+  - raw:
+    - `target/benchmarks/llama_rs_stepwise_post_graphbuilder_elyza_layers5_7.txt`,
+  - summaries:
+    - `target/benchmarks/llama_stepwise_post_graphbuilder_elyza_layers5_7_summary.csv`,
+    - `target/benchmarks/llama_stepwise_post_graphbuilder_elyza_layers5_7_summary.md`,
+  - current hotspot snapshot:
+    - CPU max in this slice: `layer=7` (`29.283 ms/token`),
+    - MTL0 max in this slice: `layer=6` (`20.165 ms/token`).
+- Rechecked `block_gateup_fused` after the graph-builder/schedule refactors on the same ELYZA hotspot slice:
+  - base:
+    - `target/benchmarks/llama_rs_stepwise_post_graphbuilder_elyza_layers5_7_blockgateup_base.txt`,
+  - variant(on):
+    - `target/benchmarks/llama_rs_stepwise_post_graphbuilder_elyza_layers5_7_blockgateup_on.txt`,
+  - impact:
+    - `target/benchmarks/llama_stepwise_post_graphbuilder_elyza_layers5_7_blockgateup_impact.md`,
+  - checksum check:
+    - `target/benchmarks/llama_stepwise_post_graphbuilder_elyza_layers5_7_blockgateup_checksum_check.md` (`max abs delta = 0.0`),
+  - means (`on/base`):
+    - CPU `~0.988`,
+    - MTL0 `~0.995`,
+    - overall `~0.991`.
+- Broader validation pass (`Qwen3.5`, layers `0..7`) for `block_gateup_fused` under the same profile lock:
+  - base:
+    - `target/benchmarks/llama_rs_stepwise_post_graphbuilder_qwen35_layers0_7_blockgateup_base.txt`,
+  - variant(on):
+    - `target/benchmarks/llama_rs_stepwise_post_graphbuilder_qwen35_layers0_7_blockgateup_on.txt`,
+  - impact:
+    - `target/benchmarks/llama_stepwise_post_graphbuilder_qwen35_layers0_7_blockgateup_impact.md`,
+  - checksum check:
+    - `target/benchmarks/llama_stepwise_post_graphbuilder_qwen35_layers0_7_blockgateup_checksum_check.md` (`max abs delta = 0.0`),
+  - means (`on/base`):
+    - CPU `~1.029`,
+    - MTL0 `~0.980`,
+    - overall `~1.004`.
+- Current pass decision:
+  - keep `block_gateup_fused=false` as default (cross-model direction remains mixed after broader validation),
+  - keep the flag available for backend-specific or model-specific A/B exploration.
+- Rechecked `head_stage_buf` after graph-builder/schedule passes on ELYZA layers `5..7`:
+  - base:
+    - `target/benchmarks/llama_rs_stepwise_post_graphbuilder_elyza_layers5_7.txt`,
+  - variant(on):
+    - `target/benchmarks/llama_rs_stepwise_post_graphbuilder_elyza_layers5_7_headstage_on.txt`,
+  - impact:
+    - `target/benchmarks/llama_stepwise_post_graphbuilder_elyza_layers5_7_headstage_impact.md`,
+  - checksum check:
+    - `target/benchmarks/llama_stepwise_post_graphbuilder_elyza_layers5_7_headstage_checksum_check.md` (`max abs delta = 0.0`),
+  - means (`on/base`):
+    - CPU `~1.000`,
+    - MTL0 `~1.004`,
+    - overall `~1.002`.
+- Policy for this pass:
+  - keep `head_stage_buf=false` as default (near-neutral to slight regression on the current hotspot slice).
+- Rechecked `mask_host_elide` after graph-builder/schedule passes on ELYZA layers `5..7`:
+  - base:
+    - `target/benchmarks/llama_rs_stepwise_post_graphbuilder_elyza_layers5_7.txt`,
+  - variant(on):
+    - `target/benchmarks/llama_rs_stepwise_post_graphbuilder_elyza_layers5_7_maskhost_on.txt`,
+  - impact:
+    - `target/benchmarks/llama_stepwise_post_graphbuilder_elyza_layers5_7_maskhost_impact.md`,
+  - checksum check:
+    - `target/benchmarks/llama_stepwise_post_graphbuilder_elyza_layers5_7_maskhost_checksum_check.md` (`max abs delta = 0.0`),
+  - means (`on/base`):
+    - CPU `~1.018`,
+    - MTL0 `~0.998`,
+    - overall `~1.008`.
+- Policy for this pass:
+  - keep `mask_host_elide=false` as default (CPU-side regression dominates on the current hotspot slice).
+
+## Review2 worktree refactor pass
+
+- Added review2-focused API unification in `ggml-rs` while preserving existing behavior:
+  - new generic memory APIs:
+    - `Context::recommended_matmul_memory::<T>(lhs, rhs) -> Result<Bytes>`,
+    - `Context::recommended_backend_matmul_memory::<T>(lhs, rhs) -> Result<Bytes>`,
+  - legacy `*_f32*_shapes*_bytes` helpers kept as compatibility wrappers.
+- Added typed tensor I/O dispatch API:
+  - `GgmlElement` trait (`f32`, `i32`) and generic methods on `Tensor`:
+    - `write_data`, `write_data_backend`, `write_data_backend_at`,
+    - `read_data`, `read_data_backend`, `get_data`.
+  - updated ggml examples to exercise the new generic surface.
+- Migrated llama-rs memory-sizing call sites to the generic helpers (`::<f32>`).
+- Validation completed in review2 worktree:
+  - `cargo fmt --all`,
+  - `cargo clippy --workspace --all-targets`,
+  - `cargo test --workspace`,
+  - runtime smoke:
+    - `examples/simple_ctx`,
+    - `examples/backend_matmul` (CPU + Metal),
+    - `llama-rs/examples/backend_smoke` (CPU + Metal).
+- Regression guard snapshots (`master` vs `review2`):
+  - `target/benchmarks/review2_bench_matmul_master_vs_refactor.md`,
+  - `target/benchmarks/review2_llamars_bench_matmul_master_vs_refactor.md`,
+  - both show no regression signal in this pass (sampled ratios stay within expected run-to-run noise envelope, with several improvements).
+- Step `1` resumed after review2 merge:
+  - captured post-merge hotspot slice run (ELYZA `block_layer=5..7`):
+    - `target/benchmarks/review2_postmerge_step1_elyza_layers5_7.txt`,
+  - compared against pre-review2 baseline:
+    - `target/benchmarks/review2_postmerge_step1_elyza_layers5_7_impact.md`,
+  - mean `post/base`:
+    - CPU `~1.002`,
+    - MTL0 `~0.997`,
+    - overall `~0.999`,
+  - interpretation:
+    - no measurable regression from review2 refactor in the active stepwise hotspot slice.
+- Follow-up: completed full compatibility-wrapper cleanup in `ggml-rs` public API:
+  - removed remaining scalar-specific tensor I/O aliases and old `*_f32*` memory helper surface,
+  - removed 1D/2D raw convenience constructors in favor of semantic newtype APIs (`Length`, `Shape2D`),
+  - migrated all in-tree call sites (`ggml-rs` examples/tests + `llama-rs` inference/example paths).
+- Validation after cleanup:
+  - `cargo fmt --all`,
+  - `cargo clippy --workspace --all-targets`,
+  - `cargo test --workspace`,
+  - runtime smoke (`--features link-system`, CPU+Metal):
+    - `target/benchmarks/review2_cleanup_runtime_smoke.txt`.
+- Step `1` guard rerun after cleanup (ELYZA `block_layer=5..7`):
+  - raw:
+    - `target/benchmarks/review2_postclean_step1_elyza_layers5_7.txt`,
+  - impact:
+    - `target/benchmarks/review2_postclean_step1_elyza_layers5_7_impact.md`,
+  - mean `post/base`:
+    - CPU `~1.013`,
+    - MTL0 `~0.998`,
+    - overall `~1.005`,
+  - checksum deltas: all `0.0`.
+- Follow-up API polish (Rust-generic host I/O internals):
+  - generalized tensor host-side internals from `f32`-specific methods to type-driven helpers:
+    - `Tensor::write_host_data<T>()`,
+    - `Tensor::read_host_data<T>()`,
+    - `Tensor::read_host_at<T>()`,
+  - introduced internal `HostElement` trait (`f32` + `i32`) for direct ggml 1D host accessor dispatch,
+  - updated `GgmlElement` implementations to use generic host helpers for both `f32` and `i32`.
+- Verification after generic host-I/O refactor:
+  - `cargo fmt --all`,
+  - `cargo clippy --workspace --all-targets`,
+  - `cargo test --workspace`,
+  - runtime smoke (`--features link-system`, CPU+Metal):
+    - `target/benchmarks/review2_generic_host_io_runtime_smoke.txt`.
+- Step `1` guard rerun after generic host-I/O refactor (ELYZA `block_layer=5..7`):
+  - raw:
+    - `target/benchmarks/review2_generic_host_io_step1_elyza_layers5_7.txt`,
+  - impact:
+    - `target/benchmarks/review2_generic_host_io_step1_elyza_layers5_7_impact.md`,
+  - mean `post/base`:
+    - CPU `~1.002`,
+    - MTL0 `~1.009`,
+    - overall `~1.006`,
+  - checksum deltas: all `0.0`.
+- Continued step `1` per-layer loop on top of the generic host-I/O pass:
+  - refreshed ELYZA layer sweep (`block_layer=0..7`):
+    - raw: `target/benchmarks/review2_generic_host_io_step1_elyza_layers0_7.txt`,
+    - summary:
+      - `target/benchmarks/review2_generic_host_io_step1_elyza_layers0_7_summary.md`,
+      - `target/benchmarks/review2_generic_host_io_step1_elyza_layers0_7_summary.csv`.
+  - current hotspot snapshot (this run):
+    - CPU max: `layer=0` (`30.048 ms/token`),
+    - MTL0 max: `layer=7` (`19.965 ms/token`).
+- Next hotspot check on this refreshed baseline: `block_gateup_fused` (`layers 0..7`, ELYZA):
+  - variant(on):
+    - `target/benchmarks/review2_generic_host_io_step1_elyza_layers0_7_blockgateup_on.txt`,
+  - impact:
+    - `target/benchmarks/review2_generic_host_io_step1_elyza_layers0_7_blockgateup_impact.md`,
+  - means (`on/base`):
+    - CPU `~1.010`,
+    - MTL0 `~0.995`,
+    - overall `~1.003`,
+  - checksum deltas: all `0.0`,
+  - decision: keep `block_gateup_fused=false` default (CPU regression dominates).
+- Follow-up hotspot check: `head_stage_buf` (`layers 0..7`, ELYZA):
+  - variant(on):
+    - `target/benchmarks/review2_generic_host_io_step1_elyza_layers0_7_headstage_on.txt`,
+  - impact:
+    - `target/benchmarks/review2_generic_host_io_step1_elyza_layers0_7_headstage_impact.md`,
+  - means (`on/base`):
+    - CPU `~1.008`,
+    - MTL0 `~0.998`,
+    - overall `~1.003`,
+  - checksum deltas: all `0.0`,
+  - decision: keep `head_stage_buf=false` default (CPU regression dominates).
+- Requested follow-up `1`: `mask_host_elide` recheck (`layers 0..7`, ELYZA):
+  - variant(on):
+    - `target/benchmarks/review2_generic_host_io_step1_elyza_layers0_7_maskhost_on.txt`,
+  - impact:
+    - `target/benchmarks/review2_generic_host_io_step1_elyza_layers0_7_maskhost_impact.md`,
+  - means (`on/base`):
+    - CPU `~0.972`,
+    - MTL0 `~1.012`,
+    - overall `~0.992`,
+  - checksum deltas: all `0.0`.
+- Requested follow-up `2`: cross-model check on Qwen3.5 (`layers 0..7`) under the same mask-host condition:
+  - base:
+    - `target/benchmarks/review2_generic_host_io_step1_qwen35_layers0_7_maskhost_base.txt`,
+  - variant(on):
+    - `target/benchmarks/review2_generic_host_io_step1_qwen35_layers0_7_maskhost_on.txt`,
+  - impact:
+    - `target/benchmarks/review2_generic_host_io_step1_qwen35_layers0_7_maskhost_impact.md`,
+  - means (`on/base`):
+    - CPU `~0.997`,
+    - MTL0 `~0.995`,
+    - overall `~0.996`,
+  - checksum deltas: all `0.0`.
+- Dependency hygiene update:
+  - added `ggml` as repository submodule at `vendor/ggml` (`.gitmodules` + `vendor/ggml`).
+  - updated docs to treat `llama.cpp` as optional external reference (no submodule dependency), with explicit reproduction/setup steps based on `LLAMA_CPP_DIR`.
+
+- User-confirmed continuation: full 6-model `mask_host_elide` sweep on the current lock (`outproj_fused_layerx5 + static_kv + position_delta`, `block_layer=0`, `steps=16`):
+  - local ggml link-system build:
+    - `cmake -S vendor/ggml -B vendor/ggml/build ... && cmake --build vendor/ggml/build -j`
+  - balanced-order A/B artifacts:
+    - base:
+      - `target/benchmarks/review2_generic_host_io_step1_models6_maskhost_base_balanced.txt`
+    - variant(on):
+      - `target/benchmarks/review2_generic_host_io_step1_models6_maskhost_on_balanced.txt`
+    - impact:
+      - `target/benchmarks/review2_generic_host_io_step1_models6_maskhost_impact.md`
+    - checksum parity:
+      - `target/benchmarks/review2_generic_host_io_step1_models6_maskhost_checksum_check.md`
+  - means (`on/base`):
+    - CPU `~1.001`
+    - MTL0 `~1.004`
+    - overall `~1.002`
+  - checksum deltas:
+    - `max abs delta = 0.0`
+  - decision:
+    - keep `mask_host_elide=false` default under the current lock (small overall regression).

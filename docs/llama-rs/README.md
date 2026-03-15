@@ -24,6 +24,12 @@ This preflight step is mandatory and must be done before coding.
 - `PARITY_MATRIX.md`: target-by-target migration and verification status.
 - `KNOWLEDGE_BASE.md`: implementation notes, environment findings, pitfalls.
 - `WORKLOG.md`: chronological execution log for long-running migration work.
+- `worklog/README.md`: mandatory worklog split policy (thresholds + rotation steps).
+
+Worklog operation rule:
+
+- `WORKLOG.md` is an index + short snapshot.
+- Detailed entries are rotated automatically into `docs/llama-rs/worklog/YYYY-MM-DD-*.md` when thresholds are exceeded.
 
 ## Operating model
 

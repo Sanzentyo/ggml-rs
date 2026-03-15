@@ -40,6 +40,14 @@ cmake --build "$LLAMA_CPP_DIR/build" --target llama-bench llama-gguf -j
   - This did not block matmul execution in backend smoke tests.
 - Backend init by literal name (`Metal`) can fail depending on registry naming; device-type and device-enumeration fallback is needed.
 
+## Worklog split policy
+
+- Top-level `docs/llama-rs/WORKLOG.md` is index + short snapshot only.
+- Detailed/benchmark-heavy entries are rotated automatically into dated files under:
+  - `docs/llama-rs/worklog/YYYY-MM-DD-<scope>.md`
+- Thresholds and exact rotation procedure are defined in:
+  - `docs/llama-rs/worklog/README.md`
+
 ## Existing validated baseline
 
 - `ggml-rs/examples/simple_ctx.rs`: CPU path runs and reproduces expected matrix result.
@@ -824,6 +832,10 @@ Calibration output:
 - `target/benchmarks/llama_rs_bench_attention_decode_stepwise_block_kvproj_kvwrite_realmlp_layerx3_s16_models_maskhost_{base,elide}_balanced_r2.txt` (stability rerun #2 raw artifacts).
 - `target/benchmarks/llama_rs_bench_attention_decode_stepwise_block_kvproj_kvwrite_realmlp_layerx3_s16_models_maskhost_{base,elide}_balanced_r3.txt` (stability rerun #3 raw artifacts).
 - `target/benchmarks/llama_stepwise_mask_host_elide_full_sweep_stability_r3.md` (`r=3` median stability table for full-sweep on/off).
+- `target/benchmarks/review2_generic_host_io_step1_models6_maskhost_base_balanced.txt` (current lock 6-model balanced base run after review2/generic-host-I/O updates).
+- `target/benchmarks/review2_generic_host_io_step1_models6_maskhost_on_balanced.txt` (same run with `mask_host_elide=true`).
+- `target/benchmarks/review2_generic_host_io_step1_models6_maskhost_impact.md` (current-lock 6-model impact table).
+- `target/benchmarks/review2_generic_host_io_step1_models6_maskhost_checksum_check.md` (current-lock checksum parity check).
 - `target/benchmarks/llama_rs_bench_attention_decode_stepwise_block_kvproj_kvwrite_realmlp_layerx3_s16_models_kvheadcache_post.txt` (6-model post-change sweep after KV-head cache reuse optimization).
 - `target/benchmarks/llama_stepwise_kvhead_cache_impact_vs_maskhost_base_r3_median.md` (post-change impact vs pre-change `r=3` median baseline).
 - `target/benchmarks/llama_rs_bench_attention_decode_stepwise_block_kvproj_kvwrite_realmlp_layerx3_s16_models_kvheadcache_post_r2.txt` (post-change rerun #2).
@@ -912,6 +924,7 @@ Variant note:
   - full 6-model balanced-order sweep average: CPU `elide/base ~0.951`, MTL0 `~0.983`,
   - full-sweep stability reruns (`r=3`, median-of-runs) average: CPU `~0.937`, MTL0 `~0.995`,
   - per-model direction is mixed (e.g., InternVL/Gemma improve on CPU, ELYZA regresses on CPU),
+  - latest current-lock recheck (`review2` + `layerx5+static_kv+position_delta`, balanced 6-model): CPU `on/base ~1.001`, MTL0 `~1.004`, overall `~1.002`,
   - therefore default remains `mask_host_elide=false`; use it as an explicit experiment knob.
 - KV-head cache reuse optimization (build rotated K and transposed/contiguous V once per KV head, then reuse across grouped query heads) now applies in stepwise decode path:
   - stable (`r=3`) post-change vs pre-change median baseline:
