@@ -301,6 +301,210 @@ impl KvCacheWriteStrategy for StepSpecificKvCacheWriteStrategy {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+enum HeadOutputProjectionMode {
+    PerHead,
+    FusedConcat { balanced_concat: bool },
+    FusedStaging,
+}
+
+impl HeadOutputProjectionMode {
+    const fn from_flags(
+        fuse_output_projection: bool,
+        use_head_output_staging_buffer: bool,
+        use_balanced_head_concat: bool,
+    ) -> Self {
+        if !fuse_output_projection {
+            Self::PerHead
+        } else if use_head_output_staging_buffer {
+            Self::FusedStaging
+        } else {
+            Self::FusedConcat {
+                balanced_concat: use_balanced_head_concat,
+            }
+        }
+    }
+}
+
+struct HeadOutputAssembler<'ctx> {
+    mode: HeadOutputProjectionMode,
+    output_projection: Option<ggml_rs::Tensor<'ctx>>,
+    head_outputs: Vec<ggml_rs::Tensor<'ctx>>,
+    head_output_staging: Option<ggml_rs::Tensor<'ctx>>,
+    head_output_staging_writes: Vec<ggml_rs::Tensor<'ctx>>,
+    concat_metadata: HeadConcatMetadata,
+    hidden_features: usize,
+    query_head_count: usize,
+    kv_head_count: usize,
+    query_length: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct HeadOutputAssemblerInit {
+    query_features: usize,
+    query_length: usize,
+    query_head_count: usize,
+    hidden_features: usize,
+    kv_head_count: usize,
+    concat_metadata: HeadConcatMetadata,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct HeadOutputAccumulateArgs {
+    query_offset: usize,
+    head_dimension: usize,
+    q_row_stride: usize,
+    o_row_stride: usize,
+}
+
+impl<'ctx> HeadOutputAssembler<'ctx> {
+    fn new(
+        ctx: &'ctx Context,
+        mode: HeadOutputProjectionMode,
+        init: HeadOutputAssemblerInit,
+    ) -> Result<Self, InferenceError> {
+        let head_output_staging = if matches!(mode, HeadOutputProjectionMode::FusedStaging) {
+            Some(
+                ctx.new_f32_tensor_2d_shape(Shape2D::new(init.query_features, init.query_length))
+                    .map_err(|source| {
+                        InferenceError::ggml(
+                            "Context::new_f32_tensor_2d_shape<HEAD_OUTPUT_STAGING>",
+                            source,
+                        )
+                    })?,
+            )
+        } else {
+            None
+        };
+        let head_outputs = if matches!(mode, HeadOutputProjectionMode::FusedConcat { .. }) {
+            Vec::with_capacity(init.query_head_count)
+        } else {
+            Vec::new()
+        };
+        let head_output_staging_writes = if head_output_staging.is_some() {
+            Vec::with_capacity(init.query_head_count)
+        } else {
+            Vec::new()
+        };
+        Ok(Self {
+            mode,
+            output_projection: None,
+            head_outputs,
+            head_output_staging,
+            head_output_staging_writes,
+            concat_metadata: init.concat_metadata,
+            hidden_features: init.hidden_features,
+            query_head_count: init.query_head_count,
+            kv_head_count: init.kv_head_count,
+            query_length: init.query_length,
+        })
+    }
+
+    fn graph_prereq_nodes(&self) -> &[ggml_rs::Tensor<'ctx>] {
+        &self.head_output_staging_writes
+    }
+
+    fn accumulate(
+        &mut self,
+        ctx: &'ctx Context,
+        w_o: &ggml_rs::Tensor<'ctx>,
+        head_output: ggml_rs::Tensor<'ctx>,
+        args: HeadOutputAccumulateArgs,
+    ) -> Result<(), InferenceError> {
+        match self.mode {
+            HeadOutputProjectionMode::PerHead => {
+                let w_o_head = ctx
+                    .view_2d(
+                        w_o,
+                        args.head_dimension,
+                        self.hidden_features,
+                        args.o_row_stride,
+                        args.query_offset,
+                    )
+                    .map_err(|source| InferenceError::ggml("Context::view_2d(W_O_HEAD)", source))?;
+                let projected = ctx.mul_mat(&w_o_head, &head_output).map_err(|source| {
+                    InferenceError::ggml("Context::mul_mat(W_O_HEAD*HEAD)", source)
+                })?;
+                self.output_projection = Some(if let Some(acc) = self.output_projection.take() {
+                    ctx.add(&acc, &projected)
+                        .map_err(|source| InferenceError::ggml("Context::add(head_acc)", source))?
+                } else {
+                    projected
+                });
+            }
+            HeadOutputProjectionMode::FusedConcat { .. } => {
+                self.head_outputs.push(head_output);
+            }
+            HeadOutputProjectionMode::FusedStaging => {
+                let head_output_staging = self
+                    .head_output_staging
+                    .as_ref()
+                    .ok_or_else(|| self.invalid_layout_error())?;
+                let head_output_slot = ctx
+                    .view_2d(
+                        head_output_staging,
+                        args.head_dimension,
+                        self.query_length,
+                        args.q_row_stride,
+                        args.query_offset,
+                    )
+                    .map_err(|source| {
+                        InferenceError::ggml("Context::view_2d(HEAD_OUTPUT_STAGING_SLOT)", source)
+                    })?;
+                let head_output_write =
+                    ctx.cpy(&head_output, &head_output_slot).map_err(|source| {
+                        InferenceError::ggml(
+                            "Context::cpy(HEAD_OUTPUT->HEAD_OUTPUT_STAGING_SLOT)",
+                            source,
+                        )
+                    })?;
+                self.head_output_staging_writes.push(head_output_write);
+            }
+        }
+        Ok(())
+    }
+
+    fn finalize(
+        &mut self,
+        ctx: &'ctx Context,
+        w_o: &ggml_rs::Tensor<'ctx>,
+    ) -> Result<ggml_rs::Tensor<'ctx>, InferenceError> {
+        match self.mode {
+            HeadOutputProjectionMode::PerHead => self
+                .output_projection
+                .take()
+                .ok_or_else(|| self.invalid_layout_error()),
+            HeadOutputProjectionMode::FusedConcat { balanced_concat } => {
+                let head_outputs = std::mem::take(&mut self.head_outputs);
+                let concatenated = if balanced_concat {
+                    BalancedHeadConcat.concat(ctx, head_outputs, 0, self.concat_metadata)?
+                } else {
+                    LeftFoldHeadConcat.concat(ctx, head_outputs, 0, self.concat_metadata)?
+                };
+                ctx.mul_mat(w_o, &concatenated)
+                    .map_err(|source| InferenceError::ggml("Context::mul_mat(W_O*HEADS)", source))
+            }
+            HeadOutputProjectionMode::FusedStaging => {
+                let head_output_staging = self
+                    .head_output_staging
+                    .as_ref()
+                    .ok_or_else(|| self.invalid_layout_error())?;
+                ctx.mul_mat(w_o, head_output_staging).map_err(|source| {
+                    InferenceError::ggml("Context::mul_mat(W_O*HEAD_STAGING)", source)
+                })
+            }
+        }
+    }
+
+    fn invalid_layout_error(&self) -> InferenceError {
+        InferenceError::InvalidAttentionLayout {
+            hidden_features: self.hidden_features,
+            query_head_count: self.query_head_count,
+            kv_head_count: self.kv_head_count,
+        }
+    }
+}
+
 trait SequenceStateUpdater {
     fn initialize_mask<'ctx>(
         &mut self,
@@ -956,30 +1160,23 @@ fn execute_stepwise_sweep_internal(
             (None, None, None, None, KvCacheWriteNodes::default())
         };
 
-    let mut output_projection = None;
-    let mut attention_head_outputs = if fuse_output_projection && !use_head_output_staging_buffer {
-        Some(Vec::with_capacity(config.query_head_count()))
-    } else {
-        None
-    };
-    let head_output_staging = if fuse_output_projection && use_head_output_staging_buffer {
-        Some(
-            ctx.new_f32_tensor_2d_shape(Shape2D::new(query_features, query_length))
-                .map_err(|source| {
-                    InferenceError::ggml(
-                        "Context::new_f32_tensor_2d_shape<HEAD_OUTPUT_STAGING>",
-                        source,
-                    )
-                })?,
-        )
-    } else {
-        None
-    };
-    let mut head_output_staging_writes = if head_output_staging.is_some() {
-        Some(Vec::with_capacity(config.query_head_count()))
-    } else {
-        None
-    };
+    let head_output_projection_mode = HeadOutputProjectionMode::from_flags(
+        fuse_output_projection,
+        use_head_output_staging_buffer,
+        use_balanced_head_concat,
+    );
+    let mut head_output_assembler = HeadOutputAssembler::new(
+        &ctx,
+        head_output_projection_mode,
+        HeadOutputAssemblerInit {
+            query_features,
+            query_length,
+            query_head_count: config.query_head_count(),
+            hidden_features,
+            kv_head_count: config.kv_head_count(),
+            concat_metadata: HeadConcatMetadata::from_config(config),
+        },
+    )?;
     let q_row_stride = query_features
         .checked_mul(bytes_per_element)
         .ok_or(InferenceError::MemorySizeOverflow)?;
@@ -1122,73 +1319,20 @@ fn execute_stepwise_sweep_internal(
         let head_output = ctx
             .mul_mat(v_t, &probabilities)
             .map_err(|source| InferenceError::ggml("Context::mul_mat(VT*P)", source))?;
-        if let Some(head_output_staging) = head_output_staging.as_ref() {
-            let head_output_slot = ctx
-                .view_2d(
-                    head_output_staging,
-                    config.head_dimension(),
-                    query_length,
-                    q_row_stride,
-                    query_offset,
-                )
-                .map_err(|source| {
-                    InferenceError::ggml("Context::view_2d(HEAD_OUTPUT_STAGING_SLOT)", source)
-                })?;
-            let head_output_write = ctx.cpy(&head_output, &head_output_slot).map_err(|source| {
-                InferenceError::ggml(
-                    "Context::cpy(HEAD_OUTPUT->HEAD_OUTPUT_STAGING_SLOT)",
-                    source,
-                )
-            })?;
-            if let Some(head_output_staging_writes) = head_output_staging_writes.as_mut() {
-                head_output_staging_writes.push(head_output_write);
-            }
-            continue;
-        }
-        if let Some(head_outputs) = attention_head_outputs.as_mut() {
-            head_outputs.push(head_output);
-            continue;
-        }
-        let w_o_head = ctx
-            .view_2d(
-                &w_o,
-                config.head_dimension(),
-                hidden_features,
-                o_row_stride,
+        head_output_assembler.accumulate(
+            &ctx,
+            &w_o,
+            head_output,
+            HeadOutputAccumulateArgs {
                 query_offset,
-            )
-            .map_err(|source| InferenceError::ggml("Context::view_2d(W_O_HEAD)", source))?;
-        let projected = ctx
-            .mul_mat(&w_o_head, &head_output)
-            .map_err(|source| InferenceError::ggml("Context::mul_mat(W_O_HEAD*HEAD)", source))?;
-
-        output_projection = Some(if let Some(acc) = output_projection {
-            ctx.add(&acc, &projected)
-                .map_err(|source| InferenceError::ggml("Context::add(head_acc)", source))?
-        } else {
-            projected
-        });
+                head_dimension: config.head_dimension(),
+                q_row_stride,
+                o_row_stride,
+            },
+        )?;
     }
 
-    let y_attention = if let Some(head_output_staging) = head_output_staging.as_ref() {
-        ctx.mul_mat(&w_o, head_output_staging)
-            .map_err(|source| InferenceError::ggml("Context::mul_mat(W_O*HEAD_STAGING)", source))?
-    } else if let Some(head_outputs) = attention_head_outputs {
-        let concat_metadata = HeadConcatMetadata::from_config(config);
-        let concatenated = if use_balanced_head_concat {
-            BalancedHeadConcat.concat(&ctx, head_outputs, 0, concat_metadata)?
-        } else {
-            LeftFoldHeadConcat.concat(&ctx, head_outputs, 0, concat_metadata)?
-        };
-        ctx.mul_mat(&w_o, &concatenated)
-            .map_err(|source| InferenceError::ggml("Context::mul_mat(W_O*HEADS)", source))?
-    } else {
-        output_projection.ok_or(InferenceError::InvalidAttentionLayout {
-            hidden_features,
-            query_head_count: config.query_head_count(),
-            kv_head_count: config.kv_head_count(),
-        })?
-    };
+    let y_attention = head_output_assembler.finalize(&ctx, &w_o)?;
     let mut block_mlp_split_tensors = None;
     let mut block_mlp_fused_tensors = None;
     let y = if include_block_scope {
@@ -1310,10 +1454,8 @@ fn execute_stepwise_sweep_internal(
         let mut graph = ctx
             .new_graph()
             .map_err(|source| InferenceError::ggml("Context::new_graph", source))?;
-        if let Some(head_output_staging_writes) = head_output_staging_writes.as_ref() {
-            for head_output_write in head_output_staging_writes {
-                graph.build_forward_expand(head_output_write);
-            }
+        for head_output_write in head_output_assembler.graph_prereq_nodes() {
+            graph.build_forward_expand(head_output_write);
         }
         graph.build_forward_expand(&y);
         if let Some(projected_k_step) = projected_k_step.as_ref() {

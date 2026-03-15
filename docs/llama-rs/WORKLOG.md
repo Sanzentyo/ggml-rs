@@ -578,3 +578,20 @@ Detailed logs are split under `docs/llama-rs/worklog/` to keep this top-level fi
   - `cargo test --workspace`
   - runtime combined artifact:
     - `target/benchmarks/llama_rs_gguf_mode_parity_r0_r1.txt`.
+
+## Latest continuation (review1 merge + trait queue resume)
+
+- Merged review1 worktree performance/hardening pass into `master`:
+  - `src/compute.rs` tensor I/O fast paths and allocation cleanup,
+  - C++ reference include resolution now honors `GGML_RS_GGML_INCLUDE_DIR` in:
+    - `llama-rs/examples/bench_attention_decode_cpp_compare.rs`,
+    - `llama-rs/tests/mlp_cpp_parity.rs`.
+- Added targeted tensor I/O perf evidence:
+  - `target/benchmarks/review1_tensorio_microbench_summary.md`.
+- Resumed trait/ADT queue in `stepwise_decode`:
+  - Candidate A complete:
+    - introduced `KvCacheWriteStrategy` abstraction (`shared` vs `step-specific`),
+    - runtime smoke artifact: `target/benchmarks/llama_rs_kv_write_strategy_trait_smoke.txt`.
+  - Candidate B complete:
+    - introduced head-output projection mode ADT + assembler (`per-head`, `fused concat`, `fused staging`),
+    - runtime smoke artifact: `target/benchmarks/llama_rs_head_output_mode_adt_smoke.txt`.
