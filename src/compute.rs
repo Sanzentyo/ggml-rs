@@ -4,9 +4,11 @@ use crate::ffi;
 use crate::num_ext::{CheckedFieldOps, TryIntoChecked};
 use crate::tensor_expr::HostElement;
 use crate::{
-    BackendDeviceType, BackendElement, BackendKind, Bytes, Cols, ComputeStatus, Error, GgmlElement,
-    Length, Result, RopeExtParams, Rows, Shape2D, TensorExpr, TensorIndex, ThreadCount, Type,
+    BackendDeviceType, BackendElement, BackendKind, Bytes, Cols, ComputeStatus, Dims, Error,
+    GgmlElement, Length, Result, RopeExtParams, Rows, Shape2D, Shape3D, Shape4D, TensorExpr,
+    TensorIndex, ThreadCount, Type,
 };
+use num_traits::NumCast;
 use std::ffi::{CStr, CString};
 use std::marker::PhantomData;
 use std::num::NonZeroUsize;
@@ -111,6 +113,52 @@ pub fn decode_tensor_data_to_f32(
     Ok(())
 }
 
+/// Decodes GGML tensor payload bytes into caller-selected element type `T`.
+///
+/// For matching plain tensor types (`f32`, `i32`) this performs a direct copy.
+/// For other GGML element types (including quantized payloads), values are
+/// decoded through GGML's `to_float` conversion and then cast to `T`.
+pub fn decode_tensor_data_to<T>(
+    ggml_type_raw: c_int,
+    payload: &[u8],
+    out: &mut Vec<T>,
+) -> Result<()>
+where
+    T: GgmlElement + NumCast,
+{
+    let element_count = tensor_element_count(ggml_type_raw, payload.len())?;
+    let expected_nbytes = element_count.checked_mul_checked(std::mem::size_of::<T>())?;
+
+    out.clear();
+    if element_count == 0 {
+        return Ok(());
+    }
+    if out.capacity() < element_count {
+        out.reserve(element_count - out.capacity());
+    }
+
+    if ggml_type_raw == T::GGML_TYPE as c_int && payload.len() == expected_nbytes {
+        unsafe {
+            // SAFETY:
+            // - `out` has reserved capacity for `element_count` elements.
+            // - `payload.len()` matches exactly `element_count * size_of::<T>()`.
+            // - Source payload bytes are read-only and copied into owned `out` storage.
+            let dst = out.spare_capacity_mut().as_mut_ptr().cast::<T>();
+            ptr::copy_nonoverlapping(payload.as_ptr().cast::<T>(), dst, element_count);
+            out.set_len(element_count);
+        }
+        return Ok(());
+    }
+
+    let mut decoded = Vec::new();
+    decode_tensor_data_to_f32(ggml_type_raw, payload, &mut decoded)?;
+    for value in decoded {
+        let casted = NumCast::from(value).ok_or(Error::UnsupportedType(ggml_type_raw))?;
+        out.push(casted);
+    }
+    Ok(())
+}
+
 /// Returns ggml's internal per-tensor metadata overhead in bytes.
 pub fn tensor_overhead_bytes() -> usize {
     unsafe { ffi::ggml_tensor_overhead() }
@@ -119,6 +167,30 @@ pub fn tensor_overhead_bytes() -> usize {
 /// Returns ggml's internal per-graph metadata overhead in bytes.
 pub fn graph_overhead_bytes() -> usize {
     unsafe { ffi::ggml_graph_overhead() }
+}
+
+/// Creates a scoped context and executes the provided closure.
+///
+/// The higher-ranked lifetime keeps all `Tensor<'ctx>` values scoped to the
+/// closure body.
+pub fn with_context<R>(
+    mem: Bytes,
+    f: impl for<'ctx> FnOnce(&'ctx Context) -> Result<R>,
+) -> Result<R> {
+    let ctx = Context::new_bytes(mem)?;
+    f(&ctx)
+}
+
+/// Creates a scoped no-allocation context and executes the provided closure.
+///
+/// This is useful for backend-only execution paths that allocate tensors via
+/// backend buffers.
+pub fn with_no_alloc_context<R>(
+    mem: Bytes,
+    f: impl for<'ctx> FnOnce(&'ctx Context) -> Result<R>,
+) -> Result<R> {
+    let ctx = Context::new_no_alloc_bytes(mem)?;
+    f(&ctx)
 }
 
 /// RAII handle for a ggml backend implementation (CPU/Metal).
@@ -401,23 +473,48 @@ impl Context {
         })
     }
 
+    /// Creates a tensor for ranks `1..=4` from generic dimensions.
+    pub fn new_tensor<const N: usize>(&self, ty: Type, dims: Dims<N>) -> Result<Tensor<'_>> {
+        let dims = *dims.as_array();
+        let dim = |index: usize| -> Result<_> {
+            dims[index]
+                .try_into_checked()
+                .map_err(|source| Error::int_conversion("tensor dimension", source))
+        };
+
+        let raw = match N {
+            1 => unsafe { ffi::ggml_new_tensor_1d(self.raw.as_ptr(), ty.as_raw() as _, dim(0)?) },
+            2 => unsafe {
+                ffi::ggml_new_tensor_2d(self.raw.as_ptr(), ty.as_raw() as _, dim(0)?, dim(1)?)
+            },
+            3 => unsafe {
+                ffi::ggml_new_tensor_3d(
+                    self.raw.as_ptr(),
+                    ty.as_raw() as _,
+                    dim(0)?,
+                    dim(1)?,
+                    dim(2)?,
+                )
+            },
+            4 => unsafe {
+                ffi::ggml_new_tensor_4d(
+                    self.raw.as_ptr(),
+                    ty.as_raw() as _,
+                    dim(0)?,
+                    dim(1)?,
+                    dim(2)?,
+                    dim(3)?,
+                )
+            },
+            _ => return Err(Error::UnsupportedRank(N)),
+        };
+        self.wrap_tensor(raw)
+            .map_err(|error| error.with_context("ggml_new_tensor"))
+    }
+
     /// Creates a 2D tensor using semantic shape newtypes.
     pub fn new_tensor_2d_shape(&self, ty: Type, shape: Shape2D) -> Result<Tensor<'_>> {
-        let cols = shape
-            .cols
-            .get()
-            .try_into_checked()
-            .map_err(|source| Error::int_conversion("tensor dimension", source))?;
-        let rows = shape
-            .rows
-            .get()
-            .try_into_checked()
-            .map_err(|source| Error::int_conversion("tensor dimension", source))?;
-
-        let raw =
-            unsafe { ffi::ggml_new_tensor_2d(self.raw.as_ptr(), ty.as_raw() as _, cols, rows) };
-        self.wrap_tensor(raw)
-            .map_err(|error| error.with_context("ggml_new_tensor_2d"))
+        self.new_tensor(ty, shape.dims())
     }
 
     pub fn new_f32_tensor_2d_shape(&self, shape: Shape2D) -> Result<Tensor<'_>> {
@@ -426,13 +523,7 @@ impl Context {
 
     /// Creates a 1D tensor with semantic `Length`.
     pub fn new_tensor_1d_len(&self, ty: Type, len: Length) -> Result<Tensor<'_>> {
-        let len = len
-            .get()
-            .try_into_checked()
-            .map_err(|source| Error::int_conversion("tensor dimension", source))?;
-        let raw = unsafe { ffi::ggml_new_tensor_1d(self.raw.as_ptr(), ty.as_raw() as _, len) };
-        self.wrap_tensor(raw)
-            .map_err(|error| error.with_context("ggml_new_tensor_1d"))
+        self.new_tensor(ty, Dims::new([len.get()]))
     }
 
     pub fn new_f32_tensor_1d_len(&self, len: Length) -> Result<Tensor<'_>> {
@@ -443,6 +534,16 @@ impl Context {
         self.new_tensor_1d_len(Type::I32, len)
     }
 
+    /// Creates a 3D tensor from semantic dimensions.
+    pub fn new_tensor_3d_shape(&self, ty: Type, shape: Shape3D) -> Result<Tensor<'_>> {
+        self.new_tensor(ty, shape.dims())
+    }
+
+    /// Creates a 4D tensor from semantic dimensions.
+    pub fn new_tensor_4d_shape(&self, ty: Type, shape: Shape4D) -> Result<Tensor<'_>> {
+        self.new_tensor(ty, shape.dims())
+    }
+
     pub fn new_tensor_3d(
         &self,
         ty: Type,
@@ -450,19 +551,7 @@ impl Context {
         ne1: usize,
         ne2: usize,
     ) -> Result<Tensor<'_>> {
-        let ne0 = (ne0)
-            .try_into_checked()
-            .map_err(|source| Error::int_conversion("tensor dimension", source))?;
-        let ne1 = (ne1)
-            .try_into_checked()
-            .map_err(|source| Error::int_conversion("tensor dimension", source))?;
-        let ne2 = (ne2)
-            .try_into_checked()
-            .map_err(|source| Error::int_conversion("tensor dimension", source))?;
-        let raw =
-            unsafe { ffi::ggml_new_tensor_3d(self.raw.as_ptr(), ty.as_raw() as _, ne0, ne1, ne2) };
-        self.wrap_tensor(raw)
-            .map_err(|error| error.with_context("ggml_new_tensor_3d"))
+        self.new_tensor_3d_shape(ty, Shape3D::new(ne0, ne1, ne2))
     }
 
     pub fn new_tensor_4d(
@@ -473,23 +562,7 @@ impl Context {
         ne2: usize,
         ne3: usize,
     ) -> Result<Tensor<'_>> {
-        let ne0 = (ne0)
-            .try_into_checked()
-            .map_err(|source| Error::int_conversion("tensor dimension", source))?;
-        let ne1 = (ne1)
-            .try_into_checked()
-            .map_err(|source| Error::int_conversion("tensor dimension", source))?;
-        let ne2 = (ne2)
-            .try_into_checked()
-            .map_err(|source| Error::int_conversion("tensor dimension", source))?;
-        let ne3 = (ne3)
-            .try_into_checked()
-            .map_err(|source| Error::int_conversion("tensor dimension", source))?;
-        let raw = unsafe {
-            ffi::ggml_new_tensor_4d(self.raw.as_ptr(), ty.as_raw() as _, ne0, ne1, ne2, ne3)
-        };
-        self.wrap_tensor(raw)
-            .map_err(|error| error.with_context("ggml_new_tensor_4d"))
+        self.new_tensor_4d_shape(ty, Shape4D::new(ne0, ne1, ne2, ne3))
     }
 
     pub fn mul_mat<'ctx>(&'ctx self, a: &Tensor<'ctx>, b: &Tensor<'ctx>) -> Result<Tensor<'ctx>> {
@@ -852,6 +925,42 @@ impl<'ctx> Tensor<'ctx> {
         Ok(elements / rows)
     }
 
+    /// Returns tensor rank reported by ggml.
+    pub fn rank(&self) -> Result<usize> {
+        (unsafe { ffi::ggml_n_dims(self.raw.as_ptr()) })
+            .try_into_checked()
+            .map_err(|source| Error::int_conversion("ggml_n_dims", source))
+    }
+
+    /// Returns dynamic tensor dimensions in ggml order (`ne0..ne{rank-1}`).
+    pub fn shape_nd(&self) -> Result<Vec<usize>> {
+        let rank = self.rank()?;
+        let ne = unsafe { self.raw.as_ref().ne };
+        (0..rank)
+            .map(|index| {
+                ne[index]
+                    .try_into_checked()
+                    .map_err(|source| Error::int_conversion("tensor dimension", source))
+            })
+            .collect()
+    }
+
+    /// Returns fixed-rank dimensions when tensor rank matches `N`.
+    pub fn dims<const N: usize>(&self) -> Result<Dims<N>> {
+        let rank = self.rank()?;
+        if rank != N {
+            return Err(Error::UnsupportedRank(rank));
+        }
+        let ne = unsafe { self.raw.as_ref().ne };
+        let mut dims = [0usize; N];
+        for (index, dst) in dims.iter_mut().enumerate() {
+            *dst = ne[index]
+                .try_into_checked()
+                .map_err(|source| Error::int_conversion("tensor dimension", source))?;
+        }
+        Ok(Dims::new(dims))
+    }
+
     /// Returns `(cols, rows)` for tensors representable as 2D.
     pub fn shape_2d(&self) -> Result<(usize, usize)> {
         let shape = self.shape()?;
@@ -864,6 +973,16 @@ impl<'ctx> Tensor<'ctx> {
             cols: Cols::new(self.col_count()?),
             rows: Rows::new(self.row_count()?),
         })
+    }
+
+    /// Returns semantic 3D shape when rank is exactly 3.
+    pub fn shape_3d(&self) -> Result<Shape3D> {
+        Ok(Shape3D::from(self.dims::<3>()?))
+    }
+
+    /// Returns semantic 4D shape when rank is exactly 4.
+    pub fn shape_4d(&self) -> Result<Shape4D> {
+        Ok(Shape4D::from(self.dims::<4>()?))
     }
 
     pub fn nbytes(&self) -> usize {

@@ -104,15 +104,31 @@ fn compile_cpp_reference() -> Result<PathBuf, Box<dyn Error>> {
 }
 
 fn ggml_root_dir() -> PathBuf {
-    std::env::var("GGML_CPP_REFERENCE_GGML_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| workspace_root().join("target/vendor/ggml"))
+    if let Ok(path) = std::env::var("GGML_CPP_REFERENCE_GGML_DIR") {
+        return PathBuf::from(path);
+    }
+
+    let workspace = workspace_root();
+    [
+        workspace.join("target/vendor/ggml"),
+        workspace.join("vendor/ggml"),
+    ]
+    .into_iter()
+    .find(|path| path.join("include").exists())
+    .unwrap_or_else(|| workspace.join("target/vendor/ggml"))
 }
 
 fn ggml_include_dir(ggml_root: &Path) -> PathBuf {
-    std::env::var_os("GGML_RS_GGML_INCLUDE_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| ggml_root.join("include"))
+    if let Some(path) = std::env::var_os("GGML_RS_GGML_INCLUDE_DIR") {
+        return PathBuf::from(path);
+    }
+
+    let include = ggml_root.join("include");
+    if include.exists() {
+        include
+    } else {
+        workspace_root().join("vendor/ggml/include")
+    }
 }
 
 fn workspace_root() -> PathBuf {

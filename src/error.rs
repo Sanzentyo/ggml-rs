@@ -52,6 +52,9 @@ pub enum Error {
     #[error("tensor shape is not representable as 2D")]
     UnexpectedShape,
 
+    #[error("tensor rank {0} is unsupported by this operation")]
+    UnsupportedRank(usize),
+
     #[error("unexpected tensor byte size: expected {expected} bytes but got {actual} bytes")]
     UnexpectedTensorByteSize { expected: usize, actual: usize },
 

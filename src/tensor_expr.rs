@@ -1,4 +1,4 @@
-use crate::{Context, Error, Result, Tensor, TensorIndex, Type, ffi};
+use crate::{Context, Error, GgmlType, Result, Tensor, TensorIndex, ffi};
 use std::ops::{Add, Div, Mul, Sub};
 
 /// Element types allowed for backend tensor transfer helpers.
@@ -42,10 +42,7 @@ impl HostElement for i32 {
 }
 
 /// Element types that map to ggml tensor types and typed tensor I/O helpers.
-pub trait GgmlElement: BackendElement {
-    /// ggml element kind represented by this Rust type.
-    const GGML_TYPE: Type;
-
+pub trait GgmlElement: BackendElement + GgmlType {
     /// Writes host values into the tensor through the most appropriate path.
     fn write_data(tensor: &Tensor<'_>, values: &[Self]) -> Result<()>;
 
@@ -57,8 +54,6 @@ pub trait GgmlElement: BackendElement {
 }
 
 impl GgmlElement for f32 {
-    const GGML_TYPE: Type = Type::F32;
-
     fn write_data(tensor: &Tensor<'_>, values: &[Self]) -> Result<()> {
         tensor.write_host_data(values)
     }
@@ -73,8 +68,6 @@ impl GgmlElement for f32 {
 }
 
 impl GgmlElement for i32 {
-    const GGML_TYPE: Type = Type::I32;
-
     fn write_data(tensor: &Tensor<'_>, values: &[Self]) -> Result<()> {
         tensor.write_host_data(values)
     }
