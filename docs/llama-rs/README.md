@@ -6,6 +6,11 @@ Build a new `llama-rs` crate that reproduces `llama.cpp` example behavior using 
 
 Current user direction is to target all CMake example targets, with CPU and Metal execution verification.
 
+Dependency policy in this repository:
+
+- `ggml` is managed as a git submodule at `vendor/ggml`.
+- `llama.cpp` is used only as an external comparison reference (not a submodule dependency here); reproduction steps are documented in `docs/llama-rs/KNOWLEDGE_BASE.md`.
+
 ## Mandatory preflight before implementation
 
 Before modifying any `llama-rs` path that touches ggml-backed execution, read:

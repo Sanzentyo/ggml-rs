@@ -2,25 +2,34 @@
 
 ## Local reference checkouts
 
-- `target/vendor/ggml`
-- `target/vendor/llama.cpp`
+- `vendor/ggml` (managed as git submodule in this repository)
+- `llama.cpp` is **not** a repository dependency/submodule here; use an external checkout path (for example `LLAMA_CPP_DIR=/path/to/llama.cpp`) when running comparison/reproduction commands.
 
 ## ggml local build used for verification
 
 ```bash
-cmake -S target/vendor/ggml -B target/vendor/ggml/build \
+cmake -S vendor/ggml -B vendor/ggml/build \
   -DGGML_METAL=ON -DGGML_CPU=ON \
   -DBUILD_SHARED_LIBS=ON -DGGML_BACKEND_DL=OFF \
   -DCMAKE_BUILD_TYPE=Release
-cmake --build target/vendor/ggml/build -j
+cmake --build vendor/ggml/build -j
 ```
 
 ## Link/run env used by Rust examples
 
 ```bash
-GGML_RS_LIB_DIRS=target/vendor/ggml/build/src:target/vendor/ggml/build/src/ggml-metal:target/vendor/ggml/build/src/ggml-blas
+GGML_RS_LIB_DIRS=vendor/ggml/build/src:vendor/ggml/build/src/ggml-metal:vendor/ggml/build/src/ggml-blas
 GGML_RS_LIBS=ggml,ggml-base,ggml-cpu,ggml-metal,ggml-blas
-DYLD_LIBRARY_PATH=target/vendor/ggml/build/src:target/vendor/ggml/build/src/ggml-metal:target/vendor/ggml/build/src/ggml-blas:$DYLD_LIBRARY_PATH
+DYLD_LIBRARY_PATH=vendor/ggml/build/src:vendor/ggml/build/src/ggml-metal:vendor/ggml/build/src/ggml-blas:$DYLD_LIBRARY_PATH
+```
+
+## llama.cpp comparison/reproduction setup (optional external checkout)
+
+```bash
+git clone https://github.com/ggerganov/llama.cpp.git /tmp/llama.cpp
+export LLAMA_CPP_DIR=/tmp/llama.cpp
+cmake -S "$LLAMA_CPP_DIR" -B "$LLAMA_CPP_DIR/build" -DGGML_METAL=ON -DGGML_CPU=ON -DBUILD_SHARED_LIBS=ON -DGGML_BACKEND_DL=OFF -DCMAKE_BUILD_TYPE=Release
+cmake --build "$LLAMA_CPP_DIR/build" --target llama-bench llama-gguf -j
 ```
 
 ## Backend-specific notes
@@ -120,16 +129,16 @@ Completed artifacts for 1-3 (CPU/Metal runtime smoke):
 ## GGUF sample generation command
 
 ```bash
-cmake -S target/vendor/llama.cpp -B target/vendor/llama.cpp/build -DGGML_METAL=ON -DGGML_CPU=ON -DBUILD_SHARED_LIBS=ON -DGGML_BACKEND_DL=OFF -DCMAKE_BUILD_TYPE=Release
-cmake --build target/vendor/llama.cpp/build --target llama-gguf -j
-target/vendor/llama.cpp/build/bin/llama-gguf target/vendor/llama.cpp/build/sample.gguf w
+cmake -S "$LLAMA_CPP_DIR" -B "$LLAMA_CPP_DIR/build" -DGGML_METAL=ON -DGGML_CPU=ON -DBUILD_SHARED_LIBS=ON -DGGML_BACKEND_DL=OFF -DCMAKE_BUILD_TYPE=Release
+cmake --build "$LLAMA_CPP_DIR/build" --target llama-gguf -j
+"$LLAMA_CPP_DIR/build/bin/llama-gguf" "$LLAMA_CPP_DIR/build/sample.gguf" w
 ```
 
 ## GGUF hash parity check command
 
 ```bash
-cargo run -p llama-rs --example gguf_hash --features link-system -- --all target/vendor/llama.cpp/build/sample.gguf > target/vendor/llama.cpp/build/sample.gguf.manifest
-cargo run -p llama-rs --example gguf_hash --features link-system -- --all --check target/vendor/llama.cpp/build/sample.gguf.manifest target/vendor/llama.cpp/build/sample.gguf
+cargo run -p llama-rs --example gguf_hash --features link-system -- --all "$LLAMA_CPP_DIR/build/sample.gguf" > "$LLAMA_CPP_DIR/build/sample.gguf.manifest"
+cargo run -p llama-rs --example gguf_hash --features link-system -- --all --check "$LLAMA_CPP_DIR/build/sample.gguf.manifest" "$LLAMA_CPP_DIR/build/sample.gguf"
 ```
 
 ## GGUF read/write parity command (safe API)
@@ -622,7 +631,7 @@ This emits one benchmark row per backend per layer (`block_layer=<n>`), which is
 Build baseline tool:
 
 ```bash
-cmake --build target/vendor/llama.cpp/build --target llama-bench -j
+cmake --build "$LLAMA_CPP_DIR/build" --target llama-bench -j
 ```
 
 Model download (session command, `uv` + HF Hub):
@@ -637,10 +646,10 @@ PY
 Baseline run profile used in this session:
 
 ```bash
-target/vendor/llama.cpp/build/bin/llama-bench \
+"$LLAMA_CPP_DIR/build/bin/llama-bench" \
   -m <model.gguf> -r 1 -o jsonl -t 8 \
   -pg 256,0 -pg 0,128 -ngl 0
-target/vendor/llama.cpp/build/bin/llama-bench \
+"$LLAMA_CPP_DIR/build/bin/llama-bench" \
   -m <model.gguf> -r 1 -o jsonl -t 8 \
   -pg 256,0 -pg 0,128 -ngl 99
 ```
@@ -656,7 +665,7 @@ Captured artifacts:
 
 Observed constraint:
 
-- `target/vendor/llama.cpp/build/sample.gguf` is a synthetic fixture and `llama-bench` rejects it as a benchmark model (`failed to load model`).
+- `"$LLAMA_CPP_DIR/build/sample.gguf"` is a synthetic fixture and `llama-bench` rejects it as a benchmark model (`failed to load model`).
 
 Snapshot (`tok/s`):
 

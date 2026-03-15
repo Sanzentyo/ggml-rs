@@ -760,3 +760,28 @@ Detailed logs are split under `docs/llama-rs/worklog/` to keep this top-level fi
   - current hotspot snapshot (this run):
     - CPU max: `layer=0` (`30.048 ms/token`),
     - MTL0 max: `layer=7` (`19.965 ms/token`).
+- Next hotspot check on this refreshed baseline: `block_gateup_fused` (`layers 0..7`, ELYZA):
+  - variant(on):
+    - `target/benchmarks/review2_generic_host_io_step1_elyza_layers0_7_blockgateup_on.txt`,
+  - impact:
+    - `target/benchmarks/review2_generic_host_io_step1_elyza_layers0_7_blockgateup_impact.md`,
+  - means (`on/base`):
+    - CPU `~1.010`,
+    - MTL0 `~0.995`,
+    - overall `~1.003`,
+  - checksum deltas: all `0.0`,
+  - decision: keep `block_gateup_fused=false` default (CPU regression dominates).
+- Follow-up hotspot check: `head_stage_buf` (`layers 0..7`, ELYZA):
+  - variant(on):
+    - `target/benchmarks/review2_generic_host_io_step1_elyza_layers0_7_headstage_on.txt`,
+  - impact:
+    - `target/benchmarks/review2_generic_host_io_step1_elyza_layers0_7_headstage_impact.md`,
+  - means (`on/base`):
+    - CPU `~1.008`,
+    - MTL0 `~0.998`,
+    - overall `~1.003`,
+  - checksum deltas: all `0.0`,
+  - decision: keep `head_stage_buf=false` default (CPU regression dominates).
+- Dependency hygiene update:
+  - added `ggml` as repository submodule at `vendor/ggml` (`.gitmodules` + `vendor/ggml`).
+  - updated docs to treat `llama.cpp` as optional external reference (no submodule dependency), with explicit reproduction/setup steps based on `LLAMA_CPP_DIR`.

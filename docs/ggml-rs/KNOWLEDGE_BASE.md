@@ -2,23 +2,24 @@
 
 ## Local verification environment
 
-- ggml checkout: `target/vendor/ggml`
+- ggml checkout (git submodule): `vendor/ggml`
+- legacy fallback path (older artifacts): `target/vendor/ggml`
 - Typical local build with CPU + Metal enabled:
 
 ```bash
-cmake -S target/vendor/ggml -B target/vendor/ggml/build \
+cmake -S vendor/ggml -B vendor/ggml/build \
   -DGGML_METAL=ON -DGGML_CPU=ON \
   -DBUILD_SHARED_LIBS=ON -DGGML_BACKEND_DL=OFF \
   -DCMAKE_BUILD_TYPE=Release
-cmake --build target/vendor/ggml/build -j
+cmake --build vendor/ggml/build -j
 ```
 
 ## Link variables for `--features link-system`
 
 ```bash
-GGML_RS_LIB_DIRS=target/vendor/ggml/build/src:target/vendor/ggml/build/src/ggml-metal:target/vendor/ggml/build/src/ggml-blas
+GGML_RS_LIB_DIRS=vendor/ggml/build/src:vendor/ggml/build/src/ggml-metal:vendor/ggml/build/src/ggml-blas
 GGML_RS_LIBS=ggml,ggml-base,ggml-cpu,ggml-metal,ggml-blas
-DYLD_LIBRARY_PATH=target/vendor/ggml/build/src:target/vendor/ggml/build/src/ggml-metal:target/vendor/ggml/build/src/ggml-blas:$DYLD_LIBRARY_PATH
+DYLD_LIBRARY_PATH=vendor/ggml/build/src:vendor/ggml/build/src/ggml-metal:vendor/ggml/build/src/ggml-blas:$DYLD_LIBRARY_PATH
 ```
 
 ## FFI generation modes
@@ -57,9 +58,9 @@ git submodule update --init --recursive
   - `tensor_element_count(ggml_type_raw, payload_bytes)`
   These use GGML type traits (`ggml_get_type_traits`) and are useful for GGUF
   model paths that need f32 views over quantized payloads.
-- Backend tensors now support partial safe writes:
-  - `Tensor::set_f32_backend_at(offset, values)`
-  - `Tensor::set_i32_backend_at(offset, values)`
+- Backend tensors support partial safe writes through typed APIs:
+  - `Tensor::write_data_backend_at::<f32>(offset, values)`
+  - `Tensor::write_data_backend_at::<i32>(offset, values)`
   Use these when only a contiguous region changes (for example, stepwise mask
   delta updates) to reduce host-device transfer overhead.
 - GGUF now has a safe write path:
