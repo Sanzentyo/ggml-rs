@@ -66,6 +66,42 @@ Clap-refactor runtime smoke artifact (CPU+Metal where applicable):
 
 - `target/benchmarks/llama_rs_clap_refactor_runtime_smoke.txt`
 
+## Inference modularization notes (stepwise track)
+
+- Stepwise decode core is now split into dedicated modules:
+  - `llama-rs/src/inference/stepwise_plan.rs` (`DecodeStepPlan` ADT + type-state builder + static-dispatch trait),
+  - `llama-rs/src/inference/stepwise_decode.rs` (stepwise config/report types + execution runners),
+  - `llama-rs/src/inference/attention_ops.rs` (RoPE/concat helpers).
+- `llama-rs/src/inference.rs` acts as the re-export and orchestration surface for these submodules.
+- Runtime smoke artifact after the deeper split:
+  - `target/benchmarks/llama_rs_stepwise_refactor_stepwisecore_smoke.txt`.
+- API naming migration:
+  - long `run_*` public entrypoints were renamed to direct operation names (for example: `mlp_inference_*`, `attention_inference_*`, `attention_decode_proxy_*`, `backend_smoke`, `simple_ctx`, `idle_decode_proxy`).
+  - stepwise execution now routes through `DecodeStepPlan::{execute_single, bench}`.
+- Runtime artifacts after ADT + naming migration:
+  - `target/benchmarks/llama_rs_stepwise_decodeplan_smoke.txt`,
+  - `target/benchmarks/llama_rs_stepwise_decodeplan_cppcompare_smoke.txt`.
+- Final post-rename runtime checks:
+  - `target/benchmarks/llama_rs_backend_smoke_decodeplan_postrename.txt`,
+  - `target/benchmarks/llama_rs_stepwise_decodeplan_postrename_smoke.txt`.
+- Repo-level auto-loaded policy file:
+  - `.github/copilot-instructions.md`.
+
+## Current sequential refactor policy (resume-safe)
+
+For the active llama.cpp reproduction + ggml-rs refinement track, refactors are executed in this fixed order and validated at each step:
+
+1. Backend/context lifecycle traitization
+2. Stepwise sequence state traitization (mask/position delta updates)
+3. Decode projection/cache traitization
+4. Then continue proactive hotspot exploration with the same trait-first ADT policy
+
+Completed artifacts for 1-3 (CPU/Metal runtime smoke):
+
+- `target/benchmarks/llama_rs_backend_runtime_trait_refactor_smoke_cpu_metal.txt`
+- `target/benchmarks/llama_rs_sequence_state_trait_refactor_smoke_cpu_metal.txt`
+- `target/benchmarks/llama_rs_projection_trait_refactor_smoke_cpu_metal.txt`
+
 ## Error-context rollout policy
 
 - `llama-rs` layers that orchestrate ggml-backed operations follow the same
@@ -226,6 +262,30 @@ Post-clap+thiserror resume artifacts (same ELYZA slice):
     - MTL0 `~0.944` (improved),
     - overall `~0.977` (improved),
     - checksum parity: `max abs delta = 0.0`.
+- CPU-side follow-up check (`head_stage_buf=true`) after qrope pass:
+  - impact artifact:
+    - `target/benchmarks/llama_stepwise_headstage_after_qrope_refactor_smoke_impact.md`
+  - sampled result (`variant/base`):
+    - CPU `~1.022`,
+    - MTL0 `~0.995`,
+    - overall `~1.011`,
+    - decision: keep `head_stage_buf=false`.
+- Refactor progress (ADT/type-state + module split):
+  - added decode-step ADT with type-state builder and trait-based dispatch:
+    - `llama-rs/src/inference/stepwise_plan.rs`,
+    - `DecodeStepPlan` / `DecodeStepPlanBuilder`,
+    - trait: `DecodeStepBenchSet` (`single`/`sweep` static dispatch).
+  - `bench_attention_layer` now uses the plan ADT for stepwise bench execution.
+  - split helper ops from `inference.rs`:
+    - `llama-rs/src/inference/attention_ops.rs`.
+  - profile precedence fix:
+    - explicit toggles now override profile presets (e.g. `--decode-stepwise-head-stage-buffer` with `--decode-stepwise-profile-outproj-fused-layerx5`).
+  - runtime smoke artifacts:
+    - `target/benchmarks/llama_rs_stepwise_refactor_plan_smoke.txt`,
+    - `target/benchmarks/llama_rs_refactor_profile_override_smoke.txt`,
+    - `target/benchmarks/llama_rs_refactor_attention_ops_smoke.txt`.
+  - API naming policy update:
+    - long `run_*` public function names were removed in favor of ADT-first and direct operation names (`mlp_inference`, `attention_inference_*`, `attention_decode_proxy_*`, etc.).
 
 Hotspot follow-up (`block_layer=5..7`, same profile lock):
 
@@ -389,7 +449,7 @@ API notes:
 
 - `MlpInferenceConfig` introduces typed dimensions (`HiddenFeatures`, `FfnFeatures`).
 - `MlpWeights::deterministic` provides backend/runtime smoke-test weights without GGUF dependency.
-- `MlpWeights::from_model` and `run_mlp_inference(...)` provide a GGUF-backed path for future model wiring.
+- `MlpWeights::from_model` and `mlp_inference(...)` provide a GGUF-backed path for future model wiring.
 
 Sample result (`--hidden 64 --ffn 128 --repeats 2`):
 
@@ -418,7 +478,7 @@ cargo run -p llama-rs --example min_infer_mlp_layer --features link-system -- /t
 
 API notes:
 
-- `run_mlp_inference_for_layer(_repeats)` now uses `resolve_mlp_weights_for_layer_auto` by default.
+- `mlp_inference_for_layer(_repeats)` now uses `resolve_mlp_weights_for_layer_auto` by default.
 - Hidden width is derived from GGUF metadata when present, and falls back to tensor-size inference for sparse fixtures.
 
 Sample result (`--layer 0 --repeats 2`):
@@ -437,7 +497,7 @@ API notes:
 
 - Attention config is ADT-based: `AttentionLayout` + `AttentionMaskPolicy` + `RotaryEmbedding`.
 - `resolve_attention_weights_for_layer_auto` derives layout from metadata/tensor lengths.
-- `run_attention_inference_with_weights_repeats` executes multi-head grouped attention on backend tensors.
+- `attention_inference_with_weights_repeats` executes multi-head grouped attention on backend tensors.
 - Causal path is supported via `AttentionMaskPolicy::Causal` (`soft_max_ext` mask). Verified on CPU; CPU/Metal parity is validated on the non-causal path.
 - Optional flags in example: `--causal`, `--no-rope`.
 
@@ -518,7 +578,7 @@ Sample result:
 - quantized GGUF block-MLP tensors are now decoded through GGML type-traits (`to_float`) in `GgufModel::tensor_f32_values`, so q4/q5/q6 models can report `block_mlp_real=true`.
 - benchmark runner uses persistent graph/tensor allocations across all decode steps and only updates causal-mask/query-position tensors per step.
 - benchmark runner also performs one untimed backend preflight per backend to reduce first-case kernel compile bias.
-- in `--decode-steps` mode, warmup and measured iterations now share one persistent stepwise allocation path (`run_attention_decode_stepwise_bench_with_cache_repeats_with_block_mlp`) to avoid duplicate setup in benchmark sweeps.
+- in `--decode-steps` mode, warmup and measured iterations now share one persistent stepwise allocation path (`DecodeStepPlan::bench`) to avoid duplicate setup in benchmark sweeps.
 - in the same path, the measured phase now skips redundant KV/precompute reinit when warmup does not mutate persistent KV cache tensors (`kv_write_cache=false`), reducing phase boundary overhead.
 - backend registry loading in `llama-rs` runtime paths is now guarded by one-time init (`ensure_backends_loaded`) to avoid repeated `Backend::load_all()` calls.
 - when `--block-mlp-model` is used, `bench_attention_layer` now caches resolved block-MLP weights by `(hidden_features, block_layer)` across the run to reuse layer decodes in repeated case/layer sweeps.
@@ -935,7 +995,7 @@ Notes:
 - C++ reference source: `llama-rs/tests/cpp/mlp_reference.cpp`
 - C++ reference now executes the same graph with ggml CPU backend (`ggml_mul_mat`/`ggml_silu`/`ggml_mul`).
 - Rust test compiles this source at runtime and compares outputs against
-  `run_mlp_inference_with_weights_repeats(..., LlamaBackend::Cpu, 1)`.
+  `mlp_inference_with_weights_repeats(..., LlamaBackend::Cpu, 1)`.
 - Coverage now includes multiple shape cases (`8x16`, `16x32`, `32x64`) and
   an additional CPU-vs-Metal parity test across the same matrix.
 

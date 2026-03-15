@@ -1,9 +1,9 @@
 use crate::backend::LlamaBackend;
 use crate::inference::{
-    AttentionInferenceConfig, AttentionLayout, AttentionMaskPolicy, AttentionWeights,
-    InferenceError, RotaryEmbedding, build_attention_decode_cache,
-    resolve_attention_weights_for_layer, resolve_llama_layer_dimensions,
-    run_attention_decode_proxy_with_cache_repeats_with_past,
+    AttentionDecodeCacheInput, AttentionDecodePlan, AttentionInferenceConfig, AttentionLayout,
+    AttentionMaskPolicy, AttentionWeights, InferenceError, RotaryEmbedding,
+    build_attention_decode_cache, resolve_attention_weights_for_layer,
+    resolve_llama_layer_dimensions,
 };
 use crate::metadata::{ModelArchitecture, resolve_transformer_metadata};
 use crate::model::GgufModel;
@@ -233,7 +233,7 @@ pub enum IdleWeightsMode {
     MetadataDeterministic,
 }
 
-pub fn run_idle_decode_proxy(
+pub fn idle_decode_proxy(
     model: &GgufModel,
     backend_kind: LlamaBackend,
     config: IdleConfig,
@@ -246,21 +246,17 @@ pub fn run_idle_decode_proxy(
         build_attention_decode_cache(&weights, &key_value_input, config.key_value_length.get())
             .map_err(|source| IdleError::inference("build_attention_decode_cache", source))?;
     let query_input = build_query_input(hidden_features);
+    let decode_plan = AttentionDecodePlan::builder()
+        .backend(backend_kind)
+        .repeats(1)
+        .past_tokens(config.past_tokens)
+        .build()
+        .map_err(|source| IdleError::inference("AttentionDecodePlan::build", source))?;
+    let decode_source = AttentionDecodeCacheInput::new(&weights, &query_input, &cache);
 
-    let warmup = run_attention_decode_proxy_with_cache_repeats_with_past(
-        &weights,
-        &query_input,
-        &cache,
-        backend_kind,
-        1,
-        config.past_tokens,
-    )
-    .map_err(|source| {
-        IdleError::inference(
-            "run_attention_decode_proxy_with_cache_repeats_with_past(warmup)",
-            source,
-        )
-    })?;
+    let warmup = decode_plan
+        .execute(decode_source)
+        .map_err(|source| IdleError::inference("AttentionDecodePlan::execute(warmup)", source))?;
 
     let mut backend_name = warmup.backend_name;
     let mut checksum = output_checksum(&warmup.output);
@@ -274,20 +270,9 @@ pub fn run_idle_decode_proxy(
             }
 
             let start = Instant::now();
-            let report = run_attention_decode_proxy_with_cache_repeats_with_past(
-                &weights,
-                &query_input,
-                &cache,
-                backend_kind,
-                1,
-                config.past_tokens,
-            )
-            .map_err(|source| {
-                IdleError::inference(
-                    "run_attention_decode_proxy_with_cache_repeats_with_past",
-                    source,
-                )
-            })?;
+            let report = decode_plan
+                .execute(decode_source)
+                .map_err(|source| IdleError::inference("AttentionDecodePlan::execute", source))?;
             let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
             backend_name = report.backend_name;
             checksum = output_checksum(&report.output);
@@ -400,14 +385,14 @@ fn build_idle_attention_config(
         })
 }
 
-pub fn run_idle_decode_proxy_from_path<P: AsRef<Path>>(
+pub fn idle_decode_proxy_from_path<P: AsRef<Path>>(
     model_path: P,
     backend_kind: LlamaBackend,
     config: IdleConfig,
 ) -> Result<IdleReport, IdleError> {
     let model = GgufModel::open(model_path)
         .map_err(|source| IdleError::model("GgufModel::open", source))?;
-    run_idle_decode_proxy(&model, backend_kind, config)
+    idle_decode_proxy(&model, backend_kind, config)
 }
 
 fn build_query_input(hidden_features: usize) -> Vec<f32> {

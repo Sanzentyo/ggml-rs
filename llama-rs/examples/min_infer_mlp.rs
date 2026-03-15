@@ -3,9 +3,7 @@
 //! Computes: `down(silu(gate(x)) * up(x))` with deterministic synthetic weights.
 
 use clap::{Parser, ValueEnum};
-use llama_rs::{
-    LlamaBackend, MlpInferenceConfig, MlpWeights, run_mlp_inference_with_weights_repeats,
-};
+use llama_rs::{LlamaBackend, MlpInferenceConfig, MlpWeights, mlp_inference_with_weights_repeats};
 use std::error::Error as StdError;
 use thiserror::Error;
 
@@ -25,8 +23,7 @@ fn run() -> Result<(), Box<dyn StdError>> {
         .collect();
 
     for backend in parsed.backends {
-        let report =
-            run_mlp_inference_with_weights_repeats(&weights, &input, backend, parsed.repeats)?;
+        let report = mlp_inference_with_weights_repeats(&weights, &input, backend, parsed.repeats)?;
         let preview_len = report.output.len().min(8);
         println!(
             "[{}] mlp hidden={} ffn={} repeats={} preview={:?}",

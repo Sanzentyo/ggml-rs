@@ -207,7 +207,7 @@ impl BatchedWorkload {
 }
 
 #[derive(Debug, Clone)]
-/// Runtime metrics produced by [`run_batched_matmul`].
+/// Runtime metrics produced by [`batched_matmul`].
 pub struct BatchedReport {
     pub backend_name: String,
     pub rows_a: usize,
@@ -307,16 +307,16 @@ impl BatchedError {
 ///
 /// The same graph and backend allocation are reused across all batch items.
 /// Input `A` is replaced per item, while `B` stays fixed for the whole run.
-pub fn run_batched_matmul(
+pub fn batched_matmul(
     backend_kind: LlamaBackend,
     config: BatchedConfig,
 ) -> Result<BatchedReport, BatchedError> {
     let workload = BatchedWorkload::deterministic(config)?;
-    run_batched_matmul_with_workload(backend_kind, &workload)
+    batched_matmul_with_workload(backend_kind, &workload)
 }
 
 /// Executes batched matmul using caller-provided workload tensors.
-pub fn run_batched_matmul_with_workload(
+pub fn batched_matmul_with_workload(
     backend_kind: LlamaBackend,
     workload: &BatchedWorkload,
 ) -> Result<BatchedReport, BatchedError> {

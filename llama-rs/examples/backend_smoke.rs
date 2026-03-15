@@ -1,5 +1,5 @@
 use clap::{Parser, ValueEnum};
-use llama_rs::{LlamaBackend, run_backend_smoke};
+use llama_rs::{LlamaBackend, backend_smoke};
 use std::error::Error as StdError;
 use thiserror::Error;
 
@@ -18,7 +18,7 @@ fn run() -> Result<(), Box<dyn StdError>> {
     };
 
     for backend in backends.into_iter().map(Into::into) {
-        let report = run_backend_smoke(backend)?;
+        let report = backend_smoke(backend)?;
         println!(
             "[{}] mul mat ({} x {}) OK",
             report.backend_name, report.cols, report.rows

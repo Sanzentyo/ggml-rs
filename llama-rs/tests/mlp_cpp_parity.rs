@@ -1,8 +1,6 @@
 #![cfg(feature = "link-system")]
 
-use llama_rs::{
-    LlamaBackend, MlpInferenceConfig, MlpWeights, run_mlp_inference_with_weights_repeats,
-};
+use llama_rs::{LlamaBackend, MlpInferenceConfig, MlpWeights, mlp_inference_with_weights_repeats};
 use std::error::Error;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -17,9 +15,9 @@ fn mlp_cpu_matches_cpp_reference_across_sizes() -> Result<(), Box<dyn Error>> {
         let weights = MlpWeights::deterministic(config);
         let input = build_input(hidden_features);
 
-        let cpp_output = run_cpp_reference(&cpp_binary, hidden_features, ffn_features)?;
+        let cpp_output = cpp_reference(&cpp_binary, hidden_features, ffn_features)?;
         let rust_report =
-            run_mlp_inference_with_weights_repeats(&weights, &input, LlamaBackend::Cpu, 1)?;
+            mlp_inference_with_weights_repeats(&weights, &input, LlamaBackend::Cpu, 1)?;
         assert_eq!(cpp_output.len(), rust_report.output.len());
 
         let max_delta = max_abs_delta(&cpp_output, &rust_report.output);
@@ -41,19 +39,15 @@ fn mlp_cpu_matches_metal_across_sizes() -> Result<(), Box<dyn Error>> {
         let input = build_input(hidden_features);
 
         let cpu_report =
-            run_mlp_inference_with_weights_repeats(&weights, &input, LlamaBackend::Cpu, 1)?;
-        let metal_report = match run_mlp_inference_with_weights_repeats(
-            &weights,
-            &input,
-            LlamaBackend::Metal,
-            1,
-        ) {
-            Ok(report) => report,
-            Err(error) => {
-                eprintln!("metal backend unavailable; skipping parity test: {error}");
-                return Ok(());
-            }
-        };
+            mlp_inference_with_weights_repeats(&weights, &input, LlamaBackend::Cpu, 1)?;
+        let metal_report =
+            match mlp_inference_with_weights_repeats(&weights, &input, LlamaBackend::Metal, 1) {
+                Ok(report) => report,
+                Err(error) => {
+                    eprintln!("metal backend unavailable; skipping parity test: {error}");
+                    return Ok(());
+                }
+            };
 
         assert_eq!(cpu_report.output.len(), metal_report.output.len());
         let max_delta = max_abs_delta(&cpu_report.output, &metal_report.output);
@@ -130,7 +124,7 @@ fn ggml_lib_dir(ggml_root: &Path) -> PathBuf {
     }
 }
 
-fn run_cpp_reference(
+fn cpp_reference(
     binary: &Path,
     hidden_features: usize,
     ffn_features: usize,

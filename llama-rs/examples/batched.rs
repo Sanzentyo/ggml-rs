@@ -3,7 +3,7 @@
 use clap::{Parser, ValueEnum};
 use llama_rs::{
     BatchSize, BatchedConfig, BatchedWorkload, LlamaBackend, ReadbackEvery, RepeatCount,
-    run_batched_matmul_with_workload,
+    batched_matmul_with_workload,
 };
 use std::error::Error as StdError;
 use thiserror::Error;
@@ -24,7 +24,7 @@ fn run() -> Result<(), Box<dyn StdError>> {
     };
     let workload = BatchedWorkload::deterministic(config)?;
     for backend in backends.into_iter().map(Into::into) {
-        let report = run_batched_matmul_with_workload(backend, &workload)?;
+        let report = batched_matmul_with_workload(backend, &workload)?;
         println!(
             "[{}] batched matmul {}x{} · {}x{} batch={} repeats={} readback_every={} readbacks={} avg_item={:.3} ms, checksum={:.6}",
             report.backend_name,

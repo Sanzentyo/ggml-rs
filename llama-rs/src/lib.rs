@@ -17,9 +17,9 @@ pub mod smoke;
 pub use backend::{LlamaBackend, ParseBackendError};
 pub use batched::{
     BatchSize, BatchedConfig, BatchedError, BatchedReport, BatchedWorkload, ReadbackEvery,
-    RepeatCount, run_batched_matmul, run_batched_matmul_with_workload,
+    RepeatCount, batched_matmul, batched_matmul_with_workload,
 };
-pub use bench::{BenchError, MatmulBenchConfig, MatmulBenchReport, run_backend_matmul_bench};
+pub use bench::{BenchError, MatmulBenchConfig, MatmulBenchReport, backend_matmul_bench};
 pub use bench_report::{
     AttentionBenchRow, BenchBackend, BenchReportError, LlamaCppBenchRow, MlpBenchRow,
     parse_attention_bench_output, parse_llama_cpp_jsonl, parse_mlp_bench_output,
@@ -32,33 +32,27 @@ pub use gguf::{GgufKvEntry, GgufReport, inspect_gguf};
 pub use gguf_hash::{GgufHashError, HashAlgorithm, HashOptions, HashRecord, hash_file};
 pub use idle::{
     IdleConfig, IdleError, IdlePauseReport, IdlePauseSchedule, IdleReport, IdleWeightsMode,
-    PauseScheduleEmpty, PauseScheduleReady, run_idle_decode_proxy, run_idle_decode_proxy_from_path,
+    PauseScheduleEmpty, PauseScheduleReady, idle_decode_proxy, idle_decode_proxy_from_path,
 };
 pub use inference::{
-    AttentionDecodeCache, AttentionDecodeProxyReport, AttentionDecodeStepwiseBenchReport,
-    AttentionDecodeStepwiseBenchSweepReport, AttentionDecodeStepwiseConfig,
-    AttentionDecodeStepwiseReport, AttentionHeadCount, AttentionHeadDimension,
-    AttentionInferenceConfig, AttentionInferenceReport, AttentionLayout, AttentionMaskPolicy,
-    AttentionWeights, FfnFeatures, HiddenFeatures, InFeatures, InferenceError,
+    AttentionDecodeCache, AttentionDecodeCacheInput, AttentionDecodePlan,
+    AttentionDecodePlanBuilder, AttentionDecodeProxyReport, AttentionDecodeSource,
+    AttentionDecodeStepwiseBenchReport, AttentionDecodeStepwiseBenchSweepReport,
+    AttentionDecodeStepwiseConfig, AttentionDecodeStepwiseReport, AttentionDecodeWeightsInput,
+    AttentionHeadCount, AttentionHeadDimension, AttentionInferenceConfig, AttentionInferenceReport,
+    AttentionLayout, AttentionMaskPolicy, AttentionWeights, DecodeStepBenchSet, DecodeStepPlan,
+    DecodeStepPlanBuilder, FfnFeatures, HiddenFeatures, InFeatures, InferenceError,
     LinearInferenceConfig, LinearInferenceReport, LinearWeights, LlamaLayerDimensions,
     MetadataResolutionMode, MlpInferenceConfig, MlpInferenceReport, MlpWeights, OutFeatures,
-    RopeConfig, RotaryEmbedding, build_attention_decode_cache, resolve_attention_weights_for_layer,
+    RopeConfig, RotaryEmbedding, attention_inference_for_layer, attention_inference_for_layer_auto,
+    attention_inference_for_layer_auto_repeats, attention_inference_for_layer_repeats,
+    attention_inference_with_weights, attention_inference_with_weights_repeats,
+    build_attention_decode_cache, linear_inference, linear_inference_with_weights,
+    linear_inference_with_weights_repeats, mlp_inference, mlp_inference_for_layer,
+    mlp_inference_for_layer_repeats, mlp_inference_with_weights,
+    mlp_inference_with_weights_repeats, resolve_attention_weights_for_layer,
     resolve_attention_weights_for_layer_auto, resolve_llama_layer_dimensions,
     resolve_mlp_weights_for_layer, resolve_mlp_weights_for_layer_auto,
-    run_attention_decode_proxy_with_cache, run_attention_decode_proxy_with_cache_repeats,
-    run_attention_decode_proxy_with_cache_repeats_with_past,
-    run_attention_decode_proxy_with_weights, run_attention_decode_proxy_with_weights_repeats,
-    run_attention_decode_stepwise_bench_sweep_with_cache_repeats_with_block_mlp,
-    run_attention_decode_stepwise_bench_with_cache_repeats_with_block_mlp,
-    run_attention_decode_stepwise_with_cache_repeats,
-    run_attention_decode_stepwise_with_cache_repeats_with_block_mlp,
-    run_attention_inference_for_layer, run_attention_inference_for_layer_auto,
-    run_attention_inference_for_layer_auto_repeats, run_attention_inference_for_layer_repeats,
-    run_attention_inference_with_weights, run_attention_inference_with_weights_repeats,
-    run_linear_inference, run_linear_inference_with_weights,
-    run_linear_inference_with_weights_repeats, run_mlp_inference, run_mlp_inference_for_layer,
-    run_mlp_inference_for_layer_repeats, run_mlp_inference_with_weights,
-    run_mlp_inference_with_weights_repeats,
 };
 pub use metadata::{
     LlamaModelMetadata, MetadataError, ModelArchitecture, ModelMetadata, TransformerMetadata,
@@ -73,5 +67,5 @@ pub use naming::{
     resolve_llama_layer_tensor_names_from_names, resolve_llama_tensor_names,
     resolve_llama_tensor_names_from_names,
 };
-pub use simple::{SimpleError, SimpleReport, run_simple_ctx};
-pub use smoke::{SmokeError, SmokeReport, run_backend_smoke};
+pub use simple::{SimpleError, SimpleReport, simple_ctx};
+pub use smoke::{SmokeError, SmokeReport, backend_smoke};

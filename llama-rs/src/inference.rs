@@ -4,16 +4,34 @@
 //! safe APIs. This acts as the first inference building block before full
 //! transformer graph assembly.
 
-use crate::backend::{LlamaBackend, ensure_backends_loaded};
+use crate::backend::LlamaBackend;
 use crate::metadata::{LlamaModelMetadata, MetadataError, resolve_llama_metadata};
 use crate::model::{GgufModel, ModelError};
 use crate::naming::{LlamaLayerTensorNames, NamingError, resolve_llama_layer_tensor_names};
-use ggml_rs::{Backend, Context, RopeExtParams, Shape2D};
+use ggml_rs::{Context, Shape2D};
 use std::error::Error as StdError;
 use std::fmt;
 use std::marker::PhantomData;
 use std::num::NonZeroUsize;
-use std::time::{Duration, Instant};
+
+mod attention_ops;
+mod backend_runtime;
+mod decode_proxy_plan;
+mod projection_ops;
+mod stepwise_decode;
+mod stepwise_plan;
+use attention_ops::{LlamaRotaryApplier, RotaryApplier};
+use backend_runtime::{BackendRuntimeBuilder, DefaultBackendRuntimeBuilder};
+pub use decode_proxy_plan::{
+    AttentionDecodeCacheInput, AttentionDecodePlan, AttentionDecodePlanBuilder,
+    AttentionDecodeSource, AttentionDecodeWeightsInput,
+};
+use projection_ops::{DecodeCacheBuilder, F32MatmulProjector, StandardDecodeCacheBuilder};
+pub use stepwise_decode::{
+    AttentionDecodeStepwiseBenchReport, AttentionDecodeStepwiseBenchSweepReport,
+    AttentionDecodeStepwiseConfig, AttentionDecodeStepwiseReport,
+};
+pub use stepwise_plan::{DecodeStepBenchSet, DecodeStepPlan, DecodeStepPlanBuilder};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 /// Strongly typed non-zero input feature count.
@@ -642,7 +660,7 @@ impl InferenceError {
 ///
 /// `W` is loaded from a GGUF tensor and interpreted as shape
 /// `[in_features, out_features]` in ggml's `(cols, rows)` convention.
-pub fn run_linear_inference(
+pub fn linear_inference(
     model: &GgufModel,
     weight_tensor_name: &str,
     input: &[f32],
@@ -650,21 +668,21 @@ pub fn run_linear_inference(
     backend_kind: LlamaBackend,
 ) -> Result<LinearInferenceReport, InferenceError> {
     let weights = LinearWeights::from_model(model, weight_tensor_name, config)?;
-    run_linear_inference_with_weights(&weights, input, backend_kind)
+    linear_inference_with_weights(&weights, input, backend_kind)
 }
 
 /// Runs one linear projection using pre-decoded reusable weights.
-pub fn run_linear_inference_with_weights(
+pub fn linear_inference_with_weights(
     weights: &LinearWeights,
     input: &[f32],
     backend_kind: LlamaBackend,
 ) -> Result<LinearInferenceReport, InferenceError> {
-    run_linear_inference_with_weights_repeats(weights, input, backend_kind, 1)
+    linear_inference_with_weights_repeats(weights, input, backend_kind, 1)
 }
 
 /// Runs one linear projection using pre-decoded reusable weights and repeated
 /// backend execution on the same graph.
-pub fn run_linear_inference_with_weights_repeats(
+pub fn linear_inference_with_weights_repeats(
     weights: &LinearWeights,
     input: &[f32],
     backend_kind: LlamaBackend,
@@ -680,14 +698,6 @@ pub fn run_linear_inference_with_weights_repeats(
         return Err(InferenceError::InvalidRepeats);
     }
 
-    ensure_backends_loaded();
-    let backend = Backend::new(backend_kind.into())
-        .map_err(|source| InferenceError::ggml("Backend::new", source))?;
-    let backend_name = backend
-        .name()
-        .map_err(|source| InferenceError::ggml("Backend::name", source))?
-        .to_string();
-
     let weight_shape = Shape2D::new(weights.in_features, weights.out_features);
     let input_shape = Shape2D::new(weights.in_features, 1);
     let ctx_size =
@@ -698,8 +708,10 @@ pub fn run_linear_inference_with_weights_repeats(
                     source,
                 )
             })?;
-    let ctx = Context::new_no_alloc_bytes(ctx_size)
-        .map_err(|source| InferenceError::ggml("Context::new_no_alloc_bytes", source))?;
+    let runtime = DefaultBackendRuntimeBuilder.build_runtime(backend_kind, ctx_size)?;
+    let backend = runtime.backend;
+    let backend_name = runtime.backend_name;
+    let ctx = runtime.ctx;
 
     let w = ctx
         .new_f32_tensor_2d_shape(weight_shape)
@@ -745,7 +757,7 @@ pub fn run_linear_inference_with_weights_repeats(
 }
 
 /// Runs a minimal MLP block `down(silu(gate(x)) * up(x))` from GGUF tensors.
-pub fn run_mlp_inference(
+pub fn mlp_inference(
     model: &GgufModel,
     gate_tensor_name: &str,
     up_tensor_name: &str,
@@ -761,18 +773,18 @@ pub fn run_mlp_inference(
         down_tensor_name,
         config,
     )?;
-    run_mlp_inference_with_weights(&weights, input, backend_kind)
+    mlp_inference_with_weights(&weights, input, backend_kind)
 }
 
 /// Resolves a transformer layer by index from GGUF tensor names and runs the
 /// minimal MLP block for that layer.
-pub fn run_mlp_inference_for_layer(
+pub fn mlp_inference_for_layer(
     model: &GgufModel,
     layer: usize,
     input: &[f32],
     backend_kind: LlamaBackend,
 ) -> Result<MlpInferenceReport, InferenceError> {
-    run_mlp_inference_for_layer_repeats(model, layer, input, backend_kind, 1)
+    mlp_inference_for_layer_repeats(model, layer, input, backend_kind, 1)
 }
 
 /// Resolves and decodes reusable MLP weights for one transformer layer.
@@ -795,8 +807,8 @@ pub fn resolve_mlp_weights_for_layer_auto(
     resolve_mlp_weights_for_layer(model, layer, dimensions.hidden_features)
 }
 
-/// Same as [`run_mlp_inference_for_layer`] with explicit repeated backend runs.
-pub fn run_mlp_inference_for_layer_repeats(
+/// Same as [`mlp_inference_for_layer`] with explicit repeated backend runs.
+pub fn mlp_inference_for_layer_repeats(
     model: &GgufModel,
     layer: usize,
     input: &[f32],
@@ -804,21 +816,21 @@ pub fn run_mlp_inference_for_layer_repeats(
     repeats: usize,
 ) -> Result<MlpInferenceReport, InferenceError> {
     let weights = resolve_mlp_weights_for_layer_auto(model, layer)?;
-    run_mlp_inference_with_weights_repeats(&weights, input, backend_kind, repeats)
+    mlp_inference_with_weights_repeats(&weights, input, backend_kind, repeats)
 }
 
 /// Runs a minimal MLP block using pre-decoded reusable weights.
-pub fn run_mlp_inference_with_weights(
+pub fn mlp_inference_with_weights(
     weights: &MlpWeights,
     input: &[f32],
     backend_kind: LlamaBackend,
 ) -> Result<MlpInferenceReport, InferenceError> {
-    run_mlp_inference_with_weights_repeats(weights, input, backend_kind, 1)
+    mlp_inference_with_weights_repeats(weights, input, backend_kind, 1)
 }
 
 /// Runs a minimal MLP block using pre-decoded reusable weights and repeated
 /// backend execution on a single graph.
-pub fn run_mlp_inference_with_weights_repeats(
+pub fn mlp_inference_with_weights_repeats(
     weights: &MlpWeights,
     input: &[f32],
     backend_kind: LlamaBackend,
@@ -834,19 +846,13 @@ pub fn run_mlp_inference_with_weights_repeats(
         return Err(InferenceError::InvalidRepeats);
     }
 
-    ensure_backends_loaded();
-    let backend = Backend::new(backend_kind.into())
-        .map_err(|source| InferenceError::ggml("Backend::new", source))?;
-    let backend_name = backend
-        .name()
-        .map_err(|source| InferenceError::ggml("Backend::name", source))?
-        .to_string();
-
     let hidden = weights.hidden_features;
     let ffn = weights.ffn_features;
     let ctx_size = recommended_mlp_backend_memory_bytes(hidden, ffn)?;
-    let ctx = Context::new_no_alloc_bytes(ctx_size)
-        .map_err(|source| InferenceError::ggml("Context::new_no_alloc_bytes", source))?;
+    let runtime = DefaultBackendRuntimeBuilder.build_runtime(backend_kind, ctx_size)?;
+    let backend = runtime.backend;
+    let backend_name = runtime.backend_name;
+    let ctx = runtime.ctx;
 
     let gate_shape = Shape2D::new(hidden, ffn);
     let up_shape = Shape2D::new(hidden, ffn);
@@ -1656,208 +1662,6 @@ pub struct AttentionDecodeProxyReport {
 }
 
 #[derive(Debug, Clone)]
-/// Output payload and execution metadata for stepwise decode-like proxy inference.
-pub struct AttentionDecodeStepwiseReport {
-    pub backend_name: String,
-    pub hidden_features: usize,
-    pub query_length: usize,
-    pub key_value_start: usize,
-    pub steps: usize,
-    pub repeats_per_step: usize,
-    pub output: Vec<f32>,
-}
-
-#[derive(Debug, Clone)]
-/// Stepwise decode benchmark report with explicit warmup/bench phase timing.
-pub struct AttentionDecodeStepwiseBenchReport {
-    pub warmup_repeats_per_step: usize,
-    pub setup_duration: Duration,
-    pub bench_duration: Duration,
-    pub execution: AttentionDecodeStepwiseReport,
-}
-
-impl AttentionDecodeStepwiseBenchReport {
-    pub fn avg_token_ms(&self) -> f64 {
-        let token_iters = self
-            .execution
-            .steps
-            .checked_mul(self.execution.repeats_per_step)
-            .unwrap_or(1)
-            .max(1);
-        self.bench_duration.as_secs_f64() * 1000.0 / token_iters as f64
-    }
-
-    pub fn setup_ms(&self) -> f64 {
-        self.setup_duration.as_secs_f64() * 1000.0
-    }
-}
-
-#[derive(Debug, Clone)]
-/// Batched stepwise decode benchmark reports sharing one setup path.
-pub struct AttentionDecodeStepwiseBenchSweepReport {
-    pub warmup_repeats_per_step: usize,
-    pub setup_duration: Duration,
-    pub entries: Vec<AttentionDecodeStepwiseBenchReport>,
-}
-
-impl AttentionDecodeStepwiseBenchSweepReport {
-    pub fn setup_ms(&self) -> f64 {
-        self.setup_duration.as_secs_f64() * 1000.0
-    }
-
-    pub fn amortized_setup_ms(&self) -> f64 {
-        let entry_count = self.entries.len().max(1);
-        self.setup_ms() / entry_count as f64
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
-/// Configuration for stepwise decode-like proxy execution.
-pub struct AttentionDecodeStepwiseConfig {
-    pub key_value_start: usize,
-    pub steps: usize,
-    pub past_start: usize,
-    pub repeats_per_step: usize,
-    pub layer_repeat: usize,
-    pub include_kv_projection: bool,
-    pub include_kv_cache_write: bool,
-    pub include_kv_cache_write_to_cache: bool,
-    pub include_block_scope: bool,
-    pub synchronize_per_step: bool,
-    pub readback_per_step: bool,
-    pub use_position_deltas: bool,
-    pub use_mask_deltas: bool,
-    pub elide_mask_host_buffer: bool,
-    pub fuse_output_projection: bool,
-    pub precompute_static_kv_head_views: bool,
-    pub use_balanced_head_concat: bool,
-    pub use_head_output_staging_buffer: bool,
-    pub use_fused_block_gate_up_projection: bool,
-}
-
-impl AttentionDecodeStepwiseConfig {
-    /// Creates a stepwise decode configuration with conservative defaults.
-    ///
-    /// Optional cost scopes (`kv_projection`, `block_scope`) and backend timing
-    /// knobs (`synchronize_per_step`, `readback_per_step`) are disabled by default.
-    pub const fn new(
-        key_value_start: usize,
-        steps: usize,
-        past_start: usize,
-        repeats_per_step: usize,
-    ) -> Self {
-        Self {
-            key_value_start,
-            steps,
-            past_start,
-            repeats_per_step,
-            layer_repeat: 1,
-            include_kv_projection: false,
-            include_kv_cache_write: false,
-            include_kv_cache_write_to_cache: false,
-            include_block_scope: false,
-            synchronize_per_step: false,
-            readback_per_step: false,
-            use_position_deltas: true,
-            use_mask_deltas: true,
-            elide_mask_host_buffer: false,
-            fuse_output_projection: false,
-            precompute_static_kv_head_views: true,
-            use_balanced_head_concat: false,
-            use_head_output_staging_buffer: false,
-            use_fused_block_gate_up_projection: false,
-        }
-    }
-
-    pub const fn with_kv_projection(mut self, include_kv_projection: bool) -> Self {
-        self.include_kv_projection = include_kv_projection;
-        self
-    }
-
-    pub const fn with_layer_repeat(mut self, layer_repeat: usize) -> Self {
-        self.layer_repeat = layer_repeat;
-        self
-    }
-
-    pub const fn with_kv_cache_write(mut self, include_kv_cache_write: bool) -> Self {
-        self.include_kv_cache_write = include_kv_cache_write;
-        self
-    }
-
-    pub const fn with_kv_cache_write_to_cache(
-        mut self,
-        include_kv_cache_write_to_cache: bool,
-    ) -> Self {
-        self.include_kv_cache_write_to_cache = include_kv_cache_write_to_cache;
-        self
-    }
-
-    pub const fn with_block_scope(mut self, include_block_scope: bool) -> Self {
-        self.include_block_scope = include_block_scope;
-        self
-    }
-
-    pub const fn with_sync_per_step(mut self, synchronize_per_step: bool) -> Self {
-        self.synchronize_per_step = synchronize_per_step;
-        self
-    }
-
-    pub const fn with_readback_per_step(mut self, readback_per_step: bool) -> Self {
-        self.readback_per_step = readback_per_step;
-        self
-    }
-
-    pub const fn with_position_deltas(mut self, use_position_deltas: bool) -> Self {
-        self.use_position_deltas = use_position_deltas;
-        self
-    }
-
-    pub const fn with_mask_deltas(mut self, use_mask_deltas: bool) -> Self {
-        self.use_mask_deltas = use_mask_deltas;
-        self
-    }
-
-    pub const fn with_mask_host_buffer_elision(mut self, elide_mask_host_buffer: bool) -> Self {
-        self.elide_mask_host_buffer = elide_mask_host_buffer;
-        self
-    }
-
-    pub const fn with_fused_output_projection(mut self, fuse_output_projection: bool) -> Self {
-        self.fuse_output_projection = fuse_output_projection;
-        self
-    }
-
-    pub const fn with_static_kv_head_view_precompute(
-        mut self,
-        precompute_static_kv_head_views: bool,
-    ) -> Self {
-        self.precompute_static_kv_head_views = precompute_static_kv_head_views;
-        self
-    }
-
-    pub const fn with_balanced_head_concat(mut self, use_balanced_head_concat: bool) -> Self {
-        self.use_balanced_head_concat = use_balanced_head_concat;
-        self
-    }
-
-    pub const fn with_head_output_staging_buffer(
-        mut self,
-        use_head_output_staging_buffer: bool,
-    ) -> Self {
-        self.use_head_output_staging_buffer = use_head_output_staging_buffer;
-        self
-    }
-
-    pub const fn with_fused_block_gate_up_projection(
-        mut self,
-        use_fused_block_gate_up_projection: bool,
-    ) -> Self {
-        self.use_fused_block_gate_up_projection = use_fused_block_gate_up_projection;
-        self
-    }
-}
-
-#[derive(Debug, Clone)]
 /// Reusable projected KV cache for decode-like attention proxy runs.
 pub struct AttentionDecodeCache {
     key_value_length: usize,
@@ -1918,18 +1722,18 @@ pub fn resolve_attention_weights_for_layer_auto(
 }
 
 /// Runs minimal self-attention from resolved GGUF layer tensors.
-pub fn run_attention_inference_for_layer(
+pub fn attention_inference_for_layer(
     model: &GgufModel,
     layer: usize,
     input: &[f32],
     config: AttentionInferenceConfig,
     backend_kind: LlamaBackend,
 ) -> Result<AttentionInferenceReport, InferenceError> {
-    run_attention_inference_for_layer_repeats(model, layer, input, config, backend_kind, 1)
+    attention_inference_for_layer_repeats(model, layer, input, config, backend_kind, 1)
 }
 
 /// Runs minimal self-attention from resolved GGUF layer tensors with explicit repeats.
-pub fn run_attention_inference_for_layer_repeats(
+pub fn attention_inference_for_layer_repeats(
     model: &GgufModel,
     layer: usize,
     input: &[f32],
@@ -1938,18 +1742,18 @@ pub fn run_attention_inference_for_layer_repeats(
     repeats: usize,
 ) -> Result<AttentionInferenceReport, InferenceError> {
     let weights = resolve_attention_weights_for_layer(model, layer, config)?;
-    run_attention_inference_with_weights_repeats(&weights, input, backend_kind, repeats)
+    attention_inference_with_weights_repeats(&weights, input, backend_kind, repeats)
 }
 
 /// Runs minimal self-attention with auto-derived topology and RoPE metadata.
-pub fn run_attention_inference_for_layer_auto(
+pub fn attention_inference_for_layer_auto(
     model: &GgufModel,
     layer: usize,
     input: &[f32],
     sequence_length: usize,
     backend_kind: LlamaBackend,
 ) -> Result<AttentionInferenceReport, InferenceError> {
-    run_attention_inference_for_layer_auto_repeats(
+    attention_inference_for_layer_auto_repeats(
         model,
         layer,
         input,
@@ -1960,7 +1764,7 @@ pub fn run_attention_inference_for_layer_auto(
 }
 
 /// Runs minimal self-attention with auto-derived topology and explicit repeats.
-pub fn run_attention_inference_for_layer_auto_repeats(
+pub fn attention_inference_for_layer_auto_repeats(
     model: &GgufModel,
     layer: usize,
     input: &[f32],
@@ -1969,20 +1773,20 @@ pub fn run_attention_inference_for_layer_auto_repeats(
     repeats: usize,
 ) -> Result<AttentionInferenceReport, InferenceError> {
     let weights = resolve_attention_weights_for_layer_auto(model, layer, sequence_length)?;
-    run_attention_inference_with_weights_repeats(&weights, input, backend_kind, repeats)
+    attention_inference_with_weights_repeats(&weights, input, backend_kind, repeats)
 }
 
 /// Runs minimal self-attention with reusable decoded weights.
-pub fn run_attention_inference_with_weights(
+pub fn attention_inference_with_weights(
     weights: &AttentionWeights,
     input: &[f32],
     backend_kind: LlamaBackend,
 ) -> Result<AttentionInferenceReport, InferenceError> {
-    run_attention_inference_with_weights_repeats(weights, input, backend_kind, 1)
+    attention_inference_with_weights_repeats(weights, input, backend_kind, 1)
 }
 
 /// Runs minimal self-attention with reusable decoded weights and explicit repeats.
-pub fn run_attention_inference_with_weights_repeats(
+pub fn attention_inference_with_weights_repeats(
     weights: &AttentionWeights,
     input: &[f32],
     backend_kind: LlamaBackend,
@@ -2004,17 +1808,11 @@ pub fn run_attention_inference_with_weights_repeats(
         return Err(InferenceError::InvalidRepeats);
     }
 
-    ensure_backends_loaded();
-    let backend = Backend::new(backend_kind.into())
-        .map_err(|source| InferenceError::ggml("Backend::new", source))?;
-    let backend_name = backend
-        .name()
-        .map_err(|source| InferenceError::ggml("Backend::name", source))?
-        .to_string();
-
     let ctx_size = recommended_attention_backend_memory_bytes(config)?;
-    let ctx = Context::new_no_alloc_bytes(ctx_size)
-        .map_err(|source| InferenceError::ggml("Context::new_no_alloc_bytes", source))?;
+    let runtime = DefaultBackendRuntimeBuilder.build_runtime(backend_kind, ctx_size)?;
+    let backend = runtime.backend;
+    let backend_name = runtime.backend_name;
+    let ctx = runtime.ctx;
 
     let query_features = config.query_features();
     let kv_features = config.kv_features();
@@ -2074,6 +1872,7 @@ pub fn run_attention_inference_with_weights_repeats(
         .ok_or(InferenceError::MemorySizeOverflow)?;
     let o_row_stride = q_row_stride;
     let attention_scale = 1.0 / (config.head_dimension() as f32).sqrt();
+    let rotary_applier = LlamaRotaryApplier;
 
     for head in 0..config.query_head_count() {
         let query_offset = head
@@ -2114,8 +1913,20 @@ pub fn run_attention_inference_with_weights_repeats(
             )
             .map_err(|source| InferenceError::ggml("Context::view_2d(V_HEAD)", source))?;
 
-        let q_head = apply_rotary_if_enabled(&ctx, &q_head, positions.as_ref(), config)?;
-        let k_head = apply_rotary_if_enabled(&ctx, &k_head, positions.as_ref(), config)?;
+        let q_head = rotary_applier.apply_single_with_sequence(
+            &ctx,
+            &q_head,
+            positions.as_ref(),
+            config,
+            sequence_length,
+        )?;
+        let k_head = rotary_applier.apply_single_with_sequence(
+            &ctx,
+            &k_head,
+            positions.as_ref(),
+            config,
+            sequence_length,
+        )?;
 
         let scores = ctx
             .mul_mat(&k_head, &q_head)
@@ -2228,100 +2039,14 @@ pub fn build_attention_decode_cache(
     key_value_input: &[f32],
     key_value_length: usize,
 ) -> Result<AttentionDecodeCache, InferenceError> {
-    let config = weights.config;
-    let hidden_features = config.hidden_features();
-    if key_value_length == 0 {
-        return Err(InferenceError::InvalidAttentionShape {
-            hidden_features,
-            sequence_length: key_value_length,
-        });
-    }
-    let expected_kv_input_len = hidden_features
-        .checked_mul(key_value_length)
-        .ok_or(InferenceError::MemorySizeOverflow)?;
-    if key_value_input.len() != expected_kv_input_len {
-        return Err(InferenceError::InvalidInputLength {
-            expected: expected_kv_input_len,
-            actual: key_value_input.len(),
-        });
-    }
-
-    let kv_features = config.kv_features();
-    let projected_k_values = project_attention_input_f32(
-        weights.k_values(),
-        key_value_input,
-        hidden_features,
-        kv_features,
-        key_value_length,
-    )?;
-    let projected_v_values = project_attention_input_f32(
-        weights.v_values(),
-        key_value_input,
-        hidden_features,
-        kv_features,
-        key_value_length,
-    )?;
-
-    Ok(AttentionDecodeCache {
-        key_value_length,
-        kv_features,
-        projected_k_values,
-        projected_v_values,
-    })
-}
-
-/// Runs decode-like attention proxy using a pre-projected KV cache.
-pub fn run_attention_decode_proxy_with_cache(
-    weights: &AttentionWeights,
-    query_input: &[f32],
-    cache: &AttentionDecodeCache,
-    backend_kind: LlamaBackend,
-) -> Result<AttentionDecodeProxyReport, InferenceError> {
-    run_attention_decode_proxy_with_cache_repeats(weights, query_input, cache, backend_kind, 1)
-}
-
-/// Runs decode-like attention proxy with explicit repeats and reusable KV cache.
-pub fn run_attention_decode_proxy_with_cache_repeats(
-    weights: &AttentionWeights,
-    query_input: &[f32],
-    cache: &AttentionDecodeCache,
-    backend_kind: LlamaBackend,
-    repeats: usize,
-) -> Result<AttentionDecodeProxyReport, InferenceError> {
-    let default_past_tokens = match weights.config.mask {
-        AttentionMaskPolicy::None => 0,
-        AttentionMaskPolicy::Causal { past_tokens } => past_tokens,
-    };
-    run_attention_decode_proxy_with_cache_repeats_inner(
+    StandardDecodeCacheBuilder::new(F32MatmulProjector).build_cache(
         weights,
-        query_input,
-        cache,
-        backend_kind,
-        repeats,
-        default_past_tokens,
+        key_value_input,
+        key_value_length,
     )
 }
 
-/// Runs decode-like attention proxy with explicit repeats and caller-provided past offset.
-pub fn run_attention_decode_proxy_with_cache_repeats_with_past(
-    weights: &AttentionWeights,
-    query_input: &[f32],
-    cache: &AttentionDecodeCache,
-    backend_kind: LlamaBackend,
-    repeats: usize,
-    past_tokens: usize,
-) -> Result<AttentionDecodeProxyReport, InferenceError> {
-    run_attention_decode_proxy_with_cache_repeats_inner(
-        weights,
-        query_input,
-        cache,
-        backend_kind,
-        repeats,
-        past_tokens,
-    )
-}
-
-fn run_attention_decode_proxy_with_cache_repeats_inner(
+fn attention_decode_proxy_with_cache_repeats_inner(
     weights: &AttentionWeights,
     query_input: &[f32],
     cache: &AttentionDecodeCache,
@@ -2370,21 +2095,15 @@ fn run_attention_decode_proxy_with_cache_repeats_inner(
         });
     }
 
-    ensure_backends_loaded();
-    let backend = Backend::new(backend_kind.into())
-        .map_err(|source| InferenceError::ggml("Backend::new", source))?;
-    let backend_name = backend
-        .name()
-        .map_err(|source| InferenceError::ggml("Backend::name", source))?
-        .to_string();
-
     let ctx_size = recommended_attention_backend_memory_bytes_for_lengths(
         config,
         query_length,
         key_value_length,
     )?;
-    let ctx = Context::new_no_alloc_bytes(ctx_size)
-        .map_err(|source| InferenceError::ggml("Context::new_no_alloc_bytes", source))?;
+    let runtime = DefaultBackendRuntimeBuilder.build_runtime(backend_kind, ctx_size)?;
+    let backend = runtime.backend;
+    let backend_name = runtime.backend_name;
+    let ctx = runtime.ctx;
 
     let query_features = config.query_features();
 
@@ -2444,6 +2163,7 @@ fn run_attention_decode_proxy_with_cache_repeats_inner(
         .ok_or(InferenceError::MemorySizeOverflow)?;
     let o_row_stride = q_row_stride;
     let attention_scale = 1.0 / (config.head_dimension() as f32).sqrt();
+    let rotary_applier = LlamaRotaryApplier;
 
     for head in 0..config.query_head_count() {
         let query_offset = head
@@ -2484,14 +2204,14 @@ fn run_attention_decode_proxy_with_cache_repeats_inner(
             )
             .map_err(|source| InferenceError::ggml("Context::view_2d(V_HEAD)", source))?;
 
-        let q_head = apply_rotary_if_enabled_with_sequence(
+        let q_head = rotary_applier.apply_single_with_sequence(
             &ctx,
             &q_head,
             positions_q.as_ref(),
             config,
             query_length,
         )?;
-        let k_head = apply_rotary_if_enabled_with_sequence(
+        let k_head = rotary_applier.apply_single_with_sequence(
             &ctx,
             &k_head,
             positions_k.as_ref(),
@@ -2609,1418 +2329,6 @@ fn run_attention_decode_proxy_with_cache_repeats_inner(
         repeats,
         output,
     })
-}
-
-/// Runs stepwise decode-like attention with persistent graph/tensor allocations.
-///
-/// This runner keeps one backend/context/graph allocation and advances decode state
-/// by updating causal-mask and query-position tensors for each step.
-pub fn run_attention_decode_stepwise_with_cache_repeats(
-    weights: &AttentionWeights,
-    query_input: &[f32],
-    cache: &AttentionDecodeCache,
-    backend_kind: LlamaBackend,
-    stepwise: AttentionDecodeStepwiseConfig,
-) -> Result<AttentionDecodeStepwiseReport, InferenceError> {
-    run_attention_decode_stepwise_with_cache_repeats_with_block_mlp(
-        weights,
-        query_input,
-        cache,
-        backend_kind,
-        stepwise,
-        None,
-    )
-}
-
-/// Same as [`run_attention_decode_stepwise_with_cache_repeats`] but allows
-/// wiring real model-derived MLP weights into block-scope mode.
-pub fn run_attention_decode_stepwise_with_cache_repeats_with_block_mlp(
-    weights: &AttentionWeights,
-    query_input: &[f32],
-    cache: &AttentionDecodeCache,
-    backend_kind: LlamaBackend,
-    stepwise: AttentionDecodeStepwiseConfig,
-    block_mlp_weights: Option<&MlpWeights>,
-) -> Result<AttentionDecodeStepwiseReport, InferenceError> {
-    let (report, _bench_duration, _setup_duration) =
-        run_attention_decode_stepwise_with_cache_repeats_with_block_mlp_internal(
-            weights,
-            query_input,
-            cache,
-            backend_kind,
-            stepwise,
-            0,
-            block_mlp_weights,
-        )?;
-    Ok(report)
-}
-
-/// Bench-oriented stepwise runner that reuses backend/context/graph allocation
-/// across warmup and measured phases.
-pub fn run_attention_decode_stepwise_bench_with_cache_repeats_with_block_mlp(
-    weights: &AttentionWeights,
-    query_input: &[f32],
-    cache: &AttentionDecodeCache,
-    backend_kind: LlamaBackend,
-    stepwise: AttentionDecodeStepwiseConfig,
-    warmup_repeats_per_step: usize,
-    block_mlp_weights: Option<&MlpWeights>,
-) -> Result<AttentionDecodeStepwiseBenchReport, InferenceError> {
-    let (execution, bench_duration, setup_duration) =
-        run_attention_decode_stepwise_with_cache_repeats_with_block_mlp_internal(
-            weights,
-            query_input,
-            cache,
-            backend_kind,
-            stepwise,
-            warmup_repeats_per_step,
-            block_mlp_weights,
-        )?;
-    Ok(AttentionDecodeStepwiseBenchReport {
-        warmup_repeats_per_step,
-        setup_duration,
-        bench_duration,
-        execution,
-    })
-}
-
-/// Bench-oriented stepwise layer sweep runner sharing one setup path.
-///
-/// This API reuses backend/context/graph allocation across all provided
-/// block-MLP weight sets and reports one shared setup duration.
-pub fn run_attention_decode_stepwise_bench_sweep_with_cache_repeats_with_block_mlp(
-    weights: &AttentionWeights,
-    query_input: &[f32],
-    cache: &AttentionDecodeCache,
-    backend_kind: LlamaBackend,
-    stepwise: AttentionDecodeStepwiseConfig,
-    warmup_repeats_per_step: usize,
-    block_mlp_weights: &[&MlpWeights],
-) -> Result<AttentionDecodeStepwiseBenchSweepReport, InferenceError> {
-    if block_mlp_weights.is_empty() {
-        return Err(InferenceError::InvalidInputLength {
-            expected: 1,
-            actual: 0,
-        });
-    }
-    let (executions, bench_durations, setup_duration) =
-        run_attention_decode_stepwise_bench_sweep_with_cache_repeats_with_block_mlp_internal(
-            weights,
-            query_input,
-            cache,
-            backend_kind,
-            stepwise,
-            warmup_repeats_per_step,
-            Some(block_mlp_weights),
-        )?;
-    let entries = executions
-        .into_iter()
-        .zip(bench_durations)
-        .map(
-            |(execution, bench_duration)| AttentionDecodeStepwiseBenchReport {
-                warmup_repeats_per_step,
-                setup_duration: Duration::ZERO,
-                bench_duration,
-                execution,
-            },
-        )
-        .collect();
-    Ok(AttentionDecodeStepwiseBenchSweepReport {
-        warmup_repeats_per_step,
-        setup_duration,
-        entries,
-    })
-}
-
-fn run_attention_decode_stepwise_with_cache_repeats_with_block_mlp_internal(
-    weights: &AttentionWeights,
-    query_input: &[f32],
-    cache: &AttentionDecodeCache,
-    backend_kind: LlamaBackend,
-    stepwise: AttentionDecodeStepwiseConfig,
-    warmup_repeats_per_step: usize,
-    block_mlp_weights: Option<&MlpWeights>,
-) -> Result<(AttentionDecodeStepwiseReport, Duration, Duration), InferenceError> {
-    let block_mlp_weight_runs_storage = block_mlp_weights.map(|weights| vec![weights]);
-    let (mut reports, mut bench_durations, setup_duration) =
-        run_attention_decode_stepwise_bench_sweep_with_cache_repeats_with_block_mlp_internal(
-            weights,
-            query_input,
-            cache,
-            backend_kind,
-            stepwise,
-            warmup_repeats_per_step,
-            block_mlp_weight_runs_storage.as_deref(),
-        )?;
-    if reports.len() != 1 || bench_durations.len() != 1 {
-        return Err(InferenceError::InvalidInputLength {
-            expected: 1,
-            actual: reports.len().max(bench_durations.len()),
-        });
-    }
-    let report = reports.pop().ok_or(InferenceError::InvalidInputLength {
-        expected: 1,
-        actual: 0,
-    })?;
-    let bench_duration = bench_durations
-        .pop()
-        .ok_or(InferenceError::InvalidInputLength {
-            expected: 1,
-            actual: 0,
-        })?;
-    Ok((report, bench_duration, setup_duration))
-}
-
-fn run_attention_decode_stepwise_bench_sweep_with_cache_repeats_with_block_mlp_internal(
-    weights: &AttentionWeights,
-    query_input: &[f32],
-    cache: &AttentionDecodeCache,
-    backend_kind: LlamaBackend,
-    stepwise: AttentionDecodeStepwiseConfig,
-    warmup_repeats_per_step: usize,
-    block_mlp_weight_runs: Option<&[&MlpWeights]>,
-) -> Result<(Vec<AttentionDecodeStepwiseReport>, Vec<Duration>, Duration), InferenceError> {
-    let key_value_start = stepwise.key_value_start;
-    let steps = stepwise.steps;
-    let past_start = stepwise.past_start;
-    let repeats_per_step = stepwise.repeats_per_step;
-    let layer_repeat = stepwise.layer_repeat;
-    let include_kv_projection = stepwise.include_kv_projection;
-    let include_kv_cache_write = stepwise.include_kv_cache_write;
-    let include_kv_cache_write_to_cache = stepwise.include_kv_cache_write_to_cache;
-    let include_block_scope = stepwise.include_block_scope;
-    let synchronize_per_step = stepwise.synchronize_per_step;
-    let readback_per_step = stepwise.readback_per_step;
-    let use_position_deltas = stepwise.use_position_deltas;
-    let use_mask_deltas = stepwise.use_mask_deltas;
-    let elide_mask_host_buffer = stepwise.elide_mask_host_buffer;
-    let fuse_output_projection = stepwise.fuse_output_projection;
-    let precompute_static_kv_head_views = stepwise.precompute_static_kv_head_views;
-    let use_balanced_head_concat = stepwise.use_balanced_head_concat;
-    let use_head_output_staging_buffer = stepwise.use_head_output_staging_buffer;
-    let use_fused_block_gate_up_projection = stepwise.use_fused_block_gate_up_projection;
-    if key_value_start == 0 {
-        return Err(InferenceError::InvalidInputLength {
-            expected: 1,
-            actual: key_value_start,
-        });
-    }
-    if steps == 0 {
-        return Err(InferenceError::InvalidInputLength {
-            expected: 1,
-            actual: steps,
-        });
-    }
-    if repeats_per_step == 0 {
-        return Err(InferenceError::InvalidRepeats);
-    }
-    if layer_repeat == 0 {
-        return Err(InferenceError::InvalidInputLength {
-            expected: 1,
-            actual: layer_repeat,
-        });
-    }
-    if include_kv_cache_write_to_cache && !include_kv_cache_write {
-        return Err(InferenceError::InvalidInputLength {
-            expected: 1,
-            actual: 0,
-        });
-    }
-    let config = weights.config;
-    if !matches!(config.mask, AttentionMaskPolicy::Causal { .. }) {
-        return Err(InferenceError::InvalidAttentionShape {
-            hidden_features: config.hidden_features(),
-            sequence_length: config.sequence_length(),
-        });
-    }
-    let hidden_features = config.hidden_features();
-    let query_length = config.sequence_length();
-    let run_block_mlp_weights: Vec<Option<&MlpWeights>> =
-        if let Some(weight_runs) = block_mlp_weight_runs {
-            weight_runs.iter().copied().map(Some).collect()
-        } else {
-            vec![None]
-        };
-    let has_block_mlp_weights = run_block_mlp_weights.iter().any(Option::is_some);
-    let has_missing_block_mlp_weights = run_block_mlp_weights.iter().any(Option::is_none);
-    if has_block_mlp_weights && has_missing_block_mlp_weights {
-        return Err(InferenceError::InvalidInputLength {
-            expected: 1,
-            actual: 0,
-        });
-    }
-    let graph_block_mlp_weights = run_block_mlp_weights.iter().flatten().copied().next();
-    if let Some(graph_block_mlp_weights) = graph_block_mlp_weights {
-        for block_mlp_weights in run_block_mlp_weights.iter().flatten() {
-            if block_mlp_weights.hidden_features != hidden_features {
-                return Err(InferenceError::InvalidInputLength {
-                    expected: hidden_features,
-                    actual: block_mlp_weights.hidden_features,
-                });
-            }
-            if block_mlp_weights.ffn_features != graph_block_mlp_weights.ffn_features {
-                return Err(InferenceError::InvalidInputLength {
-                    expected: graph_block_mlp_weights.ffn_features,
-                    actual: block_mlp_weights.ffn_features,
-                });
-            }
-        }
-    }
-    let key_value_length = cache.key_value_length();
-    let cache_kv_features = cache.kv_features();
-    if cache_kv_features != config.kv_features() {
-        return Err(InferenceError::InvalidInputLength {
-            expected: config.kv_features(),
-            actual: cache_kv_features,
-        });
-    }
-    let final_visible_length = key_value_start
-        .checked_add(steps - 1)
-        .ok_or(InferenceError::MemorySizeOverflow)?;
-    if final_visible_length > key_value_length {
-        return Err(InferenceError::InvalidInputLength {
-            expected: key_value_length,
-            actual: final_visible_length,
-        });
-    }
-
-    let expected_query_len = hidden_features
-        .checked_mul(query_length)
-        .ok_or(InferenceError::MemorySizeOverflow)?;
-    if query_input.len() != expected_query_len {
-        return Err(InferenceError::InvalidInputLength {
-            expected: expected_query_len,
-            actual: query_input.len(),
-        });
-    }
-
-    let kv_features = config.kv_features();
-    let expected_projected_len = kv_features
-        .checked_mul(key_value_length)
-        .ok_or(InferenceError::MemorySizeOverflow)?;
-    if cache.projected_k_values.len() != expected_projected_len {
-        return Err(InferenceError::InvalidInputLength {
-            expected: expected_projected_len,
-            actual: cache.projected_k_values.len(),
-        });
-    }
-    if cache.projected_v_values.len() != expected_projected_len {
-        return Err(InferenceError::InvalidInputLength {
-            expected: expected_projected_len,
-            actual: cache.projected_v_values.len(),
-        });
-    }
-
-    let setup_start = Instant::now();
-    ensure_backends_loaded();
-    let backend = Backend::new(backend_kind.into())
-        .map_err(|source| InferenceError::ggml("Backend::new", source))?;
-    let backend_name = backend
-        .name()
-        .map_err(|source| InferenceError::ggml("Backend::name", source))?
-        .to_string();
-
-    let ctx_size = recommended_attention_backend_memory_bytes_for_lengths(
-        config,
-        query_length,
-        key_value_length,
-    )?;
-    let ctx = Context::new_no_alloc_bytes(ctx_size)
-        .map_err(|source| InferenceError::ggml("Context::new_no_alloc_bytes", source))?;
-
-    let query_features = config.query_features();
-
-    let w_q = ctx
-        .new_f32_tensor_2d_shape(Shape2D::new(hidden_features, query_features))
-        .map_err(|source| InferenceError::ggml("Context::new_f32_tensor_2d_shape<W_Q>", source))?;
-    let w_o = ctx
-        .new_f32_tensor_2d_shape(Shape2D::new(query_features, hidden_features))
-        .map_err(|source| InferenceError::ggml("Context::new_f32_tensor_2d_shape<W_O>", source))?;
-    let x_q = ctx
-        .new_f32_tensor_2d_shape(Shape2D::new(hidden_features, query_length))
-        .map_err(|source| InferenceError::ggml("Context::new_f32_tensor_2d_shape<X_Q>", source))?;
-    let k = ctx
-        .new_f32_tensor_2d_shape(Shape2D::new(kv_features, key_value_length))
-        .map_err(|source| {
-            InferenceError::ggml("Context::new_f32_tensor_2d_shape<K_CACHE>", source)
-        })?;
-    let v = ctx
-        .new_f32_tensor_2d_shape(Shape2D::new(kv_features, key_value_length))
-        .map_err(|source| {
-            InferenceError::ggml("Context::new_f32_tensor_2d_shape<V_CACHE>", source)
-        })?;
-
-    let q = ctx
-        .mul_mat(&w_q, &x_q)
-        .map_err(|source| InferenceError::ggml("Context::mul_mat(Q)", source))?;
-
-    let (positions_q, positions_k) = if matches!(config.rotary, RotaryEmbedding::Llama(_)) {
-        let positions_q = ctx.new_i32_tensor_1d(query_length).map_err(|source| {
-            InferenceError::ggml("Context::new_i32_tensor_1d<QUERY_POS>", source)
-        })?;
-        let positions_k = ctx
-            .new_i32_tensor_1d(key_value_length)
-            .map_err(|source| InferenceError::ggml("Context::new_i32_tensor_1d<KV_POS>", source))?;
-        (Some(positions_q), Some(positions_k))
-    } else {
-        (None, None)
-    };
-    let mask = Some(
-        ctx.new_f32_tensor_2d_shape(Shape2D::new(key_value_length, query_length))
-            .map_err(|source| {
-                InferenceError::ggml("Context::new_f32_tensor_2d_shape<CAUSAL_MASK>", source)
-            })?,
-    );
-
-    let bytes_per_element = std::mem::size_of::<f32>();
-    let kv_cache_row_stride = kv_features
-        .checked_mul(bytes_per_element)
-        .ok_or(InferenceError::MemorySizeOverflow)?;
-    let step_specific_kv_cache_writes =
-        include_kv_projection && include_kv_cache_write && include_kv_cache_write_to_cache;
-    let precompute_kv_head_views =
-        precompute_static_kv_head_views && !step_specific_kv_cache_writes;
-
-    let (
-        w_k,
-        w_v,
-        projected_k_step,
-        projected_v_step,
-        kv_cache_write_k,
-        kv_cache_write_v,
-        kv_cache_write_k_steps,
-        kv_cache_write_v_steps,
-    ) = if include_kv_projection {
-        let w_k = ctx
-            .new_f32_tensor_2d_shape(Shape2D::new(hidden_features, kv_features))
-            .map_err(|source| {
-                InferenceError::ggml("Context::new_f32_tensor_2d_shape<W_K>", source)
-            })?;
-        let w_v = ctx
-            .new_f32_tensor_2d_shape(Shape2D::new(hidden_features, kv_features))
-            .map_err(|source| {
-                InferenceError::ggml("Context::new_f32_tensor_2d_shape<W_V>", source)
-            })?;
-        let projected_k_step = ctx
-            .mul_mat(&w_k, &x_q)
-            .map_err(|source| InferenceError::ggml("Context::mul_mat(K_STEP)", source))?;
-        let projected_v_step = ctx
-            .mul_mat(&w_v, &x_q)
-            .map_err(|source| InferenceError::ggml("Context::mul_mat(V_STEP)", source))?;
-        let (kv_cache_write_k, kv_cache_write_v, kv_cache_write_k_steps, kv_cache_write_v_steps) =
-            if include_kv_cache_write {
-                if step_specific_kv_cache_writes {
-                    let mut kv_cache_write_k_steps = Vec::with_capacity(steps);
-                    let mut kv_cache_write_v_steps = Vec::with_capacity(steps);
-                    for step in 0..steps {
-                        let step_slot = key_value_start
-                            .checked_add(step)
-                            .and_then(|value| value.checked_sub(1))
-                            .ok_or(InferenceError::MemorySizeOverflow)?;
-                        let step_offset = step_slot
-                            .checked_mul(kv_features)
-                            .and_then(|value| value.checked_mul(bytes_per_element))
-                            .ok_or(InferenceError::MemorySizeOverflow)?;
-
-                        let k_write_slot = ctx
-                            .view_2d(
-                                &k,
-                                kv_features,
-                                query_length,
-                                kv_cache_row_stride,
-                                step_offset,
-                            )
-                            .map_err(|source| {
-                                InferenceError::ggml("Context::view_2d<K_CACHE_WRITE_SLOT>", source)
-                            })?;
-                        let v_write_slot = ctx
-                            .view_2d(
-                                &v,
-                                kv_features,
-                                query_length,
-                                kv_cache_row_stride,
-                                step_offset,
-                            )
-                            .map_err(|source| {
-                                InferenceError::ggml("Context::view_2d<V_CACHE_WRITE_SLOT>", source)
-                            })?;
-                        let kv_cache_write_k =
-                            ctx.cpy(&projected_k_step, &k_write_slot)
-                                .map_err(|source| {
-                                    InferenceError::ggml(
-                                        "Context::cpy(K_STEP->K_CACHE_SLOT)",
-                                        source,
-                                    )
-                                })?;
-                        let kv_cache_write_v =
-                            ctx.cpy(&projected_v_step, &v_write_slot)
-                                .map_err(|source| {
-                                    InferenceError::ggml(
-                                        "Context::cpy(V_STEP->V_CACHE_SLOT)",
-                                        source,
-                                    )
-                                })?;
-                        kv_cache_write_k_steps.push(kv_cache_write_k);
-                        kv_cache_write_v_steps.push(kv_cache_write_v);
-                    }
-                    (
-                        None,
-                        None,
-                        Some(kv_cache_write_k_steps),
-                        Some(kv_cache_write_v_steps),
-                    )
-                } else {
-                    let k_write_slot = ctx
-                        .new_f32_tensor_2d_shape(Shape2D::new(kv_features, query_length))
-                        .map_err(|source| {
-                            InferenceError::ggml(
-                                "Context::new_f32_tensor_2d_shape<K_WRITE_SLOT>",
-                                source,
-                            )
-                        })?;
-                    let v_write_slot = ctx
-                        .new_f32_tensor_2d_shape(Shape2D::new(kv_features, query_length))
-                        .map_err(|source| {
-                            InferenceError::ggml(
-                                "Context::new_f32_tensor_2d_shape<V_WRITE_SLOT>",
-                                source,
-                            )
-                        })?;
-                    let kv_cache_write_k =
-                        ctx.cpy(&projected_k_step, &k_write_slot)
-                            .map_err(|source| {
-                                InferenceError::ggml("Context::cpy(K_STEP->K_WRITE_SLOT)", source)
-                            })?;
-                    let kv_cache_write_v =
-                        ctx.cpy(&projected_v_step, &v_write_slot)
-                            .map_err(|source| {
-                                InferenceError::ggml("Context::cpy(V_STEP->V_WRITE_SLOT)", source)
-                            })?;
-                    (Some(kv_cache_write_k), Some(kv_cache_write_v), None, None)
-                }
-            } else {
-                (None, None, None, None)
-            };
-        (
-            Some(w_k),
-            Some(w_v),
-            Some(projected_k_step),
-            Some(projected_v_step),
-            kv_cache_write_k,
-            kv_cache_write_v,
-            kv_cache_write_k_steps,
-            kv_cache_write_v_steps,
-        )
-    } else {
-        (None, None, None, None, None, None, None, None)
-    };
-
-    let mut output_projection = None;
-    let mut attention_head_outputs = if fuse_output_projection && !use_head_output_staging_buffer {
-        Some(Vec::with_capacity(config.query_head_count()))
-    } else {
-        None
-    };
-    let head_output_staging = if fuse_output_projection && use_head_output_staging_buffer {
-        Some(
-            ctx.new_f32_tensor_2d_shape(Shape2D::new(query_features, query_length))
-                .map_err(|source| {
-                    InferenceError::ggml(
-                        "Context::new_f32_tensor_2d_shape<HEAD_OUTPUT_STAGING>",
-                        source,
-                    )
-                })?,
-        )
-    } else {
-        None
-    };
-    let mut head_output_staging_writes = if head_output_staging.is_some() {
-        Some(Vec::with_capacity(config.query_head_count()))
-    } else {
-        None
-    };
-    let q_row_stride = query_features
-        .checked_mul(bytes_per_element)
-        .ok_or(InferenceError::MemorySizeOverflow)?;
-    let kv_row_stride = kv_cache_row_stride;
-    let o_row_stride = q_row_stride;
-    let attention_scale = 1.0 / (config.head_dimension() as f32).sqrt();
-    let kv_group_size = config.layout.kv_group_size();
-    let mut rotated_k_heads = Vec::with_capacity(config.kv_head_count());
-    let mut transposed_v_heads = Vec::with_capacity(config.kv_head_count());
-    let mut static_kv_head_graph = if precompute_kv_head_views {
-        Some(ctx.new_graph().map_err(|source| {
-            InferenceError::ggml("Context::new_graph<KV_HEAD_PRECOMPUTE>", source)
-        })?)
-    } else {
-        None
-    };
-
-    for kv_head in 0..config.kv_head_count() {
-        let kv_offset = kv_head
-            .checked_mul(config.head_dimension())
-            .and_then(|value| value.checked_mul(bytes_per_element))
-            .ok_or(InferenceError::MemorySizeOverflow)?;
-        let k_head = ctx
-            .view_2d(
-                &k,
-                config.head_dimension(),
-                key_value_length,
-                kv_row_stride,
-                kv_offset,
-            )
-            .map_err(|source| InferenceError::ggml("Context::view_2d(K_HEAD)", source))?;
-        let v_head = ctx
-            .view_2d(
-                &v,
-                config.head_dimension(),
-                key_value_length,
-                kv_row_stride,
-                kv_offset,
-            )
-            .map_err(|source| InferenceError::ggml("Context::view_2d(V_HEAD)", source))?;
-
-        let rotated_k_head = apply_rotary_if_enabled_with_sequence(
-            &ctx,
-            &k_head,
-            positions_k.as_ref(),
-            config,
-            key_value_length,
-        )?;
-        let v_t = ctx
-            .transpose(&v_head)
-            .map_err(|source| InferenceError::ggml("Context::transpose(V_HEAD)", source))?;
-        let v_t = ctx
-            .cont(&v_t)
-            .map_err(|source| InferenceError::ggml("Context::cont(V_HEAD)", source))?;
-
-        if let Some(precompute_graph) = static_kv_head_graph.as_mut() {
-            let rotated_k_cached = ctx
-                .new_f32_tensor_2d_shape(Shape2D::new(config.head_dimension(), key_value_length))
-                .map_err(|source| {
-                    InferenceError::ggml(
-                        "Context::new_f32_tensor_2d_shape<K_ROTATED_CACHED>",
-                        source,
-                    )
-                })?;
-            let transposed_v_cached = ctx
-                .new_f32_tensor_2d_shape(Shape2D::new(key_value_length, config.head_dimension()))
-                .map_err(|source| {
-                    InferenceError::ggml(
-                        "Context::new_f32_tensor_2d_shape<V_TRANSPOSED_CACHED>",
-                        source,
-                    )
-                })?;
-            let rotate_write = ctx
-                .cpy(&rotated_k_head, &rotated_k_cached)
-                .map_err(|source| {
-                    InferenceError::ggml("Context::cpy(K_ROTATED->K_ROTATED_CACHED)", source)
-                })?;
-            let v_transpose_write = ctx.cpy(&v_t, &transposed_v_cached).map_err(|source| {
-                InferenceError::ggml("Context::cpy(VT->V_TRANSPOSED_CACHED)", source)
-            })?;
-            precompute_graph.build_forward_expand(&rotate_write);
-            precompute_graph.build_forward_expand(&v_transpose_write);
-            rotated_k_heads.push(rotated_k_cached);
-            transposed_v_heads.push(transposed_v_cached);
-        } else {
-            rotated_k_heads.push(rotated_k_head);
-            transposed_v_heads.push(v_t);
-        }
-    }
-
-    let q_heads_source = apply_rotary_multi_head_if_enabled_with_sequence(
-        &ctx,
-        &q,
-        positions_q.as_ref(),
-        config,
-        config.query_head_count(),
-        query_length,
-    )?;
-
-    for head in 0..config.query_head_count() {
-        let query_offset = head
-            .checked_mul(config.head_dimension())
-            .and_then(|value| value.checked_mul(bytes_per_element))
-            .ok_or(InferenceError::MemorySizeOverflow)?;
-        let kv_head = head / kv_group_size;
-
-        let q_head = ctx
-            .view_2d(
-                &q_heads_source,
-                config.head_dimension(),
-                query_length,
-                q_row_stride,
-                query_offset,
-            )
-            .map_err(|source| InferenceError::ggml("Context::view_2d(Q_HEAD)", source))?;
-        let k_head =
-            rotated_k_heads
-                .get(kv_head)
-                .ok_or(InferenceError::InvalidAttentionLayout {
-                    hidden_features,
-                    query_head_count: config.query_head_count(),
-                    kv_head_count: config.kv_head_count(),
-                })?;
-        let v_t =
-            transposed_v_heads
-                .get(kv_head)
-                .ok_or(InferenceError::InvalidAttentionLayout {
-                    hidden_features,
-                    query_head_count: config.query_head_count(),
-                    kv_head_count: config.kv_head_count(),
-                })?;
-
-        let scores = ctx
-            .mul_mat(k_head, &q_head)
-            .map_err(|source| InferenceError::ggml("Context::mul_mat(K_HEAD*Q_HEAD)", source))?;
-        let probabilities = ctx
-            .soft_max_ext(&scores, mask.as_ref(), attention_scale, 0.0)
-            .map_err(|source| InferenceError::ggml("Context::soft_max_ext(causal)", source))?;
-        let head_output = ctx
-            .mul_mat(v_t, &probabilities)
-            .map_err(|source| InferenceError::ggml("Context::mul_mat(VT*P)", source))?;
-        if let Some(head_output_staging) = head_output_staging.as_ref() {
-            let head_output_slot = ctx
-                .view_2d(
-                    head_output_staging,
-                    config.head_dimension(),
-                    query_length,
-                    q_row_stride,
-                    query_offset,
-                )
-                .map_err(|source| {
-                    InferenceError::ggml("Context::view_2d(HEAD_OUTPUT_STAGING_SLOT)", source)
-                })?;
-            let head_output_write = ctx.cpy(&head_output, &head_output_slot).map_err(|source| {
-                InferenceError::ggml(
-                    "Context::cpy(HEAD_OUTPUT->HEAD_OUTPUT_STAGING_SLOT)",
-                    source,
-                )
-            })?;
-            if let Some(head_output_staging_writes) = head_output_staging_writes.as_mut() {
-                head_output_staging_writes.push(head_output_write);
-            }
-            continue;
-        }
-        if let Some(head_outputs) = attention_head_outputs.as_mut() {
-            head_outputs.push(head_output);
-            continue;
-        }
-        let w_o_head = ctx
-            .view_2d(
-                &w_o,
-                config.head_dimension(),
-                hidden_features,
-                o_row_stride,
-                query_offset,
-            )
-            .map_err(|source| InferenceError::ggml("Context::view_2d(W_O_HEAD)", source))?;
-        let projected = ctx
-            .mul_mat(&w_o_head, &head_output)
-            .map_err(|source| InferenceError::ggml("Context::mul_mat(W_O_HEAD*HEAD)", source))?;
-
-        output_projection = Some(if let Some(acc) = output_projection {
-            ctx.add(&acc, &projected)
-                .map_err(|source| InferenceError::ggml("Context::add(head_acc)", source))?
-        } else {
-            projected
-        });
-    }
-
-    let y_attention = if let Some(head_output_staging) = head_output_staging.as_ref() {
-        ctx.mul_mat(&w_o, head_output_staging)
-            .map_err(|source| InferenceError::ggml("Context::mul_mat(W_O*HEAD_STAGING)", source))?
-    } else if let Some(head_outputs) = attention_head_outputs {
-        let concatenated = if use_balanced_head_concat {
-            concat_tensors_balanced(&ctx, head_outputs, 0)?
-        } else {
-            let mut head_outputs = head_outputs.into_iter();
-            let first = head_outputs
-                .next()
-                .ok_or(InferenceError::InvalidAttentionLayout {
-                    hidden_features,
-                    query_head_count: config.query_head_count(),
-                    kv_head_count: config.kv_head_count(),
-                })?;
-            head_outputs.try_fold(first, |acc, head| {
-                ctx.concat(&acc, &head, 0).map_err(|source| {
-                    InferenceError::ggml("Context::concat(head_outputs_left_fold)", source)
-                })
-            })?
-        };
-        ctx.mul_mat(&w_o, &concatenated)
-            .map_err(|source| InferenceError::ggml("Context::mul_mat(W_O*HEADS)", source))?
-    } else {
-        output_projection.ok_or(InferenceError::InvalidAttentionLayout {
-            hidden_features,
-            query_head_count: config.query_head_count(),
-            kv_head_count: config.kv_head_count(),
-        })?
-    };
-    let mut block_mlp_split_tensors = None;
-    let mut block_mlp_fused_tensors = None;
-    let y = if include_block_scope {
-        let residual = ctx
-            .add(&x_q, &y_attention)
-            .map_err(|source| InferenceError::ggml("Context::add(residual_attn)", source))?;
-        let norm = ctx
-            .rms_norm(&residual, 1e-5)
-            .map_err(|source| InferenceError::ggml("Context::rms_norm(block)", source))?;
-        let mlp = if let Some(block_mlp_weights) = graph_block_mlp_weights {
-            let ffn_features = block_mlp_weights.ffn_features;
-            let w_down = ctx
-                .new_f32_tensor_2d_shape(Shape2D::new(ffn_features, hidden_features))
-                .map_err(|source| {
-                    InferenceError::ggml("Context::new_f32_tensor_2d_shape<W_DOWN_BLOCK>", source)
-                })?;
-            let (gate, up) = if use_fused_block_gate_up_projection {
-                let gate_up_features = ffn_features
-                    .checked_mul(2)
-                    .ok_or(InferenceError::MemorySizeOverflow)?;
-                let w_gate_up = ctx
-                    .new_f32_tensor_2d_shape(Shape2D::new(hidden_features, gate_up_features))
-                    .map_err(|source| {
-                        InferenceError::ggml(
-                            "Context::new_f32_tensor_2d_shape<W_GATE_UP_BLOCK>",
-                            source,
-                        )
-                    })?;
-                let gate_up = ctx.mul_mat(&w_gate_up, &norm).map_err(|source| {
-                    InferenceError::ggml("Context::mul_mat(GATE_UP_BLOCK)", source)
-                })?;
-                let gate_up_row_stride = gate_up_features
-                    .checked_mul(bytes_per_element)
-                    .ok_or(InferenceError::MemorySizeOverflow)?;
-                let up_offset = ffn_features
-                    .checked_mul(bytes_per_element)
-                    .ok_or(InferenceError::MemorySizeOverflow)?;
-                let gate = ctx
-                    .view_2d(&gate_up, ffn_features, query_length, gate_up_row_stride, 0)
-                    .map_err(|source| {
-                        InferenceError::ggml("Context::view_2d(GATE_BLOCK_FUSED)", source)
-                    })?;
-                let up = ctx
-                    .view_2d(
-                        &gate_up,
-                        ffn_features,
-                        query_length,
-                        gate_up_row_stride,
-                        up_offset,
-                    )
-                    .map_err(|source| {
-                        InferenceError::ggml("Context::view_2d(UP_BLOCK_FUSED)", source)
-                    })?;
-                block_mlp_fused_tensors = Some((w_gate_up, w_down));
-                (gate, up)
-            } else {
-                let w_gate = ctx
-                    .new_f32_tensor_2d_shape(Shape2D::new(hidden_features, ffn_features))
-                    .map_err(|source| {
-                        InferenceError::ggml(
-                            "Context::new_f32_tensor_2d_shape<W_GATE_BLOCK>",
-                            source,
-                        )
-                    })?;
-                let w_up = ctx
-                    .new_f32_tensor_2d_shape(Shape2D::new(hidden_features, ffn_features))
-                    .map_err(|source| {
-                        InferenceError::ggml("Context::new_f32_tensor_2d_shape<W_UP_BLOCK>", source)
-                    })?;
-                let gate = ctx.mul_mat(&w_gate, &norm).map_err(|source| {
-                    InferenceError::ggml("Context::mul_mat(GATE_BLOCK)", source)
-                })?;
-                let up = ctx
-                    .mul_mat(&w_up, &norm)
-                    .map_err(|source| InferenceError::ggml("Context::mul_mat(UP_BLOCK)", source))?;
-                block_mlp_split_tensors = Some((w_gate, w_up, w_down));
-                (gate, up)
-            };
-            let activated = ctx
-                .silu(&gate)
-                .map_err(|source| InferenceError::ggml("Context::silu(block_gate)", source))?;
-            let fused = ctx
-                .mul(&activated, &up)
-                .map_err(|source| InferenceError::ggml("Context::mul(block_fused)", source))?;
-            ctx.mul_mat(&w_down, &fused)
-                .map_err(|source| InferenceError::ggml("Context::mul_mat(MLP_OUT_BLOCK)", source))?
-        } else {
-            // Lightweight fallback when no model-derived MLP is provided.
-            let gate = ctx
-                .mul_mat(&w_q, &norm)
-                .map_err(|source| InferenceError::ggml("Context::mul_mat(GATE)", source))?;
-            let w_o_t = ctx
-                .transpose(&w_o)
-                .map_err(|source| InferenceError::ggml("Context::transpose(W_O)", source))?;
-            let w_o_t = ctx
-                .cont(&w_o_t)
-                .map_err(|source| InferenceError::ggml("Context::cont(W_O_T)", source))?;
-            let up = ctx
-                .mul_mat(&w_o_t, &norm)
-                .map_err(|source| InferenceError::ggml("Context::mul_mat(UP)", source))?;
-            let activated = ctx
-                .silu(&gate)
-                .map_err(|source| InferenceError::ggml("Context::silu(block_gate)", source))?;
-            let fused = ctx
-                .mul(&activated, &up)
-                .map_err(|source| InferenceError::ggml("Context::mul(block_fused)", source))?;
-            ctx.mul_mat(&w_o, &fused)
-                .map_err(|source| InferenceError::ggml("Context::mul_mat(MLP_OUT)", source))?
-        };
-        ctx.add(&residual, &mlp)
-            .map_err(|source| InferenceError::ggml("Context::add(residual_mlp)", source))?
-    } else {
-        y_attention
-    };
-
-    let graph_count = if step_specific_kv_cache_writes {
-        steps
-    } else {
-        1
-    };
-    let mut graphs = Vec::with_capacity(graph_count);
-    for graph_step in 0..graph_count {
-        let mut graph = ctx
-            .new_graph()
-            .map_err(|source| InferenceError::ggml("Context::new_graph", source))?;
-        if let Some(head_output_staging_writes) = head_output_staging_writes.as_ref() {
-            for head_output_write in head_output_staging_writes {
-                graph.build_forward_expand(head_output_write);
-            }
-        }
-        graph.build_forward_expand(&y);
-        if let Some(projected_k_step) = projected_k_step.as_ref() {
-            graph.build_forward_expand(projected_k_step);
-        }
-        if let Some(projected_v_step) = projected_v_step.as_ref() {
-            graph.build_forward_expand(projected_v_step);
-        }
-        if step_specific_kv_cache_writes {
-            if let Some(step_nodes) = kv_cache_write_k_steps.as_ref()
-                && let Some(kv_cache_write_k) = step_nodes.get(graph_step)
-            {
-                graph.build_forward_expand(kv_cache_write_k);
-            }
-            if let Some(step_nodes) = kv_cache_write_v_steps.as_ref()
-                && let Some(kv_cache_write_v) = step_nodes.get(graph_step)
-            {
-                graph.build_forward_expand(kv_cache_write_v);
-            }
-        } else {
-            if let Some(kv_cache_write_k) = kv_cache_write_k.as_ref() {
-                graph.build_forward_expand(kv_cache_write_k);
-            }
-            if let Some(kv_cache_write_v) = kv_cache_write_v.as_ref() {
-                graph.build_forward_expand(kv_cache_write_v);
-            }
-        }
-        graphs.push(graph);
-    }
-    let _buffer = ctx
-        .allocate_tensors(&backend)
-        .map_err(|source| InferenceError::ggml("Context::allocate_tensors", source))?;
-
-    w_q.set_f32_backend(weights.q_values())
-        .map_err(|source| InferenceError::ggml("Tensor::set_f32_backend<W_Q>", source))?;
-    w_o.set_f32_backend(weights.o_values())
-        .map_err(|source| InferenceError::ggml("Tensor::set_f32_backend<W_O>", source))?;
-    if let Some(w_k) = w_k.as_ref() {
-        w_k.set_f32_backend(weights.k_values())
-            .map_err(|source| InferenceError::ggml("Tensor::set_f32_backend<W_K>", source))?;
-    }
-    if let Some(w_v) = w_v.as_ref() {
-        w_v.set_f32_backend(weights.v_values())
-            .map_err(|source| InferenceError::ggml("Tensor::set_f32_backend<W_V>", source))?;
-    }
-    let upload_block_mlp_weights =
-        |block_mlp_weights: Option<&MlpWeights>| -> Result<(), InferenceError> {
-            if let Some((w_gate, w_up, w_down)) = block_mlp_split_tensors.as_ref() {
-                let block_mlp_weights =
-                    block_mlp_weights.ok_or(InferenceError::InvalidInputLength {
-                        expected: 1,
-                        actual: 0,
-                    })?;
-                w_gate
-                    .set_f32_backend(block_mlp_weights.gate_values())
-                    .map_err(|source| {
-                        InferenceError::ggml("Tensor::set_f32_backend<W_GATE_BLOCK>", source)
-                    })?;
-                w_up.set_f32_backend(block_mlp_weights.up_values())
-                    .map_err(|source| {
-                        InferenceError::ggml("Tensor::set_f32_backend<W_UP_BLOCK>", source)
-                    })?;
-                w_down
-                    .set_f32_backend(block_mlp_weights.down_values())
-                    .map_err(|source| {
-                        InferenceError::ggml("Tensor::set_f32_backend<W_DOWN_BLOCK>", source)
-                    })?;
-            } else if let Some((w_gate_up, w_down)) = block_mlp_fused_tensors.as_ref() {
-                let block_mlp_weights =
-                    block_mlp_weights.ok_or(InferenceError::InvalidInputLength {
-                        expected: 1,
-                        actual: 0,
-                    })?;
-                let mut gate_up_values = Vec::with_capacity(
-                    block_mlp_weights
-                        .gate_values()
-                        .len()
-                        .checked_add(block_mlp_weights.up_values().len())
-                        .ok_or(InferenceError::MemorySizeOverflow)?,
-                );
-                gate_up_values.extend_from_slice(block_mlp_weights.gate_values());
-                gate_up_values.extend_from_slice(block_mlp_weights.up_values());
-                w_gate_up
-                    .set_f32_backend(&gate_up_values)
-                    .map_err(|source| {
-                        InferenceError::ggml("Tensor::set_f32_backend<W_GATE_UP_BLOCK>", source)
-                    })?;
-                w_down
-                    .set_f32_backend(block_mlp_weights.down_values())
-                    .map_err(|source| {
-                        InferenceError::ggml("Tensor::set_f32_backend<W_DOWN_BLOCK>", source)
-                    })?;
-            } else if block_mlp_weights.is_some() {
-                return Err(InferenceError::InvalidInputLength {
-                    expected: 0,
-                    actual: 1,
-                });
-            }
-            Ok(())
-        };
-    x_q.set_f32_backend(query_input)
-        .map_err(|source| InferenceError::ggml("Tensor::set_f32_backend<X_Q>", source))?;
-    if let Some(positions_k) = positions_k.as_ref() {
-        let positions_values: Result<Vec<i32>, InferenceError> = (0..key_value_length)
-            .map(|index| i32::try_from(index).map_err(|_| InferenceError::MemorySizeOverflow))
-            .collect();
-        positions_k
-            .set_i32_backend(&positions_values?)
-            .map_err(|source| InferenceError::ggml("Tensor::set_i32_backend<KV_POS>", source))?;
-    }
-
-    let incremental_position_update = use_position_deltas
-        && query_length == 1
-        && past_start.checked_add(1) == Some(key_value_start);
-    let incremental_mask_update =
-        use_mask_deltas && query_length == 1 && past_start.checked_add(1) == Some(key_value_start);
-    let mut step_positions_q_values = if positions_q.is_some() && !incremental_position_update {
-        Some(vec![0_i32; query_length])
-    } else {
-        None
-    };
-    let mut step_mask_values =
-        if mask.is_some() && (!incremental_mask_update || !elide_mask_host_buffer) {
-            Some(vec![0.0_f32; query_length * key_value_length])
-        } else {
-            None
-        };
-    let mut initial_mask_values =
-        if incremental_mask_update && mask.is_some() && step_mask_values.is_none() {
-            Some(vec![0.0_f32; query_length * key_value_length])
-        } else {
-            None
-        };
-
-    let mut run_phase = |phase_repeats_per_step: usize,
-                         reset_kv_state: bool|
-     -> Result<(), InferenceError> {
-        if phase_repeats_per_step == 0 {
-            return Ok(());
-        }
-        let per_step_compute_count = phase_repeats_per_step
-            .checked_mul(layer_repeat)
-            .ok_or(InferenceError::MemorySizeOverflow)?;
-
-        if reset_kv_state {
-            k.set_f32_backend(&cache.projected_k_values)
-                .map_err(|source| {
-                    InferenceError::ggml("Tensor::set_f32_backend<K_CACHE>", source)
-                })?;
-            v.set_f32_backend(&cache.projected_v_values)
-                .map_err(|source| {
-                    InferenceError::ggml("Tensor::set_f32_backend<V_CACHE>", source)
-                })?;
-
-            if let Some(precompute_graph) = static_kv_head_graph.as_mut() {
-                backend.compute(precompute_graph).map_err(|source| {
-                    InferenceError::ggml("Backend::compute<KV_HEAD_PRECOMPUTE>", source)
-                })?;
-            }
-        }
-
-        if incremental_mask_update && let Some(mask) = mask.as_ref() {
-            if let Some(mask_values) = step_mask_values.as_mut() {
-                fill_causal_mask_values(mask_values, query_length, key_value_length, past_start);
-                mask.set_f32_backend(mask_values).map_err(|source| {
-                    InferenceError::ggml("Tensor::set_f32_backend<CAUSAL_MASK>", source)
-                })?;
-            } else if let Some(initial_mask_values) = initial_mask_values.as_mut() {
-                fill_causal_mask_values(
-                    initial_mask_values,
-                    query_length,
-                    key_value_length,
-                    past_start,
-                );
-                mask.set_f32_backend(initial_mask_values)
-                    .map_err(|source| {
-                        InferenceError::ggml("Tensor::set_f32_backend<CAUSAL_MASK>", source)
-                    })?;
-            }
-        }
-
-        for step in 0..steps {
-            let step_past_tokens = past_start
-                .checked_add(step)
-                .ok_or(InferenceError::MemorySizeOverflow)?;
-            if let Some(positions_q) = positions_q.as_ref() {
-                if incremental_position_update {
-                    let position = i32::try_from(step_past_tokens)
-                        .map_err(|_| InferenceError::MemorySizeOverflow)?;
-                    positions_q
-                        .set_i32_backend_at(0, &[position])
-                        .map_err(|source| {
-                            InferenceError::ggml("Tensor::set_i32_backend_at<QUERY_POS>", source)
-                        })?;
-                } else if let Some(values) = step_positions_q_values.as_mut() {
-                    for (index, value) in values.iter_mut().enumerate() {
-                        let position = step_past_tokens
-                            .checked_add(index)
-                            .ok_or(InferenceError::MemorySizeOverflow)?;
-                        *value = i32::try_from(position)
-                            .map_err(|_| InferenceError::MemorySizeOverflow)?;
-                    }
-                    positions_q.set_i32_backend(values).map_err(|source| {
-                        InferenceError::ggml("Tensor::set_i32_backend<QUERY_POS>", source)
-                    })?;
-                }
-            }
-            if let Some(mask) = mask.as_ref() {
-                if incremental_mask_update {
-                    if step > 0 {
-                        let newly_visible_key = step_past_tokens;
-                        if newly_visible_key < key_value_length {
-                            if let Some(mask_values) = step_mask_values.as_mut() {
-                                mask_values[newly_visible_key] = 0.0;
-                            }
-                            mask.set_f32_backend_at(newly_visible_key, &[0.0_f32])
-                                .map_err(|source| {
-                                    InferenceError::ggml(
-                                        "Tensor::set_f32_backend_at<CAUSAL_MASK>",
-                                        source,
-                                    )
-                                })?;
-                        }
-                    }
-                } else if let Some(mask_values) = step_mask_values.as_mut() {
-                    fill_causal_mask_values(
-                        mask_values,
-                        query_length,
-                        key_value_length,
-                        step_past_tokens,
-                    );
-                    mask.set_f32_backend(mask_values).map_err(|source| {
-                        InferenceError::ggml("Tensor::set_f32_backend<CAUSAL_MASK>", source)
-                    })?;
-                }
-            }
-            let graph_index = if step_specific_kv_cache_writes {
-                step
-            } else {
-                0
-            };
-            let graph = graphs
-                .get_mut(graph_index)
-                .expect("stepwise graph index must stay in range");
-            for _ in 0..per_step_compute_count {
-                backend
-                    .compute(graph)
-                    .map_err(|source| InferenceError::ggml("Backend::compute", source))?;
-            }
-            if synchronize_per_step {
-                backend
-                    .synchronize()
-                    .map_err(|source| InferenceError::ggml("Backend::synchronize", source))?;
-            }
-            if readback_per_step {
-                let _ = y.to_vec_f32_backend().map_err(|source| {
-                    InferenceError::ggml("Tensor::to_vec_f32_backend<Y_STEP>", source)
-                })?;
-            }
-        }
-        Ok(())
-    };
-
-    let setup_duration = setup_start.elapsed();
-    let mut executions = Vec::with_capacity(run_block_mlp_weights.len());
-    let mut bench_durations = Vec::with_capacity(run_block_mlp_weights.len());
-    for block_mlp_weights in run_block_mlp_weights {
-        upload_block_mlp_weights(block_mlp_weights)?;
-        run_phase(warmup_repeats_per_step, true)?;
-        let bench_needs_kv_reset = warmup_repeats_per_step == 0 || step_specific_kv_cache_writes;
-        let bench_start = Instant::now();
-        run_phase(repeats_per_step, bench_needs_kv_reset)?;
-        let bench_duration = bench_start.elapsed();
-
-        let output = y
-            .to_vec_f32_backend()
-            .map_err(|source| InferenceError::ggml("Tensor::to_vec_f32_backend<Y>", source))?;
-        executions.push(AttentionDecodeStepwiseReport {
-            backend_name: backend_name.clone(),
-            hidden_features,
-            query_length,
-            key_value_start,
-            steps,
-            repeats_per_step,
-            output,
-        });
-        bench_durations.push(bench_duration);
-    }
-    Ok((executions, bench_durations, setup_duration))
-}
-
-/// Runs decode-like attention proxy where query length and KV length can differ.
-///
-/// This path approximates single/multi-token decode workloads by allowing
-/// `key_value_length` to be larger than `config.sequence_length()`.
-pub fn run_attention_decode_proxy_with_weights(
-    weights: &AttentionWeights,
-    query_input: &[f32],
-    key_value_input: &[f32],
-    key_value_length: usize,
-    backend_kind: LlamaBackend,
-) -> Result<AttentionDecodeProxyReport, InferenceError> {
-    run_attention_decode_proxy_with_weights_repeats(
-        weights,
-        query_input,
-        key_value_input,
-        key_value_length,
-        backend_kind,
-        1,
-    )
-}
-
-/// Runs decode-like attention proxy with explicit repeat count.
-pub fn run_attention_decode_proxy_with_weights_repeats(
-    weights: &AttentionWeights,
-    query_input: &[f32],
-    key_value_input: &[f32],
-    key_value_length: usize,
-    backend_kind: LlamaBackend,
-    repeats: usize,
-) -> Result<AttentionDecodeProxyReport, InferenceError> {
-    let cache = build_attention_decode_cache(weights, key_value_input, key_value_length)?;
-    run_attention_decode_proxy_with_cache_repeats(
-        weights,
-        query_input,
-        &cache,
-        backend_kind,
-        repeats,
-    )
-}
-
-fn project_attention_input_f32(
-    weights: &[f32],
-    input: &[f32],
-    hidden_features: usize,
-    output_features: usize,
-    sequence_length: usize,
-) -> Result<Vec<f32>, InferenceError> {
-    let expected_weights_len = hidden_features
-        .checked_mul(output_features)
-        .ok_or(InferenceError::MemorySizeOverflow)?;
-    if weights.len() != expected_weights_len {
-        return Err(InferenceError::InvalidInputLength {
-            expected: expected_weights_len,
-            actual: weights.len(),
-        });
-    }
-    let expected_input_len = hidden_features
-        .checked_mul(sequence_length)
-        .ok_or(InferenceError::MemorySizeOverflow)?;
-    if input.len() != expected_input_len {
-        return Err(InferenceError::InvalidInputLength {
-            expected: expected_input_len,
-            actual: input.len(),
-        });
-    }
-    let output_len = output_features
-        .checked_mul(sequence_length)
-        .ok_or(InferenceError::MemorySizeOverflow)?;
-    let mut output = vec![0.0f32; output_len];
-    for seq in 0..sequence_length {
-        let input_base = seq
-            .checked_mul(hidden_features)
-            .ok_or(InferenceError::MemorySizeOverflow)?;
-        let out_base = seq
-            .checked_mul(output_features)
-            .ok_or(InferenceError::MemorySizeOverflow)?;
-        for out_feature in 0..output_features {
-            let weight_base = out_feature
-                .checked_mul(hidden_features)
-                .ok_or(InferenceError::MemorySizeOverflow)?;
-            let mut acc = 0.0f32;
-            for hidden in 0..hidden_features {
-                acc += weights[weight_base + hidden] * input[input_base + hidden];
-            }
-            output[out_base + out_feature] = acc;
-        }
-    }
-    Ok(output)
-}
-
-fn apply_rotary_if_enabled<'ctx>(
-    ctx: &'ctx Context,
-    tensor: &ggml_rs::Tensor<'ctx>,
-    positions: Option<&ggml_rs::Tensor<'ctx>>,
-    config: AttentionInferenceConfig,
-) -> Result<ggml_rs::Tensor<'ctx>, InferenceError> {
-    apply_rotary_if_enabled_with_sequence(ctx, tensor, positions, config, config.sequence_length())
-}
-
-fn concat_tensors_balanced<'ctx>(
-    ctx: &'ctx Context,
-    mut tensors: Vec<ggml_rs::Tensor<'ctx>>,
-    dim: usize,
-) -> Result<ggml_rs::Tensor<'ctx>, InferenceError> {
-    if tensors.is_empty() {
-        return Err(InferenceError::InvalidAttentionLayout {
-            hidden_features: 0,
-            query_head_count: 0,
-            kv_head_count: 0,
-        });
-    }
-    while tensors.len() > 1 {
-        let mut next_level = Vec::with_capacity(tensors.len().div_ceil(2));
-        let mut level_iter = tensors.into_iter();
-        while let Some(lhs) = level_iter.next() {
-            if let Some(rhs) = level_iter.next() {
-                let merged = ctx.concat(&lhs, &rhs, dim).map_err(|source| {
-                    InferenceError::ggml("Context::concat(head_outputs_balanced)", source)
-                })?;
-                next_level.push(merged);
-            } else {
-                next_level.push(lhs);
-            }
-        }
-        tensors = next_level;
-    }
-    tensors.pop().ok_or(InferenceError::InvalidAttentionLayout {
-        hidden_features: 0,
-        query_head_count: 0,
-        kv_head_count: 0,
-    })
-}
-
-fn apply_rotary_multi_head_if_enabled_with_sequence<'ctx>(
-    ctx: &'ctx Context,
-    tensor: &ggml_rs::Tensor<'ctx>,
-    positions: Option<&ggml_rs::Tensor<'ctx>>,
-    config: AttentionInferenceConfig,
-    head_count: usize,
-    sequence_length: usize,
-) -> Result<ggml_rs::Tensor<'ctx>, InferenceError> {
-    match (config.rotary, positions) {
-        (RotaryEmbedding::Disabled, _) => Ok(*tensor),
-        (RotaryEmbedding::Llama(params), Some(positions)) => {
-            let rope_dimensions = params.dimensions.get();
-            if rope_dimensions > config.head_dimension() {
-                return Err(InferenceError::InvalidRopeDimensions {
-                    rope_dimensions,
-                    head_dimension: config.head_dimension(),
-                });
-            }
-            let n_dims =
-                i32::try_from(rope_dimensions).map_err(|_| InferenceError::MemorySizeOverflow)?;
-            let n_ctx_orig = params
-                .original_context
-                .and_then(|value| i32::try_from(value.get()).ok())
-                .unwrap_or(0);
-            let rope_params = RopeExtParams {
-                n_dims,
-                n_ctx_orig,
-                freq_base: params.base,
-                freq_scale: params.scale,
-                ..RopeExtParams::default()
-            };
-            let contiguous = ctx
-                .cont(tensor)
-                .map_err(|source| InferenceError::ggml("Context::cont(rope_multi_head)", source))?;
-            let reshaped = ctx
-                .reshape_3d(
-                    &contiguous,
-                    config.head_dimension(),
-                    head_count,
-                    sequence_length,
-                )
-                .map_err(|source| {
-                    InferenceError::ggml("Context::reshape_3d(rope_multi_head)", source)
-                })?;
-            let rotated = ctx
-                .rope_ext(&reshaped, positions, None, rope_params)
-                .map_err(|source| InferenceError::ggml("Context::rope_ext(multi_head)", source))?;
-            let total_features = config
-                .head_dimension()
-                .checked_mul(head_count)
-                .ok_or(InferenceError::MemorySizeOverflow)?;
-            ctx.reshape_2d(&rotated, total_features, sequence_length)
-                .map_err(|source| {
-                    InferenceError::ggml("Context::reshape_2d(rope_multi_head)", source)
-                })
-        }
-        (RotaryEmbedding::Llama(_), None) => Err(InferenceError::InvalidAttentionShape {
-            hidden_features: config.hidden_features(),
-            sequence_length,
-        }),
-    }
-}
-
-fn apply_rotary_if_enabled_with_sequence<'ctx>(
-    ctx: &'ctx Context,
-    tensor: &ggml_rs::Tensor<'ctx>,
-    positions: Option<&ggml_rs::Tensor<'ctx>>,
-    config: AttentionInferenceConfig,
-    sequence_length: usize,
-) -> Result<ggml_rs::Tensor<'ctx>, InferenceError> {
-    match (config.rotary, positions) {
-        (RotaryEmbedding::Disabled, _) => Ok(*tensor),
-        (RotaryEmbedding::Llama(params), Some(positions)) => {
-            let rope_dimensions = params.dimensions.get();
-            if rope_dimensions > config.head_dimension() {
-                return Err(InferenceError::InvalidRopeDimensions {
-                    rope_dimensions,
-                    head_dimension: config.head_dimension(),
-                });
-            }
-            let n_dims =
-                i32::try_from(rope_dimensions).map_err(|_| InferenceError::MemorySizeOverflow)?;
-            let n_ctx_orig = params
-                .original_context
-                .and_then(|value| i32::try_from(value.get()).ok())
-                .unwrap_or(0);
-            let rope_params = RopeExtParams {
-                n_dims,
-                n_ctx_orig,
-                freq_base: params.base,
-                freq_scale: params.scale,
-                ..RopeExtParams::default()
-            };
-            let contiguous = ctx
-                .cont(tensor)
-                .map_err(|source| InferenceError::ggml("Context::cont(rope)", source))?;
-            let reshaped = ctx
-                .reshape_3d(&contiguous, config.head_dimension(), 1, sequence_length)
-                .map_err(|source| InferenceError::ggml("Context::reshape_3d(rope)", source))?;
-            let rotated = ctx
-                .rope_ext(&reshaped, positions, None, rope_params)
-                .map_err(|source| InferenceError::ggml("Context::rope_ext", source))?;
-            ctx.reshape_2d(&rotated, config.head_dimension(), sequence_length)
-                .map_err(|source| InferenceError::ggml("Context::reshape_2d(rope)", source))
-        }
-        (RotaryEmbedding::Llama(_), None) => Err(InferenceError::InvalidAttentionShape {
-            hidden_features: config.hidden_features(),
-            sequence_length,
-        }),
-    }
 }
 
 fn build_causal_mask_values(

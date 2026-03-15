@@ -3,8 +3,8 @@
 use clap::{Parser, ValueEnum};
 use llama_rs::{
     AttentionMaskPolicy, GgufModel, LlamaBackend, RotaryEmbedding,
-    resolve_attention_weights_for_layer_auto, resolve_llama_layer_dimensions,
-    run_attention_inference_with_weights_repeats,
+    attention_inference_with_weights_repeats, resolve_attention_weights_for_layer_auto,
+    resolve_llama_layer_dimensions,
 };
 use std::error::Error as StdError;
 use std::path::PathBuf;
@@ -35,12 +35,8 @@ fn run() -> Result<(), Box<dyn StdError>> {
         .collect();
 
     for backend in parsed.backends {
-        let report = run_attention_inference_with_weights_repeats(
-            &weights,
-            &input,
-            backend,
-            parsed.repeats,
-        )?;
+        let report =
+            attention_inference_with_weights_repeats(&weights, &input, backend, parsed.repeats)?;
         let preview_len = report.output.len().min(8);
         println!(
             "[{}] attn layer={} hidden={} seq={} repeats={} preview={:?}",

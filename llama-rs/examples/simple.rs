@@ -1,4 +1,4 @@
-use llama_rs::run_simple_ctx;
+use llama_rs::simple_ctx;
 use std::error::Error as StdError;
 use thiserror::Error;
 
@@ -9,7 +9,7 @@ fn main() -> Result<(), ExampleError> {
 fn run() -> Result<(), Box<dyn StdError>> {
     ggml_rs::init_timing();
 
-    let report = run_simple_ctx()?;
+    let report = simple_ctx()?;
     println!(
         "simple-ctx mul mat ({} x {}) OK: {:?}",
         report.cols, report.rows, report.values

@@ -1,9 +1,7 @@
 //! Benchmark runner for minimal MLP block inference.
 
 use clap::{Parser, ValueEnum};
-use llama_rs::{
-    LlamaBackend, MlpInferenceConfig, MlpWeights, run_mlp_inference_with_weights_repeats,
-};
+use llama_rs::{LlamaBackend, MlpInferenceConfig, MlpWeights, mlp_inference_with_weights_repeats};
 use std::error::Error as StdError;
 use std::time::Instant;
 use thiserror::Error;
@@ -24,14 +22,10 @@ fn run() -> Result<(), Box<dyn StdError>> {
             .collect();
 
         for backend in parsed.backends.iter().copied() {
-            run_mlp_inference_with_weights_repeats(&weights, &input, backend, parsed.warmup_iters)?;
+            mlp_inference_with_weights_repeats(&weights, &input, backend, parsed.warmup_iters)?;
             let start = Instant::now();
-            let report = run_mlp_inference_with_weights_repeats(
-                &weights,
-                &input,
-                backend,
-                parsed.bench_iters,
-            )?;
+            let report =
+                mlp_inference_with_weights_repeats(&weights, &input, backend, parsed.bench_iters)?;
             let elapsed = start.elapsed();
             let avg_ms = elapsed.as_secs_f64() * 1000.0 / parsed.bench_iters as f64;
             let checksum: f64 = report

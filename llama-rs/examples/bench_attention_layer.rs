@@ -2,15 +2,12 @@
 
 use clap::Parser;
 use llama_rs::{
-    AttentionDecodeStepwiseConfig, AttentionHeadDimension, AttentionInferenceConfig,
-    AttentionLayout, AttentionMaskPolicy, AttentionWeights, GgufModel, LlamaBackend,
-    LlamaLayerTensorNames, MlpInferenceConfig, MlpWeights, RopeConfig, RotaryEmbedding,
-    build_attention_decode_cache, resolve_mlp_weights_for_layer_auto, resolve_transformer_metadata,
-    run_attention_decode_proxy_with_cache_repeats,
-    run_attention_decode_stepwise_bench_sweep_with_cache_repeats_with_block_mlp,
-    run_attention_decode_stepwise_bench_with_cache_repeats_with_block_mlp,
-    run_attention_decode_stepwise_with_cache_repeats_with_block_mlp,
-    run_attention_inference_with_weights_repeats,
+    AttentionDecodeCacheInput, AttentionDecodePlan, AttentionDecodeStepwiseConfig,
+    AttentionHeadDimension, AttentionInferenceConfig, AttentionLayout, AttentionMaskPolicy,
+    AttentionWeights, DecodeStepPlan, GgufModel, LlamaBackend, LlamaLayerTensorNames,
+    MlpInferenceConfig, MlpWeights, RopeConfig, RotaryEmbedding,
+    attention_inference_with_weights_repeats, build_attention_decode_cache,
+    resolve_mlp_weights_for_layer_auto, resolve_transformer_metadata,
 };
 use std::collections::{HashMap, hash_map::Entry};
 use std::error::Error as StdError;
@@ -162,19 +159,21 @@ fn main() -> Result<(), ExampleError> {
                     .first()
                     .and_then(|(_, weights)| weights.as_ref().map(|entry| &entry.0));
                 if !*preflight_done {
-                    let _ = run_attention_decode_stepwise_with_cache_repeats_with_block_mlp(
-                        &weights,
-                        &query_input,
-                        cache,
-                        backend,
-                        build_stepwise_config(
+                    let preflight_plan = DecodeStepPlan::builder()
+                        .backend(backend)
+                        .stepwise(build_stepwise_config(
                             &parsed,
                             backend,
                             key_value_length,
                             step_count,
                             1,
                             layer_repeat,
-                        ),
+                        ))
+                        .build();
+                    let _ = preflight_plan.execute_single(
+                        &weights,
+                        &query_input,
+                        cache,
                         first_block_mlp_weights,
                     )?;
                     *preflight_done = true;
@@ -188,23 +187,20 @@ fn main() -> Result<(), ExampleError> {
                             .ok_or_else(|| ExampleError::from("missing block-mlp weights"))
                     })
                     .collect::<Result<_, _>>()?;
-                let sweep_report =
-                    run_attention_decode_stepwise_bench_sweep_with_cache_repeats_with_block_mlp(
-                        &weights,
-                        &query_input,
-                        cache,
+                let stepwise_plan = DecodeStepPlan::builder()
+                    .backend(backend)
+                    .stepwise(build_stepwise_config(
+                        &parsed,
                         backend,
-                        build_stepwise_config(
-                            &parsed,
-                            backend,
-                            key_value_length,
-                            step_count,
-                            parsed.bench_iters,
-                            layer_repeat,
-                        ),
-                        parsed.warmup_iters,
-                        &sweep_weights,
-                    )?;
+                        key_value_length,
+                        step_count,
+                        parsed.bench_iters,
+                        layer_repeat,
+                    ))
+                    .warmup_repeats_per_step(parsed.warmup_iters)
+                    .build();
+                let sweep_report =
+                    stepwise_plan.bench(&weights, &query_input, cache, sweep_weights.as_slice())?;
                 if sweep_report.entries.len() != block_mlp_layers.len() {
                     return Err(format!(
                         "stepwise sweep result count mismatch: expected {}, got {}",
@@ -281,41 +277,43 @@ fn main() -> Result<(), ExampleError> {
                         .ok_or("decode cache must be initialized when --decode-kv is set")?;
                     if let Some(step_count) = parsed.decode_steps {
                         if !*preflight_done {
-                            let _ =
-                                run_attention_decode_stepwise_with_cache_repeats_with_block_mlp(
-                                    &weights,
-                                    &query_input,
-                                    cache,
-                                    backend,
-                                    build_stepwise_config(
-                                        &parsed,
-                                        backend,
-                                        key_value_length,
-                                        step_count,
-                                        1,
-                                        layer_repeat,
-                                    ),
-                                    block_mlp_weights.as_ref().map(|entry| &entry.0),
-                                )?;
-                            *preflight_done = true;
-                        }
-                        let bench_report =
-                            run_attention_decode_stepwise_bench_with_cache_repeats_with_block_mlp(
-                                &weights,
-                                &query_input,
-                                cache,
-                                backend,
-                                build_stepwise_config(
+                            let preflight_plan = DecodeStepPlan::builder()
+                                .backend(backend)
+                                .stepwise(build_stepwise_config(
                                     &parsed,
                                     backend,
                                     key_value_length,
                                     step_count,
-                                    parsed.bench_iters,
+                                    1,
                                     layer_repeat,
-                                ),
-                                parsed.warmup_iters,
+                                ))
+                                .build();
+                            let _ = preflight_plan.execute_single(
+                                &weights,
+                                &query_input,
+                                cache,
                                 block_mlp_weights.as_ref().map(|entry| &entry.0),
                             )?;
+                            *preflight_done = true;
+                        }
+                        let stepwise_plan = DecodeStepPlan::builder()
+                            .backend(backend)
+                            .stepwise(build_stepwise_config(
+                                &parsed,
+                                backend,
+                                key_value_length,
+                                step_count,
+                                parsed.bench_iters,
+                                layer_repeat,
+                            ))
+                            .warmup_repeats_per_step(parsed.warmup_iters)
+                            .build();
+                        let bench_report = stepwise_plan.bench(
+                            &weights,
+                            &query_input,
+                            cache,
+                            block_mlp_weights.as_ref().map(|entry| &entry.0),
+                        )?;
                         let report = &bench_report.execution;
                         let setup_ms = bench_report.setup_ms();
                         let avg_ms = bench_report.avg_token_ms();
@@ -363,32 +361,38 @@ fn main() -> Result<(), ExampleError> {
                         );
                     } else {
                         if !*preflight_done {
-                            run_attention_decode_proxy_with_cache_repeats(
-                                &weights,
-                                &query_input,
-                                cache,
-                                backend,
-                                1,
-                            )?;
+                            AttentionDecodePlan::builder()
+                                .backend(backend)
+                                .repeats(1)
+                                .build()?
+                                .execute(AttentionDecodeCacheInput::new(
+                                    &weights,
+                                    &query_input,
+                                    cache,
+                                ))?;
                             *preflight_done = true;
                         }
                         if parsed.warmup_iters > 0 {
-                            run_attention_decode_proxy_with_cache_repeats(
+                            AttentionDecodePlan::builder()
+                                .backend(backend)
+                                .repeats(parsed.warmup_iters)
+                                .build()?
+                                .execute(AttentionDecodeCacheInput::new(
+                                    &weights,
+                                    &query_input,
+                                    cache,
+                                ))?;
+                        }
+                        let start = Instant::now();
+                        let report = AttentionDecodePlan::builder()
+                            .backend(backend)
+                            .repeats(parsed.bench_iters)
+                            .build()?
+                            .execute(AttentionDecodeCacheInput::new(
                                 &weights,
                                 &query_input,
                                 cache,
-                                backend,
-                                parsed.warmup_iters,
-                            )?;
-                        }
-                        let start = Instant::now();
-                        let report = run_attention_decode_proxy_with_cache_repeats(
-                            &weights,
-                            &query_input,
-                            cache,
-                            backend,
-                            parsed.bench_iters,
-                        )?;
+                            ))?;
                         let elapsed = start.elapsed();
                         let avg_ms = elapsed.as_secs_f64() * 1000.0 / parsed.bench_iters as f64;
                         let checksum: f64 = report
@@ -416,7 +420,7 @@ fn main() -> Result<(), ExampleError> {
                     }
                 } else {
                     if !*preflight_done {
-                        run_attention_inference_with_weights_repeats(
+                        attention_inference_with_weights_repeats(
                             &weights,
                             &query_input,
                             backend,
@@ -425,7 +429,7 @@ fn main() -> Result<(), ExampleError> {
                         *preflight_done = true;
                     }
                     if parsed.warmup_iters > 0 {
-                        run_attention_inference_with_weights_repeats(
+                        attention_inference_with_weights_repeats(
                             &weights,
                             &query_input,
                             backend,
@@ -434,7 +438,7 @@ fn main() -> Result<(), ExampleError> {
                     }
 
                     let start = Instant::now();
-                    let report = run_attention_inference_with_weights_repeats(
+                    let report = attention_inference_with_weights_repeats(
                         &weights,
                         &query_input,
                         backend,
@@ -680,6 +684,43 @@ fn parse_args() -> Result<ParsedArgs, Box<dyn StdError>> {
         decode_stepwise_position_deltas = true;
         decode_stepwise_balanced_head_concat = false;
         decode_stepwise_head_output_staging_buffer = false;
+        decode_stepwise_fuse_block_gate_up = false;
+    }
+    // Explicit toggles should override profile presets when both are provided.
+    if cli.decode_stepwise_position_delta {
+        decode_stepwise_position_deltas = true;
+    }
+    if cli.decode_stepwise_no_position_delta {
+        decode_stepwise_position_deltas = false;
+    }
+    if cli.decode_stepwise_fuse_output_proj {
+        decode_stepwise_fuse_output_projection = true;
+    }
+    if cli.decode_stepwise_no_fuse_output_proj {
+        decode_stepwise_fuse_output_projection = false;
+    }
+    if cli.decode_stepwise_static_kv_head_precompute {
+        decode_stepwise_static_kv_head_precompute = true;
+    }
+    if cli.decode_stepwise_no_static_kv_head_precompute {
+        decode_stepwise_static_kv_head_precompute = false;
+    }
+    if cli.decode_stepwise_balanced_head_concat {
+        decode_stepwise_balanced_head_concat = true;
+    }
+    if cli.decode_stepwise_no_balanced_head_concat {
+        decode_stepwise_balanced_head_concat = false;
+    }
+    if cli.decode_stepwise_head_stage_buffer {
+        decode_stepwise_head_output_staging_buffer = true;
+    }
+    if cli.decode_stepwise_no_head_stage_buffer {
+        decode_stepwise_head_output_staging_buffer = false;
+    }
+    if cli.decode_stepwise_fuse_block_gate_up {
+        decode_stepwise_fuse_block_gate_up = true;
+    }
+    if cli.decode_stepwise_no_fuse_block_gate_up {
         decode_stepwise_fuse_block_gate_up = false;
     }
 

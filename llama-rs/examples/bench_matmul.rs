@@ -1,5 +1,5 @@
 use clap::{Parser, ValueEnum};
-use llama_rs::{LlamaBackend, MatmulBenchConfig, run_backend_matmul_bench};
+use llama_rs::{LlamaBackend, MatmulBenchConfig, backend_matmul_bench};
 use std::error::Error as StdError;
 use thiserror::Error;
 
@@ -19,7 +19,7 @@ fn run() -> Result<(), Box<dyn StdError>> {
     let config = cli.config();
 
     for backend in backends.into_iter().map(Into::into) {
-        let report = run_backend_matmul_bench(backend, config)?;
+        let report = backend_matmul_bench(backend, config)?;
         println!(
             "[{}] llama-rs matmul {}x{} · {}x{} warmup={} bench={} avg={:.3} ms, checksum={:.6}",
             report.backend_name,

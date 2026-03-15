@@ -81,7 +81,7 @@ impl BenchError {
     }
 }
 
-pub fn run_backend_matmul_bench(
+pub fn backend_matmul_bench(
     backend_kind: LlamaBackend,
     config: MatmulBenchConfig,
 ) -> Result<MatmulBenchReport, BenchError> {

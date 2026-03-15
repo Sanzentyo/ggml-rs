@@ -80,6 +80,88 @@ Detailed logs are split under `docs/llama-rs/worklog/` to keep this top-level fi
     - MTL0: `avg_token ~0.944` (improved),
     - overall: `avg_token ~0.977` (improved),
     - checksum parity: `max abs delta = 0.0`.
+- Ran CPU-side follow-up check (`head_stage_buf=true`) after the qrope pass:
+  - impact: `target/benchmarks/llama_stepwise_headstage_after_qrope_refactor_smoke_impact.md`,
+  - sampled ratio (`variant/base`): CPU `~1.022`, MTL0 `~0.995`, overall `~1.011`,
+  - decision: keep `head_stage_buf=false`.
+- Started user-requested refactor pass toward ADT/type-state/trait modularization:
+  - added `llama-rs/src/inference/stepwise_plan.rs`:
+    - `StepwiseBenchPlan` ADT,
+    - type-state builder (`backend/config` required before `build()`),
+    - trait-based static dispatch (`StepwiseBlockMlpRunSet`) for single vs sweep runs.
+  - updated `bench_attention_layer` to run stepwise benchmarks via `StepwiseBenchPlan` instead of direct `run_*_bench*` calls.
+  - split helper ops from `inference.rs` into `llama-rs/src/inference/attention_ops.rs`.
+  - fixed option precedence so explicit decode-stepwise toggles override profile presets.
+  - runtime smoke artifacts:
+    - `target/benchmarks/llama_rs_stepwise_refactor_plan_smoke.txt`,
+    - `target/benchmarks/llama_rs_refactor_profile_override_smoke.txt`,
+    - `target/benchmarks/llama_rs_refactor_attention_ops_smoke.txt`.
+- Continued the same refactor by extracting stepwise decode core from `inference.rs`:
+  - added `llama-rs/src/inference/stepwise_decode.rs` and moved:
+    - `AttentionDecodeStepwiseConfig`,
+    - `AttentionDecodeStepwiseReport`,
+    - stepwise bench reports and all `run_attention_decode_stepwise_*` runners.
+  - `llama-rs/src/inference.rs` now re-exports stepwise public APIs through the new module.
+  - re-validated full workspace (`fmt`, `clippy`, `test`) and runtime CPU/Metal smoke:
+    - `target/benchmarks/llama_rs_stepwise_refactor_stepwisecore_smoke.txt`.
+- Completed ADT-first API naming pass to remove long `run_*` public entrypoints across `llama-rs`:
+  - stepwise plan rename:
+    - `StepwiseBenchPlan` -> `DecodeStepPlan`,
+    - `StepwiseBenchPlanBuilder` -> `DecodeStepPlanBuilder`,
+    - `StepwiseBlockMlpRunSet` -> `DecodeStepBenchSet`,
+  - stepwise benchmarks and preflight now route through `DecodeStepPlan::{bench, execute_single}`.
+  - crate-wide `run_*` public function prefixes were removed (linear/mlp/attention/decode/batched/smoke/simple/idle), and examples/tests were updated accordingly.
+- Added repository-level Rust policy file for auto-loaded guidance:
+  - `.github/copilot-instructions.md` (ADT-first, type-state, static dispatch, validation/runbook defaults).
+- Runtime re-validation after ADT + naming migration:
+  - `target/benchmarks/llama_rs_stepwise_decodeplan_smoke.txt`,
+  - `target/benchmarks/llama_rs_stepwise_decodeplan_cppcompare_smoke.txt`.
+- Final post-rename runtime recheck (CPU/Metal):
+  - `target/benchmarks/llama_rs_backend_smoke_decodeplan_postrename.txt`,
+  - `target/benchmarks/llama_rs_stepwise_decodeplan_postrename_smoke.txt`.
+- Continued ADT consolidation for decode-proxy execution:
+  - added `llama-rs/src/inference/decode_proxy_plan.rs` with:
+    - `AttentionDecodePlan` + type-state builder,
+    - trait-based static dispatch (`AttentionDecodeSource`),
+    - source ADTs (`AttentionDecodeCacheInput`, `AttentionDecodeWeightsInput`).
+  - migrated decode-proxy call sites in:
+    - `bench_attention_layer`,
+    - `bench_attention_decode_cpp_compare`,
+    - `idle`.
+  - reduced duplicated decode proxy public variants from `lib.rs` export surface and kept shared execution internals private.
+- Runtime re-validation for the decode-proxy ADT pass (CPU/Metal, link-system):
+  - `target/benchmarks/llama_rs_decode_proxy_plan_smoke_cpu_metal.txt`,
+  - `target/benchmarks/llama_rs_backend_smoke_decode_proxy_plan_postrefactor.txt`.
+- Reduced function-heavy attention helper code by introducing trait-driven attention ops in `llama-rs/src/inference/attention_ops.rs`:
+  - `RotaryApplier` + `LlamaRotaryApplier` (single-head and multi-head RoPE application),
+  - `HeadConcatStrategy` with concrete `LeftFoldHeadConcat` and `BalancedHeadConcat`,
+  - `HeadConcatMetadata` for typed concat error context.
+- Migrated attention call sites to the new trait APIs:
+  - `llama-rs/src/inference.rs`,
+  - `llama-rs/src/inference/stepwise_decode.rs`.
+- Re-validated after the attention-ops trait refactor:
+  - `cargo fmt --all`,
+  - `cargo clippy --workspace --all-targets`,
+  - `cargo test --workspace`,
+  - runtime smoke (CPU/Metal, link-system):
+    - `target/benchmarks/llama_rs_attention_ops_trait_refactor_smoke_cpu_metal.txt`.
+- User-directed sequential trait-first refactor policy (`1 -> 2 -> 3`) executed and recorded for resume safety:
+  1. Backend/context lifecycle abstraction:
+     - added `llama-rs/src/inference/backend_runtime.rs`,
+     - `BackendRuntimeBuilder` + `DefaultBackendRuntimeBuilder`,
+     - migrated backend/context setup in linear/MLP/attention/decode paths.
+  2. Stepwise sequence state abstraction:
+     - added `SequenceStateUpdater` + `DeltaSequenceStateUpdater` in `stepwise_decode.rs`,
+     - migrated mask/position delta update branches to trait-backed methods.
+  3. Decode projection/cache abstraction:
+     - added `llama-rs/src/inference/projection_ops.rs`,
+     - `TensorProjector` + `F32MatmulProjector`,
+     - `DecodeCacheBuilder` + `StandardDecodeCacheBuilder`,
+     - routed `build_attention_decode_cache` through trait-based builder.
+- Runtime smoke artifacts for each sequential stage (CPU/Metal, link-system):
+  - `target/benchmarks/llama_rs_backend_runtime_trait_refactor_smoke_cpu_metal.txt`,
+  - `target/benchmarks/llama_rs_sequence_state_trait_refactor_smoke_cpu_metal.txt`,
+  - `target/benchmarks/llama_rs_projection_trait_refactor_smoke_cpu_metal.txt`.
 - llama-bench proxy now includes `bench_attention_layer` (`HxQxKxS` cases) and uses explicit backend synchronization for benchmark timing stability.
 - llama.cpp baseline capture is now completed on CPU/Metal with six real GGUF models; results are recorded in `target/benchmarks/`.
 - llama-rs proxy comparison is now captured using metadata-derived MLP/attention shape sets from the same GGUF models.

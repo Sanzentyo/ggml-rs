@@ -1,9 +1,8 @@
 use clap::Parser;
 use llama_rs::{
-    AttentionDecodeStepwiseConfig, AttentionInferenceConfig, AttentionLayout, AttentionMaskPolicy,
-    AttentionWeights, LlamaBackend, build_attention_decode_cache,
-    run_attention_decode_proxy_with_cache_repeats,
-    run_attention_decode_stepwise_with_cache_repeats,
+    AttentionDecodeCacheInput, AttentionDecodePlan, AttentionDecodeStepwiseConfig,
+    AttentionInferenceConfig, AttentionLayout, AttentionMaskPolicy, AttentionWeights,
+    DecodeStepPlan, LlamaBackend, build_attention_decode_cache,
 };
 use std::collections::HashMap;
 use std::error::Error as StdError;
@@ -82,32 +81,29 @@ fn main() -> Result<(), ExampleError> {
         for backend in backends.iter().copied() {
             let (rust_avg_ms, rust_checksum) = if let Some(stepwise) = args.stepwise {
                 if args.warmup_iters > 0 {
-                    let _ = run_attention_decode_stepwise_with_cache_repeats(
-                        &weights,
-                        &query_input,
-                        &cache,
-                        backend,
-                        AttentionDecodeStepwiseConfig::new(
+                    let warmup_plan = DecodeStepPlan::builder()
+                        .backend(backend)
+                        .stepwise(AttentionDecodeStepwiseConfig::new(
                             stepwise.key_value_start,
                             stepwise.steps,
                             stepwise.past_start,
                             args.warmup_iters,
-                        ),
-                    )?;
+                        ))
+                        .build();
+                    let _ = warmup_plan.execute_single(&weights, &query_input, &cache, None)?;
                 }
-                let rust_start = Instant::now();
-                let rust_report = run_attention_decode_stepwise_with_cache_repeats(
-                    &weights,
-                    &query_input,
-                    &cache,
-                    backend,
-                    AttentionDecodeStepwiseConfig::new(
+                let bench_plan = DecodeStepPlan::builder()
+                    .backend(backend)
+                    .stepwise(AttentionDecodeStepwiseConfig::new(
                         stepwise.key_value_start,
                         stepwise.steps,
                         stepwise.past_start,
                         args.bench_iters,
-                    ),
-                )?;
+                    ))
+                    .build();
+                let rust_start = Instant::now();
+                let rust_report =
+                    bench_plan.execute_single(&weights, &query_input, &cache, None)?;
                 let rust_elapsed = rust_start.elapsed();
                 let total_iters = args
                     .bench_iters
@@ -123,22 +119,26 @@ fn main() -> Result<(), ExampleError> {
                 (rust_avg_ms, rust_checksum)
             } else {
                 if args.warmup_iters > 0 {
-                    let _ = run_attention_decode_proxy_with_cache_repeats(
+                    let _ = AttentionDecodePlan::builder()
+                        .backend(backend)
+                        .repeats(args.warmup_iters)
+                        .build()?
+                        .execute(AttentionDecodeCacheInput::new(
+                            &weights,
+                            &query_input,
+                            &cache,
+                        ))?;
+                }
+                let rust_start = Instant::now();
+                let rust_report = AttentionDecodePlan::builder()
+                    .backend(backend)
+                    .repeats(args.bench_iters)
+                    .build()?
+                    .execute(AttentionDecodeCacheInput::new(
                         &weights,
                         &query_input,
                         &cache,
-                        backend,
-                        args.warmup_iters,
-                    )?;
-                }
-                let rust_start = Instant::now();
-                let rust_report = run_attention_decode_proxy_with_cache_repeats(
-                    &weights,
-                    &query_input,
-                    &cache,
-                    backend,
-                    args.bench_iters,
-                )?;
+                    ))?;
                 let rust_elapsed = rust_start.elapsed();
                 let rust_avg_ms = rust_elapsed.as_secs_f64() * 1000.0 / args.bench_iters as f64;
                 let rust_checksum: f64 = rust_report
@@ -151,7 +151,7 @@ fn main() -> Result<(), ExampleError> {
             };
 
             if args.warmup_iters > 0 {
-                let _ = run_cpp_reference(
+                let _ = cpp_reference(
                     &cpp_binary,
                     backend,
                     *case,
@@ -161,7 +161,7 @@ fn main() -> Result<(), ExampleError> {
                     args.stepwise,
                 )?;
             }
-            let cpp_report = run_cpp_reference(
+            let cpp_report = cpp_reference(
                 &cpp_binary,
                 backend,
                 *case,
@@ -321,7 +321,7 @@ fn compile_cpp_reference() -> Result<PathBuf, Box<dyn StdError>> {
     Ok(output)
 }
 
-fn run_cpp_reference(
+fn cpp_reference(
     binary: &Path,
     backend: LlamaBackend,
     case: Case,

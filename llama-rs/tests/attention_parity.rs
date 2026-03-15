@@ -2,7 +2,7 @@
 
 use llama_rs::{
     AttentionInferenceConfig, AttentionLayout, AttentionMaskPolicy, AttentionWeights, LlamaBackend,
-    run_attention_inference_with_weights_repeats,
+    attention_inference_with_weights_repeats,
 };
 use std::error::Error;
 
@@ -15,19 +15,15 @@ fn attention_cpu_matches_metal() -> Result<(), Box<dyn Error>> {
         .map(|index| ((index + 3) % 29) as f32 * 0.0625)
         .collect();
 
-    let cpu = run_attention_inference_with_weights_repeats(&weights, &input, LlamaBackend::Cpu, 1)?;
-    let metal = match run_attention_inference_with_weights_repeats(
-        &weights,
-        &input,
-        LlamaBackend::Metal,
-        1,
-    ) {
-        Ok(report) => report,
-        Err(error) => {
-            eprintln!("metal backend unavailable; skipping attention parity: {error}");
-            return Ok(());
-        }
-    };
+    let cpu = attention_inference_with_weights_repeats(&weights, &input, LlamaBackend::Cpu, 1)?;
+    let metal =
+        match attention_inference_with_weights_repeats(&weights, &input, LlamaBackend::Metal, 1) {
+            Ok(report) => report,
+            Err(error) => {
+                eprintln!("metal backend unavailable; skipping attention parity: {error}");
+                return Ok(());
+            }
+        };
 
     assert_eq!(cpu.output.len(), metal.output.len());
     let max_delta = cpu
@@ -54,8 +50,7 @@ fn attention_causal_cpu_runs() -> Result<(), Box<dyn Error>> {
         .map(|index| ((index + 3) % 29) as f32 * 0.0625)
         .collect();
 
-    let report =
-        run_attention_inference_with_weights_repeats(&weights, &input, LlamaBackend::Cpu, 1)?;
+    let report = attention_inference_with_weights_repeats(&weights, &input, LlamaBackend::Cpu, 1)?;
     assert_eq!(report.output.len(), input.len());
 
     Ok(())

@@ -1,7 +1,6 @@
 use clap::Parser;
 use llama_rs::{
-    GgufModel, IdleConfig, IdlePauseSchedule, LlamaBackend, PauseScheduleEmpty,
-    run_idle_decode_proxy,
+    GgufModel, IdleConfig, IdlePauseSchedule, LlamaBackend, PauseScheduleEmpty, idle_decode_proxy,
 };
 use std::error::Error as StdError;
 use std::str::FromStr;
@@ -34,7 +33,7 @@ fn main() -> Result<(), ExampleError> {
             args.iters,
             pauses.clone(),
         )?;
-        let report = run_idle_decode_proxy(&model, backend, config)?;
+        let report = idle_decode_proxy(&model, backend, config)?;
         for pause_report in &report.pauses {
             println!(
                 "backend={} requested_layer={} layer={} weights_mode={:?} pause_ms={} avg_decode_ms={:.3} stddev_ms={:.3} iters={} kv={} past={} hidden={} checksum={:.6}",

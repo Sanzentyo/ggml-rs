@@ -88,7 +88,7 @@ pub struct SmokeReport {
     pub values: Vec<f32>,
 }
 
-pub fn run_backend_smoke(backend: LlamaBackend) -> Result<SmokeReport> {
+pub fn backend_smoke(backend: LlamaBackend) -> Result<SmokeReport> {
     ensure_backends_loaded();
 
     let backend = ggml_rs::Backend::new(backend.into())

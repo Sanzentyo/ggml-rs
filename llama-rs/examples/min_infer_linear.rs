@@ -3,7 +3,7 @@
 use clap::{Parser, ValueEnum};
 use llama_rs::{
     GgufModel, LinearInferenceConfig, LinearWeights, LlamaBackend,
-    run_linear_inference_with_weights_repeats,
+    linear_inference_with_weights_repeats,
 };
 use std::error::Error as StdError;
 use thiserror::Error;
@@ -19,12 +19,8 @@ fn run() -> Result<(), Box<dyn StdError>> {
     let model = GgufModel::open(&parsed.path)?;
     let weights = LinearWeights::from_model(&model, &parsed.weight_tensor, parsed.config)?;
     let input = make_input(parsed.config.in_features());
-    let report = run_linear_inference_with_weights_repeats(
-        &weights,
-        &input,
-        parsed.backend,
-        parsed.repeats,
-    )?;
+    let report =
+        linear_inference_with_weights_repeats(&weights, &input, parsed.backend, parsed.repeats)?;
 
     let preview: Vec<f32> = report.output.iter().copied().take(8).collect();
     println!(

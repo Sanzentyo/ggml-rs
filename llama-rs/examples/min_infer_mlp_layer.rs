@@ -2,8 +2,8 @@
 
 use clap::{Parser, ValueEnum};
 use llama_rs::{
-    GgufModel, LlamaBackend, resolve_llama_layer_dimensions, resolve_mlp_weights_for_layer,
-    resolve_mlp_weights_for_layer_auto, run_mlp_inference_with_weights_repeats,
+    GgufModel, LlamaBackend, mlp_inference_with_weights_repeats, resolve_llama_layer_dimensions,
+    resolve_mlp_weights_for_layer, resolve_mlp_weights_for_layer_auto,
 };
 use std::error::Error as StdError;
 use std::path::PathBuf;
@@ -30,8 +30,7 @@ fn run() -> Result<(), Box<dyn StdError>> {
         .collect();
 
     for backend in parsed.backends {
-        let report =
-            run_mlp_inference_with_weights_repeats(&weights, &input, backend, parsed.repeats)?;
+        let report = mlp_inference_with_weights_repeats(&weights, &input, backend, parsed.repeats)?;
         let preview_len = report.output.len().min(8);
         println!(
             "[{}] layer={} hidden={} ffn={} repeats={} preview={:?}",

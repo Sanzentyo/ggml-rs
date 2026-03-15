@@ -49,6 +49,47 @@
     - `target/benchmarks/llama_stepwise_graph_reuse_qrope_multihead_elyza_layers5_7_impact.md`,
     - post/base `avg_token`: CPU `~1.001`, MTL0 `~0.944`, overall `~0.977`,
     - checksum parity: `max abs delta = 0.0`.
+- Added post-qrope CPU-side follow-up (`head_stage_buf=true`) and kept default-off:
+  - impact artifact:
+    - `target/benchmarks/llama_stepwise_headstage_after_qrope_refactor_smoke_impact.md`,
+  - sampled `variant/base`:
+    - CPU `~1.022`, MTL0 `~0.995`, overall `~1.011`,
+  - decision: keep `head_stage_buf=false`.
+- Started refactor pass for ADT/type-state/trait-driven execution and module split:
+  - added `llama-rs/src/inference/stepwise_plan.rs`:
+    - `DecodeStepPlan` ADT,
+    - type-state builder for required backend+stepwise fields,
+    - trait-based static dispatch (`DecodeStepBenchSet`) for single/sweep bench runs.
+  - updated `bench_attention_layer` to drive stepwise bench calls through the ADT.
+  - split helper ops from monolithic file:
+    - `llama-rs/src/inference/attention_ops.rs`.
+  - fixed profile precedence:
+    - explicit decode-stepwise toggles now override profile presets.
+  - runtime smoke artifacts:
+    - `target/benchmarks/llama_rs_stepwise_refactor_plan_smoke.txt`,
+    - `target/benchmarks/llama_rs_refactor_profile_override_smoke.txt`,
+    - `target/benchmarks/llama_rs_refactor_attention_ops_smoke.txt`.
+- Continued refactor depth by extracting stepwise decode core into its own module:
+  - added `llama-rs/src/inference/stepwise_decode.rs`,
+  - moved stepwise public types + execution internals (`AttentionDecodeStepwise*`) out of monolithic `inference.rs`,
+  - wired `DecodeStepPlan::{execute_single, bench}` as the public execution surface.
+- Re-validated after stepwise-core extraction:
+  - `cargo fmt --all`,
+  - `cargo clippy --workspace --all-targets`,
+  - `cargo test --workspace`,
+  - CPU/Metal runtime smoke:
+    - `target/benchmarks/llama_rs_stepwise_refactor_stepwisecore_smoke.txt`.
+- Completed API naming migration for Rust-idiomatic call surfaces:
+  - removed public `run_*` prefixes across `llama-rs` APIs (linear/mlp/attention/decode/batched/smoke/simple/idle),
+  - updated examples/tests to the renamed call sites and ADT-first style.
+- Added repository policy file for naturally auto-loaded guidance:
+  - `.github/copilot-instructions.md` (ADT-first + type-state + static dispatch + validation defaults).
+- CPU/Metal runtime re-check after naming migration:
+  - `target/benchmarks/llama_rs_stepwise_decodeplan_smoke.txt`,
+  - `target/benchmarks/llama_rs_stepwise_decodeplan_cppcompare_smoke.txt`.
+- Final post-rename runtime smoke:
+  - `target/benchmarks/llama_rs_backend_smoke_decodeplan_postrename.txt`,
+  - `target/benchmarks/llama_rs_stepwise_decodeplan_postrename_smoke.txt`.
 - Re-validated `llama-rs/examples/backend_smoke.rs` on CPU and Metal after the GGUF write-path expansion.
 - Expanded `ggml-rs` safe op surface for llama runtime needs: `add`, `mul`, `silu`, `rms_norm`, `scale`, `get_rows`, `repeat`, `cpy`, `cont`, `reshape_*`, `view_*`, `permute`, `diag_mask_inf`, `soft_max(_ext)`, `rope_ext`.
 - Added tensor naming (`set_name` / `name`) and backend `i32` tensor transfer helpers.

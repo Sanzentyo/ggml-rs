@@ -85,7 +85,7 @@ pub struct SimpleReport {
     pub values: Vec<f32>,
 }
 
-pub fn run_simple_ctx() -> Result<SimpleReport, SimpleError> {
+pub fn simple_ctx() -> Result<SimpleReport, SimpleError> {
     let ctx_size = Context::recommended_matmul_memory_f32_shapes_bytes(SHAPE_A, SHAPE_B).map_err(
         |source| {
             SimpleError::ggml(
