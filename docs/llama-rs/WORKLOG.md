@@ -16,8 +16,42 @@ Detailed logs are split under `docs/llama-rs/worklog/` to keep this top-level fi
 - MLP and attention layer examples are verified on CPU and Metal for synthetic fixtures.
 - Link-system parity tests (`mlp_cpp_parity`, `attention_parity`) pass after RoPE integration fixes.
 - Unified example argument parsing on `clap` derive + typed CLI structs across `llama-rs/examples` (including `gguf`, `idle`, `bench_attention_layer`, and `bench_attention_decode_cpp_compare`).
+- Refactored clap-unified example error surfaces to `thiserror`-based typed errors (while preserving the existing validation/error-policy behavior).
 - Re-verified the clap-unified runtime surfaces on CPU/Metal with `--features link-system` and recorded:
   - `target/benchmarks/llama_rs_clap_refactor_runtime_smoke.txt`.
+- Resumed step `1` (layer-by-layer optimization loop) on ELYZA (`block_layer=0..7`) with the current lock (`outproj_fused_layerx5 + static_kv + kv_proj + kv_write + block`) and recorded:
+  - raw: `target/benchmarks/llama_rs_stepwise_resume_after_clap_elyza_layers0_7.txt`
+  - summary: `target/benchmarks/llama_stepwise_resume_after_clap_elyza_layers0_7_summary.{csv,md}`
+- Hotspot A/B results on `block_layer=2..7`:
+  - `mask_host_elide`: regression (`~1.008` on/base),
+  - `head_stage_buf`: near-neutral (`~1.000` on/base),
+  - `block_gateup_fused`: near-neutral (`~1.000` on/base),
+  - `head_concat_balanced`: regression (`~1.010` on/base).
+- Delta toggle recheck on the same hotspot window:
+  - `--decode-stepwise-no-mask-delta`: `~0.994` variant/base,
+  - `--decode-stepwise-no-position-delta`: `~0.994` variant/base.
+- Stability rerun (`r=3` median) for the same delta toggles:
+  - `target/benchmarks/llama_stepwise_resume_after_clap_elyza_layers2_7_delta_stability_r3.md`
+  - `no-mask/base ~0.998`, `no-pos/base ~0.999` overall (near-neutral), so defaults stay unchanged.
+- Expanded `thiserror` rollout across remaining `llama-rs/examples` (`run()` + typed `ExampleError` boundary) and re-verified link-system runtime surfaces:
+  - `target/benchmarks/llama_rs_thiserror_rollout_runtime_smoke.txt`.
+- Added stepwise warmup+bench reuse path to reduce repeated backend/context setup during layer sweeps:
+  - new API: `run_attention_decode_stepwise_bench_with_cache_repeats_with_block_mlp`,
+  - `bench_attention_layer` now uses the new API in `--decode-steps` mode,
+  - runtime smoke: `target/benchmarks/llama_rs_stepwise_backend_context_reuse_smoke.txt`.
+- Added phase-init elision on top of the warmup+bench reuse path (skip redundant KV/precompute reinit between warmup and bench when cache writes do not mutate persistent KV tensors):
+  - runtime smoke: `target/benchmarks/llama_rs_stepwise_phase_init_elision_smoke.txt`,
+  - ELYZA `block_layer=5..7` remeasure and impact:
+    - raw: `target/benchmarks/llama_rs_stepwise_phase_init_elision_elyza_layers5_7.txt`,
+    - summary: `target/benchmarks/llama_stepwise_phase_init_elision_elyza_layers5_7_impact.md`,
+    - `new/base` avg_token: CPU `~0.629`, MTL0 `~0.549` (baseline from `llama_rs_stepwise_resume_after_clap_elyza_layers0_7.txt` subset).
+- Added one-time backend loader guard (`ensure_backends_loaded`) across `llama-rs` runtime paths (`bench`, `batched`, `smoke`, `inference`) to remove repeated `Backend::load_all()` calls.
+  - validation/remeasure:
+    - raw: `target/benchmarks/llama_rs_stepwise_backend_load_once_elyza_layers5_7.txt`,
+    - impact: `target/benchmarks/llama_stepwise_backend_load_once_elyza_layers5_7_impact.md`,
+    - `new/base` avg_token vs phase-init-elision baseline: CPU `~1.013`, MTL0 `~1.000` (near-neutral; keep as cleanup/hardening).
+- Added block-MLP layer-loop cache in `bench_attention_layer` (`HashMap<(hidden_features, block_layer), (MlpWeights, block_mlp_real)>`) so repeated case/layer sweeps reuse resolved model-layer weights instead of re-decoding each time.
+  - smoke (CPU+Metal, duplicated case to exercise cache path): `target/benchmarks/llama_rs_stepwise_layer_loop_reuse_cache_smoke.txt`.
 - llama-bench proxy now includes `bench_attention_layer` (`HxQxKxS` cases) and uses explicit backend synchronization for benchmark timing stability.
 - llama.cpp baseline capture is now completed on CPU/Metal with six real GGUF models; results are recorded in `target/benchmarks/`.
 - llama-rs proxy comparison is now captured using metadata-derived MLP/attention shape sets from the same GGUF models.

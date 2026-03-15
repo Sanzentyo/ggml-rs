@@ -5,6 +5,7 @@ use llama_rs::{
 };
 use std::error::Error as StdError;
 use std::str::FromStr;
+use thiserror::Error;
 
 const USAGE: &str = "usage: cargo run -p llama-rs --example idle --features link-system -- <model.gguf> [--layer N] [--decode-kv N] [--past N] [--iters N] [--pauses a,b,c] [cpu|metal ...]";
 
@@ -19,7 +20,7 @@ struct ParsedArgs {
     backends: Vec<LlamaBackend>,
 }
 
-fn main() -> Result<(), Box<dyn StdError>> {
+fn main() -> Result<(), ExampleError> {
     ggml_rs::init_timing();
     let args = ParsedArgs::from_cli(Cli::parse());
     let model = GgufModel::open(&args.model_path)?;
@@ -54,6 +55,14 @@ fn main() -> Result<(), Box<dyn StdError>> {
     }
 
     Ok(())
+}
+
+#[derive(Debug, Error)]
+enum ExampleError {
+    #[error(transparent)]
+    Llama(#[from] llama_rs::LlamaError),
+    #[error(transparent)]
+    Boxed(#[from] Box<dyn StdError>),
 }
 
 impl ParsedArgs {

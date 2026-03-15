@@ -4,7 +4,7 @@
 //! safe APIs. This acts as the first inference building block before full
 //! transformer graph assembly.
 
-use crate::backend::LlamaBackend;
+use crate::backend::{LlamaBackend, ensure_backends_loaded};
 use crate::metadata::{LlamaModelMetadata, MetadataError, resolve_llama_metadata};
 use crate::model::{GgufModel, ModelError};
 use crate::naming::{LlamaLayerTensorNames, NamingError, resolve_llama_layer_tensor_names};
@@ -13,6 +13,7 @@ use std::error::Error as StdError;
 use std::fmt;
 use std::marker::PhantomData;
 use std::num::NonZeroUsize;
+use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 /// Strongly typed non-zero input feature count.
@@ -679,7 +680,8 @@ pub fn run_linear_inference_with_weights_repeats(
         return Err(InferenceError::InvalidRepeats);
     }
 
-    Backend::load_all();
+    let setup_start = Instant::now();
+    ensure_backends_loaded();
     let backend = Backend::new(backend_kind.into())
         .map_err(|source| InferenceError::ggml("Backend::new", source))?;
     let backend_name = backend
@@ -833,7 +835,7 @@ pub fn run_mlp_inference_with_weights_repeats(
         return Err(InferenceError::InvalidRepeats);
     }
 
-    Backend::load_all();
+    ensure_backends_loaded();
     let backend = Backend::new(backend_kind.into())
         .map_err(|source| InferenceError::ggml("Backend::new", source))?;
     let backend_name = backend
@@ -1666,6 +1668,31 @@ pub struct AttentionDecodeStepwiseReport {
     pub output: Vec<f32>,
 }
 
+#[derive(Debug, Clone)]
+/// Stepwise decode benchmark report with explicit warmup/bench phase timing.
+pub struct AttentionDecodeStepwiseBenchReport {
+    pub warmup_repeats_per_step: usize,
+    pub setup_duration: Duration,
+    pub bench_duration: Duration,
+    pub execution: AttentionDecodeStepwiseReport,
+}
+
+impl AttentionDecodeStepwiseBenchReport {
+    pub fn avg_token_ms(&self) -> f64 {
+        let token_iters = self
+            .execution
+            .steps
+            .checked_mul(self.execution.repeats_per_step)
+            .unwrap_or(1)
+            .max(1);
+        self.bench_duration.as_secs_f64() * 1000.0 / token_iters as f64
+    }
+
+    pub fn setup_ms(&self) -> f64 {
+        self.setup_duration.as_secs_f64() * 1000.0
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 /// Configuration for stepwise decode-like proxy execution.
 pub struct AttentionDecodeStepwiseConfig {
@@ -1959,7 +1986,7 @@ pub fn run_attention_inference_with_weights_repeats(
         return Err(InferenceError::InvalidRepeats);
     }
 
-    Backend::load_all();
+    ensure_backends_loaded();
     let backend = Backend::new(backend_kind.into())
         .map_err(|source| InferenceError::ggml("Backend::new", source))?;
     let backend_name = backend
@@ -2325,7 +2352,7 @@ fn run_attention_decode_proxy_with_cache_repeats_inner(
         });
     }
 
-    Backend::load_all();
+    ensure_backends_loaded();
     let backend = Backend::new(backend_kind.into())
         .map_err(|source| InferenceError::ggml("Backend::new", source))?;
     let backend_name = backend
@@ -2597,6 +2624,57 @@ pub fn run_attention_decode_stepwise_with_cache_repeats_with_block_mlp(
     stepwise: AttentionDecodeStepwiseConfig,
     block_mlp_weights: Option<&MlpWeights>,
 ) -> Result<AttentionDecodeStepwiseReport, InferenceError> {
+    let (report, _bench_duration, _setup_duration) =
+        run_attention_decode_stepwise_with_cache_repeats_with_block_mlp_internal(
+            weights,
+            query_input,
+            cache,
+            backend_kind,
+            stepwise,
+            0,
+            block_mlp_weights,
+        )?;
+    Ok(report)
+}
+
+/// Bench-oriented stepwise runner that reuses backend/context/graph allocation
+/// across warmup and measured phases.
+pub fn run_attention_decode_stepwise_bench_with_cache_repeats_with_block_mlp(
+    weights: &AttentionWeights,
+    query_input: &[f32],
+    cache: &AttentionDecodeCache,
+    backend_kind: LlamaBackend,
+    stepwise: AttentionDecodeStepwiseConfig,
+    warmup_repeats_per_step: usize,
+    block_mlp_weights: Option<&MlpWeights>,
+) -> Result<AttentionDecodeStepwiseBenchReport, InferenceError> {
+    let (execution, bench_duration, setup_duration) =
+        run_attention_decode_stepwise_with_cache_repeats_with_block_mlp_internal(
+            weights,
+            query_input,
+            cache,
+            backend_kind,
+            stepwise,
+            warmup_repeats_per_step,
+            block_mlp_weights,
+        )?;
+    Ok(AttentionDecodeStepwiseBenchReport {
+        warmup_repeats_per_step,
+        setup_duration,
+        bench_duration,
+        execution,
+    })
+}
+
+fn run_attention_decode_stepwise_with_cache_repeats_with_block_mlp_internal(
+    weights: &AttentionWeights,
+    query_input: &[f32],
+    cache: &AttentionDecodeCache,
+    backend_kind: LlamaBackend,
+    stepwise: AttentionDecodeStepwiseConfig,
+    warmup_repeats_per_step: usize,
+    block_mlp_weights: Option<&MlpWeights>,
+) -> Result<(AttentionDecodeStepwiseReport, Duration, Duration), InferenceError> {
     let key_value_start = stepwise.key_value_start;
     let steps = stepwise.steps;
     let past_start = stepwise.past_start;
@@ -2643,9 +2721,6 @@ pub fn run_attention_decode_stepwise_with_cache_repeats_with_block_mlp(
             actual: 0,
         });
     }
-    let per_step_compute_count = repeats_per_step
-        .checked_mul(layer_repeat)
-        .ok_or(InferenceError::MemorySizeOverflow)?;
     let config = weights.config;
     if !matches!(config.mask, AttentionMaskPolicy::Causal { .. }) {
         return Err(InferenceError::InvalidAttentionShape {
@@ -2708,7 +2783,7 @@ pub fn run_attention_decode_stepwise_with_cache_repeats_with_block_mlp(
         });
     }
 
-    Backend::load_all();
+    ensure_backends_loaded();
     let backend = Backend::new(backend_kind.into())
         .map_err(|source| InferenceError::ggml("Backend::new", source))?;
     let backend_name = backend
@@ -3367,12 +3442,7 @@ pub fn run_attention_decode_stepwise_with_cache_repeats_with_block_mlp(
     }
     x_q.set_f32_backend(query_input)
         .map_err(|source| InferenceError::ggml("Tensor::set_f32_backend<X_Q>", source))?;
-    k.set_f32_backend(&cache.projected_k_values)
-        .map_err(|source| InferenceError::ggml("Tensor::set_f32_backend<K_CACHE>", source))?;
-    v.set_f32_backend(&cache.projected_v_values)
-        .map_err(|source| InferenceError::ggml("Tensor::set_f32_backend<V_CACHE>", source))?;
-
-    if let Some(positions_k) = positions_k {
+    if let Some(positions_k) = positions_k.as_ref() {
         let positions_values: Result<Vec<i32>, InferenceError> = (0..key_value_length)
             .map(|index| i32::try_from(index).map_err(|_| InferenceError::MemorySizeOverflow))
             .collect();
@@ -3381,142 +3451,183 @@ pub fn run_attention_decode_stepwise_with_cache_repeats_with_block_mlp(
             .map_err(|source| InferenceError::ggml("Tensor::set_i32_backend<KV_POS>", source))?;
     }
 
-    if let Some(precompute_graph) = static_kv_head_graph.as_mut() {
-        backend.compute(precompute_graph).map_err(|source| {
-            InferenceError::ggml("Backend::compute<KV_HEAD_PRECOMPUTE>", source)
-        })?;
-    }
-
     let incremental_position_update = use_position_deltas
         && query_length == 1
         && past_start.checked_add(1) == Some(key_value_start);
+    let incremental_mask_update =
+        use_mask_deltas && query_length == 1 && past_start.checked_add(1) == Some(key_value_start);
     let mut step_positions_q_values = if positions_q.is_some() && !incremental_position_update {
         Some(vec![0_i32; query_length])
     } else {
         None
     };
-    let incremental_mask_update =
-        use_mask_deltas && query_length == 1 && past_start.checked_add(1) == Some(key_value_start);
     let mut step_mask_values =
         if mask.is_some() && (!incremental_mask_update || !elide_mask_host_buffer) {
             Some(vec![0.0_f32; query_length * key_value_length])
         } else {
             None
         };
-    if incremental_mask_update && let Some(mask) = mask.as_ref() {
-        if let Some(mask_values) = step_mask_values.as_mut() {
-            fill_causal_mask_values(mask_values, query_length, key_value_length, past_start);
-            mask.set_f32_backend(mask_values).map_err(|source| {
-                InferenceError::ggml("Tensor::set_f32_backend<CAUSAL_MASK>", source)
-            })?;
+    let mut initial_mask_values =
+        if incremental_mask_update && mask.is_some() && step_mask_values.is_none() {
+            Some(vec![0.0_f32; query_length * key_value_length])
         } else {
-            let mut initial_mask_values = vec![0.0_f32; query_length * key_value_length];
-            fill_causal_mask_values(
-                &mut initial_mask_values,
-                query_length,
-                key_value_length,
-                past_start,
-            );
-            mask.set_f32_backend(&initial_mask_values)
-                .map_err(|source| {
-                    InferenceError::ggml("Tensor::set_f32_backend<CAUSAL_MASK>", source)
-                })?;
-        }
-    }
+            None
+        };
 
-    for step in 0..steps {
-        let step_past_tokens = past_start
-            .checked_add(step)
+    let mut run_phase = |phase_repeats_per_step: usize,
+                         reset_kv_state: bool|
+     -> Result<(), InferenceError> {
+        if phase_repeats_per_step == 0 {
+            return Ok(());
+        }
+        let per_step_compute_count = phase_repeats_per_step
+            .checked_mul(layer_repeat)
             .ok_or(InferenceError::MemorySizeOverflow)?;
-        if let Some(positions_q) = positions_q.as_ref() {
-            if incremental_position_update {
-                let position = i32::try_from(step_past_tokens)
-                    .map_err(|_| InferenceError::MemorySizeOverflow)?;
-                positions_q
-                    .set_i32_backend_at(0, &[position])
-                    .map_err(|source| {
-                        InferenceError::ggml("Tensor::set_i32_backend_at<QUERY_POS>", source)
-                    })?;
-            } else if let Some(values) = step_positions_q_values.as_mut() {
-                for (index, value) in values.iter_mut().enumerate() {
-                    let position = step_past_tokens
-                        .checked_add(index)
-                        .ok_or(InferenceError::MemorySizeOverflow)?;
-                    *value =
-                        i32::try_from(position).map_err(|_| InferenceError::MemorySizeOverflow)?;
-                }
-                positions_q.set_i32_backend(values).map_err(|source| {
-                    InferenceError::ggml("Tensor::set_i32_backend<QUERY_POS>", source)
+
+        if reset_kv_state {
+            k.set_f32_backend(&cache.projected_k_values)
+                .map_err(|source| {
+                    InferenceError::ggml("Tensor::set_f32_backend<K_CACHE>", source)
+                })?;
+            v.set_f32_backend(&cache.projected_v_values)
+                .map_err(|source| {
+                    InferenceError::ggml("Tensor::set_f32_backend<V_CACHE>", source)
+                })?;
+
+            if let Some(precompute_graph) = static_kv_head_graph.as_mut() {
+                backend.compute(precompute_graph).map_err(|source| {
+                    InferenceError::ggml("Backend::compute<KV_HEAD_PRECOMPUTE>", source)
                 })?;
             }
         }
-        if let Some(mask) = mask.as_ref() {
-            if incremental_mask_update {
-                if step > 0 {
-                    let newly_visible_key = step_past_tokens;
-                    if newly_visible_key < key_value_length {
-                        if let Some(mask_values) = step_mask_values.as_mut() {
-                            mask_values[newly_visible_key] = 0.0;
-                        }
-                        mask.set_f32_backend_at(newly_visible_key, &[0.0_f32])
-                            .map_err(|source| {
-                                InferenceError::ggml(
-                                    "Tensor::set_f32_backend_at<CAUSAL_MASK>",
-                                    source,
-                                )
-                            })?;
-                    }
-                }
-            } else if let Some(mask_values) = step_mask_values.as_mut() {
-                fill_causal_mask_values(
-                    mask_values,
-                    query_length,
-                    key_value_length,
-                    step_past_tokens,
-                );
+
+        if incremental_mask_update && let Some(mask) = mask.as_ref() {
+            if let Some(mask_values) = step_mask_values.as_mut() {
+                fill_causal_mask_values(mask_values, query_length, key_value_length, past_start);
                 mask.set_f32_backend(mask_values).map_err(|source| {
                     InferenceError::ggml("Tensor::set_f32_backend<CAUSAL_MASK>", source)
                 })?;
+            } else if let Some(initial_mask_values) = initial_mask_values.as_mut() {
+                fill_causal_mask_values(
+                    initial_mask_values,
+                    query_length,
+                    key_value_length,
+                    past_start,
+                );
+                mask.set_f32_backend(initial_mask_values)
+                    .map_err(|source| {
+                        InferenceError::ggml("Tensor::set_f32_backend<CAUSAL_MASK>", source)
+                    })?;
             }
         }
-        let graph_index = if step_specific_kv_cache_writes {
-            step
-        } else {
-            0
-        };
-        let graph = graphs
-            .get_mut(graph_index)
-            .expect("stepwise graph index must stay in range");
-        for _ in 0..per_step_compute_count {
-            backend
-                .compute(graph)
-                .map_err(|source| InferenceError::ggml("Backend::compute", source))?;
+
+        for step in 0..steps {
+            let step_past_tokens = past_start
+                .checked_add(step)
+                .ok_or(InferenceError::MemorySizeOverflow)?;
+            if let Some(positions_q) = positions_q.as_ref() {
+                if incremental_position_update {
+                    let position = i32::try_from(step_past_tokens)
+                        .map_err(|_| InferenceError::MemorySizeOverflow)?;
+                    positions_q
+                        .set_i32_backend_at(0, &[position])
+                        .map_err(|source| {
+                            InferenceError::ggml("Tensor::set_i32_backend_at<QUERY_POS>", source)
+                        })?;
+                } else if let Some(values) = step_positions_q_values.as_mut() {
+                    for (index, value) in values.iter_mut().enumerate() {
+                        let position = step_past_tokens
+                            .checked_add(index)
+                            .ok_or(InferenceError::MemorySizeOverflow)?;
+                        *value = i32::try_from(position)
+                            .map_err(|_| InferenceError::MemorySizeOverflow)?;
+                    }
+                    positions_q.set_i32_backend(values).map_err(|source| {
+                        InferenceError::ggml("Tensor::set_i32_backend<QUERY_POS>", source)
+                    })?;
+                }
+            }
+            if let Some(mask) = mask.as_ref() {
+                if incremental_mask_update {
+                    if step > 0 {
+                        let newly_visible_key = step_past_tokens;
+                        if newly_visible_key < key_value_length {
+                            if let Some(mask_values) = step_mask_values.as_mut() {
+                                mask_values[newly_visible_key] = 0.0;
+                            }
+                            mask.set_f32_backend_at(newly_visible_key, &[0.0_f32])
+                                .map_err(|source| {
+                                    InferenceError::ggml(
+                                        "Tensor::set_f32_backend_at<CAUSAL_MASK>",
+                                        source,
+                                    )
+                                })?;
+                        }
+                    }
+                } else if let Some(mask_values) = step_mask_values.as_mut() {
+                    fill_causal_mask_values(
+                        mask_values,
+                        query_length,
+                        key_value_length,
+                        step_past_tokens,
+                    );
+                    mask.set_f32_backend(mask_values).map_err(|source| {
+                        InferenceError::ggml("Tensor::set_f32_backend<CAUSAL_MASK>", source)
+                    })?;
+                }
+            }
+            let graph_index = if step_specific_kv_cache_writes {
+                step
+            } else {
+                0
+            };
+            let graph = graphs
+                .get_mut(graph_index)
+                .expect("stepwise graph index must stay in range");
+            for _ in 0..per_step_compute_count {
+                backend
+                    .compute(graph)
+                    .map_err(|source| InferenceError::ggml("Backend::compute", source))?;
+            }
+            if synchronize_per_step {
+                backend
+                    .synchronize()
+                    .map_err(|source| InferenceError::ggml("Backend::synchronize", source))?;
+            }
+            if readback_per_step {
+                let _ = y.to_vec_f32_backend().map_err(|source| {
+                    InferenceError::ggml("Tensor::to_vec_f32_backend<Y_STEP>", source)
+                })?;
+            }
         }
-        if synchronize_per_step {
-            backend
-                .synchronize()
-                .map_err(|source| InferenceError::ggml("Backend::synchronize", source))?;
-        }
-        if readback_per_step {
-            let _ = y.to_vec_f32_backend().map_err(|source| {
-                InferenceError::ggml("Tensor::to_vec_f32_backend<Y_STEP>", source)
-            })?;
-        }
-    }
+        Ok(())
+    };
+
+    let setup_duration = setup_start.elapsed();
+
+    run_phase(warmup_repeats_per_step, true)?;
+    let bench_needs_kv_reset = warmup_repeats_per_step == 0 || step_specific_kv_cache_writes;
+    let bench_start = Instant::now();
+    run_phase(repeats_per_step, bench_needs_kv_reset)?;
+    let bench_duration = bench_start.elapsed();
 
     let output = y
         .to_vec_f32_backend()
         .map_err(|source| InferenceError::ggml("Tensor::to_vec_f32_backend<Y>", source))?;
 
-    Ok(AttentionDecodeStepwiseReport {
-        backend_name,
-        hidden_features,
-        query_length,
-        key_value_start,
-        steps,
-        repeats_per_step,
-        output,
-    })
+    Ok((
+        AttentionDecodeStepwiseReport {
+            backend_name,
+            hidden_features,
+            query_length,
+            key_value_start,
+            steps,
+            repeats_per_step,
+            output,
+        },
+        bench_duration,
+        setup_duration,
+    ))
 }
 
 /// Runs decode-like attention proxy where query length and KV length can differ.

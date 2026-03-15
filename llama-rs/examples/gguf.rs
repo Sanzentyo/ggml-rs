@@ -2,6 +2,7 @@ use clap::{Parser, ValueEnum};
 use ggml_rs::{Context, GgufArrayValue, GgufValue, GgufWriter, Tensor, Type};
 use llama_rs::{GgufReport, inspect_gguf};
 use std::error::Error as StdError;
+use thiserror::Error;
 
 const USAGE: &str = "usage: cargo run -p llama-rs --example gguf --features link-system -- <file.gguf> <w|r|r0|r1> [n|--no-check]";
 const TEST_TENSOR_COUNT: usize = 10;
@@ -40,7 +41,7 @@ impl Lcg {
     }
 }
 
-fn main() -> Result<(), Box<dyn StdError>> {
+fn main() -> Result<(), ExampleError> {
     let cli = Cli::parse();
     let path = cli.path.as_str();
 
@@ -65,6 +66,18 @@ fn main() -> Result<(), Box<dyn StdError>> {
     }
 
     Ok(())
+}
+
+#[derive(Debug, Error)]
+enum ExampleError {
+    #[error(transparent)]
+    Llama(#[from] llama_rs::LlamaError),
+    #[error(transparent)]
+    Ggml(#[from] ggml_rs::Error),
+    #[error(transparent)]
+    Io(#[from] std::io::Error),
+    #[error(transparent)]
+    Boxed(#[from] Box<dyn StdError>),
 }
 
 fn ensure_no_read_flags(cli: &Cli, mode_name: &str) -> Result<(), Box<dyn StdError>> {

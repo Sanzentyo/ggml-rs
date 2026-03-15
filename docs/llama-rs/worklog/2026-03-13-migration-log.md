@@ -23,6 +23,12 @@
 - Returned to the stepwise optimization loop and captured a resumed layerwise profile (`block_layer=0..7`) on ELYZA:
   - raw: `target/benchmarks/llama_rs_stepwise_resume_elyza_layers0_7.txt`,
   - ranked summary: `target/benchmarks/llama_stepwise_resume_elyza_layers0_7_summary.md`.
+- Completed `thiserror` boundary rollout for remaining `llama-rs/examples` (`main -> Result<(), ExampleError>` + `run()` separation) and re-validated runtime smoke:
+  - `target/benchmarks/llama_rs_thiserror_rollout_runtime_smoke.txt`.
+- Added backend/context reuse for stepwise benchmark phases:
+  - new API: `run_attention_decode_stepwise_bench_with_cache_repeats_with_block_mlp`,
+  - `bench_attention_layer` now executes warmup+bench in one persistent stepwise allocation path for `--decode-steps`,
+  - runtime smoke artifact: `target/benchmarks/llama_rs_stepwise_backend_context_reuse_smoke.txt`.
 - Re-validated `llama-rs/examples/backend_smoke.rs` on CPU and Metal after the GGUF write-path expansion.
 - Expanded `ggml-rs` safe op surface for llama runtime needs: `add`, `mul`, `silu`, `rms_norm`, `scale`, `get_rows`, `repeat`, `cpy`, `cont`, `reshape_*`, `view_*`, `permute`, `diag_mask_inf`, `soft_max(_ext)`, `rope_ext`.
 - Added tensor naming (`set_name` / `name`) and backend `i32` tensor transfer helpers.
@@ -817,8 +823,97 @@
     - `bench_attention_layer` decode-stepwise smoke,
     - `bench_attention_decode_cpp_compare` stepwise smoke,
     - artifact: `target/benchmarks/llama_rs_clap_refactor_runtime_smoke.txt`.
+- Follow-up refactor (requested): switched clap-unified examples to `thiserror`-based typed error wrappers.
+  - added `thiserror` to `llama-rs` dev dependencies and replaced `main` result boundaries with per-example error enums.
+  - preserved existing behavior constraints and runtime command surfaces.
+  - re-validated with:
+    - `cargo fmt --all`
+    - `cargo clippy --workspace --all-targets`
+    - `cargo test --workspace`
+    - link-system runtime smoke artifact refreshed:
+      - `target/benchmarks/llama_rs_clap_refactor_runtime_smoke.txt`.
+- Step `1` resumed (layer-by-layer loop) immediately after clap+thiserror pass:
+  - profile capture (`block_layer=0..7`, ELYZA, current lock):
+    - raw: `target/benchmarks/llama_rs_stepwise_resume_after_clap_elyza_layers0_7.txt`,
+    - summaries:
+      - `target/benchmarks/llama_stepwise_resume_after_clap_elyza_layers0_7_summary.csv`,
+      - `target/benchmarks/llama_stepwise_resume_after_clap_elyza_layers0_7_summary.md`.
+  - hotspot snapshot:
+    - CPU top layer in this slice: `layer=4` (`47.741 ms/token`),
+    - MTL0 top layer in this slice: `layer=2` (`38.495 ms/token`).
+- Hotspot A/B sweeps (`block_layer=2..7`, same lock, ELYZA):
+  - `mask_host_elide`:
+    - impact: `target/benchmarks/llama_stepwise_resume_after_clap_elyza_layers2_7_maskhost_impact.md`,
+    - result: CPU `~1.008`, MTL0 `~1.008`, overall `~1.008` (`on/base`, regression).
+  - `head_stage_buf`:
+    - impact: `target/benchmarks/llama_stepwise_resume_after_clap_elyza_layers2_7_headstage_impact.md`,
+    - result: CPU `~0.993`, MTL0 `~1.007`, overall `~1.000` (near-neutral).
+  - `block_gateup_fused`:
+    - impact: `target/benchmarks/llama_stepwise_resume_after_clap_elyza_layers2_7_blockgateup_impact.md`,
+    - result: CPU `~0.999`, MTL0 `~1.001`, overall `~1.000` (near-neutral).
+  - `head_concat_balanced`:
+    - impact: `target/benchmarks/llama_stepwise_resume_after_clap_elyza_layers2_7_balconcat_impact.md`,
+    - result: CPU `~1.014`, MTL0 `~1.005`, overall `~1.010` (regression).
+  - delta toggle recheck:
+    - no-mask-delta impact:
+      - `target/benchmarks/llama_stepwise_resume_after_clap_elyza_layers2_7_maskdelta_impact.md`,
+      - means: CPU `~0.997`, MTL0 `~0.991`, overall `~0.994` (`variant/base`).
+    - no-position-delta impact:
+      - `target/benchmarks/llama_stepwise_resume_after_clap_elyza_layers2_7_positiondelta_impact.md`,
+      - means: CPU `~0.991`, MTL0 `~0.996`, overall `~0.994` (`variant/base`).
+- Delta-toggle stability reruns (`r=3` median) on the same hotspot window:
+  - artifact:
+    - `target/benchmarks/llama_stepwise_resume_after_clap_elyza_layers2_7_delta_stability_r3.md`
+  - stable means:
+    - `no-mask/base`: CPU `~0.996`, MTL0 `~0.999`, overall `~0.998`,
+    - `no-pos/base`: CPU `~0.997`, MTL0 `~1.001`, overall `~0.999`.
+  - decision:
+    - treat both deltas as near-neutral under this lock; keep current defaults unchanged.
+- Backend/context reuse follow-up (phase-init elision in warmup->bench path):
+  - implementation:
+    - keep per-call warmup+bench in one persistent stepwise allocation path,
+    - skip redundant KV/precompute reinit between warmup and measured phase when stepwise settings do not mutate persistent KV cache tensors (`kv_write_cache=false` path).
+  - validation:
+    - `cargo fmt --all`
+    - `cargo clippy --workspace --all-targets`
+    - `cargo test --workspace`
+    - smoke artifact:
+      - `target/benchmarks/llama_rs_stepwise_phase_init_elision_smoke.txt`
+  - ELYZA remeasure (`block_layer=5..7`, same `outproj_fused_layerx5` lock):
+    - raw:
+      - `target/benchmarks/llama_rs_stepwise_phase_init_elision_elyza_layers5_7.txt`
+    - impact:
+      - `target/benchmarks/llama_stepwise_phase_init_elision_elyza_layers5_7_impact.md`
+    - `new/base` avg_token:
+      - CPU `~0.629`, MTL0 `~0.549` (baseline from `llama_rs_stepwise_resume_after_clap_elyza_layers0_7.txt` subset `block_layer=5..7`).
+- Backend loader cleanup pass:
+  - added `ensure_backends_loaded()` (`OnceLock`) in `llama-rs/src/backend.rs`,
+  - replaced repeated `Backend::load_all()` calls in:
+    - `llama-rs/src/bench.rs`,
+    - `llama-rs/src/batched.rs`,
+    - `llama-rs/src/smoke.rs`,
+    - `llama-rs/src/inference.rs`.
+  - validation:
+    - `cargo fmt --all`
+    - `cargo clippy --workspace --all-targets`
+    - `cargo test --workspace`
+  - ELYZA remeasure (`block_layer=5..7`, same lock):
+    - raw:
+      - `target/benchmarks/llama_rs_stepwise_backend_load_once_elyza_layers5_7.txt`
+    - impact:
+      - `target/benchmarks/llama_stepwise_backend_load_once_elyza_layers5_7_impact.md`
+    - `new/base` avg_token vs phase-init-elision baseline:
+      - CPU `~1.013`, MTL0 `~1.000` (near-neutral).
+- Layer-loop reuse pass in benchmark harness:
+  - added block-MLP cache in `bench_attention_layer` keyed by `(hidden_features, block_layer)` to reuse resolved model-layer MLP weights across repeated case/layer sweeps.
+  - verification:
+    - `cargo fmt --all`
+    - `cargo clippy --workspace --all-targets`
+    - `cargo test --workspace`
+    - runtime cache-path smoke (duplicated case, CPU+Metal):
+      - `target/benchmarks/llama_rs_stepwise_layer_loop_reuse_cache_smoke.txt`.
 
 ## Next concrete steps
 
-1. Continue to the next operator hotspot on top of `layerx5 + static-KV` lock.
+1. Continue to the next operator hotspot on top of `layerx5 + static-KV` lock (after the phase-init elision pass).
 2. Keep balanced/static-KV, balanced-concat, position-delta, head-stage, and block-gate/up toggles available as comparison anchors for future passes.

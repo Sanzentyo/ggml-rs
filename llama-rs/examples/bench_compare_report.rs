@@ -8,8 +8,9 @@ use llama_rs::{
 use std::error::Error as StdError;
 use std::fs;
 use std::path::PathBuf;
+use thiserror::Error;
 
-fn main() -> Result<(), Box<dyn StdError>> {
+fn main() -> Result<(), ExampleError> {
     let config = Config::from_cli(Cli::parse());
 
     let mut cpp_rows = Vec::new();
@@ -30,6 +31,18 @@ fn main() -> Result<(), Box<dyn StdError>> {
 
     println!("{markdown}");
     Ok(())
+}
+
+#[derive(Debug, Error)]
+enum ExampleError {
+    #[error(transparent)]
+    BenchReport(#[from] llama_rs::BenchReportError),
+    #[error(transparent)]
+    Llama(#[from] llama_rs::LlamaError),
+    #[error(transparent)]
+    Io(#[from] std::io::Error),
+    #[error(transparent)]
+    Boxed(#[from] Box<dyn StdError>),
 }
 
 #[derive(Debug)]

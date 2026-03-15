@@ -17,6 +17,7 @@ xxhash-rust = { version = "0.8", features = ["xxh64"] }
 
 [dev-dependencies]
 clap = { version = "4.5", features = ["derive"] }
+thiserror = "2.0"
 
 [[example]]
 name = "backend_smoke"

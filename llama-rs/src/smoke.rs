@@ -1,4 +1,4 @@
-use crate::backend::LlamaBackend;
+use crate::backend::{LlamaBackend, ensure_backends_loaded};
 use std::error::Error as StdError;
 use std::fmt;
 
@@ -89,7 +89,7 @@ pub struct SmokeReport {
 }
 
 pub fn run_backend_smoke(backend: LlamaBackend) -> Result<SmokeReport> {
-    ggml_rs::Backend::load_all();
+    ensure_backends_loaded();
 
     let backend = ggml_rs::Backend::new(backend.into())
         .map_err(|source| SmokeError::ggml("Backend::new", source))?;

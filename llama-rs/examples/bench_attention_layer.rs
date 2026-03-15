@@ -7,12 +7,15 @@ use llama_rs::{
     LlamaLayerTensorNames, MlpInferenceConfig, MlpWeights, RopeConfig, RotaryEmbedding,
     build_attention_decode_cache, resolve_mlp_weights_for_layer_auto, resolve_transformer_metadata,
     run_attention_decode_proxy_with_cache_repeats,
+    run_attention_decode_stepwise_bench_with_cache_repeats_with_block_mlp,
     run_attention_decode_stepwise_with_cache_repeats_with_block_mlp,
     run_attention_inference_with_weights_repeats,
 };
+use std::collections::HashMap;
 use std::error::Error as StdError;
 use std::str::FromStr;
 use std::time::Instant;
+use thiserror::Error;
 
 fn build_stepwise_config(
     parsed: &ParsedArgs,
@@ -65,7 +68,7 @@ fn stepwise_profile_label(parsed: &ParsedArgs, layer_repeat: usize) -> &'static 
     }
 }
 
-fn main() -> Result<(), Box<dyn StdError>> {
+fn main() -> Result<(), ExampleError> {
     ggml_rs::init_timing();
     let parsed = parse_args()?;
     let block_mlp_model = if let Some(model_path) = parsed.block_mlp_model_path.as_deref() {
@@ -86,6 +89,7 @@ fn main() -> Result<(), Box<dyn StdError>> {
     } else {
         vec![parsed.block_mlp_layer]
     };
+    let mut block_mlp_cache: HashMap<(usize, usize), (MlpWeights, bool)> = HashMap::new();
     let mut preflight_cpu_done = false;
     let mut preflight_metal_done = false;
 
@@ -114,11 +118,16 @@ fn main() -> Result<(), Box<dyn StdError>> {
             .transpose()?;
         for block_layer in block_layers.iter().copied() {
             let block_mlp_weights = if let Some(model) = block_mlp_model.as_ref() {
-                Some(resolve_block_mlp_weights_for_layer(
-                    model,
-                    block_layer,
-                    case.hidden_features,
-                )?)
+                let cache_key = (case.hidden_features, block_layer);
+                if !block_mlp_cache.contains_key(&cache_key) {
+                    let resolved = resolve_block_mlp_weights_for_layer(
+                        model,
+                        block_layer,
+                        case.hidden_features,
+                    )?;
+                    block_mlp_cache.insert(cache_key, resolved);
+                }
+                block_mlp_cache.get(&cache_key)
             } else {
                 None
             };
@@ -154,28 +163,8 @@ fn main() -> Result<(), Box<dyn StdError>> {
                                 )?;
                             *preflight_done = true;
                         }
-                        if parsed.warmup_iters > 0 {
-                            let _ =
-                                run_attention_decode_stepwise_with_cache_repeats_with_block_mlp(
-                                    &weights,
-                                    &query_input,
-                                    cache,
-                                    backend,
-                                    build_stepwise_config(
-                                        &parsed,
-                                        backend,
-                                        key_value_length,
-                                        step_count,
-                                        parsed.warmup_iters,
-                                        layer_repeat,
-                                    ),
-                                    block_mlp_weights.as_ref().map(|entry| &entry.0),
-                                )?;
-                        }
-
-                        let start = Instant::now();
-                        let report =
-                            run_attention_decode_stepwise_with_cache_repeats_with_block_mlp(
+                        let bench_report =
+                            run_attention_decode_stepwise_bench_with_cache_repeats_with_block_mlp(
                                 &weights,
                                 &query_input,
                                 cache,
@@ -188,14 +177,11 @@ fn main() -> Result<(), Box<dyn StdError>> {
                                     parsed.bench_iters,
                                     layer_repeat,
                                 ),
+                                parsed.warmup_iters,
                                 block_mlp_weights.as_ref().map(|entry| &entry.0),
                             )?;
-                        let elapsed = start.elapsed();
-                        let total_step_iters = parsed
-                            .bench_iters
-                            .checked_mul(step_count)
-                            .ok_or("stepwise iteration count overflow")?;
-                        let avg_ms = elapsed.as_secs_f64() * 1000.0 / total_step_iters as f64;
+                        let report = &bench_report.execution;
+                        let avg_ms = bench_report.avg_token_ms();
                         let checksum: f64 = report
                             .output
                             .iter()
@@ -345,6 +331,40 @@ fn main() -> Result<(), Box<dyn StdError>> {
     }
 
     Ok(())
+}
+
+#[derive(Debug, Error)]
+enum ExampleError {
+    #[error("{0}")]
+    Message(String),
+    #[error(transparent)]
+    Model(#[from] llama_rs::ModelError),
+    #[error(transparent)]
+    Metadata(#[from] llama_rs::MetadataError),
+    #[error(transparent)]
+    Inference(#[from] llama_rs::InferenceError),
+    #[error(transparent)]
+    Llama(#[from] llama_rs::LlamaError),
+    #[error(transparent)]
+    Ggml(#[from] ggml_rs::Error),
+    #[error(transparent)]
+    Io(#[from] std::io::Error),
+    #[error(transparent)]
+    Utf8(#[from] std::string::FromUtf8Error),
+    #[error(transparent)]
+    Boxed(#[from] Box<dyn StdError>),
+}
+
+impl From<String> for ExampleError {
+    fn from(value: String) -> Self {
+        Self::Message(value)
+    }
+}
+
+impl From<&'static str> for ExampleError {
+    fn from(value: &'static str) -> Self {
+        Self::Message(value.to_owned())
+    }
 }
 
 #[derive(Debug, Clone, Copy)]

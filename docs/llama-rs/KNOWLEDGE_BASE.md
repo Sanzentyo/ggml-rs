@@ -59,6 +59,7 @@ DYLD_LIBRARY_PATH=target/vendor/ggml/build/src:target/vendor/ggml/build/src/ggml
 
 - `llama-rs/examples` argument parsing is standardized on typed `clap` derive structs.
 - This pass includes `bench_attention_layer`, `bench_attention_decode_cpp_compare`, `bench_compare_report`, `gguf`, `gguf_hash`, and `idle`.
+- Error boundaries for the clap-unified examples are standardized with `thiserror`-based typed enums.
 - `gguf` keeps legacy shorthand compatibility for read mode (`r1 n`) in addition to `--check/--no-check`.
 
 Clap-refactor runtime smoke artifact (CPU+Metal where applicable):
@@ -181,6 +182,28 @@ Artifacts:
 
 - raw: `target/benchmarks/llama_rs_stepwise_resume_elyza_layers0_7.txt`
 - ranked summary: `target/benchmarks/llama_stepwise_resume_elyza_layers0_7_summary.{csv,md}`
+
+Post-clap+thiserror resume artifacts (same ELYZA slice):
+
+- raw: `target/benchmarks/llama_rs_stepwise_resume_after_clap_elyza_layers0_7.txt`
+- ranked summary: `target/benchmarks/llama_stepwise_resume_after_clap_elyza_layers0_7_summary.{csv,md}`
+- hotspot A/B impacts (`block_layer=2..7`):
+  - `target/benchmarks/llama_stepwise_resume_after_clap_elyza_layers2_7_maskhost_impact.md`
+  - `target/benchmarks/llama_stepwise_resume_after_clap_elyza_layers2_7_headstage_impact.md`
+  - `target/benchmarks/llama_stepwise_resume_after_clap_elyza_layers2_7_blockgateup_impact.md`
+  - `target/benchmarks/llama_stepwise_resume_after_clap_elyza_layers2_7_balconcat_impact.md`
+  - `target/benchmarks/llama_stepwise_resume_after_clap_elyza_layers2_7_maskdelta_impact.md`
+  - `target/benchmarks/llama_stepwise_resume_after_clap_elyza_layers2_7_positiondelta_impact.md`
+  - stability rerun: `target/benchmarks/llama_stepwise_resume_after_clap_elyza_layers2_7_delta_stability_r3.md`
+- phase-init-elision follow-up (`block_layer=5..7`, same lock):
+  - raw: `target/benchmarks/llama_rs_stepwise_phase_init_elision_elyza_layers5_7.txt`
+  - smoke: `target/benchmarks/llama_rs_stepwise_phase_init_elision_smoke.txt`
+  - impact: `target/benchmarks/llama_stepwise_phase_init_elision_elyza_layers5_7_impact.md`
+- backend-load-once cleanup remeasure (`block_layer=5..7`, same lock):
+  - raw: `target/benchmarks/llama_rs_stepwise_backend_load_once_elyza_layers5_7.txt`
+  - impact: `target/benchmarks/llama_stepwise_backend_load_once_elyza_layers5_7_impact.md`
+- layer-loop reuse cache smoke (`bench_attention_layer` block-MLP cache path):
+  - `target/benchmarks/llama_rs_stepwise_layer_loop_reuse_cache_smoke.txt`
 
 Hotspot follow-up (`block_layer=5..7`, same profile lock):
 
@@ -473,6 +496,10 @@ Sample result:
 - quantized GGUF block-MLP tensors are now decoded through GGML type-traits (`to_float`) in `GgufModel::tensor_f32_values`, so q4/q5/q6 models can report `block_mlp_real=true`.
 - benchmark runner uses persistent graph/tensor allocations across all decode steps and only updates causal-mask/query-position tensors per step.
 - benchmark runner also performs one untimed backend preflight per backend to reduce first-case kernel compile bias.
+- in `--decode-steps` mode, warmup and measured iterations now share one persistent stepwise allocation path (`run_attention_decode_stepwise_bench_with_cache_repeats_with_block_mlp`) to avoid duplicate setup in benchmark sweeps.
+- in the same path, the measured phase now skips redundant KV/precompute reinit when warmup does not mutate persistent KV cache tensors (`kv_write_cache=false`), reducing phase boundary overhead.
+- backend registry loading in `llama-rs` runtime paths is now guarded by one-time init (`ensure_backends_loaded`) to avoid repeated `Backend::load_all()` calls.
+- when `--block-mlp-model` is used, `bench_attention_layer` now caches resolved block-MLP weights by `(hidden_features, block_layer)` across the run to reuse layer decodes in repeated case/layer sweeps.
 - argument parsing in `bench_attention_layer` is refactored to iterator-driven `next_arg(...)` handling; complex-flag smoke artifact: `target/benchmarks/llama_rs_parser_refactor_smoke.txt`.
 
 Canonical refresh sequence (parity default + variants):

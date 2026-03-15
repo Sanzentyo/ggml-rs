@@ -4,8 +4,13 @@ use clap::Parser;
 use llama_rs::{GgufModel, detect_layer_indices, resolve_llama_tensor_names};
 use std::error::Error as StdError;
 use std::path::PathBuf;
+use thiserror::Error;
 
-fn main() -> Result<(), Box<dyn StdError>> {
+fn main() -> Result<(), ExampleError> {
+    run().map_err(Into::into)
+}
+
+fn run() -> Result<(), Box<dyn StdError>> {
     let parsed = ParsedArgs::parse();
     let model = GgufModel::open(&parsed.model_path)?;
 
@@ -53,6 +58,10 @@ fn main() -> Result<(), Box<dyn StdError>> {
 
     Ok(())
 }
+
+#[derive(Debug, Error)]
+#[error(transparent)]
+struct ExampleError(#[from] Box<dyn StdError>);
 
 #[derive(Debug, Parser)]
 #[command(about = "Resolve layer tensor role names from GGUF", version, long_about = None)]

@@ -3,7 +3,7 @@
 //! This module intentionally focuses on a reusable matmul workload as a
 //! foundation for future token-level batch scheduling.
 
-use crate::backend::LlamaBackend;
+use crate::backend::{LlamaBackend, ensure_backends_loaded};
 use ggml_rs::{Backend, Context, Shape2D};
 use std::error::Error as StdError;
 use std::fmt;
@@ -322,7 +322,7 @@ pub fn run_batched_matmul_with_workload(
 ) -> Result<BatchedReport, BatchedError> {
     let config = workload.config.validated()?;
 
-    Backend::load_all();
+    ensure_backends_loaded();
 
     let backend = Backend::new(backend_kind.into())
         .map_err(|source| BatchedError::ggml("Backend::new", source))?;

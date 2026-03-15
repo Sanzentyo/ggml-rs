@@ -3,8 +3,13 @@
 use clap::Parser;
 use llama_rs::GgufModel;
 use std::error::Error as StdError;
+use thiserror::Error;
 
-fn main() -> Result<(), Box<dyn StdError>> {
+fn main() -> Result<(), ExampleError> {
+    run().map_err(Into::into)
+}
+
+fn run() -> Result<(), Box<dyn StdError>> {
     let cli = Cli::parse();
 
     let model = GgufModel::open(&cli.path)?;
@@ -49,6 +54,10 @@ fn main() -> Result<(), Box<dyn StdError>> {
 
     Ok(())
 }
+
+#[derive(Debug, Error)]
+#[error(transparent)]
+struct ExampleError(#[from] Box<dyn StdError>);
 
 #[derive(Debug, Parser)]
 #[command(about = "Inspect model tensor catalog and payloads", version, long_about = None)]

@@ -1,8 +1,13 @@
 use clap::Parser;
 use llama_rs::inspect_gguf;
 use std::error::Error as StdError;
+use thiserror::Error;
 
-fn main() -> Result<(), Box<dyn StdError>> {
+fn main() -> Result<(), ExampleError> {
+    run().map_err(Into::into)
+}
+
+fn run() -> Result<(), Box<dyn StdError>> {
     let cli = Cli::parse();
 
     let report = inspect_gguf(&cli.path)?;
@@ -37,6 +42,10 @@ fn main() -> Result<(), Box<dyn StdError>> {
 
     Ok(())
 }
+
+#[derive(Debug, Error)]
+#[error(transparent)]
+struct ExampleError(#[from] Box<dyn StdError>);
 
 #[derive(Debug, Parser)]
 #[command(about = "Inspect GGUF metadata and tensor table", version, long_about = None)]

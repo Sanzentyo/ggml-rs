@@ -2,6 +2,7 @@ use ggml_rs::BackendKind;
 use std::error::Error as StdError;
 use std::fmt;
 use std::str::FromStr;
+use std::sync::OnceLock;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum LlamaBackend {
@@ -25,6 +26,11 @@ impl From<LlamaBackend> for BackendKind {
             LlamaBackend::Metal => BackendKind::Metal,
         }
     }
+}
+
+pub(crate) fn ensure_backends_loaded() {
+    static BACKENDS_LOADED: OnceLock<()> = OnceLock::new();
+    BACKENDS_LOADED.get_or_init(ggml_rs::Backend::load_all);
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

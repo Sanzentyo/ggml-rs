@@ -1,4 +1,4 @@
-use crate::backend::LlamaBackend;
+use crate::backend::{LlamaBackend, ensure_backends_loaded};
 use ggml_rs::{Backend, Context, Shape2D};
 use std::error::Error as StdError;
 use std::fmt;
@@ -95,7 +95,7 @@ pub fn run_backend_matmul_bench(
         return Err(BenchError::InvalidBenchIters);
     }
 
-    Backend::load_all();
+    ensure_backends_loaded();
 
     let backend = Backend::new(backend_kind.into())
         .map_err(|source| BenchError::ggml("Backend::new", source))?;

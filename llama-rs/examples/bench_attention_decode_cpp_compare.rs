@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::str::FromStr;
 use std::time::Instant;
+use thiserror::Error;
 
 #[derive(Debug, Clone, Copy)]
 struct Case {
@@ -60,7 +61,7 @@ struct CppReport {
 
 type ParsedArgs = (Args, Vec<Case>, Vec<LlamaBackend>);
 
-fn main() -> Result<(), Box<dyn StdError>> {
+fn main() -> Result<(), ExampleError> {
     ggml_rs::init_timing();
     let (args, cases, backends) = parse_args()?;
     let cpp_binary = compile_cpp_reference()?;
@@ -218,6 +219,36 @@ fn main() -> Result<(), Box<dyn StdError>> {
     }
 
     Ok(())
+}
+
+#[derive(Debug, Error)]
+enum ExampleError {
+    #[error("{0}")]
+    Message(String),
+    #[error(transparent)]
+    Inference(#[from] llama_rs::InferenceError),
+    #[error(transparent)]
+    Llama(#[from] llama_rs::LlamaError),
+    #[error(transparent)]
+    Ggml(#[from] ggml_rs::Error),
+    #[error(transparent)]
+    Io(#[from] std::io::Error),
+    #[error(transparent)]
+    Utf8(#[from] std::string::FromUtf8Error),
+    #[error(transparent)]
+    Boxed(#[from] Box<dyn StdError>),
+}
+
+impl From<String> for ExampleError {
+    fn from(value: String) -> Self {
+        Self::Message(value)
+    }
+}
+
+impl From<&'static str> for ExampleError {
+    fn from(value: &'static str) -> Self {
+        Self::Message(value.to_owned())
+    }
 }
 
 fn backend_name(backend: LlamaBackend) -> &'static str {

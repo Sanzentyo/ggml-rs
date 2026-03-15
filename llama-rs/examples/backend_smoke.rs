@@ -1,8 +1,13 @@
 use clap::{Parser, ValueEnum};
 use llama_rs::{LlamaBackend, run_backend_smoke};
 use std::error::Error as StdError;
+use thiserror::Error;
 
-fn main() -> Result<(), Box<dyn StdError>> {
+fn main() -> Result<(), ExampleError> {
+    run().map_err(Into::into)
+}
+
+fn run() -> Result<(), Box<dyn StdError>> {
     ggml_rs::init_timing();
 
     let cli = Cli::parse();
@@ -22,6 +27,10 @@ fn main() -> Result<(), Box<dyn StdError>> {
 
     Ok(())
 }
+
+#[derive(Debug, Error)]
+#[error(transparent)]
+struct ExampleError(#[from] Box<dyn StdError>);
 
 #[derive(Debug, Clone, Parser)]
 #[command(about = "Run backend smoke checks", version, long_about = None)]

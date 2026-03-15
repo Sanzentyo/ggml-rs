@@ -2,8 +2,9 @@ use clap::Parser;
 use llama_rs::{HashAlgorithm, HashOptions, HashRecord, hash_file};
 use std::collections::HashMap;
 use std::error::Error as StdError;
+use thiserror::Error;
 
-fn main() -> Result<(), Box<dyn StdError>> {
+fn main() -> Result<(), ExampleError> {
     let options = CliOptions::from_cli(Cli::parse());
     let records = hash_file(&options.input, &options.hash_options)?;
 
@@ -21,6 +22,16 @@ fn main() -> Result<(), Box<dyn StdError>> {
     }
 
     Ok(())
+}
+
+#[derive(Debug, Error)]
+enum ExampleError {
+    #[error(transparent)]
+    Llama(#[from] llama_rs::LlamaError),
+    #[error(transparent)]
+    Io(#[from] std::io::Error),
+    #[error(transparent)]
+    Boxed(#[from] Box<dyn StdError>),
 }
 
 #[derive(Debug, Clone)]
