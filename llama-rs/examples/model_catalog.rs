@@ -1,13 +1,13 @@
 //! Model catalog demo for GGUF metadata + tensor payload validation.
 
+use clap::Parser;
 use llama_rs::GgufModel;
 use std::error::Error as StdError;
 
 fn main() -> Result<(), Box<dyn StdError>> {
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    let (path, head, checks) = parse_args(&args)?;
+    let cli = Cli::parse();
 
-    let model = GgufModel::open(path)?;
+    let model = GgufModel::open(&cli.path)?;
     let report = model.report();
 
     println!("path:         {}", model.path().display());
@@ -18,8 +18,8 @@ fn main() -> Result<(), Box<dyn StdError>> {
     println!("n_kv:         {}", report.kv_entries.len());
     println!("n_tensors:    {}", report.tensors.len());
 
-    println!("\n[tensors head={head}]");
-    for tensor in report.tensors.iter().take(head) {
+    println!("\n[tensors head={}]", cli.head);
+    for tensor in report.tensors.iter().take(cli.head) {
         let payload = model.tensor_payload(&tensor.name)?;
         println!(
             "- name={} type={}({}) size={} offset={} payload_len={}",
@@ -32,9 +32,9 @@ fn main() -> Result<(), Box<dyn StdError>> {
         );
     }
 
-    if !checks.is_empty() {
+    if !cli.check_tensors.is_empty() {
         println!("\n[check tensors]");
-        for name in checks {
+        for name in cli.check_tensors {
             let info = model.tensor_info(&name)?;
             let payload = model.tensor_payload(&name)?;
             println!(
@@ -50,43 +50,15 @@ fn main() -> Result<(), Box<dyn StdError>> {
     Ok(())
 }
 
-fn parse_args(args: &[String]) -> Result<(&str, usize, Vec<String>), Box<dyn StdError>> {
-    let mut path = None;
-    let mut head = 10usize;
-    let mut checks = Vec::new();
-
-    let mut index = 0usize;
-    while index < args.len() {
-        match args[index].as_str() {
-            "--head" => {
-                index += 1;
-                let Some(value) = args.get(index) else {
-                    return Err("missing value after --head".into());
-                };
-                head = value
-                    .parse::<usize>()
-                    .map_err(|error| format!("invalid --head value `{value}` ({error})"))?;
-            }
-            "--check-tensor" => {
-                index += 1;
-                let Some(value) = args.get(index) else {
-                    return Err("missing value after --check-tensor".into());
-                };
-                checks.push(value.clone());
-            }
-            token => {
-                if path.is_none() {
-                    path = Some(token);
-                } else {
-                    return Err(format!("unexpected argument `{token}`").into());
-                }
-            }
-        }
-        index += 1;
-    }
-
-    let Some(path) = path else {
-        return Err("usage: cargo run -p llama-rs --example model_catalog --features link-system -- <model.gguf> [--head N] [--check-tensor NAME ...]".into());
-    };
-    Ok((path, head, checks))
+#[derive(Debug, Parser)]
+#[command(about = "Inspect model tensor catalog and payloads", version, long_about = None)]
+struct Cli {
+    /// Path to GGUF model.
+    path: String,
+    /// Number of leading tensor rows to print.
+    #[arg(long, default_value_t = 10)]
+    head: usize,
+    /// Tensor names to inspect in detail.
+    #[arg(long = "check-tensor")]
+    check_tensors: Vec<String>,
 }

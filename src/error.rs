@@ -69,6 +69,9 @@ pub enum Error {
 
     #[error("ggml graph compute failed with status {0}")]
     ComputeFailed(i32),
+
+    #[error("gguf_write_to_file reported failure")]
+    GgufWriteFailed,
 }
 
 impl Error {

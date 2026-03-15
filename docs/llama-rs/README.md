@@ -32,11 +32,17 @@ This preflight step is mandatory and must be done before coding.
 ## Current runtime foundations
 
 - `model`: GGUF load + tensor lookup + payload validation, with handle-based lookup (`TensorHandle`) for repeated access and typed KV access (`kv_value`).
+- `gguf`: typed GGUF inspection (`gguf_inspect`) plus deterministic read/write fixture flow (`gguf` example with `w` / `r0` / `r1` / `r`) on safe API only.
 - `embedding`: f32 tensor summary helpers for embedding-oriented workflows.
 - `batched`: backend graph reuse and batched matmul execution scaffolding.
 - `metadata`: architecture-aware GGUF metadata ADTs (`ModelArchitecture`, `TransformerMetadata`, `ModelMetadata`, `LlamaModelMetadata`) for config derivation across architecture-prefixed GGUF keys.
-- `inference`: minimal linear inference (`Y = W * X`), MLP-block inference, layer-index GGUF-backed MLP execution, layer-dimension auto-resolution (`resolve_llama_layer_dimensions`, with `FullMetadata` / `TensorHeuristic` resolution mode), and ADT-based attention path (multi-head + optional causal mask + optional RoPE).
+- `inference`: minimal linear inference (`Y = W * X`), MLP-block inference, layer-index GGUF-backed MLP execution, layer-dimension auto-resolution (`resolve_llama_layer_dimensions`, with `FullMetadata` / `TensorHeuristic` resolution mode), ADT-based attention path (multi-head + optional causal mask + optional RoPE), decode-like proxy path with projected KV cache reuse, and persistent stepwise decode-growth helpers for token-by-token benchmark simulation.
+- `idle`: decode-proxy idle runner (`run_idle_decode_proxy` + `examples/idle`) with state-typed pause schedule (`IdlePauseSchedule<PauseScheduleReady>`) and pause-vs-latency reporting on CPU/Metal. For mixed/non-llama architectures, it attempts real layer resolution first and reports explicit fallback mode (`weights_mode=MetadataDeterministic`) when metadata-derived deterministic weights are used.
+- `bench_attention_layer` profile presets: `--decode-stepwise-profile-outproj-fused-layerx5` and `--decode-stepwise-profile-outproj-fused-balanced` for reproducible calibration modes on CPU/Metal, plus:
+  - `--decode-stepwise-{no-}static-kv-head-precompute` for static KV-head transform precompute A/B,
+  - `--decode-stepwise-{no-}balanced-head-concat` for fused-output head-concat strategy A/B,
+  - `--decode-stepwise-{no-}position-delta` for incremental QUERY_POS update strategy A/B.
 - `naming`: GGUF tensor-name resolver (`blk.*` / `layers.*` / `model.layers.*`) for real-model wiring.
 - Type-safety additions: feature-count newtypes and type-state builder for linear inference config, plus non-zero schedule newtypes for batched execution.
 - Public error boundary: crate-level `LlamaError` / `LlamaResult<T>` for cross-module integration.
-- Coverage additions: name-resolver unit tests, metadata parser unit tests, ggml-based C++ parity + CPU/Metal parity tests (`mlp_cpp_parity`), attention CPU/Metal parity + causal CPU test (`attention_parity`), and multi-case MLP-layer benchmark (`bench_mlp_layer`).
+- Coverage additions: name-resolver unit tests, metadata parser unit tests, ggml-based C++ parity + CPU/Metal parity tests (`mlp_cpp_parity`), attention CPU/Metal parity + causal CPU test (`attention_parity`), and multi-case layer benchmarks (`bench_mlp_layer`, `bench_attention_layer`).

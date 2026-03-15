@@ -10,6 +10,8 @@ centered on `Context`, `Tensor`, `Graph`, and `Backend`.
 
 - Explicit low-level-style API through `Context` methods (`mul_mat`, `add`,
   `rms_norm`, `rope_ext`, ...).
+- Backend execution includes explicit synchronization support via
+  `Backend::synchronize()` for stable benchmark timing/readback boundaries.
 - Expression API via `TensorExpr` with operator overloading (`+`, `-`, `*`,
   `/`) that still returns `Result<_>`.
 - Typed backend I/O through `BackendElement`.
@@ -30,7 +32,7 @@ let out = expr?.into_tensor();
 - `src/shape.rs`: semantic newtypes and static-shape traits
 - `src/types.rs`: `Type`, `BackendKind`, `BackendDeviceType`, `ComputeStatus`, `RopeExtParams`
 - `src/num_ext.rs`: checked conversion/arithmetic helpers
-- `src/gguf.rs`: safe GGUF inspection helpers
+- `src/gguf.rs`: safe GGUF inspection and writing helpers (`GgufFile`, `GgufWriter`)
 - `src/tensor_expr.rs`: expression wrapper and operator impls
 - `src/typed_tensor.rs`: typed tensor wrappers (`Tensor2D`, `Tensor2DConst`)
 - `src/compute.rs`: context/backend/tensor/graph implementations
@@ -44,16 +46,15 @@ The default path uses `bindgen` (common Rust C-FFI workflow):
 - `build.rs` generates bindings from ggml headers into `$OUT_DIR/ffi_bindings.rs`
 - `src/ffi.rs` includes those generated bindings
 
-Fallback path:
+- Header resolution order:
+  1. `GGML_RS_GGML_INCLUDE_DIR`
+  2. `vendor/ggml/include` (submodule layout)
+  3. `target/vendor/ggml/include` (legacy local layout)
 
-- `GGML_RS_DISABLE_BINDGEN=1` switches to checked-in fallback bindings (`src/ffi_manual.rs`)
-- fallback mode can still auto-generate numeric constants via:
+If headers are missing, initialize submodules:
 
 ```bash
-GGML_RS_DISABLE_BINDGEN=1 \
-GGML_RS_AUTOGEN_FFI_CONSTS=1 \
-GGML_RS_GGML_INCLUDE_DIR=target/vendor/ggml/include \
-cargo test --workspace
+git submodule update --init --recursive
 ```
 
 ## Error handling policy

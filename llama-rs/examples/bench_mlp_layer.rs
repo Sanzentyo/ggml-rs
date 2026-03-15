@@ -1,15 +1,15 @@
 //! Benchmark runner for minimal MLP block inference.
 
+use clap::{Parser, ValueEnum};
 use llama_rs::{
     LlamaBackend, MlpInferenceConfig, MlpWeights, run_mlp_inference_with_weights_repeats,
 };
 use std::error::Error as StdError;
-use std::str::FromStr;
 use std::time::Instant;
 
 fn main() -> Result<(), Box<dyn StdError>> {
     ggml_rs::init_timing();
-    let parsed = parse_args(std::env::args().skip(1))?;
+    let parsed = ParsedArgs::from_cli(Cli::parse())?;
 
     for &(hidden_features, ffn_features) in &parsed.cases {
         let config = MlpInferenceConfig::new(hidden_features, ffn_features)?;
@@ -59,97 +59,59 @@ struct ParsedArgs {
     backends: Vec<LlamaBackend>,
 }
 
-fn parse_args(args: impl Iterator<Item = String>) -> Result<ParsedArgs, Box<dyn StdError>> {
-    let mut hidden_features = 64usize;
-    let mut ffn_features = 128usize;
-    let mut cases: Vec<(usize, usize)> = Vec::new();
-    let mut warmup_iters = 3usize;
-    let mut bench_iters = 30usize;
-    let mut backends = Vec::new();
-
-    let mut pending_hidden = false;
-    let mut pending_ffn = false;
-    let mut pending_cases = false;
-    let mut pending_warmup = false;
-    let mut pending_iters = false;
-
-    for arg in args {
-        if pending_hidden {
-            hidden_features = parse_usize_arg("--hidden", &arg)?;
-            pending_hidden = false;
-            continue;
+impl ParsedArgs {
+    fn from_cli(cli: Cli) -> Result<Self, Box<dyn StdError>> {
+        if cli.bench_iters == 0 {
+            return Err("--iters must be greater than zero".into());
         }
-        if pending_ffn {
-            ffn_features = parse_usize_arg("--ffn", &arg)?;
-            pending_ffn = false;
-            continue;
-        }
-        if pending_cases {
-            cases = parse_cases_arg(&arg)?;
-            pending_cases = false;
-            continue;
-        }
-        if pending_warmup {
-            warmup_iters = parse_usize_arg("--warmup", &arg)?;
-            pending_warmup = false;
-            continue;
-        }
-        if pending_iters {
-            bench_iters = parse_usize_arg("--iters", &arg)?;
-            pending_iters = false;
-            continue;
-        }
-
-        match arg.as_str() {
-            "--hidden" => pending_hidden = true,
-            "--ffn" => pending_ffn = true,
-            "--cases" => pending_cases = true,
-            "--warmup" => pending_warmup = true,
-            "--iters" => pending_iters = true,
-            token => backends.push(LlamaBackend::from_str(token)?),
-        }
+        let cases = match cli.cases.as_deref() {
+            Some(value) => parse_cases_arg(value)?,
+            None => vec![(cli.hidden_features, cli.ffn_features)],
+        };
+        let backends = if cli.backends.is_empty() {
+            vec![BackendArg::Cpu, BackendArg::Metal]
+        } else {
+            cli.backends
+        };
+        Ok(Self {
+            cases,
+            warmup_iters: cli.warmup_iters,
+            bench_iters: cli.bench_iters,
+            backends: backends.into_iter().map(Into::into).collect(),
+        })
     }
-
-    if pending_hidden {
-        return Err("missing value after --hidden".into());
-    }
-    if pending_ffn {
-        return Err("missing value after --ffn".into());
-    }
-    if pending_cases {
-        return Err("missing value after --cases".into());
-    }
-    if pending_warmup {
-        return Err("missing value after --warmup".into());
-    }
-    if pending_iters {
-        return Err("missing value after --iters".into());
-    }
-    if bench_iters == 0 {
-        return Err("--iters must be greater than zero".into());
-    }
-
-    if backends.is_empty() {
-        backends.push(LlamaBackend::Cpu);
-        backends.push(LlamaBackend::Metal);
-    }
-
-    if cases.is_empty() {
-        cases.push((hidden_features, ffn_features));
-    }
-
-    Ok(ParsedArgs {
-        cases,
-        warmup_iters,
-        bench_iters,
-        backends,
-    })
 }
 
-fn parse_usize_arg(flag: &str, value: &str) -> Result<usize, Box<dyn StdError>> {
-    value
-        .parse::<usize>()
-        .map_err(|error| format!("invalid value for {flag}: {value} ({error})").into())
+#[derive(Debug, Clone, Parser)]
+#[command(about = "Benchmark deterministic MLP layer workload", version, long_about = None)]
+struct Cli {
+    #[arg(long = "hidden", default_value_t = 64)]
+    hidden_features: usize,
+    #[arg(long = "ffn", default_value_t = 128)]
+    ffn_features: usize,
+    #[arg(long = "cases")]
+    cases: Option<String>,
+    #[arg(long = "warmup", default_value_t = 3)]
+    warmup_iters: usize,
+    #[arg(long = "iters", default_value_t = 30)]
+    bench_iters: usize,
+    #[arg(value_enum)]
+    backends: Vec<BackendArg>,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum BackendArg {
+    Cpu,
+    Metal,
+}
+
+impl From<BackendArg> for LlamaBackend {
+    fn from(value: BackendArg) -> Self {
+        match value {
+            BackendArg::Cpu => LlamaBackend::Cpu,
+            BackendArg::Metal => LlamaBackend::Metal,
+        }
+    }
 }
 
 fn parse_cases_arg(value: &str) -> Result<Vec<(usize, usize)>, Box<dyn StdError>> {
@@ -162,8 +124,12 @@ fn parse_cases_arg(value: &str) -> Result<Vec<(usize, usize)>, Box<dyn StdError>
         let (hidden, ffn) = token
             .split_once('x')
             .ok_or_else(|| format!("invalid case `{token}` (expected HxF)"))?;
-        let hidden = parse_usize_arg("--cases", hidden)?;
-        let ffn = parse_usize_arg("--cases", ffn)?;
+        let hidden = hidden
+            .parse::<usize>()
+            .map_err(|error| format!("invalid hidden value in --cases `{hidden}` ({error})"))?;
+        let ffn = ffn
+            .parse::<usize>()
+            .map_err(|error| format!("invalid ffn value in --cases `{ffn}` ({error})"))?;
         cases.push((hidden, ffn));
     }
     if cases.is_empty() {

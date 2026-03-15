@@ -1,9 +1,10 @@
+use clap::Parser;
 use llama_rs::{HashAlgorithm, HashOptions, HashRecord, hash_file};
 use std::collections::HashMap;
 use std::error::Error as StdError;
 
 fn main() -> Result<(), Box<dyn StdError>> {
-    let options = parse_options(std::env::args().skip(1))?;
+    let options = CliOptions::from_cli(Cli::parse());
     let records = hash_file(&options.input, &options.hash_options)?;
 
     if let Some(manifest) = &options.check_manifest {
@@ -29,82 +30,71 @@ struct CliOptions {
     check_manifest: Option<String>,
 }
 
-fn parse_options(args: impl Iterator<Item = String>) -> Result<CliOptions, Box<dyn StdError>> {
-    let mut args = args.peekable();
-    let mut include_layers = true;
-    let mut check_manifest = None;
-    let mut selected = Vec::new();
-    let mut input = None;
-
-    while let Some(arg) = args.next() {
-        match arg.as_str() {
-            "--xxh64" => selected.push(HashAlgorithm::Xxh64),
-            "--sha1" => selected.push(HashAlgorithm::Sha1),
-            "--sha256" => selected.push(HashAlgorithm::Sha256),
-            "--uuid" => selected.push(HashAlgorithm::Uuid),
-            "--all" => selected.extend([
+impl CliOptions {
+    fn from_cli(cli: Cli) -> Self {
+        let mut selected = Vec::new();
+        if cli.xxh64 {
+            selected.push(HashAlgorithm::Xxh64);
+        }
+        if cli.sha1 {
+            selected.push(HashAlgorithm::Sha1);
+        }
+        if cli.sha256 {
+            selected.push(HashAlgorithm::Sha256);
+        }
+        if cli.uuid {
+            selected.push(HashAlgorithm::Uuid);
+        }
+        if cli.all {
+            selected.extend([
                 HashAlgorithm::Xxh64,
                 HashAlgorithm::Sha1,
                 HashAlgorithm::Sha256,
-            ]),
-            "--no-layer" => include_layers = false,
-            "-c" | "--check" => {
-                let Some(path) = args.next() else {
-                    return Err("missing manifest path after --check".into());
-                };
-                check_manifest = Some(path);
-            }
-            "-h" | "--help" => {
-                print_usage();
-                std::process::exit(0);
-            }
-            _ if arg.starts_with('-') => {
-                return Err(format!("unknown option: {arg}").into());
-            }
-            _ => {
-                input = Some(arg);
-                break;
-            }
+            ]);
+        }
+        if selected.is_empty() {
+            selected.push(HashAlgorithm::Xxh64);
+        }
+        selected.sort_unstable_by_key(|algo| algo.as_label());
+        selected.dedup();
+
+        Self {
+            input: cli.input,
+            hash_options: HashOptions {
+                algorithms: selected,
+                include_layers: !cli.no_layer,
+            },
+            check_manifest: cli.check_manifest,
         }
     }
-
-    if input.is_none() {
-        input = args.next();
-    }
-
-    let Some(input) = input else {
-        print_usage();
-        return Err("missing input gguf path".into());
-    };
-
-    if selected.is_empty() {
-        selected.push(HashAlgorithm::Xxh64);
-    }
-    selected.sort_unstable_by_key(|algo| algo.as_label());
-    selected.dedup();
-
-    Ok(CliOptions {
-        input,
-        hash_options: HashOptions {
-            algorithms: selected,
-            include_layers,
-        },
-        check_manifest,
-    })
 }
 
-fn print_usage() {
-    eprintln!(
-        "usage: cargo run -p llama-rs --example gguf_hash --features link-system -- [options] <file.gguf>"
-    );
-    eprintln!("options:");
-    eprintln!("  --xxh64             use xxh64 hash");
-    eprintln!("  --sha1              use sha1 hash");
-    eprintln!("  --sha256            use sha256 hash");
-    eprintln!("  --uuid              generate UUIDv5");
-    eprintln!("  --all               use xxh64 + sha1 + sha256");
-    eprintln!("  --no-layer          exclude per-layer hashes");
-    eprintln!("  -c, --check <file>  verify against a manifest");
+#[derive(Debug, Clone, Parser)]
+#[command(about = "Hash GGUF file sections and optional layer ranges", version, long_about = None)]
+struct Cli {
+    /// Include xxh64.
+    #[arg(long)]
+    xxh64: bool,
+    /// Include sha1.
+    #[arg(long)]
+    sha1: bool,
+    /// Include sha256.
+    #[arg(long)]
+    sha256: bool,
+    /// Include UUIDv5 from hash material.
+    #[arg(long)]
+    uuid: bool,
+    /// Include xxh64 + sha1 + sha256.
+    #[arg(long)]
+    all: bool,
+    /// Exclude per-layer hashes.
+    #[arg(long = "no-layer")]
+    no_layer: bool,
+    /// Verify against manifest.
+    #[arg(long = "check", short = 'c')]
+    check_manifest: Option<String>,
+    /// Input GGUF file.
+    input: String,
 }
 
 fn verify_manifest(manifest: &str, records: &[HashRecord]) -> Result<(), Box<dyn StdError>> {

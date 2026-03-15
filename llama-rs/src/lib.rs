@@ -1,10 +1,12 @@
 pub mod backend;
 pub mod batched;
 pub mod bench;
+pub mod bench_report;
 pub mod embedding;
 pub mod error;
 pub mod gguf;
 pub mod gguf_hash;
+pub mod idle;
 pub mod inference;
 pub mod metadata;
 pub mod model;
@@ -18,19 +20,35 @@ pub use batched::{
     RepeatCount, run_batched_matmul, run_batched_matmul_with_workload,
 };
 pub use bench::{BenchError, MatmulBenchConfig, MatmulBenchReport, run_backend_matmul_bench};
+pub use bench_report::{
+    AttentionBenchRow, BenchBackend, BenchReportError, LlamaCppBenchRow, MlpBenchRow,
+    parse_attention_bench_output, parse_llama_cpp_jsonl, parse_mlp_bench_output,
+    render_markdown_summary,
+};
 pub use embedding::{EmbeddingError, EmbeddingStats, summarize_embedding_tensor};
 pub use error::{LlamaError, LlamaResult};
 pub use ggml_rs::{GgufArrayValue, GgufValue};
 pub use gguf::{GgufKvEntry, GgufReport, inspect_gguf};
 pub use gguf_hash::{GgufHashError, HashAlgorithm, HashOptions, HashRecord, hash_file};
+pub use idle::{
+    IdleConfig, IdleError, IdlePauseReport, IdlePauseSchedule, IdleReport, IdleWeightsMode,
+    PauseScheduleEmpty, PauseScheduleReady, run_idle_decode_proxy, run_idle_decode_proxy_from_path,
+};
 pub use inference::{
-    AttentionHeadCount, AttentionHeadDimension, AttentionInferenceConfig, AttentionInferenceReport,
-    AttentionLayout, AttentionMaskPolicy, AttentionWeights, FfnFeatures, HiddenFeatures,
-    InFeatures, InferenceError, LinearInferenceConfig, LinearInferenceReport, LinearWeights,
-    LlamaLayerDimensions, MetadataResolutionMode, MlpInferenceConfig, MlpInferenceReport,
-    MlpWeights, OutFeatures, RopeConfig, RotaryEmbedding, resolve_attention_weights_for_layer,
+    AttentionDecodeCache, AttentionDecodeProxyReport, AttentionDecodeStepwiseConfig,
+    AttentionDecodeStepwiseReport, AttentionHeadCount, AttentionHeadDimension,
+    AttentionInferenceConfig, AttentionInferenceReport, AttentionLayout, AttentionMaskPolicy,
+    AttentionWeights, FfnFeatures, HiddenFeatures, InFeatures, InferenceError,
+    LinearInferenceConfig, LinearInferenceReport, LinearWeights, LlamaLayerDimensions,
+    MetadataResolutionMode, MlpInferenceConfig, MlpInferenceReport, MlpWeights, OutFeatures,
+    RopeConfig, RotaryEmbedding, build_attention_decode_cache, resolve_attention_weights_for_layer,
     resolve_attention_weights_for_layer_auto, resolve_llama_layer_dimensions,
     resolve_mlp_weights_for_layer, resolve_mlp_weights_for_layer_auto,
+    run_attention_decode_proxy_with_cache, run_attention_decode_proxy_with_cache_repeats,
+    run_attention_decode_proxy_with_cache_repeats_with_past,
+    run_attention_decode_proxy_with_weights, run_attention_decode_proxy_with_weights_repeats,
+    run_attention_decode_stepwise_with_cache_repeats,
+    run_attention_decode_stepwise_with_cache_repeats_with_block_mlp,
     run_attention_inference_for_layer, run_attention_inference_for_layer_auto,
     run_attention_inference_for_layer_auto_repeats, run_attention_inference_for_layer_repeats,
     run_attention_inference_with_weights, run_attention_inference_with_weights_repeats,

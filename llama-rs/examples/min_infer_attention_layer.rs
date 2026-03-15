@@ -1,5 +1,6 @@
 //! Resolve-by-layer minimal attention inference demo.
 
+use clap::{Parser, ValueEnum};
 use llama_rs::{
     AttentionMaskPolicy, GgufModel, LlamaBackend, RotaryEmbedding,
     resolve_attention_weights_for_layer_auto, resolve_llama_layer_dimensions,
@@ -7,12 +8,11 @@ use llama_rs::{
 };
 use std::error::Error as StdError;
 use std::path::PathBuf;
-use std::str::FromStr;
 
 fn main() -> Result<(), Box<dyn StdError>> {
     ggml_rs::init_timing();
 
-    let parsed = parse_args(std::env::args().skip(1))?;
+    let parsed = ParsedArgs::from_cli(Cli::parse());
     let model = GgufModel::open(&parsed.model_path)?;
     let dimensions = resolve_llama_layer_dimensions(&model, parsed.layer)?;
     let mut weights =
@@ -66,84 +66,58 @@ struct ParsedArgs {
     backends: Vec<LlamaBackend>,
 }
 
-fn parse_args(args: impl Iterator<Item = String>) -> Result<ParsedArgs, Box<dyn StdError>> {
-    let mut model_path: Option<PathBuf> = None;
-    let mut layer = 0usize;
-    let mut sequence_length = 4usize;
-    let mut repeats = 1usize;
-    let mut causal = false;
-    let mut no_rope = false;
-    let mut backends = Vec::new();
-
-    let mut pending_layer = false;
-    let mut pending_seq = false;
-    let mut pending_repeats = false;
-
-    for arg in args {
-        if pending_layer {
-            layer = parse_usize_arg("--layer", &arg)?;
-            pending_layer = false;
-            continue;
-        }
-        if pending_seq {
-            sequence_length = parse_usize_arg("--seq", &arg)?;
-            pending_seq = false;
-            continue;
-        }
-        if pending_repeats {
-            repeats = parse_usize_arg("--repeats", &arg)?;
-            pending_repeats = false;
-            continue;
-        }
-
-        match arg.as_str() {
-            "--layer" => pending_layer = true,
-            "--seq" => pending_seq = true,
-            "--repeats" | "-n" => pending_repeats = true,
-            "--causal" => causal = true,
-            "--no-rope" => no_rope = true,
-            token => {
-                if model_path.is_none() {
-                    model_path = Some(PathBuf::from(token));
-                } else {
-                    backends.push(LlamaBackend::from_str(token)?);
-                }
-            }
+impl ParsedArgs {
+    fn from_cli(cli: Cli) -> Self {
+        let backends = if cli.backends.is_empty() {
+            vec![BackendArg::Cpu, BackendArg::Metal]
+        } else {
+            cli.backends
+        };
+        Self {
+            model_path: cli.model_path,
+            layer: cli.layer,
+            sequence_length: cli.sequence_length,
+            repeats: cli.repeats,
+            causal: cli.causal,
+            no_rope: cli.no_rope,
+            backends: backends.into_iter().map(Into::into).collect(),
         }
     }
-
-    if pending_layer {
-        return Err("missing value after --layer".into());
-    }
-    if pending_seq {
-        return Err("missing value after --seq".into());
-    }
-    if pending_repeats {
-        return Err("missing value after --repeats".into());
-    }
-
-    let model_path = model_path.ok_or(
-        "usage: min_infer_attention_layer <gguf-path> [--layer N] [--seq S] [--causal] [--no-rope] [--repeats N] [cpu|metal ...]",
-    )?;
-
-    if backends.is_empty() {
-        backends.push(LlamaBackend::Cpu);
-        backends.push(LlamaBackend::Metal);
-    }
-
-    Ok(ParsedArgs {
-        model_path,
-        layer,
-        sequence_length,
-        repeats,
-        causal,
-        no_rope,
-        backends,
-    })
 }
 
-fn parse_usize_arg(flag: &str, value: &str) -> Result<usize, Box<dyn StdError>> {
-    value
-        .parse::<usize>()
-        .map_err(|error| format!("invalid value for {flag}: {value} ({error})").into())
+#[derive(Debug, Clone, Parser)]
+#[command(
+    about = "Run attention inference by resolved layer index",
+    version,
+    long_about = None
+)]
+struct Cli {
+    model_path: PathBuf,
+    #[arg(long, default_value_t = 0)]
+    layer: usize,
+    #[arg(long = "seq", default_value_t = 4)]
+    sequence_length: usize,
+    #[arg(long, short = 'n', default_value_t = 1)]
+    repeats: usize,
+    #[arg(long)]
+    causal: bool,
+    #[arg(long = "no-rope")]
+    no_rope: bool,
+    #[arg(value_enum)]
+    backends: Vec<BackendArg>,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum BackendArg {
+    Cpu,
+    Metal,
+}
+
+impl From<BackendArg> for LlamaBackend {
+    fn from(value: BackendArg) -> Self {
+        match value {
+            BackendArg::Cpu => LlamaBackend::Cpu,
+            BackendArg::Metal => LlamaBackend::Metal,
+        }
+    }
 }

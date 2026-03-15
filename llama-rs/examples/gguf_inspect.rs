@@ -1,15 +1,11 @@
+use clap::Parser;
 use llama_rs::inspect_gguf;
 use std::error::Error as StdError;
 
 fn main() -> Result<(), Box<dyn StdError>> {
-    let Some(path) = std::env::args().nth(1) else {
-        eprintln!(
-            "usage: cargo run -p llama-rs --example gguf_inspect --features link-system -- <file.gguf>"
-        );
-        std::process::exit(2);
-    };
+    let cli = Cli::parse();
 
-    let report = inspect_gguf(&path)?;
+    let report = inspect_gguf(&cli.path)?;
     println!("version:      {}", report.version);
     println!("alignment:    {}", report.alignment);
     println!("data_offset:  {}", report.data_offset);
@@ -40,4 +36,11 @@ fn main() -> Result<(), Box<dyn StdError>> {
     }
 
     Ok(())
+}
+
+#[derive(Debug, Parser)]
+#[command(about = "Inspect GGUF metadata and tensor table", version, long_about = None)]
+struct Cli {
+    /// Path to GGUF file.
+    path: String,
 }

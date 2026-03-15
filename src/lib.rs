@@ -31,11 +31,11 @@ mod typed_tensor;
 mod types;
 
 pub use compute::{
-    Backend, BackendBuffer, Context, Graph, Tensor, graph_overhead_bytes, init_timing,
-    tensor_overhead_bytes, type_size,
+    Backend, BackendBuffer, Context, Graph, Tensor, decode_tensor_data_to_f32,
+    graph_overhead_bytes, init_timing, tensor_element_count, tensor_overhead_bytes, type_size,
 };
 pub use error::{Error, Result};
-pub use gguf::{GgufArrayValue, GgufFile, GgufTensorInfo, GgufType, GgufValue};
+pub use gguf::{GgufArrayValue, GgufFile, GgufTensorInfo, GgufType, GgufValue, GgufWriter};
 pub use shape::{
     Bytes, Cols, Length, Rows, Shape2D, Shape2DSpec, StaticShape2D, TensorIndex, ThreadCount,
 };
@@ -46,8 +46,8 @@ pub use types::{BackendDeviceType, BackendKind, ComputeStatus, RopeExtParams, Ty
 pub mod prelude {
     pub use crate::{
         Backend, BackendBuffer, BackendDeviceType, BackendElement, BackendKind, Bytes, Cols,
-        ComputeStatus, Context, GgufArrayValue, GgufFile, GgufValue, Graph, Length, RopeExtParams,
-        Rows, Shape2D, Shape2DSpec, StaticShape2D, Tensor, Tensor2D, Tensor2DConst, TensorExpr,
-        TensorIndex, ThreadCount, Type,
+        ComputeStatus, Context, GgufArrayValue, GgufFile, GgufValue, GgufWriter, Graph, Length,
+        RopeExtParams, Rows, Shape2D, Shape2DSpec, StaticShape2D, Tensor, Tensor2D, Tensor2DConst,
+        TensorExpr, TensorIndex, ThreadCount, Type,
     };
 }

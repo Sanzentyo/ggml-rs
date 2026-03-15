@@ -151,6 +151,9 @@ pub fn run_backend_matmul_bench(
             .compute(&mut graph)
             .map_err(|source| BenchError::ggml("Backend::compute(warmup)", source))?;
     }
+    backend
+        .synchronize()
+        .map_err(|source| BenchError::ggml("Backend::synchronize(warmup)", source))?;
 
     let start = Instant::now();
     for _ in 0..config.bench_iters {
@@ -158,6 +161,9 @@ pub fn run_backend_matmul_bench(
             .compute(&mut graph)
             .map_err(|source| BenchError::ggml("Backend::compute(bench)", source))?;
     }
+    backend
+        .synchronize()
+        .map_err(|source| BenchError::ggml("Backend::synchronize(bench)", source))?;
     let elapsed = start.elapsed();
     let avg_ms = elapsed.as_secs_f64() * 1000.0 / config.bench_iters as f64;
 

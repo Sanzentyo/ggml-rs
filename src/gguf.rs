@@ -2,7 +2,7 @@
 
 use crate::ffi;
 use crate::num_ext::TryIntoChecked;
-use crate::{Error, Result};
+use crate::{Error, Result, Tensor};
 use std::ffi::{CStr, CString};
 use std::marker::PhantomData;
 use std::os::raw::{c_char, c_int};
@@ -416,6 +416,202 @@ impl GgufFile {
 }
 
 impl Drop for GgufFile {
+    fn drop(&mut self) {
+        unsafe {
+            ffi::gguf_free(self.raw.as_ptr());
+        }
+    }
+}
+
+/// RAII owner for a writable GGUF context.
+pub struct GgufWriter {
+    raw: NonNull<ffi::gguf_context>,
+    _not_send_sync: PhantomData<*mut ()>,
+}
+
+impl GgufWriter {
+    pub fn new() -> Result<Self> {
+        let raw = unsafe { ffi::gguf_init_empty() };
+        let raw = NonNull::new(raw).ok_or_else(|| Error::null_pointer("gguf_init_empty"))?;
+        Ok(Self {
+            raw,
+            _not_send_sync: PhantomData,
+        })
+    }
+
+    pub fn set_value(&mut self, key: &str, value: &GgufValue) -> Result<()> {
+        let key = CString::new(key)?;
+        let key_ptr = key.as_ptr();
+
+        match value {
+            GgufValue::U8(value) => unsafe {
+                ffi::gguf_set_val_u8(self.raw.as_ptr(), key_ptr, *value);
+            },
+            GgufValue::I8(value) => unsafe {
+                ffi::gguf_set_val_i8(self.raw.as_ptr(), key_ptr, *value);
+            },
+            GgufValue::U16(value) => unsafe {
+                ffi::gguf_set_val_u16(self.raw.as_ptr(), key_ptr, *value);
+            },
+            GgufValue::I16(value) => unsafe {
+                ffi::gguf_set_val_i16(self.raw.as_ptr(), key_ptr, *value);
+            },
+            GgufValue::U32(value) => unsafe {
+                ffi::gguf_set_val_u32(self.raw.as_ptr(), key_ptr, *value);
+            },
+            GgufValue::I32(value) => unsafe {
+                ffi::gguf_set_val_i32(self.raw.as_ptr(), key_ptr, *value);
+            },
+            GgufValue::F32(value) => unsafe {
+                ffi::gguf_set_val_f32(self.raw.as_ptr(), key_ptr, *value);
+            },
+            GgufValue::Bool(value) => unsafe {
+                ffi::gguf_set_val_bool(self.raw.as_ptr(), key_ptr, *value);
+            },
+            GgufValue::String(value) => {
+                let value = CString::new(value.as_str())?;
+                unsafe {
+                    ffi::gguf_set_val_str(self.raw.as_ptr(), key_ptr, value.as_ptr());
+                }
+            }
+            GgufValue::U64(value) => unsafe {
+                ffi::gguf_set_val_u64(self.raw.as_ptr(), key_ptr, *value);
+            },
+            GgufValue::I64(value) => unsafe {
+                ffi::gguf_set_val_i64(self.raw.as_ptr(), key_ptr, *value);
+            },
+            GgufValue::F64(value) => unsafe {
+                ffi::gguf_set_val_f64(self.raw.as_ptr(), key_ptr, *value);
+            },
+            GgufValue::Array(value) => self.set_array_value(key_ptr, value)?,
+        }
+
+        Ok(())
+    }
+
+    pub fn set_values<'a, I>(&mut self, values: I) -> Result<()>
+    where
+        I: IntoIterator<Item = (&'a str, &'a GgufValue)>,
+    {
+        for (key, value) in values {
+            self.set_value(key, value)?;
+        }
+        Ok(())
+    }
+
+    pub fn remove_key(&mut self, key: &str) -> Result<Option<usize>> {
+        let key = CString::new(key)?;
+        let removed = unsafe { ffi::gguf_remove_key(self.raw.as_ptr(), key.as_ptr()) };
+        if removed < 0 {
+            Ok(None)
+        } else {
+            Ok(Some(removed.try_into_checked().map_err(|source| {
+                Error::int_conversion("gguf_remove_key", source)
+            })?))
+        }
+    }
+
+    pub fn merge_kv_from(&mut self, source: &GgufFile) {
+        unsafe {
+            ffi::gguf_set_kv(self.raw.as_ptr(), source.raw.as_ptr());
+        }
+    }
+
+    pub fn add_tensor(&mut self, tensor: &Tensor<'_>) {
+        unsafe {
+            ffi::gguf_add_tensor(self.raw.as_ptr(), tensor.raw_ptr().cast_const());
+        }
+    }
+
+    pub fn write_to_file<P: AsRef<Path>>(&self, path: P, only_meta: bool) -> Result<()> {
+        let path = path_to_c_string(path.as_ref())?;
+        let written =
+            unsafe { ffi::gguf_write_to_file(self.raw.as_ptr(), path.as_ptr(), only_meta) };
+        if written {
+            Ok(())
+        } else {
+            Err(Error::GgufWriteFailed)
+        }
+    }
+
+    pub fn write_data_to_file<P: AsRef<Path>>(&self, path: P) -> Result<()> {
+        self.write_to_file(path, false)
+    }
+
+    pub fn write_metadata_to_file<P: AsRef<Path>>(&self, path: P) -> Result<()> {
+        self.write_to_file(path, true)
+    }
+
+    fn set_array_value(&mut self, key: *const c_char, value: &GgufArrayValue) -> Result<()> {
+        match value {
+            GgufArrayValue::U8(values) => {
+                self.set_array_data(key, ffi::GGUF_TYPE_UINT8 as ffi::gguf_type, values);
+            }
+            GgufArrayValue::I8(values) => {
+                self.set_array_data(key, ffi::GGUF_TYPE_INT8 as ffi::gguf_type, values);
+            }
+            GgufArrayValue::U16(values) => {
+                self.set_array_data(key, ffi::GGUF_TYPE_UINT16 as ffi::gguf_type, values);
+            }
+            GgufArrayValue::I16(values) => {
+                self.set_array_data(key, ffi::GGUF_TYPE_INT16 as ffi::gguf_type, values);
+            }
+            GgufArrayValue::U32(values) => {
+                self.set_array_data(key, ffi::GGUF_TYPE_UINT32 as ffi::gguf_type, values);
+            }
+            GgufArrayValue::I32(values) => {
+                self.set_array_data(key, ffi::GGUF_TYPE_INT32 as ffi::gguf_type, values);
+            }
+            GgufArrayValue::F32(values) => {
+                self.set_array_data(key, ffi::GGUF_TYPE_FLOAT32 as ffi::gguf_type, values);
+            }
+            GgufArrayValue::Bool(values) => {
+                self.set_array_data(key, ffi::GGUF_TYPE_BOOL as ffi::gguf_type, values);
+            }
+            GgufArrayValue::U64(values) => {
+                self.set_array_data(key, ffi::GGUF_TYPE_UINT64 as ffi::gguf_type, values);
+            }
+            GgufArrayValue::I64(values) => {
+                self.set_array_data(key, ffi::GGUF_TYPE_INT64 as ffi::gguf_type, values);
+            }
+            GgufArrayValue::F64(values) => {
+                self.set_array_data(key, ffi::GGUF_TYPE_FLOAT64 as ffi::gguf_type, values);
+            }
+            GgufArrayValue::String(values) => {
+                let c_values = values
+                    .iter()
+                    .map(|value| CString::new(value.as_str()))
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                let mut ptrs = c_values
+                    .iter()
+                    .map(|value| value.as_ptr())
+                    .collect::<Vec<*const c_char>>();
+                let data_ptr = if ptrs.is_empty() {
+                    ptr::null_mut()
+                } else {
+                    ptrs.as_mut_ptr()
+                };
+                unsafe {
+                    ffi::gguf_set_arr_str(self.raw.as_ptr(), key, data_ptr, ptrs.len());
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn set_array_data<T>(&mut self, key: *const c_char, ty: ffi::gguf_type, values: &[T]) {
+        let data_ptr = if values.is_empty() {
+            ptr::null()
+        } else {
+            values.as_ptr().cast()
+        };
+        unsafe {
+            ffi::gguf_set_arr_data(self.raw.as_ptr(), key, ty, data_ptr, values.len());
+        }
+    }
+}
+
+impl Drop for GgufWriter {
     fn drop(&mut self) {
         unsafe {
             ffi::gguf_free(self.raw.as_ptr());

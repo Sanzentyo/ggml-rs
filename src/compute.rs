@@ -26,6 +26,78 @@ pub fn type_size(ty: Type) -> usize {
     unsafe { ffi::ggml_type_size(ty.as_raw() as _) }
 }
 
+fn resolve_ggml_type(ggml_type_raw: c_int) -> Result<ffi::ggml_type> {
+    if !(0..ffi::GGML_TYPE_COUNT).contains(&ggml_type_raw) {
+        return Err(Error::UnsupportedType(ggml_type_raw));
+    }
+    Ok(ggml_type_raw as ffi::ggml_type)
+}
+
+/// Returns the number of scalar values represented by a tensor payload.
+pub fn tensor_element_count(ggml_type_raw: c_int, payload_bytes: usize) -> Result<usize> {
+    let ggml_type = resolve_ggml_type(ggml_type_raw)?;
+    let block_size = unsafe { ffi::ggml_blck_size(ggml_type) }
+        .try_into_checked()
+        .map_err(|source| Error::int_conversion("ggml_blck_size", source))?;
+    let type_size = unsafe { ffi::ggml_type_size(ggml_type) };
+    if block_size == 0 || type_size == 0 {
+        return Err(Error::UnsupportedType(ggml_type_raw));
+    }
+    if !payload_bytes.is_multiple_of(type_size) {
+        let expected = (payload_bytes / type_size)
+            .checked_mul_checked(type_size)
+            .map_err(|source| source.with_context("tensor_element_count"))?;
+        return Err(Error::UnexpectedTensorByteSize {
+            expected,
+            actual: payload_bytes,
+        });
+    }
+    let block_count = payload_bytes
+        .checked_div(type_size)
+        .ok_or(Error::Overflow)?;
+    block_count
+        .checked_mul_checked(block_size)
+        .map_err(|source| source.with_context("tensor_element_count"))
+}
+
+/// Decodes GGML tensor payload bytes into `f32` values using GGML type traits.
+///
+/// This supports both plain and quantized GGML tensor types as long as the
+/// local GGML build exposes a `to_float` converter for the provided type.
+pub fn decode_tensor_data_to_f32(
+    ggml_type_raw: c_int,
+    payload: &[u8],
+    out: &mut Vec<f32>,
+) -> Result<()> {
+    let ggml_type = resolve_ggml_type(ggml_type_raw)?;
+    let element_count = tensor_element_count(ggml_type_raw, payload.len())
+        .map_err(|source| source.with_context("decode_tensor_data_to_f32"))?;
+
+    let type_traits =
+        NonNull::new(unsafe { ffi::ggml_get_type_traits(ggml_type) as *mut ffi::ggml_type_traits })
+            .ok_or_else(|| Error::null_pointer("ggml_get_type_traits"))?;
+    let to_float =
+        unsafe { type_traits.as_ref().to_float }.ok_or(Error::UnsupportedType(ggml_type_raw))?;
+
+    out.clear();
+    if element_count == 0 {
+        return Ok(());
+    }
+    out.resize(element_count, 0.0);
+
+    if unsafe { ffi::ggml_is_quantized(ggml_type) } {
+        unsafe { ffi::ggml_quantize_init(ggml_type) };
+    }
+
+    let k = element_count
+        .try_into_checked()
+        .map_err(|source| Error::int_conversion("decode_tensor_data_to_f32(k)", source))?;
+    unsafe {
+        to_float(payload.as_ptr().cast(), out.as_mut_ptr(), k);
+    }
+    Ok(())
+}
+
 /// Returns ggml's internal per-tensor metadata overhead in bytes.
 pub fn tensor_overhead_bytes() -> usize {
     unsafe { ffi::ggml_tensor_overhead() }
@@ -159,6 +231,14 @@ impl Backend {
         } else {
             Err(Error::ComputeFailed(status))
         }
+    }
+
+    /// Synchronizes queued backend work before host-side timing or readback.
+    pub fn synchronize(&self) -> Result<()> {
+        unsafe {
+            ffi::ggml_backend_synchronize(self.raw.as_ptr());
+        }
+        Ok(())
     }
 }
 
@@ -524,6 +604,30 @@ impl Context {
             .map_err(|error| error.with_context("ggml_repeat"))
     }
 
+    /// Concatenates two 2D tensors along the selected dimension (`0` = cols, `1` = rows).
+    pub fn concat<'ctx>(
+        &'ctx self,
+        a: &Tensor<'ctx>,
+        b: &Tensor<'ctx>,
+        dim: usize,
+    ) -> Result<Tensor<'ctx>> {
+        let (a_cols, a_rows) = a.shape_2d()?;
+        let (b_cols, b_rows) = b.shape_2d()?;
+        match dim {
+            0 if a_rows == b_rows => {}
+            1 if a_cols == b_cols => {}
+            _ => return Err(Error::UnexpectedShape),
+        }
+
+        let dim = (dim)
+            .try_into_checked()
+            .map_err(|source| Error::int_conversion("concat dimension", source))?;
+        let raw =
+            unsafe { ffi::ggml_concat(self.raw.as_ptr(), a.raw.as_ptr(), b.raw.as_ptr(), dim) };
+        self.wrap_tensor(raw)
+            .map_err(|error| error.with_context("ggml_concat"))
+    }
+
     pub fn cpy<'ctx>(&'ctx self, a: &Tensor<'ctx>, b: &Tensor<'ctx>) -> Result<Tensor<'ctx>> {
         let raw = unsafe { ffi::ggml_cpy(self.raw.as_ptr(), a.raw.as_ptr(), b.raw.as_ptr()) };
         self.wrap_tensor(raw)
@@ -761,6 +865,10 @@ pub struct Tensor<'ctx> {
 }
 
 impl<'ctx> Tensor<'ctx> {
+    pub(crate) fn raw_ptr(&self) -> *mut ffi::ggml_tensor {
+        self.raw.as_ptr()
+    }
+
     /// Returns total element count (`ggml_nelements`).
     pub fn element_count(&self) -> Result<usize> {
         (unsafe { ffi::ggml_nelements(self.raw.as_ptr()) })
@@ -809,6 +917,20 @@ impl<'ctx> Tensor<'ctx> {
         elements.checked_mul_checked(std::mem::size_of::<T>())
     }
 
+    fn ensure_backend_slice_compatible<T: BackendElement>(&self) -> Result<usize> {
+        // ggml backend APIs are byte-oriented; enforce exact element-size match
+        // up front to avoid silent reinterpretation.
+        let expected_nbytes = self.expected_nbytes_for::<T>()?;
+        let actual_nbytes = self.nbytes();
+        if expected_nbytes != actual_nbytes {
+            return Err(Error::UnexpectedTensorByteSize {
+                expected: expected_nbytes,
+                actual: actual_nbytes,
+            });
+        }
+        Ok(expected_nbytes)
+    }
+
     /// Assigns a debug name to the tensor.
     pub fn set_name(&self, name: &str) -> Result<()> {
         let name = CString::new(name)?;
@@ -853,6 +975,10 @@ impl<'ctx> Tensor<'ctx> {
         self.set_backend_slice(values)
     }
 
+    pub fn set_f32_backend_at(&self, element_offset: usize, values: &[f32]) -> Result<()> {
+        self.set_backend_slice_at(element_offset, values)
+    }
+
     /// Writes host values through backend tensor APIs.
     pub fn set_backend_slice<T: BackendElement>(&self, values: &[T]) -> Result<()> {
         let expected = self.element_count()?;
@@ -863,16 +989,7 @@ impl<'ctx> Tensor<'ctx> {
             });
         }
 
-        // ggml backend APIs are byte-oriented; enforce exact element-size match
-        // up front to avoid silent reinterpretation.
-        let expected_nbytes = self.expected_nbytes_for::<T>()?;
-        let actual_nbytes = self.nbytes();
-        if expected_nbytes != actual_nbytes {
-            return Err(Error::UnexpectedTensorByteSize {
-                expected: expected_nbytes,
-                actual: actual_nbytes,
-            });
-        }
+        let expected_nbytes = self.ensure_backend_slice_compatible::<T>()?;
 
         unsafe {
             ffi::ggml_backend_tensor_set(
@@ -886,8 +1003,49 @@ impl<'ctx> Tensor<'ctx> {
         Ok(())
     }
 
+    /// Writes a backend slice into a contiguous tensor region.
+    pub fn set_backend_slice_at<T: BackendElement>(
+        &self,
+        element_offset: usize,
+        values: &[T],
+    ) -> Result<()> {
+        if values.is_empty() {
+            return Ok(());
+        }
+
+        let tensor_len = self.element_count()?;
+        let end = element_offset
+            .checked_add(values.len())
+            .ok_or(Error::Overflow)?;
+        if end > tensor_len {
+            return Err(Error::IndexOutOfBounds {
+                index: end.saturating_sub(1),
+                len: tensor_len,
+            });
+        }
+
+        self.ensure_backend_slice_compatible::<T>()?;
+
+        let byte_offset = element_offset.checked_mul_checked(std::mem::size_of::<T>())?;
+        let write_nbytes = values.len().checked_mul_checked(std::mem::size_of::<T>())?;
+        unsafe {
+            ffi::ggml_backend_tensor_set(
+                self.raw.as_ptr(),
+                values.as_ptr().cast(),
+                byte_offset,
+                write_nbytes,
+            );
+        }
+
+        Ok(())
+    }
+
     pub fn set_i32_backend(&self, values: &[i32]) -> Result<()> {
         self.set_backend_slice(values)
+    }
+
+    pub fn set_i32_backend_at(&self, element_offset: usize, values: &[i32]) -> Result<()> {
+        self.set_backend_slice_at(element_offset, values)
     }
 
     /// Reads a single `f32` element with bounds checking.

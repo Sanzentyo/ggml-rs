@@ -156,13 +156,15 @@ pub fn resolve_llama_layer_tensor_names_from_names<'a>(
     names: impl IntoIterator<Item = &'a str>,
     layer: usize,
 ) -> Result<LlamaLayerTensorNames, NamingError> {
-    let resolved = resolve_llama_tensor_names_from_names(names)?;
-    let available: Vec<usize> = resolved.layers.iter().map(|item| item.layer).collect();
-    resolved
-        .layers
-        .into_iter()
-        .find(|item| item.layer == layer)
-        .ok_or(NamingError::LayerNotFound { layer, available })
+    let names: HashSet<&str> = names.into_iter().collect();
+    let available = detect_layer_indices_from_name_set(&names);
+    if available.is_empty() {
+        return Err(NamingError::NoLayersDetected);
+    }
+    if !available.contains(&layer) {
+        return Err(NamingError::LayerNotFound { layer, available });
+    }
+    resolve_layer(&names, layer)
 }
 
 /// Resolves tensor names for one specific layer index.
@@ -499,5 +501,36 @@ mod tests {
             }
             other => panic!("unexpected error: {other}"),
         }
+    }
+
+    #[test]
+    fn resolves_requested_layer_even_when_other_layers_are_incomplete() {
+        let names = [
+            "token_embd.weight",
+            "output_norm.weight",
+            // layer 0 intentionally incomplete for llama-style attention roles
+            "blk.0.attn_norm.weight",
+            "blk.0.attn_qkv.weight",
+            "blk.0.ffn_norm.weight",
+            "blk.0.ffn_gate.weight",
+            "blk.0.ffn_up.weight",
+            "blk.0.ffn_down.weight",
+            // layer 3 has a complete llama-style attention role set
+            "blk.3.attn_norm.weight",
+            "blk.3.attn_q.weight",
+            "blk.3.attn_k.weight",
+            "blk.3.attn_v.weight",
+            "blk.3.attn_output.weight",
+            "blk.3.ffn_norm.weight",
+            "blk.3.ffn_gate.weight",
+            "blk.3.ffn_up.weight",
+            "blk.3.ffn_down.weight",
+        ];
+
+        let resolved = resolve_llama_layer_tensor_names_from_names(names, 3)
+            .expect("layer-scoped resolution should not fail on unrelated incomplete layers");
+        assert_eq!(resolved.layer, 3);
+        assert_eq!(resolved.attn_q, "blk.3.attn_q.weight");
+        assert_eq!(resolved.attn_output, "blk.3.attn_output.weight");
     }
 }

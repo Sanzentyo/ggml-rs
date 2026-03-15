@@ -216,14 +216,16 @@ impl GgufModel {
         self.tensor_payload_internal(tensor)
     }
 
-    /// Decodes a tensor as little-endian `f32` values into a new vector.
+    /// Decodes a tensor into `f32` values.
+    ///
+    /// Quantized GGUF tensor payloads are decoded via GGML type traits.
     pub fn tensor_f32_values(&self, name: &str) -> Result<Vec<f32>, ModelError> {
         let mut values = Vec::new();
         self.decode_tensor_f32_into(name, &mut values)?;
         Ok(values)
     }
 
-    /// Decodes a tensor as little-endian `f32` values into caller-owned storage.
+    /// Decodes a tensor into caller-owned `f32` storage.
     ///
     /// This is useful for hot paths that want to reuse buffers and avoid
     /// repeated allocations.
@@ -236,37 +238,24 @@ impl GgufModel {
         self.decode_tensor_f32_into_by_handle(handle, out)
     }
 
-    /// Decodes a tensor handle as little-endian `f32` values into caller-owned storage.
+    /// Decodes a tensor handle into caller-owned `f32` storage.
     pub fn decode_tensor_f32_into_by_handle(
         &self,
         handle: TensorHandle,
         out: &mut Vec<f32>,
     ) -> Result<(), ModelError> {
         let tensor = self.tensor_info_by_handle(handle);
-        if tensor.ggml_type_name != "f32" && tensor.ggml_type_raw != 0 {
-            return Err(ModelError::UnsupportedTensorType {
-                tensor_name: tensor.name.clone(),
-                ggml_type_name: tensor.ggml_type_name.clone(),
-                ggml_type_raw: tensor.ggml_type_raw,
-            });
-        }
-
         let payload = self.tensor_payload_internal(tensor)?;
-        if payload.len() % std::mem::size_of::<f32>() != 0 {
-            return Err(ModelError::InvalidTensorByteLength {
-                tensor_name: tensor.name.clone(),
-                bytes: payload.len(),
-            });
-        }
-
-        out.clear();
-        out.reserve(payload.len() / std::mem::size_of::<f32>());
-        out.extend(
-            payload
-                .chunks_exact(std::mem::size_of::<f32>())
-                .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]])),
-        );
-        Ok(())
+        ggml_rs::decode_tensor_data_to_f32(tensor.ggml_type_raw, payload, out).map_err(|source| {
+            match source {
+                ggml_rs::Error::UnsupportedType(_) => ModelError::UnsupportedTensorType {
+                    tensor_name: tensor.name.clone(),
+                    ggml_type_name: tensor.ggml_type_name.clone(),
+                    ggml_type_raw: tensor.ggml_type_raw,
+                },
+                other => ModelError::ggml("decode_tensor_data_to_f32", other),
+            }
+        })
     }
 
     /// Iterates all tensor names in file order.
@@ -344,22 +333,17 @@ impl GgufModel {
     /// Returns the element count for an `f32` tensor by handle without decoding payload.
     pub fn tensor_f32_len_by_handle(&self, handle: TensorHandle) -> Result<usize, ModelError> {
         let tensor = self.tensor_info_by_handle(handle);
-        if tensor.ggml_type_name != "f32" && tensor.ggml_type_raw != 0 {
-            return Err(ModelError::UnsupportedTensorType {
-                tensor_name: tensor.name.clone(),
-                ggml_type_name: tensor.ggml_type_name.clone(),
-                ggml_type_raw: tensor.ggml_type_raw,
-            });
-        }
-
         let payload = self.tensor_payload_internal(tensor)?;
-        if payload.len() % std::mem::size_of::<f32>() != 0 {
-            return Err(ModelError::InvalidTensorByteLength {
-                tensor_name: tensor.name.clone(),
-                bytes: payload.len(),
-            });
-        }
-        Ok(payload.len() / std::mem::size_of::<f32>())
+        ggml_rs::tensor_element_count(tensor.ggml_type_raw, payload.len()).map_err(|source| {
+            match source {
+                ggml_rs::Error::UnsupportedType(_) => ModelError::UnsupportedTensorType {
+                    tensor_name: tensor.name.clone(),
+                    ggml_type_name: tensor.ggml_type_name.clone(),
+                    ggml_type_raw: tensor.ggml_type_raw,
+                },
+                other => ModelError::ggml("tensor_element_count", other),
+            }
+        })
     }
 
     fn tensor_payload_internal<'a>(

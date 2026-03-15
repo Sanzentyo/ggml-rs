@@ -23,24 +23,23 @@ DYLD_LIBRARY_PATH=target/vendor/ggml/build/src:target/vendor/ggml/build/src/ggml
 
 ## FFI generation modes
 
-Default mode (recommended):
+Bindgen-only mode (default and required):
 
 - `build.rs` uses `bindgen` and emits `$OUT_DIR/ffi_bindings.rs`
 - `src/ffi.rs` includes generated bindings
 
-Fallback mode:
+Header lookup order:
 
 ```bash
-GGML_RS_DISABLE_BINDGEN=1 cargo test --workspace
+GGML_RS_GGML_INCLUDE_DIR=<path>/include     # explicit override
+vendor/ggml/include                          # submodule layout
+target/vendor/ggml/include                   # legacy local layout
 ```
 
-Optional constant auto-generation in fallback mode:
+Submodule setup command:
 
 ```bash
-GGML_RS_DISABLE_BINDGEN=1 \
-GGML_RS_AUTOGEN_FFI_CONSTS=1 \
-GGML_RS_GGML_INCLUDE_DIR=target/vendor/ggml/include \
-cargo test --workspace
+git submodule update --init --recursive
 ```
 
 ## Backend behavior notes
@@ -51,6 +50,27 @@ cargo test --workspace
   a single backend-name string.
 - `ggml_metal_device_init` may log warnings while still producing valid matmul
   execution results.
+- For benchmark timing, call `Backend::synchronize()` after compute loops to
+  ensure queued backend work is fully completed before measuring/reporting.
+- Quantized tensor decode helpers are available in safe API:
+  - `decode_tensor_data_to_f32(ggml_type_raw, payload, out)`
+  - `tensor_element_count(ggml_type_raw, payload_bytes)`
+  These use GGML type traits (`ggml_get_type_traits`) and are useful for GGUF
+  model paths that need f32 views over quantized payloads.
+- Backend tensors now support partial safe writes:
+  - `Tensor::set_f32_backend_at(offset, values)`
+  - `Tensor::set_i32_backend_at(offset, values)`
+  Use these when only a contiguous region changes (for example, stepwise mask
+  delta updates) to reduce host-device transfer overhead.
+- GGUF now has a safe write path:
+  - `GgufWriter::new()`
+  - `GgufWriter::set_value(key, &GgufValue)` / `set_values(iter)` (typed scalars/arrays)
+  - `GgufWriter::remove_key(key)` / `merge_kv_from(&GgufFile)`
+  - `GgufWriter::add_tensor(&Tensor)`
+  - `GgufWriter::write_to_file(path, only_meta)` plus mode-specific helpers:
+    - `write_data_to_file(path)`
+    - `write_metadata_to_file(path)`
+  This allows fixture generation and round-trip checks without exposing unsafe pointers.
 
 ## Error context policy
 

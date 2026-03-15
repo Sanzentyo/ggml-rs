@@ -3,8 +3,10 @@
 use crate::backend::ParseBackendError;
 use crate::batched::BatchedError;
 use crate::bench::BenchError;
+use crate::bench_report::BenchReportError;
 use crate::embedding::EmbeddingError;
 use crate::gguf_hash::GgufHashError;
+use crate::idle::IdleError;
 use crate::inference::InferenceError;
 use crate::metadata::MetadataError;
 use crate::model::ModelError;
@@ -23,6 +25,7 @@ pub enum LlamaError {
     ParseBackend(ParseBackendError),
     Ggml(ggml_rs::Error),
     Bench(BenchError),
+    BenchReport(BenchReportError),
     Batched(BatchedError),
     Model(ModelError),
     Embedding(EmbeddingError),
@@ -32,6 +35,7 @@ pub enum LlamaError {
     Simple(SimpleError),
     Smoke(SmokeError),
     GgufHash(GgufHashError),
+    Idle(IdleError),
 }
 
 impl fmt::Display for LlamaError {
@@ -40,6 +44,7 @@ impl fmt::Display for LlamaError {
             Self::ParseBackend(source) => write!(f, "backend parse error: {source}"),
             Self::Ggml(source) => write!(f, "ggml error: {source}"),
             Self::Bench(source) => write!(f, "bench error: {source}"),
+            Self::BenchReport(source) => write!(f, "bench report error: {source}"),
             Self::Batched(source) => write!(f, "batched error: {source}"),
             Self::Model(source) => write!(f, "model error: {source}"),
             Self::Embedding(source) => write!(f, "embedding error: {source}"),
@@ -49,6 +54,7 @@ impl fmt::Display for LlamaError {
             Self::Simple(source) => write!(f, "simple error: {source}"),
             Self::Smoke(source) => write!(f, "smoke error: {source}"),
             Self::GgufHash(source) => write!(f, "gguf_hash error: {source}"),
+            Self::Idle(source) => write!(f, "idle error: {source}"),
         }
     }
 }
@@ -59,6 +65,7 @@ impl StdError for LlamaError {
             Self::ParseBackend(source) => Some(source),
             Self::Ggml(source) => Some(source),
             Self::Bench(source) => Some(source),
+            Self::BenchReport(source) => Some(source),
             Self::Batched(source) => Some(source),
             Self::Model(source) => Some(source),
             Self::Embedding(source) => Some(source),
@@ -68,6 +75,7 @@ impl StdError for LlamaError {
             Self::Simple(source) => Some(source),
             Self::Smoke(source) => Some(source),
             Self::GgufHash(source) => Some(source),
+            Self::Idle(source) => Some(source),
         }
     }
 }
@@ -87,6 +95,12 @@ impl From<ggml_rs::Error> for LlamaError {
 impl From<BenchError> for LlamaError {
     fn from(value: BenchError) -> Self {
         Self::Bench(value)
+    }
+}
+
+impl From<BenchReportError> for LlamaError {
+    fn from(value: BenchReportError) -> Self {
+        Self::BenchReport(value)
     }
 }
 
@@ -141,5 +155,11 @@ impl From<SmokeError> for LlamaError {
 impl From<GgufHashError> for LlamaError {
     fn from(value: GgufHashError) -> Self {
         Self::GgufHash(value)
+    }
+}
+
+impl From<IdleError> for LlamaError {
+    fn from(value: IdleError) -> Self {
+        Self::Idle(value)
     }
 }

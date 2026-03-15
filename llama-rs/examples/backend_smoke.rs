@@ -1,11 +1,18 @@
+use clap::{Parser, ValueEnum};
 use llama_rs::{LlamaBackend, run_backend_smoke};
 use std::error::Error as StdError;
-use std::str::FromStr;
 
 fn main() -> Result<(), Box<dyn StdError>> {
     ggml_rs::init_timing();
 
-    for backend in parse_requested_backends(std::env::args().skip(1))? {
+    let cli = Cli::parse();
+    let backends = if cli.backends.is_empty() {
+        vec![BackendArg::Cpu, BackendArg::Metal]
+    } else {
+        cli.backends
+    };
+
+    for backend in backends.into_iter().map(Into::into) {
         let report = run_backend_smoke(backend)?;
         println!(
             "[{}] mul mat ({} x {}) OK",
@@ -16,17 +23,24 @@ fn main() -> Result<(), Box<dyn StdError>> {
     Ok(())
 }
 
-fn parse_requested_backends(
-    args: impl Iterator<Item = String>,
-) -> Result<Vec<LlamaBackend>, Box<dyn StdError>> {
-    let mut parsed = Vec::new();
-    for arg in args {
-        parsed.push(LlamaBackend::from_str(&arg)?);
-    }
+#[derive(Debug, Clone, Parser)]
+#[command(about = "Run backend smoke checks", version, long_about = None)]
+struct Cli {
+    #[arg(value_enum)]
+    backends: Vec<BackendArg>,
+}
 
-    if parsed.is_empty() {
-        Ok(vec![LlamaBackend::Cpu, LlamaBackend::Metal])
-    } else {
-        Ok(parsed)
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum BackendArg {
+    Cpu,
+    Metal,
+}
+
+impl From<BackendArg> for LlamaBackend {
+    fn from(value: BackendArg) -> Self {
+        match value {
+            BackendArg::Cpu => LlamaBackend::Cpu,
+            BackendArg::Metal => LlamaBackend::Metal,
+        }
     }
 }

@@ -1,12 +1,19 @@
+use clap::{Parser, ValueEnum};
 use llama_rs::{LlamaBackend, MatmulBenchConfig, run_backend_matmul_bench};
 use std::error::Error as StdError;
-use std::str::FromStr;
 
 fn main() -> Result<(), Box<dyn StdError>> {
     ggml_rs::init_timing();
 
-    let (config, backends) = parse_args(std::env::args().skip(1))?;
-    for backend in backends {
+    let cli = Cli::parse();
+    let backends = if cli.backends.is_empty() {
+        vec![BackendArg::Cpu, BackendArg::Metal]
+    } else {
+        cli.backends.clone()
+    };
+    let config = cli.config();
+
+    for backend in backends.into_iter().map(Into::into) {
         let report = run_backend_matmul_bench(backend, config)?;
         println!(
             "[{}] llama-rs matmul {}x{} · {}x{} warmup={} bench={} avg={:.3} ms, checksum={:.6}",
@@ -25,65 +32,47 @@ fn main() -> Result<(), Box<dyn StdError>> {
     Ok(())
 }
 
-fn parse_args(
-    args: impl Iterator<Item = String>,
-) -> Result<(MatmulBenchConfig, Vec<LlamaBackend>), Box<dyn StdError>> {
-    let mut config = MatmulBenchConfig::default();
-    let mut backends = Vec::new();
+#[derive(Debug, Clone, Parser)]
+#[command(about = "Benchmark backend matmul path", version, long_about = None)]
+struct Cli {
+    #[arg(long = "iters", short = 'n', default_value_t = MatmulBenchConfig::default().bench_iters)]
+    bench_iters: usize,
+    #[arg(long = "warmup", short = 'w', default_value_t = MatmulBenchConfig::default().warmup_iters)]
+    warmup_iters: usize,
+    #[arg(long = "size", short = 's')]
+    size: Option<usize>,
+    #[arg(value_enum)]
+    backends: Vec<BackendArg>,
+}
 
-    let mut pending_iters = false;
-    let mut pending_warmup = false;
-    let mut pending_size = false;
-
-    for arg in args {
-        if pending_iters {
-            config.bench_iters = parse_usize_arg("--iters", &arg)?;
-            pending_iters = false;
-            continue;
-        }
-        if pending_warmup {
-            config.warmup_iters = parse_usize_arg("--warmup", &arg)?;
-            pending_warmup = false;
-            continue;
-        }
-        if pending_size {
-            let size = parse_usize_arg("--size", &arg)?;
+impl Cli {
+    fn config(&self) -> MatmulBenchConfig {
+        let mut config = MatmulBenchConfig {
+            warmup_iters: self.warmup_iters,
+            bench_iters: self.bench_iters,
+            ..MatmulBenchConfig::default()
+        };
+        if let Some(size) = self.size {
             config.rows_a = size;
             config.cols_a = size;
             config.rows_b = size;
             config.cols_b = size;
-            pending_size = false;
-            continue;
         }
-
-        match arg.as_str() {
-            "--iters" | "-n" => pending_iters = true,
-            "--warmup" | "-w" => pending_warmup = true,
-            "--size" | "-s" => pending_size = true,
-            token => backends.push(LlamaBackend::from_str(token)?),
-        }
+        config
     }
-
-    if pending_iters {
-        return Err("missing value after --iters".into());
-    }
-    if pending_warmup {
-        return Err("missing value after --warmup".into());
-    }
-    if pending_size {
-        return Err("missing value after --size".into());
-    }
-
-    if backends.is_empty() {
-        backends.push(LlamaBackend::Cpu);
-        backends.push(LlamaBackend::Metal);
-    }
-
-    Ok((config, backends))
 }
 
-fn parse_usize_arg(flag: &str, value: &str) -> Result<usize, Box<dyn StdError>> {
-    value
-        .parse::<usize>()
-        .map_err(|error| format!("invalid value for {flag}: {value} ({error})").into())
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum BackendArg {
+    Cpu,
+    Metal,
+}
+
+impl From<BackendArg> for LlamaBackend {
+    fn from(value: BackendArg) -> Self {
+        match value {
+            BackendArg::Cpu => LlamaBackend::Cpu,
+            BackendArg::Metal => LlamaBackend::Metal,
+        }
+    }
 }
