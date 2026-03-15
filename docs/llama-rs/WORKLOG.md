@@ -625,3 +625,19 @@ Detailed logs are split under `docs/llama-rs/worklog/` to keep this top-level fi
     - CPU `~0.988`,
     - MTL0 `~0.995`,
     - overall `~0.991`.
+- Broader validation pass (`Qwen3.5`, layers `0..7`) for `block_gateup_fused` under the same profile lock:
+  - base:
+    - `target/benchmarks/llama_rs_stepwise_post_graphbuilder_qwen35_layers0_7_blockgateup_base.txt`,
+  - variant(on):
+    - `target/benchmarks/llama_rs_stepwise_post_graphbuilder_qwen35_layers0_7_blockgateup_on.txt`,
+  - impact:
+    - `target/benchmarks/llama_stepwise_post_graphbuilder_qwen35_layers0_7_blockgateup_impact.md`,
+  - checksum check:
+    - `target/benchmarks/llama_stepwise_post_graphbuilder_qwen35_layers0_7_blockgateup_checksum_check.md` (`max abs delta = 0.0`),
+  - means (`on/base`):
+    - CPU `~1.029`,
+    - MTL0 `~0.980`,
+    - overall `~1.004`.
+- Current pass decision:
+  - keep `block_gateup_fused=false` as default (cross-model direction remains mixed after broader validation),
+  - keep the flag available for backend-specific or model-specific A/B exploration.
