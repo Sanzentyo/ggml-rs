@@ -124,9 +124,13 @@ Clap-refactor runtime smoke artifact (CPU+Metal where applicable):
   - `llama-rs/src/inference/stepwise_plan.rs` (`DecodeStepPlan` ADT + type-state builder + static-dispatch trait),
   - `llama-rs/src/inference/stepwise_decode.rs` (stepwise config/report types + execution runners),
   - `llama-rs/src/inference/attention_ops.rs` (RoPE/concat helpers).
+- Attention runtime execution has also been extracted into:
+  - `llama-rs/src/inference/attention_runtime.rs` (attention weight resolve/decode, direct attention inference runners, decode-cache builder, and decode-proxy execution core).
 - `llama-rs/src/inference.rs` acts as the re-export and orchestration surface for these submodules.
 - Runtime smoke artifact after the deeper split:
   - `target/benchmarks/llama_rs_stepwise_refactor_stepwisecore_smoke.txt`.
+- Runtime smoke artifact after the attention-runtime extraction:
+  - `target/benchmarks/review4_attention_runtime_modularization_runtime_smoke.txt`.
 - API naming migration:
   - long `run_*` public entrypoints were renamed to direct operation names (for example: `mlp_inference_*`, `attention_inference_*`, `attention_decode_proxy_*`, `backend_smoke`, `simple_ctx`, `idle_decode_proxy`).
   - stepwise execution now routes through `DecodeStepPlan::{execute_single, bench}`.
@@ -697,6 +701,18 @@ Latest inventory verification (`uv`):
 
 - `target/benchmarks/review4_model_asset_uv_check.txt`
 - confirmed six required GGUF assets are present (`missing_count=0`).
+
+Recent architecture cleanup (role split + ADT/trait):
+
+- Extracted layer-dimension resolution logic from monolithic `inference.rs` into:
+  - `llama-rs/src/inference/layer_dimensions.rs`
+- `layer_dimensions` now owns:
+  - `MetadataResolutionMode` and `LlamaLayerDimensions` ADTs,
+  - `resolve_llama_layer_dimensions(...)`,
+  - trait-based head-layout policy (`HeadLayoutStrategy`) with
+    `PreferredHeadLayoutStrategy` default implementation.
+- Post-refactor runtime smoke (`CPU/Metal`) passed:
+  - `target/benchmarks/review4_llamars_modularization_runtime_smoke.txt`.
 
 Baseline run profile used in this session:
 

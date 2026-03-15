@@ -74,3 +74,21 @@ Detailed logs live under `docs/llama-rs/worklog/`.
   - `target/benchmarks/review4_model_asset_uv_check.txt` confirmed all six required GGUF files (`missing_count=0`),
   - real-model CPU/Metal idle smoke re-run succeeded for Qwen3.5 and ELYZA:
     `target/benchmarks/review4_idle_realmodel_cpu_metal_smoke.txt`.
+- Per request, continued structural cleanup of `llama-rs`:
+  - extracted layer-dimension resolution from `inference.rs` into
+    `inference/layer_dimensions.rs`,
+  - introduced trait-based layout policy split (`HeadLayoutStrategy` /
+    `PreferredHeadLayoutStrategy`) and kept ADT surfaces (`MetadataResolutionMode`,
+  `LlamaLayerDimensions`) in the focused module,
+  - validated + runtime-smoked:
+    `target/benchmarks/review4_llamars_modularization_runtime_smoke.txt`.
+- Continued the same modularization pass by extracting attention runtime execution
+  from `inference.rs` into `inference/attention_runtime.rs` and re-exporting the
+  public attention APIs from `inference.rs`.
+- Re-validated the workspace after the extraction and re-ran CPU/Metal runtime
+  smoke with locally built `vendor/ggml` shared libs:
+  `target/benchmarks/review4_attention_runtime_modularization_runtime_smoke.txt`.
+- Ran a GPT-J synthetic guard on top of this refactor:
+  - `target/benchmarks/review4_attention_runtime_modularization_gptj_guard.txt`
+  - parity stayed exact (token/checksum match) in
+    `target/benchmarks/review4_attention_runtime_modularization_gptj_guard_impact.md`.

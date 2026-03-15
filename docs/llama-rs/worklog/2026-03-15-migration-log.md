@@ -923,3 +923,61 @@ Detailed entries migrated from `docs/llama-rs/WORKLOG.md` during worklog compact
     - `target/benchmarks/review4_idle_realmodel_cpu_metal_smoke.txt`.
 - Outcome:
   - CPU and Metal execution succeeded with real model assets in both runs.
+
+## Llama-rs modularization pass (role split + ADT/trait)
+
+- Refactored `llama-rs` inference internals to reduce monolithic responsibilities:
+  - extracted layer-dimension resolution into
+    `llama-rs/src/inference/layer_dimensions.rs`.
+- Moved and isolated these surfaces into the new module:
+  - `MetadataResolutionMode`,
+  - `LlamaLayerDimensions`,
+  - `resolve_llama_layer_dimensions(...)`,
+  - all helper validations for hidden/FFN/projection shape inference.
+- Added explicit strategy trait for attention layout inference:
+  - `HeadLayoutStrategy`,
+  - `PreferredHeadLayoutStrategy` (default heuristic implementation).
+- `inference.rs` now re-exports the public layer-dimension ADTs/functions and
+  keeps execution-path code focused on graph/runtime behavior.
+- Validation:
+  - `cargo fmt --all`
+  - `cargo clippy --workspace --all-targets`
+  - `cargo test --workspace`
+  - `cargo check --workspace --all-targets --features link-system`
+- Runtime smoke after split:
+  - `target/benchmarks/review4_llamars_modularization_runtime_smoke.txt`
+  - includes:
+    - `llama-rs/examples/backend_smoke -- cpu metal`,
+    - `llama-rs/examples/idle <Qwen3.5 model> --layer 0 --decode-kv 64 --iters 1 --pauses 0 cpu metal`.
+
+## Llama-rs modularization continuation (attention runtime extraction)
+
+- Continued the same `inference.rs` role-split by extracting attention runtime
+  execution into:
+  - `llama-rs/src/inference/attention_runtime.rs`.
+- Moved the following surfaces from `inference.rs` into the new module:
+  - `resolve_attention_weights_for_layer(_auto)`,
+  - `attention_inference_for_layer(_auto)(_repeats)`,
+  - `attention_inference_with_weights(_repeats)`,
+  - `build_attention_decode_cache`,
+  - decode-proxy execution core and attention backend memory sizing helpers.
+- `llama-rs/src/inference.rs` now re-exports the public attention APIs and keeps
+  only orchestration-level visibility (`pub use` / `pub(crate) use`) for shared
+  internals consumed by `decode_proxy_plan` / `stepwise_decode`.
+- Full validation after extraction:
+  - `cargo fmt --all`
+  - `cargo clippy --workspace --all-targets`
+  - `cargo test --workspace`
+  - `cargo check --workspace --all-targets --features link-system`
+- Rebuilt local `vendor/ggml` shared libs and re-ran CPU/Metal runtime smoke:
+  - `target/benchmarks/review4_attention_runtime_modularization_runtime_smoke.txt`
+  - includes:
+    - `ggml-rs/examples/backend_matmul -- cpu`,
+    - `ggml-rs/examples/backend_matmul -- metal`,
+    - `llama-rs/examples/backend_smoke -- cpu metal`.
+- Post-split synthetic guard (`gptj_main_synth`, `seed=17`, `n_predict=6`):
+  - run artifact:
+    - `target/benchmarks/review4_attention_runtime_modularization_gptj_guard.txt`,
+  - impact summary:
+    - `target/benchmarks/review4_attention_runtime_modularization_gptj_guard_impact.md`,
+  - parity remained exact (`generated_tokens` and `logit_checksum` matched the pre-split baseline).
