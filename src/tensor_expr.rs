@@ -46,8 +46,18 @@ pub trait GgmlElement: BackendElement + GgmlType {
     /// Writes host values into the tensor through the most appropriate path.
     fn write_data(tensor: &Tensor<'_>, values: &[Self]) -> Result<()>;
 
+    /// Writes a host tensor slice.
+    fn write_data_at(tensor: &Tensor<'_>, element_offset: usize, values: &[Self]) -> Result<()>;
+
     /// Reads tensor values into host memory through the most appropriate path.
     fn read_data(tensor: &Tensor<'_>) -> Result<Vec<Self>>;
+
+    /// Reads a host tensor slice into host memory.
+    fn read_data_at(
+        tensor: &Tensor<'_>,
+        element_offset: usize,
+        element_count: usize,
+    ) -> Result<Vec<Self>>;
 
     /// Reads one element with bounds checking.
     fn get_data(tensor: &Tensor<'_>, index: TensorIndex) -> Result<Self>;
@@ -58,8 +68,20 @@ impl GgmlElement for f32 {
         tensor.write_host_data(values)
     }
 
+    fn write_data_at(tensor: &Tensor<'_>, element_offset: usize, values: &[Self]) -> Result<()> {
+        tensor.write_host_data_at(element_offset, values)
+    }
+
     fn read_data(tensor: &Tensor<'_>) -> Result<Vec<Self>> {
         tensor.read_host_data()
+    }
+
+    fn read_data_at(
+        tensor: &Tensor<'_>,
+        element_offset: usize,
+        element_count: usize,
+    ) -> Result<Vec<Self>> {
+        tensor.read_host_data_at(element_offset, element_count)
     }
 
     fn get_data(tensor: &Tensor<'_>, index: TensorIndex) -> Result<Self> {
@@ -72,8 +94,20 @@ impl GgmlElement for i32 {
         tensor.write_host_data(values)
     }
 
+    fn write_data_at(tensor: &Tensor<'_>, element_offset: usize, values: &[Self]) -> Result<()> {
+        tensor.write_host_data_at(element_offset, values)
+    }
+
     fn read_data(tensor: &Tensor<'_>) -> Result<Vec<Self>> {
         tensor.read_host_data()
+    }
+
+    fn read_data_at(
+        tensor: &Tensor<'_>,
+        element_offset: usize,
+        element_count: usize,
+    ) -> Result<Vec<Self>> {
+        tensor.read_host_data_at(element_offset, element_count)
     }
 
     fn get_data(tensor: &Tensor<'_>, index: TensorIndex) -> Result<Self> {

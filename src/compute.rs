@@ -1020,6 +1020,11 @@ impl<'ctx> Tensor<'ctx> {
         T::write_data(self, values)
     }
 
+    /// Writes host values at the provided element offset.
+    pub fn write_data_at<T: GgmlElement>(&self, element_offset: usize, values: &[T]) -> Result<()> {
+        T::write_data_at(self, element_offset, values)
+    }
+
     /// Writes backend values with an element type inferred from the slice.
     pub fn write_data_backend<T: BackendElement>(&self, values: &[T]) -> Result<()> {
         self.write_backend_slice(values)
@@ -1039,9 +1044,27 @@ impl<'ctx> Tensor<'ctx> {
         T::read_data(self)
     }
 
+    /// Reads a host tensor slice using typed tensor I/O dispatch.
+    pub fn read_data_at<T: GgmlElement>(
+        &self,
+        element_offset: usize,
+        element_count: usize,
+    ) -> Result<Vec<T>> {
+        T::read_data_at(self, element_offset, element_count)
+    }
+
     /// Reads all backend values for the requested element type.
     pub fn read_data_backend<T: BackendElement>(&self) -> Result<Vec<T>> {
         self.read_backend_vec()
+    }
+
+    /// Reads a backend tensor slice for the requested element type.
+    pub fn read_data_backend_at<T: BackendElement>(
+        &self,
+        element_offset: usize,
+        element_count: usize,
+    ) -> Result<Vec<T>> {
+        self.read_backend_vec_at(element_offset, element_count)
     }
 
     /// Reads one element using typed tensor I/O dispatch.
@@ -1077,6 +1100,58 @@ impl<'ctx> Tensor<'ctx> {
 
         for (index, value) in values.iter().copied().enumerate() {
             let index = (index)
+                .try_into_checked()
+                .map_err(|source| Error::int_conversion("tensor index", source))?;
+            T::set_1d_raw(self.raw.as_ptr(), index, value);
+        }
+
+        Ok(())
+    }
+
+    /// Writes a host slice with bounds checking.
+    pub(crate) fn write_host_data_at<T: HostElement>(
+        &self,
+        element_offset: usize,
+        values: &[T],
+    ) -> Result<()> {
+        if values.is_empty() {
+            return Ok(());
+        }
+
+        let len = self.element_count()?;
+        let end = element_offset
+            .checked_add(values.len())
+            .ok_or(Error::Overflow)?;
+        if end > len {
+            return Err(Error::IndexOutOfBounds {
+                index: end.saturating_sub(1),
+                len,
+            });
+        }
+
+        let element_size = std::mem::size_of::<T>();
+        let expected_nbytes = len.checked_mul_checked(element_size)?;
+        if expected_nbytes == self.nbytes()
+            && let Some(dst) = self.contiguous_data_ptr::<T>()
+        {
+            unsafe {
+                // SAFETY:
+                // - `dst` points to contiguous tensor storage with at least `len` elements.
+                // - `element_offset..element_offset + values.len()` was bounds-checked.
+                // - Source and destination do not overlap (`values` is caller-owned slice).
+                ptr::copy_nonoverlapping(
+                    values.as_ptr(),
+                    dst.as_ptr().add(element_offset),
+                    values.len(),
+                );
+            }
+            return Ok(());
+        }
+
+        for (index, value) in values.iter().copied().enumerate() {
+            let index = element_offset
+                .checked_add(index)
+                .ok_or(Error::Overflow)?
                 .try_into_checked()
                 .map_err(|source| Error::int_conversion("tensor index", source))?;
             T::set_1d_raw(self.raw.as_ptr(), index, value);
@@ -1193,6 +1268,58 @@ impl<'ctx> Tensor<'ctx> {
         Ok(out)
     }
 
+    /// Reads a host slice with bounds checking.
+    pub(crate) fn read_host_data_at<T: HostElement>(
+        &self,
+        element_offset: usize,
+        element_count: usize,
+    ) -> Result<Vec<T>> {
+        if element_count == 0 {
+            return Ok(Vec::new());
+        }
+
+        let len = self.element_count()?;
+        let end = element_offset
+            .checked_add(element_count)
+            .ok_or(Error::Overflow)?;
+        if end > len {
+            return Err(Error::IndexOutOfBounds {
+                index: end.saturating_sub(1),
+                len,
+            });
+        }
+
+        let element_size = std::mem::size_of::<T>();
+        let expected_nbytes = len.checked_mul_checked(element_size)?;
+        if expected_nbytes == self.nbytes()
+            && let Some(src) = self.contiguous_data_ptr::<T>()
+        {
+            let mut out = Vec::with_capacity(element_count);
+            unsafe {
+                // SAFETY:
+                // - `src` points to contiguous tensor storage with at least `len` elements.
+                // - `element_offset..element_offset + element_count` was bounds-checked.
+                // - `out` has capacity for `element_count`; set_len is called after init.
+                ptr::copy_nonoverlapping(
+                    src.as_ptr().add(element_offset),
+                    out.as_mut_ptr(),
+                    element_count,
+                );
+                out.set_len(element_count);
+            }
+            return Ok(out);
+        }
+
+        let mut out = Vec::with_capacity(element_count);
+        for index in element_offset..end {
+            let index = (index)
+                .try_into_checked()
+                .map_err(|source| Error::int_conversion("tensor index", source))?;
+            out.push(T::get_1d_raw(self.raw.as_ptr(), index));
+        }
+        Ok(out)
+    }
+
     /// Reads all values through backend tensor APIs.
     fn read_backend_vec<T: BackendElement>(&self) -> Result<Vec<T>> {
         let len = self.element_count()?;
@@ -1218,6 +1345,48 @@ impl<'ctx> Tensor<'ctx> {
                 expected_nbytes,
             );
             out.set_len(len);
+        }
+        Ok(out)
+    }
+
+    /// Reads a contiguous value range through backend tensor APIs.
+    fn read_backend_vec_at<T: BackendElement>(
+        &self,
+        element_offset: usize,
+        element_count: usize,
+    ) -> Result<Vec<T>> {
+        if element_count == 0 {
+            return Ok(Vec::new());
+        }
+
+        let tensor_len = self.element_count()?;
+        let end = element_offset
+            .checked_add(element_count)
+            .ok_or(Error::Overflow)?;
+        if end > tensor_len {
+            return Err(Error::IndexOutOfBounds {
+                index: end.saturating_sub(1),
+                len: tensor_len,
+            });
+        }
+
+        self.ensure_backend_slice_compatible::<T>()?;
+
+        let byte_offset = element_offset.checked_mul_checked(std::mem::size_of::<T>())?;
+        let read_nbytes = element_count.checked_mul_checked(std::mem::size_of::<T>())?;
+        let mut out = Vec::<T>::with_capacity(element_count);
+        unsafe {
+            // SAFETY:
+            // - `out` has capacity for `element_count` elements.
+            // - Requested byte range was bounds-checked against tensor element count.
+            // - ggml writes exactly `read_nbytes` bytes into the destination buffer.
+            ffi::ggml_backend_tensor_get(
+                self.raw.as_ptr(),
+                out.as_mut_ptr().cast(),
+                byte_offset,
+                read_nbytes,
+            );
+            out.set_len(element_count);
         }
         Ok(out)
     }

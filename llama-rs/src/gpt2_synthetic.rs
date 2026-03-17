@@ -157,9 +157,10 @@ pub fn run_ctx(config: SyntheticConfig) -> Result<SyntheticReport, SyntheticErro
 
     let start = Instant::now();
     let mut checksum = 0.0_f64;
+    let mut lhs = vec![0.0_f32; config.n_embd * active_batch];
 
     for step in 0..config.n_predict {
-        let lhs = make_lhs_batch(config.n_embd, active_batch, config.seed, step);
+        fill_lhs_batch(&mut lhs, config.seed, step);
         let ctx = Context::new_bytes(ctx_size)
             .map_err(|source| SyntheticError::ggml("Context::new_bytes", source))?;
         let lhs_tensor = ctx
@@ -368,9 +369,11 @@ fn run_backend_for_steps(
 
     let start = Instant::now();
     let mut checksum = 0.0_f64;
+    let mut lhs = vec![0.0_f32; config.n_embd * active_batch];
+    let sample_len = (config.n_vocab * active_batch).min(32);
 
     for step in step_indices.iter().copied() {
-        let lhs = make_lhs_batch(config.n_embd, active_batch, config.seed, step);
+        fill_lhs_batch(&mut lhs, config.seed, step);
         lhs_tensor
             .write_data_backend(&lhs)
             .map_err(|source| SyntheticError::ggml("Tensor::write_data_backend<A>", source))?;
@@ -381,8 +384,8 @@ fn run_backend_for_steps(
         let values = graph
             .last_node()
             .map_err(|source| SyntheticError::ggml("Graph::last_node", source))?
-            .read_data_backend::<f32>()
-            .map_err(|source| SyntheticError::ggml("Tensor::read_data_backend", source))?;
+            .read_data_backend_at::<f32>(0, sample_len)
+            .map_err(|source| SyntheticError::ggml("Tensor::read_data_backend_at", source))?;
         checksum += checksum_from_logits(&values, config.n_vocab, active_batch);
     }
 
@@ -484,10 +487,10 @@ fn make_rhs_weights(n_embd: usize, n_vocab: usize, seed: u64) -> Vec<f32> {
         .collect()
 }
 
-fn make_lhs_batch(n_embd: usize, active_batch: usize, seed: u64, step: usize) -> Vec<f32> {
-    (0..(n_embd * active_batch))
-        .map(|index| synth_value(seed, step, index, 53))
-        .collect()
+fn fill_lhs_batch(values: &mut [f32], seed: u64, step: usize) {
+    for (index, value) in values.iter_mut().enumerate() {
+        *value = synth_value(seed, step, index, 53);
+    }
 }
 
 fn synth_value(seed: u64, step: usize, index: usize, salt: u64) -> f32 {

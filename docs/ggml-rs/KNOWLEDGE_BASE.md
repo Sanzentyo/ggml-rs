@@ -66,11 +66,17 @@ git submodule update --init --recursive
     the release caller fast path remains contiguous copy (`__rust_alloc + memcpy`)
     for native payloads.
   - policy: keep ownership-returning decode API as default (`Result<Vec<T>>`).
-- Backend tensors support partial safe writes through typed APIs:
+- Backend tensors support partial safe range I/O through typed APIs:
   - `Tensor::write_data_backend_at::<f32>(offset, values)`
   - `Tensor::write_data_backend_at::<i32>(offset, values)`
+  - `Tensor::read_data_backend_at::<f32>(offset, len)`
+  - `Tensor::read_data_backend_at::<i32>(offset, len)`
   Use these when only a contiguous region changes (for example, stepwise mask
-  delta updates) to reduce host-device transfer overhead.
+  delta updates or sampled readback) to reduce host-device transfer overhead.
+- Host tensors also support typed range reads:
+  - `Tensor::read_data_at::<f32>(offset, len)`
+  - `Tensor::read_data_at::<i32>(offset, len)`
+  This is useful for deterministic sampled checks without exposing unsafe pointers.
 - GGUF now has a safe write path:
   - `GgufWriter::new()`
   - `GgufWriter::set_value(key, &GgufValue)` / `set_values(iter)` (typed scalars/arrays)

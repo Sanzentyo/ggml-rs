@@ -106,6 +106,20 @@ cmake --build "$LLAMA_CPP_DIR/build" --target llama-bench llama-gguf -j
     - `target/benchmarks/review3_constructor_clap_runtime_smoke.txt`
   - loop-reuse synthetic perf impact artifact:
     - `target/benchmarks/vision_mnist/loopreuse_impact.md`
+  - latest GPT-2 synthetic host-allocation optimization artifact:
+    - `target/benchmarks/review4_gpt2_fillreuse_impact.md`
+  - runtime smoke for this GPT-2 pass:
+    - `target/benchmarks/review4_gpt2_fillreuse_runtime_smoke.txt`
+  - latest GPT-2 backend sampled-read pass artifacts:
+    - `target/benchmarks/review4_gpt2_readslice_final_paritycfg.txt`
+    - `target/benchmarks/review4_gpt2_readslice_final_stability_r3_summary.md`
+    - `target/benchmarks/review4_gpt2_readslice_final_impact_vs_original.md`
+  - latest GPT-J logits range-read pass artifacts:
+    - `target/benchmarks/review4_gptj_slice_stability_r5_summary.md`
+    - `target/benchmarks/review4_gptj_slice_impact_vs_post_baseline.md`
+  - rejected GPT-J host-write incremental trial artifacts:
+    - `target/benchmarks/review4_gptj_hostwrite_stability_r5_summary.md`
+    - `target/benchmarks/review4_gptj_hostwrite_impact_vs_slice_baseline.md`
 
 ## Example CLI policy (clap unification)
 

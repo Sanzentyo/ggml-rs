@@ -15,8 +15,9 @@ centered on `Context`, `Tensor`, `Graph`, and `Backend`.
 - Expression API via `TensorExpr` with operator overloading (`+`, `-`, `*`,
   `/`) that still returns `Result<_>`.
 - Typed tensor I/O through `GgmlElement` (`Tensor::write_data`,
-  `Tensor::read_data`, `Tensor::get_data`) plus backend-slice traits
-  (`BackendElement`).
+  `Tensor::read_data`, `Tensor::read_data_at`, `Tensor::get_data`) plus
+  backend-slice traits (`BackendElement`) and backend range I/O helpers
+  (`Tensor::write_data_backend_at`, `Tensor::read_data_backend_at`).
 - Unified typed memory estimation through
   `Context::recommended_matmul_memory::<T>(...)` and
   `Context::recommended_backend_matmul_memory::<T>(...)`.

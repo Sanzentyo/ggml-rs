@@ -981,3 +981,272 @@ Detailed entries migrated from `docs/llama-rs/WORKLOG.md` during worklog compact
   - impact summary:
     - `target/benchmarks/review4_attention_runtime_modularization_gptj_guard_impact.md`,
   - parity remained exact (`generated_tokens` and `logit_checksum` matched the pre-split baseline).
+
+## Step1 continuation (GPT-2 synthetic host-allocation cleanup)
+
+- Implemented a low-risk synthetic optimization in `llama-rs/src/gpt2_synthetic.rs`:
+  - replaced per-step `lhs` vector allocation with a reusable preallocated host
+    buffer in both:
+    - `run_ctx`,
+    - `run_backend_for_steps` (therefore also covering alloc/backend/sched/batched paths).
+  - new helper:
+    - `fill_lhs_batch(&mut [f32], seed, step)`.
+- Validation + parity-config re-run:
+  - `cargo fmt --all`
+  - `cargo clippy --workspace --all-targets`
+  - `cargo test --workspace`
+  - `cargo check --workspace --all-targets --features link-system`
+  - parity-config run artifact:
+    - `target/benchmarks/review4_gpt2_fillreuse_paritycfg.txt`
+  - impact artifact:
+    - `target/benchmarks/review4_gpt2_fillreuse_impact.md`
+    - `ctx avg_item_ms`: `0.043166 -> 0.017536` (`~0.406`)
+    - `alloc avg_item_ms`: `0.018706 -> 0.016009` (`~0.856`)
+    - checksum parity: unchanged for both rows.
+- CPU/Metal runtime smoke for backend path:
+  - `target/benchmarks/review4_gpt2_fillreuse_runtime_smoke.txt`
+  - includes:
+    - `llama-rs/examples/gpt2_backend cpu`,
+    - `llama-rs/examples/gpt2_backend metal`.
+
+## Step1 continuation (backend sampled-read pass)
+
+- Extended `ggml-rs` safe tensor backend I/O surface:
+  - added `Tensor::read_data_backend_at::<T>(element_offset, element_count)`.
+- Added coverage in `tests/ggml_tensor_ops.rs`:
+  - backend slice read success case (`offset=2, len=3`),
+  - out-of-bounds read error case.
+- Updated `llama-rs/src/gpt2_synthetic.rs` backend runner to use sampled readback:
+  - `run_backend_for_steps` now reads only checksum-required prefix via
+    `read_data_backend_at::<f32>(0, sample_len)`.
+- Validation:
+  - `cargo fmt --all`
+  - `cargo clippy --workspace --all-targets`
+  - `cargo test --workspace`
+  - `cargo test -p ggml-rs --features link-system --test ggml_tensor_ops`
+  - `cargo check --workspace --all-targets --features link-system`
+- Runtime/parity artifacts:
+  - `target/benchmarks/review4_gpt2_readslice_paritycfg.txt`
+  - `target/benchmarks/review4_gpt2_readslice_impact_vs_fillreuse.md`
+  - `target/benchmarks/review4_gpt2_readslice_backend_impact_vs_fillreuse.md`
+  - stability summaries:
+    - `target/benchmarks/review4_gpt2_readslice_stability_r3_summary.md`
+    - `target/benchmarks/review4_gpt2_readslice_ctx_stability_r3_summary.md`
+- Follow-up decision in the same pass:
+  - attempted a context-path sampled checksum (`Tensor::get_data`) optimization for `run_ctx`,
+  - stability evidence showed no reliable gain, so this part was reverted.
+- Added/kept host range-read API in `ggml-rs`:
+  - `Tensor::read_data_at::<T>(offset, len)`,
+  - validated via `ggml_tensor_ops`; this API remains available even though
+    `gpt2 run_ctx` stayed on full readback for stable behavior.
+- Final retained state:
+  - backend sampled-read API + backend-path usage stays enabled,
+  - final artifacts:
+    - `target/benchmarks/review4_gpt2_readslice_final_paritycfg.txt`
+    - `target/benchmarks/review4_gpt2_readslice_final_stability_r3_summary.md`
+    - `target/benchmarks/review4_gpt2_readslice_final_impact_vs_original.md`
+  - final impact vs original parity baseline:
+    - `ctx avg_item_ms`: `0.043166 -> 0.021701` (`~0.503`, median),
+    - `alloc avg_item_ms`: `0.018706 -> 0.014245` (`~0.762`, median),
+    - checksum parity remained stable across `r=3`.
+
+## Step1 continuation (GPT-J logits range-read)
+
+- Updated `examples/gptj_main_synth.rs` to avoid full logits readback per step:
+  - replaced full tensor read + slice (`read_data::<f32>()` then `[start..]`) with
+    direct range read:
+    - `read_data_at::<f32>(start, GPTJ_VOCAB)`.
+- Validation:
+  - `cargo fmt --all`
+  - `cargo clippy --workspace --all-targets`
+  - `cargo test --workspace`
+  - `cargo test -p ggml-rs --features link-system --test ggml_tensor_ops`
+  - `cargo check --workspace --all-targets --features link-system`
+- Parity/perf artifacts:
+  - guard run:
+    - `target/benchmarks/review4_gptj_slice_parity_guard.txt`
+  - stability:
+    - `target/benchmarks/review4_gptj_slice_stability_r5_summary.md`
+  - baseline impact:
+    - `target/benchmarks/review4_gptj_slice_impact_vs_post_baseline.md`
+    - median `elapsed_us`: `985 -> 874` (`~0.887`),
+    - generated tokens/checksum remained stable across `r=5`.
+- Follow-up host-write incremental update trial:
+  - attempted to update only the newest token position via
+    `Tensor::write_data_at` in the loop,
+  - rejected after regression evidence:
+    - `target/benchmarks/review4_gptj_hostwrite_stability_r5_summary.md`
+    - `target/benchmarks/review4_gptj_hostwrite_impact_vs_slice_baseline.md`
+    - trial/baseline median ratio: `~2.127`,
+  - final code keeps full token-buffer write per iteration and only retains
+    logits range-read optimization.
+
+## Step2 continuation (stepwise decode toggle stability, canonical lock)
+
+- Canonical condition for this pass:
+  - `--cases 4096x32x8x1 --causal --decode-kv 129 --decode-steps 8 --past 128`
+  - `--decode-stepwise-profile-outproj-fused-layerx5`
+  - `--decode-stepwise-kv-proj --decode-stepwise-kv-cache-write --decode-stepwise-block --block-mlp-layer 0`
+  - backends: `cpu metal`, `warmup=1`, `iters=2`.
+- First A/B artifact for `no-mask-delta`:
+  - `target/benchmarks/review4_step2_stepwise_nomask_impact.md`
+  - snapshot (`variant/base`): CPU `~0.942`, MTL0 `~1.002`.
+- Stability reruns (`r=3`) for `no-mask-delta`:
+  - raw:
+    - `target/benchmarks/review4_step2_stepwise_baseline_cpu_metal{,_r2,_r3}.txt`,
+    - `target/benchmarks/review4_step2_stepwise_nomask_cpu_metal{,_r2,_r3}.txt`,
+  - summary:
+    - `target/benchmarks/review4_step2_stepwise_nomask_stability_r3.md`,
+  - median summary (`variant/base`):
+    - CPU `~1.006`,
+    - MTL0 `~0.998`,
+    - overall mean of backend medians `~1.002`.
+- Added `no-position-delta` A/B and stability run:
+  - first-run impact:
+    - `target/benchmarks/review4_step2_stepwise_nopos_impact.md`,
+  - raw reruns:
+    - `target/benchmarks/review4_step2_stepwise_nopos_base_cpu_metal{,_r2,_r3}.txt`,
+    - `target/benchmarks/review4_step2_stepwise_nopos_variant_cpu_metal{,_r2,_r3}.txt`,
+  - stability summary:
+    - `target/benchmarks/review4_step2_stepwise_nopos_stability_r3.md`,
+  - median summary (`variant/base`):
+    - CPU `~1.014`,
+    - MTL0 `~1.001`,
+    - overall mean of backend medians `~1.007`.
+- Added projection-hotspot recheck (`--decode-stepwise-no-fuse-output-proj`):
+  - `target/benchmarks/review4_step2_stepwise_outproj_nofuse_impact.md`,
+  - result (`variant/base`): CPU `~1.026`, MTL0 `~1.074`, overall `~1.050`.
+- Added static-KV-head precompute ablation (`--decode-stepwise-no-static-kv-head-precompute`):
+  - `target/benchmarks/review4_step2_stepwise_statickv_off_impact.md`,
+  - token ratio (`variant/base`): CPU `~0.992`, MTL0 `~1.007`, overall `~0.999`,
+  - setup ratio (`variant/base`): CPU `~1.014`, MTL0 `~1.150`, overall `~1.082`,
+  - checksum parity remained exact (`0.0` delta on both backends).
+- Added head-stage-buffer recheck on the same lock:
+  - first-run impact:
+    - `target/benchmarks/review4_step2_stepwise_headstage_on_impact.md`,
+  - stability reruns (`r=3`):
+    - raw:
+      - `target/benchmarks/review4_step2_stepwise_headstage_base_cpu_metal{,_r2,_r3}.txt`,
+      - `target/benchmarks/review4_step2_stepwise_headstage_on_cpu_metal{,_r2,_r3}.txt`,
+    - summary:
+      - `target/benchmarks/review4_step2_stepwise_headstage_stability_r3.md`,
+  - median summary (`head-stage/base`):
+    - token: CPU `~0.979`, MTL0 `~0.996`, overall `~0.988`,
+    - setup: CPU `~1.014`, MTL0 `~1.163`, overall `~1.089`,
+  - checksum parity remained exact (`0.0` delta on both backends).
+- Per user-selected next step, ran broader layer sweep (`block_layer=0..7`) for head-stage:
+  - base:
+    - `target/benchmarks/review4_step2_headstage_broadsweep_layers0_7_base.txt`,
+  - head-stage on:
+    - `target/benchmarks/review4_step2_headstage_broadsweep_layers0_7_on.txt`,
+  - impact summary:
+    - `target/benchmarks/review4_step2_headstage_broadsweep_layers0_7_impact.md`,
+    - `target/benchmarks/review4_step2_headstage_broadsweep_layers0_7_impact.csv`,
+  - broad-sweep means (`head-stage/base`):
+    - CPU token `~1.004` (3/8 layers faster),
+    - MTL0 token `~0.998` (5/8 layers faster),
+    - overall token `~1.001`,
+    - overall setup `~1.003`,
+  - checksum parity remained exact (`0.0` delta for all rows).
+- Ran next broader layer sweep for block gate/up fusion (`block_layer=0..7`):
+  - first broad impact:
+    - `target/benchmarks/review4_step2_blockgateup_broadsweep_layers0_7_impact.md`,
+    - `target/benchmarks/review4_step2_blockgateup_broadsweep_layers0_7_impact.csv`,
+  - additional paired rerun (`r2`) with stability summary:
+    - `target/benchmarks/review4_step2_blockgateup_broadsweep_layers0_7_base_r2.txt`,
+    - `target/benchmarks/review4_step2_blockgateup_broadsweep_layers0_7_on_r2.txt`,
+    - `target/benchmarks/review4_step2_blockgateup_broadsweep_layers0_7_stability_r2.md`,
+    - `target/benchmarks/review4_step2_blockgateup_broadsweep_layers0_7_stability_r2.csv`,
+  - stability (`r=2`) summary (`gateup-fused/base`):
+    - CPU token `~0.996`,
+    - MTL0 token `~1.001`,
+    - overall token `~0.998`,
+    - overall setup `~1.018`,
+  - checksum parity remained exact (`0.0` delta for all rows).
+- Pass decision:
+  - keep defaults unchanged on this lock:
+    - `mask_delta=true`,
+    - `position_delta=true`,
+    - `outproj_fused=true`,
+    - `kvhead_static_precompute=true`,
+    - `head_stage_buf=false` (broader sweep stayed near-neutral overall),
+    - `block_gateup_fused=false` (broader stability stayed near-neutral overall).
+- Per follow-up directive (`1,2 then 3`), ran two more broad-sweep passes (`block_layer=0..7`, `r=2`) on the same lock:
+  1. Head-concat balanced (`--decode-stepwise-balanced-head-concat`):
+     - variant runs:
+       - `target/benchmarks/review4_step2_headconcat_broadsweep_layers0_7_on.txt`,
+       - `target/benchmarks/review4_step2_headconcat_broadsweep_layers0_7_on_r2.txt`,
+     - stability summary:
+       - `target/benchmarks/review4_step2_headconcat_broadsweep_layers0_7_stability_r2.md`,
+       - overall token `~1.006`, overall setup `~1.057` (regression).
+  2. Mask-host elision (`--decode-stepwise-elide-mask-host-buffer`):
+     - variant runs:
+       - `target/benchmarks/review4_step2_maskhost_broadsweep_layers0_7_on.txt`,
+       - `target/benchmarks/review4_step2_maskhost_broadsweep_layers0_7_on_r2.txt`,
+     - stability summary:
+       - `target/benchmarks/review4_step2_maskhost_broadsweep_layers0_7_stability_r2.md`,
+       - overall token `~0.996`, overall setup `~1.083` (small token-side win offset by setup cost).
+- Then moved to alternate condition (`3`) and remeasured with `--decode-steps 16` on layers `0..7`:
+  - base:
+    - `target/benchmarks/review4_step2_alt_steps16_layers0_7_base.txt`,
+  - mask-host variant:
+    - `target/benchmarks/review4_step2_alt_steps16_layers0_7_maskhost_on.txt`,
+    - `target/benchmarks/review4_step2_alt_steps16_layers0_7_maskhost_impact.md`,
+  - block-gateup variant:
+    - `target/benchmarks/review4_step2_alt_steps16_layers0_7_blockgateup_on.txt`,
+    - `target/benchmarks/review4_step2_alt_steps16_layers0_7_blockgateup_impact.md`,
+  - combined summary:
+    - `target/benchmarks/review4_step2_alt_steps16_layers0_7_summary.md`,
+    - `maskhost-elide`: token `~1.008`, setup `~1.012`,
+    - `block-gateup-fused`: token `~1.004`, setup `~1.025`.
+- Updated decision after `1,2,3` pass:
+  - keep defaults unchanged on this lock:
+    - `head_concat_balanced=false`,
+    - `mask_host_elide=false`,
+    - `block_gateup_fused=false`,
+    - `head_stage_buf=false`,
+  - checksum parity remained exact (`0.0` deltas) across these sweeps.
+- Next candidate pass on the same canonical lock (`block_layer=0..7`):
+  - enabled `--decode-stepwise-kv-cache-write-to-cache`,
+  - artifact:
+    - `target/benchmarks/review4_step2_kvwritecache_broadsweep_layers0_7_impact.md`,
+    - `target/benchmarks/review4_step2_kvwritecache_broadsweep_layers0_7_impact.csv`,
+  - summary (`variant/base`):
+    - token: CPU `~1.024`, MTL0 `~1.012`, overall `~1.018`,
+    - setup: CPU `~1.111`, MTL0 `~1.114`, overall `~1.112`,
+  - checksum note:
+    - CPU delta remained `0.0`,
+    - MTL0 rows showed non-zero checksum delta (`+104`) and require no further pursuit because performance regressed clearly.
+- Decision update:
+  - keep `kv_cache_write_to_cache=false` on this lock.
+- Next candidate pass on the same canonical lock (`block_layer=0..7`):
+  - enabled `--decode-stepwise-no-static-kv-head-precompute`,
+  - artifact:
+    - `target/benchmarks/review4_step2_statickv_off_broadsweep_layers0_7_impact.md`,
+    - `target/benchmarks/review4_step2_statickv_off_broadsweep_layers0_7_impact.csv`,
+  - summary (`variant/base`):
+    - token: CPU `~0.998`, MTL0 `~1.013`, overall `~1.006`,
+    - setup: CPU `~1.163`, MTL0 `~1.156`, overall `~1.160`,
+  - checksum parity remained exact (`0.0` delta for all rows).
+- Decision update:
+  - keep `kvhead_static_precompute=true` on this lock.
+- Next candidate pass (`sync/readback`) started from layer-0 probe:
+  - `target/benchmarks/review4_step2_sync_readback_layer0_impact.md`,
+  - quick layer-0 snapshot:
+    - `sync_step`: CPU `~1.003`, MTL0 `~0.994`,
+    - `readback_step`: CPU `~1.015`, MTL0 `~0.999`.
+- Continued with broad sync-step sweep (`block_layer=0..7`) and stability rerun:
+  - first broad run:
+    - `target/benchmarks/review4_step2_syncstep_broadsweep_layers0_7_impact.md`,
+  - r2 broad run:
+    - `target/benchmarks/review4_step2_syncstep_broadsweep_layers0_7_on_r2.txt`,
+  - stability summary:
+    - `target/benchmarks/review4_step2_syncstep_broadsweep_layers0_7_stability_r2.md`,
+    - aggregate (`sync-step/base`, r=2 medians):
+      - CPU token `~0.916`,
+      - MTL0 token `~1.019`,
+      - overall `~0.967`,
+      - setup overhead increased (overall `~1.236`).
+- Decision update:
+  - keep `sync_step=false` as default on this lock for now (strong backend split and setup cost),
+  - keep backend-specific policy exploration as a separate follow-up item.

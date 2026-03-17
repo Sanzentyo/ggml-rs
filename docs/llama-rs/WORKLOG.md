@@ -50,6 +50,52 @@ Detailed logs live under `docs/llama-rs/worklog/`.
   both `no-mask-delta` and `no-position-delta` are slower (`~1.018` and
   `~1.041` variant/base overall), with checksum parity preserved (`0.0` deltas);
   defaults remain unchanged.
+- Step2 continuation on the canonical `4096x32x8x1` decode-stepwise condition
+  (`block_layer=0`, `steps=8`, profile `outproj_fused_layerx5`) now has fresh
+  `r=3` stability artifacts:
+  - `target/benchmarks/review4_step2_stepwise_nomask_stability_r3.md`
+    (`no-mask/base`: CPU `~1.006`, MTL0 `~0.998`, overall `~1.002`),
+  - `target/benchmarks/review4_step2_stepwise_nopos_stability_r3.md`
+    (`no-position/base`: CPU `~1.014`, MTL0 `~1.001`, overall `~1.007`),
+  - `target/benchmarks/review4_step2_stepwise_outproj_nofuse_impact.md`
+    (`no-fuse/base`: CPU `~1.026`, MTL0 `~1.074`, overall `~1.050`).
+  - `target/benchmarks/review4_step2_stepwise_statickv_off_impact.md`
+    (`no-static-kv/base`: CPU `~0.992`, MTL0 `~1.007`, overall token `~0.999`,
+    setup `~1.082`).
+  - `target/benchmarks/review4_step2_stepwise_headstage_stability_r3.md`
+    (`head-stage/base`: CPU token `~0.979`, MTL0 token `~0.996`, overall token
+    `~0.988`; setup `~1.089` overall).
+  - `target/benchmarks/review4_step2_headstage_broadsweep_layers0_7_impact.md`
+    (`head-stage/base`, layers `0..7`): CPU token mean `~1.004` (3/8 wins),
+    MTL0 token mean `~0.998` (5/8 wins), overall token `~1.001`.
+  - `target/benchmarks/review4_step2_blockgateup_broadsweep_layers0_7_stability_r2.md`
+    (`block-gateup/base`, layers `0..7`, `r=2`): CPU token `~0.996`,
+    MTL0 token `~1.001`, overall token `~0.998`, setup `~1.018`.
+  - `target/benchmarks/review4_step2_headconcat_broadsweep_layers0_7_stability_r2.md`
+    (`head-concat/base`, layers `0..7`, `r=2`): overall token `~1.006`,
+    setup `~1.057` (regression).
+  - `target/benchmarks/review4_step2_maskhost_broadsweep_layers0_7_stability_r2.md`
+    (`maskhost/base`, layers `0..7`, `r=2`): overall token `~0.996`,
+    setup `~1.083` (token gain small vs setup cost).
+  - Alternate condition (`decode-steps=16`, layers `0..7`) summary:
+    - `target/benchmarks/review4_step2_alt_steps16_layers0_7_summary.md`
+    - `maskhost-elide`: token `~1.008`, setup `~1.012`,
+    - `block-gateup-fused`: token `~1.004`, setup `~1.025`.
+  - Next candidate `kv_cache_write_to_cache` broad sweep:
+    - `target/benchmarks/review4_step2_kvwritecache_broadsweep_layers0_7_impact.md`
+    - overall token `~1.018`, setup `~1.112` (clear regression).
+  - Next candidate `no-static-kv-head-precompute` broad sweep:
+    - `target/benchmarks/review4_step2_statickv_off_broadsweep_layers0_7_impact.md`
+    - overall token `~1.006`, setup `~1.160` (regression).
+  - Next candidate `sync_step` broad stability (`r=2`):
+    - `target/benchmarks/review4_step2_syncstep_broadsweep_layers0_7_stability_r2.md`
+    - backend split remains strong: CPU token `~0.916` vs MTL0 token `~1.019`,
+      with setup overhead increase.
+  Policy remains unchanged: keep `mask_delta=true`, `position_delta=true`,
+  `outproj_fused=true`, `kvhead_static_precompute=true`, and keep
+  `head_stage_buf=false`, `block_gateup_fused=false`, `head_concat_balanced=false`,
+  `mask_host_elide=false`, `kv_cache_write_to_cache=false`, `sync_step=false`
+  under the current lock.
 - Ran a lock-coordinated parallel subagent pass for ggml upstream example parity
   batches (`foundation`, `gpt2`, `gptj_magika`, `vision_mnist`) and logged
   per-batch progress under `docs/llama-rs/worklog/subagents/`.
@@ -92,3 +138,35 @@ Detailed logs live under `docs/llama-rs/worklog/`.
   - `target/benchmarks/review4_attention_runtime_modularization_gptj_guard.txt`
   - parity stayed exact (token/checksum match) in
     `target/benchmarks/review4_attention_runtime_modularization_gptj_guard_impact.md`.
+- Continued step `1` synthetic optimization with a low-risk `gpt2_synthetic` host-allocation cleanup:
+  - reused a single `lhs` buffer across steps in `run_ctx` and backend runner paths,
+  - parity-config impact (`target/benchmarks/review4_gpt2_fillreuse_impact.md`):
+    - `ctx avg_item_ms`: `0.043166 -> 0.017536` (`~0.406`),
+    - `alloc avg_item_ms`: `0.018706 -> 0.016009` (`~0.856`),
+    - checksums unchanged.
+- Runtime smoke for this pass was re-run on CPU/Metal:
+  - `target/benchmarks/review4_gpt2_fillreuse_runtime_smoke.txt`.
+- Added backend sampled-read API usage for GPT-2 synthetic backend path:
+  - new safe API in `ggml-rs`: `Tensor::read_data_backend_at::<T>(offset, len)`,
+  - `gpt2_synthetic::run_backend_for_steps` now reads only checksum sample range.
+- Added host sampled-read safe API in `ggml-rs`:
+  - `Tensor::read_data_at::<T>(offset, len)`,
+  - verified via `ggml_tensor_ops` tests; kept as API surface, while `gpt2 run_ctx`
+    remains on full readback after stability checks.
+- Continued synthetic step1 on `gptj_main_synth`:
+  - switched final-step logits readback from full tensor copy to range read
+    (`Tensor::read_data_at::<f32>(start, GPTJ_VOCAB)`),
+  - parity remained exact (tokens/checksum stable across `r=5`),
+  - stability + impact artifacts:
+    - `target/benchmarks/review4_gptj_slice_stability_r5_summary.md`
+    - `target/benchmarks/review4_gptj_slice_impact_vs_post_baseline.md`
+    - median `elapsed_us`: `985 -> 874` (`~0.887`).
+- Additional host-write incremental trial (`Tensor::write_data_at` for token updates)
+  was benchmarked and rejected due regression:
+  - `target/benchmarks/review4_gptj_hostwrite_stability_r5_summary.md`
+  - `target/benchmarks/review4_gptj_hostwrite_impact_vs_slice_baseline.md`.
+- Re-validated link-system tests (`ggml_tensor_ops`) and CPU/Metal runtime,
+  with stability artifacts:
+  - `target/benchmarks/review4_gpt2_readslice_final_paritycfg.txt`
+  - `target/benchmarks/review4_gpt2_readslice_final_stability_r3_summary.md`
+  - `target/benchmarks/review4_gpt2_readslice_final_impact_vs_original.md`.

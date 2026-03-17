@@ -14,6 +14,17 @@ fn scoped_context_helpers_work() -> Result<(), Error> {
     let element_count = with_context(mem, |ctx| {
         let tensor = ctx.new_tensor_2d::<f32>(lhs)?;
         tensor.write_data(&[1.0, 2.0, 3.0, 4.0])?;
+        assert_eq!(tensor.read_data_at::<f32>(1, 2)?, vec![2.0, 3.0]);
+        tensor.write_data_at(2, &[9.0, 8.0])?;
+        assert_eq!(tensor.read_data::<f32>()?, vec![1.0, 2.0, 9.0, 8.0]);
+        let err = tensor
+            .read_data_at::<f32>(4, 1)
+            .expect_err("host read range past end should error");
+        assert!(matches!(err, Error::IndexOutOfBounds { .. }));
+        let err = tensor
+            .write_data_at(4, &[1.0])
+            .expect_err("host write range past end should error");
+        assert!(matches!(err, Error::IndexOutOfBounds { .. }));
         Ok(tensor.element_count()?)
     })?;
     assert_eq!(element_count, 4);
@@ -88,10 +99,19 @@ fn backend_roundtrip_and_bounds_checks() -> Result<(), Error> {
             tensor.read_data_backend::<i32>()?,
             vec![10, 20, 111, 222, 50, 60, 70, 80]
         );
+        assert_eq!(
+            tensor.read_data_backend_at::<i32>(2, 3)?,
+            vec![111, 222, 50]
+        );
 
         let err = tensor
             .write_data_backend_at(8, &[1])
             .expect_err("offset past end should error");
+        assert!(matches!(err, Error::IndexOutOfBounds { .. }));
+
+        let err = tensor
+            .read_data_backend_at::<i32>(7, 2)
+            .expect_err("read range past end should error");
         assert!(matches!(err, Error::IndexOutOfBounds { .. }));
 
         Ok(())
