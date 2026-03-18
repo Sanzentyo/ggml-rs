@@ -70,12 +70,23 @@
 - Balanced preset target: `cpu5_mtl7`
 - Keep defaults:
   - `head_stage_buf=false`
+  - `block_gateup_fused=true` (inside balanced preset)
   - `head_concat_balanced=false`
   - `position_delta=true`
 - Active parity objective: keep proxy/cpp as close to `1.0` as possible while preserving checksum parity.
 
-## 8) Next task started
+## 8) Next task completed (`block_gateup_fused` cross-model A/B)
 
-- Next operator pass is now started:
-  - `step2-blockgateup-crossmodel-refresh`
-  - target: cross-model A/B for `--decode-stepwise-fuse-block-gate-up` on refreshed balanced preset.
+- Cross-model artifacts:
+  - base: `target/benchmarks/review4_step2_balanced_cpu5_mtl7_blockgate_base.txt`
+  - variant: `target/benchmarks/review4_step2_balanced_cpu5_mtl7_blockgate_on.txt`
+  - impact: `target/benchmarks/review4_step2_balanced_cpu5_mtl7_blockgate_impact.md`
+- Aggregate:
+  - token `variant/base`: CPU `~1.005`, MTL0 `~1.001`, overall `~1.003`
+  - proxy/cpp overall: `~0.995 -> ~0.998` (closer to `1.0`)
+  - checksum delta max: `0.0`
+  - setup ratio (variant/base): overall `~1.011`
+- Decision for parity-focused default: enable `block_gateup_fused` in the balanced preset.
+- Runtime confirmation:
+  - `target/benchmarks/review4_balanced_cpu5_mtl7_blockgate_preset_smoke.txt`
+  - both CPU/Metal lines show `block_gateup_fused=true`.

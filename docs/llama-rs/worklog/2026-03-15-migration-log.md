@@ -101,6 +101,25 @@ Detailed entries migrated from `docs/llama-rs/WORKLOG.md` during worklog compact
 - Status:
   - `passed=3`, `failed=0`, `skipped_run_targets=13`.
 - Skipped runs remained model/data-argument dependent targets and were explicitly reported with `GGML_UPSTREAM_RUN_ARGS_<TARGET>` guidance.
+
+## 2026-03-18 next operator pass (`block_gateup_fused`) on refreshed balanced preset
+
+- Ran cross-model A/B (`6` models, CPU/Metal):
+  - base: `target/benchmarks/review4_step2_balanced_cpu5_mtl7_blockgate_base.txt`
+  - variant: `target/benchmarks/review4_step2_balanced_cpu5_mtl7_blockgate_on.txt`
+  - impact: `target/benchmarks/review4_step2_balanced_cpu5_mtl7_blockgate_impact.md`
+- Aggregate (`variant/base`):
+  - token ratio: CPU `~1.005`, MTL0 `~1.001`, overall `~1.003`,
+  - checksum delta max: `0.0`.
+- Relative to refreshed cpp baselines:
+  - proxy/cpp overall moved `~0.995 -> ~0.998` (closer to `1.0`),
+  - CPU `~0.980 -> ~0.984`,
+  - MTL0 `~1.011 -> ~1.011` (near-flat).
+- Decision for parity-focused balanced preset:
+  - enable `block_gateup_fused=true`,
+  - keep `head_stage_buf=false`.
+- Runtime verification:
+  - `target/benchmarks/review4_balanced_cpu5_mtl7_blockgate_preset_smoke.txt` confirms balanced preset emits `block_gateup_fused=true` on both CPU/Metal lines.
 - Unified root `ggml-rs/examples` on clap derive argument parsing (including
   `backend_matmul`, `bench_matmul`, `perf_metal`, synthetic GPT-J/Magika/MNIST/SAM/YOLO,
   and `bench_upstream_suite`) and re-verified runtime CPU/Metal smoke:

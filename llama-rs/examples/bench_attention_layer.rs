@@ -49,6 +49,7 @@ fn stepwise_profile_label(parsed: &ParsedArgs, layer_repeat: usize) -> &'static 
     if parsed.decode_stepwise_fuse_output_projection
         && parsed.decode_stepwise_layer_repeat_cpu == Some(5)
         && parsed.decode_stepwise_layer_repeat_metal == Some(7)
+        && parsed.decode_stepwise_fuse_block_gate_up
     {
         return "outproj_fused_balanced_cpu5_mtl7";
     }
@@ -677,7 +678,7 @@ fn parse_args() -> Result<ParsedArgs, Box<dyn StdError>> {
         decode_stepwise_position_deltas = true;
         decode_stepwise_balanced_head_concat = false;
         decode_stepwise_head_output_staging_buffer = false;
-        decode_stepwise_fuse_block_gate_up = false;
+        decode_stepwise_fuse_block_gate_up = true;
     }
     // Explicit toggles should override profile presets when both are provided.
     if cli.decode_stepwise_position_delta {

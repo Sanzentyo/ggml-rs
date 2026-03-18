@@ -648,7 +648,7 @@ Sample result:
 - optional `--decode-stepwise-no-mask-delta` disables incremental mask-delta updates and forces full per-step mask uploads (for matched A/B checks).
 - optional `--decode-stepwise-elide-mask-host-buffer` enables experimental host-buffer elision for incremental mask updates (`query_length=1`); default is disabled.
 - optional `--decode-stepwise-head-stage-buffer` enables an experimental per-head staging-buffer path before fused output projection; default is disabled.
-- optional `--decode-stepwise-fuse-block-gate-up` enables experimental fusion of block-MLP gate/up projection into one matmul in stepwise block mode; default is disabled.
+- optional `--decode-stepwise-fuse-block-gate-up` enables fusion of block-MLP gate/up projection into one matmul in stepwise block mode; CLI default is disabled (balanced preset currently enables it).
 - optional `--block-mlp-model <gguf> --block-mlp-layer <n>` wires model-derived block-MLP topology into block mode (`block_mlp_real=true/false` in output).
 - optional `--block-mlp-layer-range <start:end>` runs the same benchmark across multiple block layers in one command and emits `block_layer=<n>` per line.
 - stepwise output includes `mask_host_elide=<true|false>` to keep this A/B condition explicit in artifacts.
@@ -1096,12 +1096,18 @@ Variant note:
     - step1 hotspot slice (ELYZA `layers 5..7`): token `on/base ~0.996`, setup `on/base ~1.005`,
     - step2 models6 slice: token `on/base ~0.994`; proxy/cpp overall `~0.993 -> ~0.987`,
     - checksum parity: exact (`max abs delta = 0.0`),
+  - refreshed follow-up on `block_gateup_fused` under tuned balanced preset (`cpu5_mtl7`):
+    - step2 models6 slice: token `on/base ~1.003`,
+    - proxy/cpp overall `~0.995 -> ~0.998` (closer to `1.0`),
+    - setup ratio `on/base ~1.011`,
+    - checksum parity: exact (`max abs delta = 0.0`),
   - policy:
     - keep `outproj_fused` default-off for canonical layerx3 path,
     - active optimization track (user-selected) is `outproj_fused + layer_repeat=5`,
     - static-KV precompute is now enabled by default in this track,
     - balanced + static-KV remains the near-parity alternative when closer-to-1.0 calibration is prioritized; current tuned preset is `CPU=5`, `MTL0=7`,
     - keep `head_stage_buf=false` as default (small token gain but parity objective regresses on refreshed 6-model pass),
+    - set `block_gateup_fused=true` in the balanced preset (parity objective improves toward `1.0` on refreshed 6-model pass),
     - keep `head_concat_balanced=false` as default (marginal/mixed impact), but keep the A/B toggle available,
     - keep `position_delta=true` as default (small positive overall impact), with explicit A/B toggle retained.
 

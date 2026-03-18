@@ -169,6 +169,14 @@ Detailed logs live under `docs/llama-rs/worklog/`.
   - run log: `target/benchmarks/review4_step3_upstream_suite_refresh.txt`
   - summary: `target/benchmarks/review4_step3_upstream_suite_refresh_summary.md`
   - status: `passed=3`, `failed=0`, `skipped_run_targets=13` (model/data-arg dependent targets explicitly listed).
+- Continued with next operator pass (`block_gateup_fused`) cross-model A/B (`6` models, CPU/Metal) on refreshed balanced preset:
+  - base: `target/benchmarks/review4_step2_balanced_cpu5_mtl7_blockgate_base.txt`
+  - variant: `target/benchmarks/review4_step2_balanced_cpu5_mtl7_blockgate_on.txt`
+  - impact: `target/benchmarks/review4_step2_balanced_cpu5_mtl7_blockgate_impact.md`
+  - aggregate (`variant/base`): token CPU `~1.005`, MTL0 `~1.001`, overall `~1.003`; checksum delta `0.0`.
+  - parity objective (`proxy/cpp -> 1.0`) improved overall `~0.995 -> ~0.998`.
+  - policy update: balanced preset now enables `block_gateup_fused=true` (parity-focused), while `head_stage_buf=false` remains unchanged.
+  - runtime smoke: `target/benchmarks/review4_balanced_cpu5_mtl7_blockgate_preset_smoke.txt` confirms `block_gateup_fused=true` on CPU/Metal preset runs.
 - Ran a lock-coordinated parallel subagent pass for ggml upstream example parity
   batches (`foundation`, `gpt2`, `gptj_magika`, `vision_mnist`) and logged
   per-batch progress under `docs/llama-rs/worklog/subagents/`.
