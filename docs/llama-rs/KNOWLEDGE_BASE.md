@@ -253,6 +253,8 @@ Artifact:
 - `target/benchmarks/llama_rs_idle_elyza_layer0_cpu_metal.txt`
 - `target/benchmarks/llama_rs_idle_qwen35_cpu_metal_fallback.txt`
 - `target/benchmarks/llama_rs_idle_elyza_cpu_metal_post_qwen_fix.txt`
+- `target/benchmarks/review4_idle_minitron_post_fallback_fix.txt`
+- `target/benchmarks/review4_model_inference_refresh_idle_cpu_metal_post_fallback_fix_summary.md`
 - `idle` now tries the requested layer first, then scans detected layers for attention-capable tensors.
 - For non-llama architectures where real per-layer attention weights cannot be resolved, `idle` falls back to metadata-derived deterministic attention weights and reports `weights_mode=MetadataDeterministic`.
 - Llama-style models keep real tensor decoding (`weights_mode=ModelLayer`).
@@ -637,8 +639,8 @@ Sample result:
 - output line includes `stepwise=true`, `kv_start=...`, `steps=...`, `setup=... ms`, and `avg_token=... ms`.
 - optional `--decode-stepwise-kv-proj` enables per-step KV projection cost modeling in the persistent runner (`kv_proj=true` in output).
 - optional `--decode-stepwise-block` enables residual+RMSNorm+MLP-shaped block-scope cost modeling (`block=true` in output).
-- optional `--decode-stepwise-sync-step` inserts per-step backend synchronization (currently applied to Metal path in the benchmark runner).
-- optional `--decode-stepwise-readback-step` inserts per-step output readback (currently applied to Metal path in the benchmark runner).
+- optional `--decode-stepwise-sync-step` inserts per-step backend synchronization (applies consistently to both CPU and Metal benchmark paths).
+- optional `--decode-stepwise-readback-step` inserts per-step output readback (applies consistently to both CPU and Metal benchmark paths).
 - optional `--decode-stepwise-kv-cache-write` adds explicit projected-K/V copy nodes (requires `--decode-stepwise-kv-proj`) to model cache-write cost.
 - optional `--decode-stepwise-kv-cache-write-to-cache` rewires KV-write copies into per-step views of the persistent K/V cache tensor (requires `--decode-stepwise-kv-cache-write`).
 - optional `--decode-stepwise-layer-repeat <n>` multiplies per-step graph execution count (`n >= 1`) to model extra stacked decode work while keeping the same graph structure.
@@ -1022,7 +1024,7 @@ Variant note:
 - Experimental `--decode-stepwise-fuse-output-proj` is available for stepwise output projection:
   - implementation: concatenate per-head attention outputs (`Context::concat(..., dim=0)`) then run one `W_O * HEADS` matmul,
   - preset flag: `--decode-stepwise-profile-outproj-fused-layerx5` (`outproj_fused=true`, `layer_repeat=5`),
-  - backend-balanced preset flag: `--decode-stepwise-profile-outproj-fused-balanced` (`CPU layer_repeat=5`, `MTL layer_repeat=6`, `outproj_fused=true`),
+  - backend-balanced preset flag: `--decode-stepwise-profile-outproj-fused-balanced` (`CPU layer_repeat=6`, `MTL layer_repeat=7`, `outproj_fused=true`),
   - stepwise output tags preset runs with `profile=outproj_fused_layerx5`,
   - static-KV precompute controls:
     - `--decode-stepwise-static-kv-head-precompute`,
@@ -1050,7 +1052,7 @@ Variant note:
     - CPU avg proxy/cpp `~1.073`,
     - MTL0 avg proxy/cpp `~0.908`,
     - overall `~0.991`,
-  - balanced preset (`CPU=5`, `MTL0=6`) full-run calibration:
+  - balanced preset historical snapshot (`CPU=5`, `MTL0=6`) full-run calibration:
     - CPU avg proxy/cpp `~1.076`,
     - MTL0 avg proxy/cpp `~1.063`,
     - overall `~1.070`,
@@ -1067,6 +1069,19 @@ Variant note:
     - CPU avg proxy/cpp `~1.025`,
     - MTL0 avg proxy/cpp `~1.041`,
     - overall `~1.033`,
+  - latest fine-tune sweep on the same static-KV calibration condition (`review4`, 7 repeat-pair candidates), recalibrated on refreshed llama.cpp decode baselines:
+    - summary: `target/benchmarks/review4_finetune_balanced_profile_sweep_summary.md`,
+    - machine-readable ranking: `target/benchmarks/review4_finetune_balanced_profile_sweep_summary.json`,
+    - selected pair: `CPU=5`, `MTL0=7` (`cpu5_mtl7`),
+    - selected averages: CPU `~0.981`, MTL0 `~1.010`, overall `~0.995`, balance gap `~0.029`,
+    - candidate raw runs:
+      - `target/benchmarks/review4_finetune_balanced_profile_cpu5_mtl7.txt`,
+      - `target/benchmarks/review4_finetune_balanced_profile_cpu6_mtl6.txt`,
+      - `target/benchmarks/review4_finetune_balanced_profile_cpu6_mtl7.txt`,
+      - `target/benchmarks/review4_finetune_balanced_profile_cpu5_mtl6_refresh.txt`,
+      - `target/benchmarks/review4_finetune_balanced_profile_cpu5_mtl5.txt`,
+      - `target/benchmarks/review4_finetune_balanced_profile_cpu4_mtl6.txt`,
+      - `target/benchmarks/review4_finetune_balanced_profile_cpu4_mtl5.txt`,
   - fused-output balanced head-concat A/B (`outproj_fused_layerx5`, static-KV on, 6-model):
     - CPU avg `on/off ~1.000`,
     - MTL0 avg `on/off ~0.983`,
@@ -1077,11 +1092,16 @@ Variant note:
     - MTL0 avg `on/off ~1.001`,
     - overall `on/off ~0.995`,
     - checksum parity: exact (`max abs delta = 0.0`),
+  - refreshed follow-up on `head_stage_buf` under tuned balanced preset (`cpu5_mtl7`):
+    - step1 hotspot slice (ELYZA `layers 5..7`): token `on/base ~0.996`, setup `on/base ~1.005`,
+    - step2 models6 slice: token `on/base ~0.994`; proxy/cpp overall `~0.993 -> ~0.987`,
+    - checksum parity: exact (`max abs delta = 0.0`),
   - policy:
     - keep `outproj_fused` default-off for canonical layerx3 path,
     - active optimization track (user-selected) is `outproj_fused + layer_repeat=5`,
     - static-KV precompute is now enabled by default in this track,
-    - balanced + static-KV is a near-parity alternative when closer-to-1.0 calibration is prioritized,
+    - balanced + static-KV remains the near-parity alternative when closer-to-1.0 calibration is prioritized; current tuned preset is `CPU=5`, `MTL0=7`,
+    - keep `head_stage_buf=false` as default (small token gain but parity objective regresses on refreshed 6-model pass),
     - keep `head_concat_balanced=false` as default (marginal/mixed impact), but keep the A/B toggle available,
     - keep `position_delta=true` as default (small positive overall impact), with explicit A/B toggle retained.
 

@@ -5,7 +5,7 @@ use crate::inference::{
     build_attention_decode_cache, resolve_attention_weights_for_layer,
     resolve_llama_layer_dimensions,
 };
-use crate::metadata::{ModelArchitecture, resolve_transformer_metadata};
+use crate::metadata::resolve_transformer_metadata;
 use crate::model::GgufModel;
 use crate::naming::detect_layer_indices;
 use std::error::Error as StdError;
@@ -335,9 +335,7 @@ fn resolve_idle_attention_weights(
         }
     }
 
-    if let Ok(metadata) = resolve_transformer_metadata(model)
-        && matches!(metadata.architecture(), ModelArchitecture::Other(_))
-    {
+    if let Ok(metadata) = resolve_transformer_metadata(model) {
         let layout = AttentionLayout::from_hidden_features(
             metadata.embedding_length(),
             metadata.attention_head_count(),

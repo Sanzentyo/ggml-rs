@@ -96,6 +96,79 @@ Detailed logs live under `docs/llama-rs/worklog/`.
   `head_stage_buf=false`, `block_gateup_fused=false`, `head_concat_balanced=false`,
   `mask_host_elide=false`, `kv_cache_write_to_cache=false`, `sync_step=false`
   under the current lock.
+- Post-fallback idle validation completed on the previously failing Minitron model:
+  - `target/benchmarks/review4_idle_minitron_post_fallback_fix.txt`
+  - `weights_mode=MetadataDeterministic` now succeeds on both `CPU` and `MTL0`.
+- Full post-fallback idle refresh completed across all 6 target models:
+  - `target/benchmarks/review4_model_inference_refresh_idle_cpu_metal_post_fallback_fix.txt`
+  - `target/benchmarks/review4_model_inference_refresh_idle_cpu_metal_post_fallback_fix_summary.md`
+  - all models now emit both CPU/Metal rows.
+- Sync-step policy follow-up completed on a model-hidden-matched 6-model sweep:
+  - `target/benchmarks/review4_step2_syncpolicy_cpuenabled_models6_impact.md`
+  - runner fix: `--decode-stepwise-sync-step` is now applied consistently on both CPU and Metal in `bench_attention_layer` (instead of Metal-only).
+  - aggregate (`sync/base`): CPU token `~1.002`, MTL0 token `~0.996`, overall `~0.999`.
+  - policy remains `sync_step=false` by default (mixed and near-neutral net effect).
+- Next step2 operator pass (`readback_step`) completed on the same lock:
+  - `target/benchmarks/review4_step2_readback_models6_impact.md`
+  - aggregate (`readback/base`): CPU token `~0.987`, MTL0 token `~1.005`, overall `~0.996`.
+  - policy remains `readback_step=false` by default (backend split; keep as explicit A/B switch).
+- Subsequent operator pass (`kv_cache_write_to_cache`) recheck completed on the same lock:
+  - `target/benchmarks/review4_step2_kvwritecache_models6_impact.md`
+  - aggregate (`variant/base`): CPU token `~1.008`, MTL0 token `~1.019`, overall `~1.014` (regression).
+  - checksum deltas were non-zero on multiple rows, so policy remains `kv_cache_write_to_cache=false`.
+- Additional operator pass (`head_stage_buf`) recheck completed on the same lock:
+  - `target/benchmarks/review4_step2_headstage_models6_impact.md`
+  - aggregate (`variant/base`): CPU token `~1.020`, MTL0 token `~1.002`, overall `~1.011` (regression).
+  - checksum parity remained exact (`0.0` deltas), policy remains `head_stage_buf=false`.
+- Additional operator pass (`block_gateup_fused`) recheck completed on the same lock:
+  - `target/benchmarks/review4_step2_blockgateup_models6_impact.md`
+  - aggregate (`variant/base`): CPU token `~0.993`, MTL0 token `~1.003`, overall `~0.998`; setup `~1.022`.
+  - policy remains `block_gateup_fused=false` (backend split + setup overhead).
+- Additional operator pass (`mask_host_elide`) recheck completed on the same lock:
+  - `target/benchmarks/review4_step2_maskhost_models6_impact.md`
+  - aggregate (`variant/base`): CPU token `~0.988`, MTL0 token `~1.004`, overall `~0.996`.
+  - policy remains `mask_host_elide=false` (backend split; keep as explicit A/B switch).
+- `perf-close-cpp-gap` follow-up trial:
+  - tested a micro-optimization in `gpt2_synthetic` (cache `graph.last_node()` lookup outside the loop),
+  - r5 median impact artifact: `target/benchmarks/review4_perf_close_gap_gpt2_backend_lastnodecache_r5_impact.md`,
+  - result: CPU `~0.991` but Metal `~1.101` (`post/pre`), so the change was rejected and reverted.
+- `parallel-remaining-examples` follow-up:
+  - hardened `bench_upstream_suite` with dynamic CMake target discovery and updated default target set to currently available upstream targets.
+  - first post-hardening suite artifact:
+    - `target/benchmarks/review4_parallel_remaining_examples_suite_post_hardening_summary.md`
+  - added run-skip rules for model/data-argument dependent targets in the harness.
+  - latest suite artifact:
+    - `target/benchmarks/review4_parallel_remaining_examples_suite_post_skiprules_summary.md`
+  - latest status: `passed=3`, `failed=0`, `skipped_run_targets=13` (explicitly reported as model/data-arg dependent).
+- Unblocked `fine-tune-balanced-profile`, refreshed llama.cpp baselines, and reran the extended repeat-pair calibration sweep (`7` candidates) against refreshed decode rows:
+  - summary: `target/benchmarks/review4_finetune_balanced_profile_sweep_summary.md`
+  - ranking JSON: `target/benchmarks/review4_finetune_balanced_profile_sweep_summary.json`
+  - tuned calibration table: `target/benchmarks/review4_finetune_balanced_profile_cpu5_mtl7_calibration.md`
+  - tuned-vs-baseline impact: `target/benchmarks/review4_finetune_balanced_profile_cpu5_mtl7_impact.md`
+  - selected pair: `CPU=5`, `MTL0=7` (`cpu5_mtl7`) with avg proxy/cpp:
+    - CPU `~0.981`, MTL0 `~1.010`, overall `~0.995`.
+  - updated `bench_attention_layer` balanced preset wiring/tag accordingly:
+    - profile tag now `outproj_fused_balanced_cpu5_mtl7`.
+- Resumed step `1` on the refreshed balanced preset (`cpu5_mtl7`) with ELYZA layer sweep (`block_layer=0..7`):
+  - raw: `target/benchmarks/review4_step1_balanced_cpu5_mtl7_elyza_layers0_7.txt`
+  - summary: `target/benchmarks/review4_step1_balanced_cpu5_mtl7_elyza_layers0_7_summary.{md,csv}`
+  - aggregate: CPU `~28.427 ms`, MTL0 `~28.061 ms`, overall `~28.244 ms` (`avg_token`).
+- Ran hotspot-window A/B (`layers 5..7`) with `--decode-stepwise-head-stage-buffer` on top of the refreshed balanced preset:
+  - base: `target/benchmarks/review4_step1_balanced_cpu5_mtl7_elyza_layers5_7_headstage_base.txt`
+  - variant: `target/benchmarks/review4_step1_balanced_cpu5_mtl7_elyza_layers5_7_headstage_on.txt`
+  - impact: `target/benchmarks/review4_step1_balanced_cpu5_mtl7_elyza_layers5_7_headstage_impact.md`
+  - aggregate (`variant/base`): token CPU `~0.997`, MTL0 `~0.995`, overall `~0.996`; setup `~1.005`; checksum delta `0.0`.
+  - policy on this slice remains `head_stage_buf=false` (near-neutral token gain with setup regression).
+- Continued with step `2` cross-model operator A/B (`6` models, CPU/Metal) for `head_stage_buf` on refreshed balanced preset:
+  - base: `target/benchmarks/review4_step2_balanced_cpu5_mtl7_headstage_base.txt`
+  - variant: `target/benchmarks/review4_step2_balanced_cpu5_mtl7_headstage_on.txt`
+  - impact: `target/benchmarks/review4_step2_balanced_cpu5_mtl7_headstage_impact.md`
+  - aggregate (`variant/base`): token CPU `~0.995`, MTL0 `~0.994`, overall `~0.994`; checksum delta `0.0`.
+  - parity objective (`proxy/cpp -> 1.0`) moved `~0.993 -> ~0.987` overall, so policy remains `head_stage_buf=false`.
+- Continued with step `3` upstream-suite refresh on the same lock:
+  - run log: `target/benchmarks/review4_step3_upstream_suite_refresh.txt`
+  - summary: `target/benchmarks/review4_step3_upstream_suite_refresh_summary.md`
+  - status: `passed=3`, `failed=0`, `skipped_run_targets=13` (model/data-arg dependent targets explicitly listed).
 - Ran a lock-coordinated parallel subagent pass for ggml upstream example parity
   batches (`foundation`, `gpt2`, `gptj_magika`, `vision_mnist`) and logged
   per-batch progress under `docs/llama-rs/worklog/subagents/`.
@@ -170,3 +243,47 @@ Detailed logs live under `docs/llama-rs/worklog/`.
   - `target/benchmarks/review4_gpt2_readslice_final_paritycfg.txt`
   - `target/benchmarks/review4_gpt2_readslice_final_stability_r3_summary.md`
   - `target/benchmarks/review4_gpt2_readslice_final_impact_vs_original.md`.
+- Continued requested `1 -> 2 -> 3` loop pass on canonical lock with cycle-indexed artifacts (`c01..c04`):
+  - step2 operator passes (model-hidden-matched 6-model CPU/MTL A/B, base reused from `review4_step2_syncpolicy_cpuenabled_models6_{cpu_base,mtl_base}.txt`):
+    - `c01` `head_concat_balanced=true`: `target/benchmarks/review4_c01_20260317T165532_step2_headconcat_models6_impact.md` (`overall token ~1.024`, setup `~1.090`) -> reject.
+    - `c02` `no_static_kv_head_precompute`: `target/benchmarks/review4_c02_20260317T170617_step2_statickv_off_models6_impact.md` (`overall token ~1.038`, setup `~1.126`) -> reject.
+    - `c03` `no_position_delta`: `target/benchmarks/review4_c03_20260317T171408_step2_nopos_models6_impact.md` (`overall token ~1.019`, setup `~1.167`) -> reject.
+    - `c04` `no_mask_delta`: `target/benchmarks/review4_c04_20260317T172201_step2_nomask_models6_impact.md` (`overall token ~1.019`, setup `~1.202`) -> reject.
+  - `perf-close-cpp-gap` runtime A/B (`gpt2_backend`, `r=5` medians):
+    - `c01` `threads=2` vs `1`: `target/benchmarks/review4_c01_20260317T170130_perf_close_gap_gpt2_backend_threads2_r5_impact.md` (CPU `~0.985`, MTL0 `~0.912`) -> accept.
+    - `c02` `n_batch=16` vs `8`: `target/benchmarks/review4_c02_20260317T171023_perf_close_gap_gpt2_backend_batch16_r5_impact.md` (CPU `~0.599`, MTL0 `~0.538`) -> accept.
+    - `c03` `threads=2` on `n_batch=16`: `target/benchmarks/review4_c03_20260317T171810_perf_close_gap_gpt2_backend_threads2_batch16_r5_impact.md` (CPU `~0.993`, MTL0 `~0.542`) -> accept.
+    - `c04` `threads=4` vs `2` on `n_batch=16`: `target/benchmarks/review4_c04_20260317T172614_perf_close_gap_gpt2_backend_threads4_batch16_r5_impact.md` (CPU `~1.085`, MTL0 `~0.982`) -> reject.
+    - kept source defaults/code unchanged (runtime tuning evidence only; no robust code-level candidate promoted).
+  - `parallel-remaining-examples` keep-going reruns remained stable in all 4 cycles:
+    - summaries:
+      - `target/benchmarks/review4_c01_20260317T170512_parallel_remaining_examples_suite_summary.md`
+      - `target/benchmarks/review4_c02_20260317T171305_parallel_remaining_examples_suite_summary.md`
+      - `target/benchmarks/review4_c03_20260317T172057_parallel_remaining_examples_suite_summary.md`
+      - `target/benchmarks/review4_c04_20260317T172855_parallel_remaining_examples_suite_summary.md`
+    - each run: `passed=3`, `failed=0`, `skipped_run_targets=13`.
+- Loop continuation `c05..c08` executed on the same canonical lock; detailed per-cycle entries are recorded in `docs/llama-rs/worklog/2026-03-15-migration-log.md`.
+- New artifact families were added under `target/benchmarks/review4_c0[5-8]_...` for step2/perf/suite outputs and summaries.
+- Snapshot (`c05..c08`): step2 remained reject-only (`overall token ~1.014/1.035/1.015/1.018`), perf accepted `c05/c06`, rejected `c07`, and kept `c08` as conservative monitor-only; suite stayed stable (`passed=3`, `failed=0`, `skipped_run_targets=13`).
+- Loop continuation `c09..c18` completed; detailed cycle-by-cycle entries are in `docs/llama-rs/worklog/2026-03-15-migration-log.md`.
+- Snapshot (`c09..c18`): step2 remained reject-only (`overall token ~1.012..1.035`), perf was mixed (`batch16` remained strongest; `threads2` and `threads2@batch16` became unstable; `threads4@batch16` remained non-robust), and suite stayed stable (`passed=3`, `failed=0`, `skipped_run_targets=13`).
+- Runtime tracker after `c18`: cumulative loop estimate reached `8121s` (`~135.4 min`), leaving `~2679s` (`~44.7 min`) to the `>= ~3h` stop boundary.
+- Final continuation block `c19..c22` completed and reached the stop condition at cycle boundary `c22` (`phase1+phase2 ~= 10842s`, `~180.7 min`).
+- Snapshot (`c19..c22`): step2 stayed conservative/reject-only overall (including one mixed split run where `nomask` improved on CPU but regressed on Metal), perf remained strongest on `batch16@threads2`, and suite stayed stable (`passed=3`, `failed=0`, `skipped_run_targets=13`).
+- Detailed completion record and artifact index for `c19..c22` is appended in `docs/llama-rs/worklog/2026-03-15-migration-log.md`.
+- Completed remaining step2 task (`step2-next-operator-pass-6`) with combined interaction pass:
+  - `target/benchmarks/review4_step2_nomask_nopos_models6_impact.md`
+  - token stayed near-neutral (`overall ~0.999`) but setup cost exploded (`overall ~1.782`) -> reject, defaults unchanged.
+- Completed remaining `perf-close-cpp-gap` quantification for model-exec path:
+  - `target/benchmarks/review4_perf_close_gap_model_exec_opt_r5_impact.md`
+  - `gpt2_backend` baseline (`batch8,threads1`) vs optimized (`batch16,threads2`) median `avg_item_ms`:
+    - CPU `0.007759 -> 0.005056` (`34.8%` faster),
+    - MTL0 `0.043701 -> 0.030004` (`31.3%` faster).
+  - cycle-wide candidate summary:
+    - `target/benchmarks/review4_phase2_perf_summary.md` (`batch16` best robust median candidate).
+- Completed remaining parallel suite hardening task:
+  - `bench_upstream_suite` now accepts per-target run args via `GGML_UPSTREAM_RUN_ARGS_<TARGET>`.
+  - validation run artifact:
+    - `target/benchmarks/review4_parallel_remaining_examples_suite_runargs_env.txt`
+    - `target/benchmarks/review4_parallel_remaining_examples_suite_runargs_env_summary.md`
+  - status remains deterministic: `passed=3`, `failed=0`, `skipped_run_targets=13`.

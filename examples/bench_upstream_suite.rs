@@ -4,11 +4,29 @@
 //! repeated without editing source code.
 
 use clap::{ArgAction, Parser};
+use std::collections::HashSet;
 use std::fs;
 use std::process::Command;
 use std::time::Instant;
 
-const DEFAULT_BENCH_TARGETS: &[&str] = &["test-backend-ops", "test-quantize-perf"];
+const DEFAULT_BENCH_TARGETS: &[&str] = &[
+    "simple-ctx",
+    "simple-backend",
+    "perf-metal",
+    "gpt-2-ctx",
+    "gpt-2-backend",
+    "gpt-2-alloc",
+    "gpt-2-batched",
+    "gpt-2-sched",
+    "gpt-2-quantize",
+    "gpt-j",
+    "gpt-j-quantize",
+    "magika",
+    "mnist-eval",
+    "mnist-train",
+    "sam",
+    "yolov3-tiny",
+];
 
 #[derive(Debug, Parser)]
 #[command(name = "bench_upstream_suite")]
@@ -31,11 +49,33 @@ fn main() {
         !options.targets.is_empty(),
         "no upstream benchmark targets selected"
     );
+    let available_targets = discover_targets(&options.build_dir)
+        .unwrap_or_else(|error| panic!("failed to discover CMake targets: {error}"));
+    let mut runnable_targets = Vec::new();
+    let mut skipped_targets = Vec::new();
+    for target in &options.targets {
+        if available_targets.contains(target) {
+            runnable_targets.push(target.clone());
+        } else {
+            skipped_targets.push(target.clone());
+        }
+    }
+    assert!(
+        !runnable_targets.is_empty(),
+        "no selected upstream benchmark targets are available in `{}`",
+        options.build_dir
+    );
 
     if options.list_only {
         println!("selected upstream benchmark targets:");
-        for target in &options.targets {
+        for target in &runnable_targets {
             println!(" - {target}");
+        }
+        if !skipped_targets.is_empty() {
+            println!("skipped unavailable targets:");
+            for target in &skipped_targets {
+                println!(" - {target}");
+            }
         }
         return;
     }
@@ -43,8 +83,9 @@ fn main() {
     let suite_started = Instant::now();
     let mut passed = Vec::new();
     let mut failures = Vec::new();
+    let mut skipped_runs = Vec::new();
 
-    for target in &options.targets {
+    for target in &runnable_targets {
         let started = Instant::now();
         if !options.skip_build
             && let Err(error) = build_target(&options.build_dir, target)
@@ -55,8 +96,13 @@ fn main() {
             }
             continue;
         }
+        let run_args = target_run_args(target);
+        if let Some(reason) = default_run_skip_reason(target, run_args.is_some()) {
+            skipped_runs.push(format!("{target}: {reason}"));
+            continue;
+        }
 
-        if let Err(error) = run_target(&options.build_dir, target) {
+        if let Err(error) = run_target(&options.build_dir, target, run_args.as_deref()) {
             failures.push(format!("{target}: run error: {error}"));
             if !options.keep_going {
                 break;
@@ -70,13 +116,16 @@ fn main() {
     }
 
     let total_elapsed = suite_started.elapsed().as_secs_f64();
-    let summary = render_summary(
-        &options.build_dir,
-        &options.targets,
-        &passed,
-        &failures,
+    let summary = render_summary(SummaryView {
+        build_dir: &options.build_dir,
+        requested: &options.targets,
+        selected: &runnable_targets,
+        skipped: &skipped_targets,
+        skipped_runs: &skipped_runs,
+        passed: &passed,
+        failures: &failures,
         total_elapsed,
-    );
+    });
     if let Some(path) = options.summary_path.as_deref() {
         fs::write(path, &summary)
             .unwrap_or_else(|error| panic!("failed to write summary file `{path}`: {error}"));
@@ -179,24 +228,47 @@ fn env_flag(key: &str) -> bool {
         .unwrap_or(false)
 }
 
-fn render_summary(
-    build_dir: &str,
-    selected: &[String],
-    passed: &[(String, f64)],
-    failures: &[String],
+struct SummaryView<'a> {
+    build_dir: &'a str,
+    requested: &'a [String],
+    selected: &'a [String],
+    skipped: &'a [String],
+    skipped_runs: &'a [String],
+    passed: &'a [(String, f64)],
+    failures: &'a [String],
     total_elapsed: f64,
-) -> String {
+}
+
+fn render_summary(summary: SummaryView<'_>) -> String {
     let mut lines = Vec::new();
     lines.push("[upstream-bench] summary".to_string());
-    lines.push(format!("build_dir={build_dir}"));
-    lines.push(format!("selected_targets={}", selected.join(",")));
-    lines.push(format!("passed={}", passed.len()));
-    lines.push(format!("failed={}", failures.len()));
-    lines.push(format!("total_elapsed_secs={total_elapsed:.2}"));
-    if !failures.is_empty() {
+    lines.push(format!("build_dir={}", summary.build_dir));
+    lines.push(format!("requested_targets={}", summary.requested.join(",")));
+    lines.push(format!("selected_targets={}", summary.selected.join(",")));
+    lines.push(format!("skipped_targets={}", summary.skipped.join(",")));
+    lines.push(format!(
+        "skipped_run_targets={}",
+        summary.skipped_runs.len()
+    ));
+    lines.push(format!("passed={}", summary.passed.len()));
+    lines.push(format!("failed={}", summary.failures.len()));
+    lines.push(format!("total_elapsed_secs={:.2}", summary.total_elapsed));
+    if !summary.skipped.is_empty() {
+        lines.push("skipped:".to_string());
+        for target in summary.skipped {
+            lines.push(format!(" - {target}"));
+        }
+    }
+    if !summary.failures.is_empty() {
         lines.push("failures:".to_string());
-        for failure in failures {
+        for failure in summary.failures {
             lines.push(format!(" - {failure}"));
+        }
+    }
+    if !summary.skipped_runs.is_empty() {
+        lines.push("skipped_runs:".to_string());
+        for skipped_run in summary.skipped_runs {
+            lines.push(format!(" - {skipped_run}"));
         }
     }
     format!("{}\n", lines.join("\n"))
@@ -222,9 +294,33 @@ fn build_target(build_dir: &str, target: &str) -> Result<(), String> {
     }
 }
 
-fn run_target(build_dir: &str, target: &str) -> Result<(), String> {
+fn discover_targets(build_dir: &str) -> Result<HashSet<String>, String> {
+    let output = Command::new("cmake")
+        .args(["--build", build_dir, "--target", "help"])
+        .output()
+        .map_err(|error| format!("failed to spawn cmake target help: {error}"))?;
+    if !output.status.success() {
+        return Err("cmake target help returned non-zero status".to_string());
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut targets = HashSet::new();
+    for line in stdout.lines() {
+        if let Some(rest) = line.trim().strip_prefix("... ")
+            && let Some(target) = rest.split_whitespace().next()
+        {
+            targets.insert(target.to_string());
+        }
+    }
+    Ok(targets)
+}
+
+fn run_target(build_dir: &str, target: &str, args: Option<&[String]>) -> Result<(), String> {
     let bin = format!("{build_dir}/bin/{target}");
-    let status = Command::new(&bin)
+    let mut command = Command::new(&bin);
+    if let Some(args) = args {
+        command.args(args);
+    }
+    let status = command
         .status()
         .map_err(|error| format!("failed to run upstream benchmark {target} ({bin}): {error}"))?;
     if status.success() {
@@ -232,4 +328,36 @@ fn run_target(build_dir: &str, target: &str) -> Result<(), String> {
     } else {
         Err("benchmark binary returned non-zero status".to_string())
     }
+}
+
+fn default_run_skip_reason(target: &str, has_explicit_args: bool) -> Option<&'static str> {
+    if has_explicit_args {
+        return None;
+    }
+    match target {
+        "gpt-2-ctx" | "gpt-2-backend" | "gpt-2-alloc" | "gpt-2-batched" | "gpt-2-sched"
+        | "gpt-2-quantize" | "gpt-j" | "gpt-j-quantize" | "magika" | "mnist-eval"
+        | "mnist-train" | "sam" | "yolov3-tiny" => Some(
+            "requires external model/data arguments; set GGML_UPSTREAM_RUN_ARGS_<TARGET> to run",
+        ),
+        _ => None,
+    }
+}
+
+fn target_run_args(target: &str) -> Option<Vec<String>> {
+    let suffix: String = target
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() {
+                ch.to_ascii_uppercase()
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let key = format!("GGML_UPSTREAM_RUN_ARGS_{suffix}");
+    std::env::var(key).ok().and_then(|raw| {
+        let args: Vec<String> = raw.split_whitespace().map(ToOwned::to_owned).collect();
+        if args.is_empty() { None } else { Some(args) }
+    })
 }

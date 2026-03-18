@@ -113,6 +113,10 @@ Test suite specific:
 Bench suite specific:
 
 - `GGML_UPSTREAM_BENCH_TARGETS=target1,target2,...`
+- `GGML_UPSTREAM_RUN_ARGS_<TARGET>=...`:
+  pass run arguments for model/data-dependent upstream bins.
+  (`<TARGET>` is uppercased with non-alnum mapped to `_`, e.g.
+  `gpt-2-ctx` -> `GGML_UPSTREAM_RUN_ARGS_GPT_2_CTX`)
 - CLI args can directly pass target names and override env/default targets
 - CLI flags: `--skip-build`, `--list-only`, `--keep-going`, `--fail-fast`
 

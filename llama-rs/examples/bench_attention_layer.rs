@@ -17,7 +17,6 @@ use thiserror::Error;
 
 fn build_stepwise_config(
     parsed: &ParsedArgs,
-    backend: LlamaBackend,
     key_value_start: usize,
     steps: usize,
     repeats_per_step: usize,
@@ -34,10 +33,8 @@ fn build_stepwise_config(
     .with_kv_cache_write(parsed.decode_stepwise_kv_cache_write)
     .with_kv_cache_write_to_cache(parsed.decode_stepwise_kv_cache_write_to_cache)
     .with_block_scope(parsed.decode_stepwise_block_scope)
-    .with_sync_per_step(parsed.decode_stepwise_sync_step && matches!(backend, LlamaBackend::Metal))
-    .with_readback_per_step(
-        parsed.decode_stepwise_readback_step && matches!(backend, LlamaBackend::Metal),
-    )
+    .with_sync_per_step(parsed.decode_stepwise_sync_step)
+    .with_readback_per_step(parsed.decode_stepwise_readback_step)
     .with_position_deltas(parsed.decode_stepwise_position_deltas)
     .with_mask_deltas(parsed.decode_stepwise_mask_deltas)
     .with_mask_host_buffer_elision(parsed.decode_stepwise_mask_host_buffer_elision)
@@ -51,9 +48,9 @@ fn build_stepwise_config(
 fn stepwise_profile_label(parsed: &ParsedArgs, layer_repeat: usize) -> &'static str {
     if parsed.decode_stepwise_fuse_output_projection
         && parsed.decode_stepwise_layer_repeat_cpu == Some(5)
-        && parsed.decode_stepwise_layer_repeat_metal == Some(6)
+        && parsed.decode_stepwise_layer_repeat_metal == Some(7)
     {
-        return "outproj_fused_balanced_cpu5_mtl6";
+        return "outproj_fused_balanced_cpu5_mtl7";
     }
     if parsed.decode_stepwise_fuse_output_projection
         && parsed.decode_stepwise_layer_repeat_cpu.is_none()
@@ -163,7 +160,6 @@ fn main() -> Result<(), ExampleError> {
                         .backend(backend)
                         .stepwise(build_stepwise_config(
                             &parsed,
-                            backend,
                             key_value_length,
                             step_count,
                             1,
@@ -191,7 +187,6 @@ fn main() -> Result<(), ExampleError> {
                     .backend(backend)
                     .stepwise(build_stepwise_config(
                         &parsed,
-                        backend,
                         key_value_length,
                         step_count,
                         parsed.bench_iters,
@@ -281,7 +276,6 @@ fn main() -> Result<(), ExampleError> {
                                 .backend(backend)
                                 .stepwise(build_stepwise_config(
                                     &parsed,
-                                    backend,
                                     key_value_length,
                                     step_count,
                                     1,
@@ -300,7 +294,6 @@ fn main() -> Result<(), ExampleError> {
                             .backend(backend)
                             .stepwise(build_stepwise_config(
                                 &parsed,
-                                backend,
                                 key_value_length,
                                 step_count,
                                 parsed.bench_iters,
@@ -679,7 +672,7 @@ fn parse_args() -> Result<ParsedArgs, Box<dyn StdError>> {
         decode_stepwise_fuse_output_projection = true;
         decode_stepwise_layer_repeat = 5;
         decode_stepwise_layer_repeat_cpu = Some(5);
-        decode_stepwise_layer_repeat_metal = Some(6);
+        decode_stepwise_layer_repeat_metal = Some(7);
         decode_stepwise_static_kv_head_precompute = true;
         decode_stepwise_position_deltas = true;
         decode_stepwise_balanced_head_concat = false;

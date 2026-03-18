@@ -132,7 +132,7 @@ Common controls:
 - `GGML_UPSTREAM_SKIP_BUILD=1`
 - `GGML_UPSTREAM_BUILD_JOBS=<n>`
 - `GGML_UPSTREAM_LIST_ONLY=1`
-- `GGML_UPSTREAM_EXCLUDE_TARGETS=test-opt,test-quantize-fns`
+- `GGML_UPSTREAM_EXCLUDE_TARGETS=gpt-j,magika`
 - `GGML_UPSTREAM_SUMMARY_PATH=target/upstream-suite-summary.txt`
 
 Test-suite controls:
@@ -142,11 +142,19 @@ Test-suite controls:
 
 Bench-suite controls:
 
-- `GGML_UPSTREAM_BENCH_TARGETS=test-backend-ops,test-quantize-perf`
+- `GGML_UPSTREAM_BENCH_TARGETS=simple-ctx,simple-backend,perf-metal`
 - Direct CLI targets are also supported:
-  `cargo run --example bench_upstream_suite --features link-system -- test-backend-ops`
+  `cargo run --example bench_upstream_suite --features link-system -- simple-ctx perf-metal`
 - Bench CLI flags are available: `--skip-build`, `--list-only`,
   `--keep-going`, `--fail-fast`
+- `GGML_UPSTREAM_RUN_ARGS_<TARGET>=...` passes run args to a specific target
+  (`<TARGET>` uses uppercase with non-alnum mapped to `_`; e.g.
+  `GGML_UPSTREAM_RUN_ARGS_GPT_2_CTX='-m /path/model.bin -p hello'`).
+- `bench_upstream_suite` now discovers available CMake targets via
+  `cmake --build <build_dir> --target help` and reports unavailable selections as
+  `skipped_targets` in the summary.
+- model/data-argument-dependent targets are reported as `skipped_runs` by default
+  in this harness to keep suite runs deterministic in asset-free environments.
 
 Detailed runbook:
 
