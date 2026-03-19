@@ -29,6 +29,7 @@ Detailed logs live under `docs/llama-rs/worklog/`.
 | --- | --- | --- |
 | 2026-03-13 | `docs/llama-rs/worklog/2026-03-13-migration-log.md` | Backend bring-up, GGUF/model foundations, metadata-first resolver hardening, attention ADT migration, benchmark harness expansion, CPU/Metal runtime verification |
 | 2026-03-15 | `docs/llama-rs/worklog/2026-03-15-migration-log.md` | Stepwise optimization loop continuation, review2 cleanup, generic host-I/O refactor, dependency-management alignment, recent hotspot A/B passes |
+| 2026-03-18 | `docs/llama-rs/worklog/2026-03-18-e2e-inference-comparison.md` | True-E2E status, tokenizer completion, mixed-layer fallback runtime verification on CPU/Metal |
 
 ## Latest status snapshot
 
@@ -177,6 +178,60 @@ Detailed logs live under `docs/llama-rs/worklog/`.
   - parity objective (`proxy/cpp -> 1.0`) improved overall `~0.995 -> ~0.998`.
   - policy update: balanced preset now enables `block_gateup_fused=true` (parity-focused), while `head_stage_buf=false` remains unchanged.
   - runtime smoke: `target/benchmarks/review4_balanced_cpu5_mtl7_blockgate_preset_smoke.txt` confirms `block_gateup_fused=true` on CPU/Metal preset runs.
+- Added requested end-to-end comparison status report across all target models:
+  - `docs/llama-rs/worklog/2026-03-18-e2e-inference-comparison.md`
+  - includes model-by-model comparison table using currently measurable decode-path metrics vs `llama.cpp`,
+  - tracks the true llama-rs E2E support matrix and remaining implementation gaps (tokenizer/sampler parity, mixed-layer architecture support).
+- Implemented first true-E2E token-id generation path in `llama-rs` (safe API only):
+  - new module: `llama-rs/src/e2e.rs`,
+  - new public API: `generate_token_ids_from_model`, `generate_token_ids_from_path`,
+    `E2eGenerationConfig`, `E2eGenerationReport`, `resolve_eos_token_id`,
+  - added CLI example: `llama-rs/examples/e2e_generate_tokens.rs`.
+- Runtime verification for the new E2E path (LLaMA architecture):
+  - CPU/Metal executed with `Llama-3-ELYZA-JP-8B-q4_k_m.gguf` and prompt token `[1]`,
+  - generated token parity across backends: `[1811]`,
+  - evidence: `target/benchmarks/review4_e2e_tokenid_elyza_cpu_metal.{txt,md}`.
+- Extended E2E metadata resolution to transformer metadata (`resolve_transformer_metadata`) and
+  predecoded per-layer attention/MLP weights in the layer plan.
+- Runtime verification for non-LLaMA metadata model (`Qwen3-8B-Q4_K_M.gguf`):
+  - CPU/Metal executed with prompt token `[1]`,
+  - generated token parity across backends: `[82]`,
+  - evidence:
+    - `target/benchmarks/review4_e2e_transformer_unblock_qwen3_8b_cpu_metal.txt`,
+    - `target/benchmarks/review4_e2e_transformer_unblock_qwen3_8b_cpu_metal_impact.md`.
+- Added backend-reuse execution path for attention inference in E2E loops:
+  - new crate-internal helper: `attention_inference_with_weights_on_backend_repeats`,
+  - E2E loop now reuses one backend handle across per-layer attention and MLP executions.
+- Post-change runtime impact (`Qwen3-8B`, same prompt/settings):
+  - CPU `avg_token_ms`: `156825.685 -> 90718.457` (`post/pre ~0.578`),
+  - MTL0 `avg_token_ms`: `150036.521 -> 85586.570` (`post/pre ~0.570`),
+  - Metal init churn (`ggml_metal_init: allocating`): `37 -> 1`,
+  - evidence:
+    - `target/benchmarks/review4_e2e_transformer_unblock_qwen3_8b_cpu_metal_post_backendreuse.txt`,
+    - `target/benchmarks/review4_e2e_transformer_unblock_qwen3_8b_cpu_metal_post_backendreuse_impact.md`.
+- Added GGUF tokenizer-backed prompt-text path (`gpt2` byte-level BPE) and verified runtime on `Qwen3-8B`:
+  - evidence:
+    - `target/benchmarks/review4_e2e_text_tokenizer_qwen3_8b_cpu_metal.txt`
+  - CPU/MTL0 generated-token parity from prompt text `"Hello"`: both `[82]`.
+- Implemented mixed-layer fallback policy for true-E2E (`Strict` / `SkipUnsupportedAttention`):
+  - API/config: `E2eGenerationConfig::with_mixed_layer_policy`,
+  - CLI: `--mixed-layer-policy {strict|skip-unsupported-attention}` in `e2e_generate_tokens`.
+- Runtime verification for `Qwen3.5-4B-Q4_K_M.gguf`:
+  - strict mode remains blocked at layer-role resolution (`MissingLayerTensor attn_q` at layer `0`),
+  - fallback mode now executes on both CPU/MTL0 with matched generated token IDs (`[220]`),
+  - current fallback execution shape: `attention_layers=0`, `mlp_only_layers=32`,
+  - evidence:
+    - `target/benchmarks/review4_e2e_mixed_block_qwen35_cpu_metal.txt`.
+- Updated E2E comparison report to reflect tokenizer completion + mixed-layer fallback status:
+  - `docs/llama-rs/worklog/2026-03-18-e2e-inference-comparison.md`.
+- Hardened llama.cpp parity harness to consume direct generated token IDs (no output re-tokenize fallback):
+  - helper source: `llama-rs/tools/llama_simple_token_ids.cpp`,
+  - parity example now auto-builds/uses `llama-simple-token-ids`,
+  - true-E2E generation loop now executes on the active token window per step (`current_token_count`) instead of future-padded length,
+  - Qwen3-8B strict parity result:
+    - prompt `"Hello"`: CPU/MTL0 match (`[82]`) in `target/benchmarks/review4_e2e_parity_harness_qwen3_8b_cpu_metal_v3_hello.txt`,
+    - prompt `"Hello "`: CPU/MTL0 mismatch (`llama-rs [25]` vs `llama.cpp [17]`) in `target/benchmarks/review4_e2e_parity_harness_qwen3_8b_cpu_metal_v3_hello_space.txt`,
+    - prompt token IDs remain aligned in the mismatch case (`llama-rs == llama.cpp == [9707, 220]`), so remaining gap is generation-path parity, not tokenizer extraction.
 - Ran a lock-coordinated parallel subagent pass for ggml upstream example parity
   batches (`foundation`, `gpt2`, `gptj_magika`, `vision_mnist`) and logged
   per-batch progress under `docs/llama-rs/worklog/subagents/`.

@@ -2,6 +2,7 @@ pub mod backend;
 pub mod batched;
 pub mod bench;
 pub mod bench_report;
+pub mod e2e;
 pub mod embedding;
 pub mod error;
 pub mod gguf;
@@ -14,6 +15,7 @@ pub mod model;
 pub mod naming;
 pub mod simple;
 pub mod smoke;
+pub mod tokenizer;
 
 pub use backend::{LlamaBackend, ParseBackendError};
 pub use batched::{
@@ -25,6 +27,11 @@ pub use bench_report::{
     AttentionBenchRow, BenchBackend, BenchReportError, LlamaCppBenchRow, MlpBenchRow,
     parse_attention_bench_output, parse_llama_cpp_jsonl, parse_mlp_bench_output,
     render_markdown_summary,
+};
+pub use e2e::{
+    E2eError, E2eGenerationConfig, E2eGenerationReport, MixedLayerPolicy,
+    generate_token_ids_from_model, generate_token_ids_from_path, resolve_eos_token_id,
+    tokenize_prompt_text,
 };
 pub use embedding::{EmbeddingError, EmbeddingStats, summarize_embedding_tensor};
 pub use error::{LlamaError, LlamaResult};
@@ -74,3 +81,4 @@ pub use naming::{
 };
 pub use simple::{SimpleError, SimpleReport, simple_ctx};
 pub use smoke::{SmokeError, SmokeReport, backend_smoke};
+pub use tokenizer::{GgufTokenizer, TokenizerError, TokenizerModel, tokenize_text_prompt};

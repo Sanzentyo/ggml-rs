@@ -251,8 +251,10 @@ fn resolve_layer(
         "ffn_norm",
         vec![
             format!("blk.{layer}.ffn_norm.weight"),
+            format!("blk.{layer}.post_attention_norm.weight"),
             format!("layers.{layer}.ffn_norm.weight"),
             format!("model.layers.{layer}.post_attention_layernorm.weight"),
+            format!("model.layers.{layer}.post_attention_norm.weight"),
         ],
     )?;
     let ffn_gate = resolve_required_layer(

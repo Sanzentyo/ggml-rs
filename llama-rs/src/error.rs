@@ -4,6 +4,7 @@ use crate::backend::ParseBackendError;
 use crate::batched::BatchedError;
 use crate::bench::BenchError;
 use crate::bench_report::BenchReportError;
+use crate::e2e::E2eError;
 use crate::embedding::EmbeddingError;
 use crate::gguf_hash::GgufHashError;
 use crate::idle::IdleError;
@@ -13,6 +14,7 @@ use crate::model::ModelError;
 use crate::naming::NamingError;
 use crate::simple::SimpleError;
 use crate::smoke::SmokeError;
+use crate::tokenizer::TokenizerError;
 use std::error::Error as StdError;
 use std::fmt;
 
@@ -29,6 +31,7 @@ pub enum LlamaError {
     Batched(BatchedError),
     Model(ModelError),
     Embedding(EmbeddingError),
+    E2e(E2eError),
     Inference(InferenceError),
     Metadata(MetadataError),
     Naming(NamingError),
@@ -36,6 +39,7 @@ pub enum LlamaError {
     Smoke(SmokeError),
     GgufHash(GgufHashError),
     Idle(IdleError),
+    Tokenizer(TokenizerError),
 }
 
 impl fmt::Display for LlamaError {
@@ -48,6 +52,7 @@ impl fmt::Display for LlamaError {
             Self::Batched(source) => write!(f, "batched error: {source}"),
             Self::Model(source) => write!(f, "model error: {source}"),
             Self::Embedding(source) => write!(f, "embedding error: {source}"),
+            Self::E2e(source) => write!(f, "e2e error: {source}"),
             Self::Inference(source) => write!(f, "inference error: {source}"),
             Self::Metadata(source) => write!(f, "metadata error: {source}"),
             Self::Naming(source) => write!(f, "naming error: {source}"),
@@ -55,6 +60,7 @@ impl fmt::Display for LlamaError {
             Self::Smoke(source) => write!(f, "smoke error: {source}"),
             Self::GgufHash(source) => write!(f, "gguf_hash error: {source}"),
             Self::Idle(source) => write!(f, "idle error: {source}"),
+            Self::Tokenizer(source) => write!(f, "tokenizer error: {source}"),
         }
     }
 }
@@ -69,6 +75,7 @@ impl StdError for LlamaError {
             Self::Batched(source) => Some(source),
             Self::Model(source) => Some(source),
             Self::Embedding(source) => Some(source),
+            Self::E2e(source) => Some(source),
             Self::Inference(source) => Some(source),
             Self::Metadata(source) => Some(source),
             Self::Naming(source) => Some(source),
@@ -76,6 +83,7 @@ impl StdError for LlamaError {
             Self::Smoke(source) => Some(source),
             Self::GgufHash(source) => Some(source),
             Self::Idle(source) => Some(source),
+            Self::Tokenizer(source) => Some(source),
         }
     }
 }
@@ -122,6 +130,12 @@ impl From<EmbeddingError> for LlamaError {
     }
 }
 
+impl From<E2eError> for LlamaError {
+    fn from(value: E2eError) -> Self {
+        Self::E2e(value)
+    }
+}
+
 impl From<InferenceError> for LlamaError {
     fn from(value: InferenceError) -> Self {
         Self::Inference(value)
@@ -161,5 +175,11 @@ impl From<GgufHashError> for LlamaError {
 impl From<IdleError> for LlamaError {
     fn from(value: IdleError) -> Self {
         Self::Idle(value)
+    }
+}
+
+impl From<TokenizerError> for LlamaError {
+    fn from(value: TokenizerError) -> Self {
+        Self::Tokenizer(value)
     }
 }

@@ -96,6 +96,66 @@ pub fn attention_inference_with_weights_repeats(
     let config = weights.config;
     let hidden_features = config.hidden_features();
     let sequence_length = config.sequence_length();
+    let ctx_size = recommended_attention_backend_memory_bytes(config)?;
+    let runtime = DefaultBackendRuntimeBuilder.build_runtime(backend_kind, ctx_size)?;
+    let output = attention_inference_with_weights_with_context(
+        weights,
+        input,
+        sequence_length,
+        &runtime.backend,
+        &runtime.ctx,
+        repeats,
+    )?;
+
+    Ok(AttentionInferenceReport {
+        backend_name: runtime.backend_name,
+        hidden_features,
+        sequence_length,
+        repeats,
+        output,
+    })
+}
+
+pub(crate) fn attention_inference_with_weights_on_backend_repeats_with_length(
+    weights: &AttentionWeights,
+    input: &[f32],
+    sequence_length: usize,
+    backend: &Backend,
+    repeats: usize,
+) -> Result<Vec<f32>, InferenceError> {
+    if sequence_length == 0 {
+        return Err(InferenceError::InvalidAttentionShape {
+            hidden_features: weights.config.hidden_features(),
+            sequence_length,
+        });
+    }
+    let ctx_size = recommended_attention_backend_memory_bytes_for_lengths(
+        weights.config,
+        sequence_length,
+        sequence_length,
+    )?;
+    let ctx = Context::new_no_alloc_bytes(ctx_size)
+        .map_err(|source| InferenceError::ggml("Context::new_no_alloc_bytes", source))?;
+    attention_inference_with_weights_with_context(
+        weights,
+        input,
+        sequence_length,
+        backend,
+        &ctx,
+        repeats,
+    )
+}
+
+fn attention_inference_with_weights_with_context(
+    weights: &AttentionWeights,
+    input: &[f32],
+    sequence_length: usize,
+    backend: &Backend,
+    ctx: &Context,
+    repeats: usize,
+) -> Result<Vec<f32>, InferenceError> {
+    let config = weights.config;
+    let hidden_features = config.hidden_features();
     let expected_input_len = hidden_features
         .checked_mul(sequence_length)
         .ok_or(InferenceError::MemorySizeOverflow)?;
@@ -108,12 +168,6 @@ pub fn attention_inference_with_weights_repeats(
     if repeats == 0 {
         return Err(InferenceError::InvalidRepeats);
     }
-
-    let ctx_size = recommended_attention_backend_memory_bytes(config)?;
-    let runtime = DefaultBackendRuntimeBuilder.build_runtime(backend_kind, ctx_size)?;
-    let backend = runtime.backend;
-    let backend_name = runtime.backend_name;
-    let ctx = runtime.ctx;
 
     let query_features = config.query_features();
     let kv_features = config.kv_features();
@@ -215,14 +269,14 @@ pub fn attention_inference_with_weights_repeats(
             .map_err(|source| InferenceError::ggml("Context::view_2d(V_HEAD)", source))?;
 
         let q_head = rotary_applier.apply_single_with_sequence(
-            &ctx,
+            ctx,
             &q_head,
             positions.as_ref(),
             config,
             sequence_length,
         )?;
         let k_head = rotary_applier.apply_single_with_sequence(
-            &ctx,
+            ctx,
             &k_head,
             positions.as_ref(),
             config,
@@ -277,7 +331,7 @@ pub fn attention_inference_with_weights_repeats(
         .map_err(|source| InferenceError::ggml("Context::new_graph", source))?;
     graph.build_forward_expand(&y);
     let _buffer = ctx
-        .allocate_tensors(&backend)
+        .allocate_tensors(backend)
         .map_err(|source| InferenceError::ggml("Context::allocate_tensors", source))?;
 
     w_q.write_data_backend(weights.q_values())
@@ -321,19 +375,11 @@ pub fn attention_inference_with_weights_repeats(
             .map_err(|source| InferenceError::ggml("Backend::compute", source))?;
     }
 
-    let output = graph
+    graph
         .last_node()
         .map_err(|source| InferenceError::ggml("Graph::last_node", source))?
         .read_data_backend::<f32>()
-        .map_err(|source| InferenceError::ggml("Tensor::read_data_backend", source))?;
-
-    Ok(AttentionInferenceReport {
-        backend_name,
-        hidden_features,
-        sequence_length,
-        repeats,
-        output,
-    })
+        .map_err(|source| InferenceError::ggml("Tensor::read_data_backend", source))
 }
 
 /// Builds reusable projected KV tensors for decode-like proxy runs.

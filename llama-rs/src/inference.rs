@@ -8,7 +8,7 @@ use crate::backend::LlamaBackend;
 use crate::metadata::MetadataError;
 use crate::model::{GgufModel, ModelError};
 use crate::naming::{LlamaLayerTensorNames, NamingError, resolve_llama_layer_tensor_names};
-use ggml_rs::{Context, GgmlElement, Length, Shape2D};
+use ggml_rs::{Backend, Context, GgmlElement, Length, Shape2D};
 use num_traits::NumCast;
 use std::marker::PhantomData;
 use std::num::NonZeroUsize;
@@ -26,7 +26,8 @@ use attention_ops::{LlamaRotaryApplier, RotaryApplier};
 #[cfg(test)]
 pub(crate) use attention_runtime::build_causal_mask_values;
 pub(crate) use attention_runtime::{
-    attention_decode_proxy_with_cache_repeats_inner, fill_causal_mask_values,
+    attention_decode_proxy_with_cache_repeats_inner,
+    attention_inference_with_weights_on_backend_repeats_with_length, fill_causal_mask_values,
     recommended_attention_backend_memory_bytes_for_lengths,
 };
 pub use attention_runtime::{
