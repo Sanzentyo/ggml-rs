@@ -869,6 +869,39 @@ impl Context {
             .map_err(|error| error.with_context("ggml_rope_ext"))
     }
 
+    /// Applies RoPE with mixed element types: f32 data tensor and i32 positions.
+    ///
+    /// This is the common case for LLM inference where position indices are `i32`
+    /// while the data tensor is `f32`.
+    pub fn rope_ext_with_i32_positions<'ctx, T: GgmlElement>(
+        &'ctx self,
+        a: &Tensor<'ctx, T>,
+        positions: &Tensor<'ctx, i32>,
+        freq_factors: Option<&Tensor<'ctx, T>>,
+        params: RopeExtParams,
+    ) -> Result<Tensor<'ctx, T>> {
+        let freq_factors_raw = freq_factors.map_or(ptr::null_mut(), |t| t.raw.as_ptr());
+        let raw = unsafe {
+            ffi::ggml_rope_ext(
+                self.raw.as_ptr(),
+                a.raw.as_ptr(),
+                positions.raw.as_ptr(),
+                freq_factors_raw,
+                params.n_dims,
+                params.mode,
+                params.n_ctx_orig,
+                params.freq_base,
+                params.freq_scale,
+                params.ext_factor,
+                params.attn_factor,
+                params.beta_fast,
+                params.beta_slow,
+            )
+        };
+        self.wrap_typed_tensor(raw)
+            .map_err(|error| error.with_context("ggml_rope_ext"))
+    }
+
     pub fn new_graph(&self) -> Result<Graph<'_>> {
         let raw = unsafe { ffi::ggml_new_graph(self.raw.as_ptr()) };
         self.wrap_graph(raw)
