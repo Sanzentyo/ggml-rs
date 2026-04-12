@@ -186,3 +186,103 @@ fn metal_backend_creation_succeeds() -> Result<(), Error> {
     backend.synchronize()?;
     Ok(())
 }
+
+/// Multi-op graph: matmul + add (bias).
+/// Verifies that a backend can execute graphs with more than one operation.
+fn multi_op_matmul_add_on_backend(kind: BackendKind) -> Result<(), Error> {
+    let mem = Bytes::new(64 * 1024 * 1024);
+    with_no_alloc_context(mem, |ctx| {
+        let backend = Backend::new(kind)?;
+
+        // W: 3×2, x: 2×1, b: 3-element bias (broadcasts to mul_mat result [3,1])
+        let w = ctx.new_tensor_2d::<f32>(Shape2D::new(2, 3))?;
+        let x = ctx.new_tensor_2d::<f32>(Shape2D::new(2, 1))?;
+        let b = ctx.new_tensor_1d::<f32>(Length::new(3))?;
+
+        let wx = ctx.mul_mat(&w, &x)?;
+        let result = ctx.add(&wx, &b)?;
+
+        let mut graph = ctx.new_graph()?;
+        graph.build_forward_expand(&result);
+        let _buffer = ctx.allocate_tensors(&backend)?;
+
+        w.write_data_backend(&[1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0])?;
+        x.write_data_backend(&[10.0_f32, 20.0])?;
+        b.write_data_backend(&[100.0_f32, 200.0, 300.0])?;
+
+        backend.compute(&mut graph)?;
+
+        let output = result.read_data_backend()?;
+        // W*x = [50, 110, 170], + b = [150, 310, 470]
+        let expected = [150.0_f32, 310.0, 470.0];
+        assert_eq!(output.len(), expected.len());
+        for (i, (&actual, &expected)) in output.iter().zip(expected.iter()).enumerate() {
+            assert!(
+                (actual - expected).abs() < 1e-3,
+                "multi_op index {i}: expected {expected}, got {actual}"
+            );
+        }
+        Ok(())
+    })
+}
+
+#[test]
+fn cpu_multi_op_matmul_add() -> Result<(), Error> {
+    multi_op_matmul_add_on_backend(BackendKind::Cpu)
+}
+
+#[test]
+#[cfg(target_os = "macos")]
+fn metal_multi_op_matmul_add() -> Result<(), Error> {
+    multi_op_matmul_add_on_backend(BackendKind::Metal)
+}
+
+/// Backend matmul parity: verify CPU and Metal produce the same result.
+fn backend_matmul_on(kind: BackendKind) -> Result<Vec<f32>, Error> {
+    let lhs = Shape2D::new(3, 2);
+    let rhs = Shape2D::new(3, 4);
+    let mem = Context::recommended_backend_matmul_memory::<f32>(lhs, rhs)?;
+
+    with_no_alloc_context(mem, |ctx| {
+        let backend = Backend::new(kind)?;
+        let a = ctx.new_tensor_2d::<f32>(lhs)?;
+        let b = ctx.new_tensor_2d::<f32>(rhs)?;
+        let result = ctx.mul_mat(&a, &b)?;
+
+        let mut graph = ctx.new_graph()?;
+        graph.build_forward_expand(&result);
+        let _buffer = ctx.allocate_tensors(&backend)?;
+
+        let a_data: Vec<f32> = (1..=6).map(|i| i as f32).collect();
+        let b_data: Vec<f32> = (1..=12).map(|i| i as f32 * 0.5).collect();
+        a.write_data_backend(&a_data)?;
+        b.write_data_backend(&b_data)?;
+
+        backend.compute(&mut graph)?;
+        result.read_data_backend()
+    })
+}
+
+#[test]
+fn cpu_backend_matmul_nontrivial() -> Result<(), Error> {
+    let output = backend_matmul_on(BackendKind::Cpu)?;
+    assert_eq!(output.len(), 2 * 4); // 2 rows × 4 rows (matmul transposes)
+    // Verify non-zero
+    assert!(output.iter().any(|&v| v.abs() > 0.1));
+    Ok(())
+}
+
+#[test]
+#[cfg(target_os = "macos")]
+fn metal_cpu_matmul_parity() -> Result<(), Error> {
+    let cpu_output = backend_matmul_on(BackendKind::Cpu)?;
+    let metal_output = backend_matmul_on(BackendKind::Metal)?;
+    assert_eq!(cpu_output.len(), metal_output.len());
+    for (i, (&cpu, &metal)) in cpu_output.iter().zip(metal_output.iter()).enumerate() {
+        assert!(
+            (cpu - metal).abs() < 1e-3,
+            "CPU/Metal mismatch at {i}: CPU={cpu}, Metal={metal}"
+        );
+    }
+    Ok(())
+}

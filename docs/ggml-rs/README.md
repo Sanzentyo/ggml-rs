@@ -128,6 +128,7 @@ Detailed operations runbook:
 
 - `examples/simple_ctx.rs`: simple context-based matmul
 - `examples/backend_matmul.rs`: backend compute on CPU/Metal
+- `examples/backend_ops.rs`: multi-op backend graph (matmul + bias add)
 - `examples/perf_metal.rs`: Metal backend stress graph equivalent to upstream `perf-metal`
 - `examples/arithmetic_expr.rs`: expression-style tensor arithmetic
 - `examples/bench_matmul.rs`: end-to-end backend matmul benchmark

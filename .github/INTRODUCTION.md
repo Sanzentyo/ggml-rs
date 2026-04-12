@@ -18,10 +18,10 @@ And you should write rusty code(ADT, enum, type state pattern)
 2. ~~Expand `Type` enum to all ggml types, seal `HostElement`, update decode APIs.~~ **DONE** — zero clippy warnings.
 3. ~~Implement MRoPE for full attention layers (required for multi-token prompts).~~ **DONE** — multi-token parity achieved.
 4. ~~Causal depthwise conv & QKV packing comparison.~~ **DONE** — documented in `docs/llama-rs/worklog/2026-04-13-conv-qkv-comparison.md`.
-5. ~~Continue review_3 refactor items (generic inference, ND tensor, semantic wrapper dedup).~~ **10/12 DONE** — test coverage 122 tests (zero warnings), backend examples exist.
+5. ~~Continue review_3 refactor items (generic inference, ND tensor, semantic wrapper dedup).~~ **12/12 DONE** — test coverage 80+ tests (zero warnings), backend examples + README updated.
 6. ~~Autoregressive decode state management (prefill/decode split).~~ **DONE** — KV cache for full attention, conv buffer + SSM states for linear attention, decode equivalence tests pass.
 7. ~~Two-phase generation loop (prefill + incremental decode).~~ **DONE** — generation.rs branches on layer types: all-Qwen3.5 → two-phase (prefill all prompt tokens, then decode one-at-a-time), otherwise → full-reprocess fallback.
-8. Backend example enhancement (review_3 item 11) + README (item 12).
+8. ~~Backend example enhancement (review_3 item 11) + README (item 12).~~ **DONE** — `backend_ops.rs` example, fixed stale README snippets, multi-op + Metal parity tests added.
 9. Merge back to `main` only after validation and runtime checks pass.
 
 ## Completed refactor items
@@ -52,6 +52,9 @@ And you should write rusty code(ADT, enum, type state pattern)
   → prefill + incremental decode (one token at a time with cached state); Standard
   attention present → full-reprocess fallback. Handles `max_new_tokens==0`, EOS on
   first generated token, MLP-only layers.
+- **Backend examples + README** (review_3 items 11, 12): `backend_ops.rs` multi-op graph
+  example (matmul + bias on CPU/Metal), fixed stale API names in README, added multi-op
+  and Metal parity backend tests. Updated EXAMPLE_PARITY_MATRIX.md.
 
 ## Validation checkpoints completed on this branch
 

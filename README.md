@@ -50,6 +50,9 @@ cargo run --example simple_ctx --features link-system
 # ggml-rs: backend compute (CPU/Metal)
 cargo run --example backend_matmul --features link-system
 
+# ggml-rs: multi-op backend graph (matmul + bias)
+cargo run --example backend_ops --features link-system -- cpu
+
 # ggml-rs: expression-style arithmetic
 cargo run --example arithmetic_expr --features link-system
 
@@ -101,12 +104,22 @@ let result = expr?.into_tensor();
 ### Backend compute (CPU / Metal)
 
 ```rust
-let backend = Backend::new_by_type(BackendKind::Cpu)?;
-let buffer = backend.alloc_ctx_tensors(&ctx)?;
+let backend = Backend::new(BackendKind::Cpu)?;
+
+// No-alloc context: tensors are graph placeholders until backend allocates storage.
+let ctx = Context::new_no_alloc_bytes(Bytes::new(64 * 1024 * 1024))?;
+let a = ctx.new_tensor_2d::<f32>(shape_a)?;
+let b = ctx.new_tensor_2d::<f32>(shape_b)?;
+let c = ctx.mul_mat(&a, &b)?;
+
+let mut graph = ctx.new_graph()?;
+graph.build_forward_expand(&c);
+
+// Allocate backend storage, transfer data, compute, read results.
+let _buffer = ctx.allocate_tensors(&backend)?;
 a.write_data_backend(&input_a)?;
 b.write_data_backend(&input_b)?;
-backend.graph_compute(&mut graph)?;
-backend.synchronize()?;
+backend.compute(&mut graph)?;
 let output: Vec<f32> = c.read_data_backend()?;
 ```
 
@@ -114,12 +127,25 @@ let output: Vec<f32> = c.read_data_backend()?;
 
 ```rust
 let file = GgufFile::open("model.gguf")?;
-for (key, value) in file.kv_pairs() {
+let kv_count = file.kv_count()?;
+for i in 0..kv_count {
+    let key = file.kv_key(i)?;
+    let value = file.kv_value(i)?;
     println!("{key}: {value:?}");
 }
-for info in file.tensor_infos() {
-    println!("{}: {:?} {:?}", info.name, info.ggml_type, info.shape);
+let tensor_count = file.tensor_count()?;
+for i in 0..tensor_count {
+    let info = file.tensor_info(i)?;
+    println!("{}: {:?}", info.name, info.ggml_type);
 }
+```
+
+### Type-safe GGUF value extraction
+
+```rust
+// Extract typed values using TryFromGgufValue
+let vocab_size: Option<u32> = file.kv_value_as("llama.vocab_size")?;
+let head_count: Option<u32> = file.kv_value_as("llama.attention.head_count")?;
 ```
 
 ### Generic GGUF decode
@@ -136,9 +162,12 @@ let values: Vec<f32> = decode_tensor_data_to(tensor_type, raw_data, element_coun
 - **Tokenizer**: BPE tokenization from GGUF vocabulary
 - **Metadata**: Typed extraction of model hyperparameters (`TransformerMetadata`)
 - **E2E inference**: Full transformer generation (Qwen3.5, standard attention, MLP)
-  - Full attention with RoPE (MRoPE/IMROPE for Qwen3.5)
+  - Full attention with NeoX RoPE (position offset for autoregressive decode)
   - Linear attention with causal depthwise convolution + delta-net recurrence
+  - Two-phase generation: prefill all prompt tokens, then decode one-at-a-time
   - Verified token-ID parity with llama.cpp
+- **Type system**: `Type` covers all 32+ ggml tensor types (quantized, float, integer)
+- **Modular e2e**: 13 focused submodules (attention, linear_attention, state, generation, etc.)
 
 ```bash
 # Parity harness — verify llama-rs matches llama.cpp output
@@ -170,6 +199,7 @@ cargo run -p llama-rs --example e2e_parity_harness --features link-system -- \
 | llama-rs knowledge base | `docs/llama-rs/KNOWLEDGE_BASE.md` |
 | llama-rs parity matrix | `docs/llama-rs/PARITY_MATRIX.md` |
 | Development worklog | `docs/llama-rs/WORKLOG.md` |
+| Conv & QKV comparison | `docs/llama-rs/worklog/2026-04-13-conv-qkv-comparison.md` |
 
 ## License
 
