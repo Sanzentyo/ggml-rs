@@ -86,6 +86,13 @@ git submodule update --init --recursive
     - `write_data_to_file(path)`
     - `write_metadata_to_file(path)`
   This allows fixture generation and round-trip checks without exposing unsafe pointers.
+- GGUF key-value access now accepts `impl AsRef<str>` for ergonomic string handling (`2026-04-12`):
+  - `GgufFile::find_key(key: impl AsRef<str>)`, `kv_value_by_key(key: impl AsRef<str>)`
+  - `GgufWriter::set_value(key: impl AsRef<str>, ...)`, `remove_key(key: impl AsRef<str>)`
+- GGUF typed value extraction via `TryFromGgufValue` trait (`2026-04-12`):
+  - `TryFromGgufValue` implemented for `u8`, `i8`, `u16`, `i16`, `u32`, `i32`, `f32`, `bool`, `String`, `u64`, `i64`, `f64`
+  - `GgufFile::kv_value_as::<T>(key)` — extracts a typed value with compile-time type safety
+  - `Error::GgufTypeMismatch` for type-mismatch errors
 - Tensor constructor wrappers were consolidated into generic APIs (`2026-03-15`):
   - use `new_tensor_typed::<T, N>(Dims<N>)` for rank-generic paths,
   - use semantic helpers `new_tensor_1d::<T>(Length)`, `new_tensor_2d::<T>(Shape2D)`,
