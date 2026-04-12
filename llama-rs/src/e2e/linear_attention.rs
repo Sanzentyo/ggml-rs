@@ -1,6 +1,7 @@
 use super::error::E2eError;
 use super::numeric::{checked_mul, sigmoid_scalar, silu_scalar, softplus_scalar};
 use super::plan::Qwen35LinearAttentionLayerPlan;
+use super::state::LinearAttentionState;
 use super::tensor_ops::{
     head_slice, head_slice_mut, per_head_l2_norm, project_sequence, rms_norm_single,
 };
@@ -10,6 +11,27 @@ pub(super) fn qwen35_linear_attention_inference(
     input: &[f32],
     sequence_length: usize,
     rms_norm_eps: f32,
+) -> Result<Vec<f32>, E2eError> {
+    qwen35_linear_attention_core(attention, input, sequence_length, rms_norm_eps, None)
+}
+
+/// Prefill variant: runs the full sequence AND captures conv buffer + SSM states.
+pub(super) fn qwen35_linear_attention_prefill(
+    attention: &Qwen35LinearAttentionLayerPlan,
+    input: &[f32],
+    sequence_length: usize,
+    rms_norm_eps: f32,
+    state: &mut LinearAttentionState,
+) -> Result<Vec<f32>, E2eError> {
+    qwen35_linear_attention_core(attention, input, sequence_length, rms_norm_eps, Some(state))
+}
+
+fn qwen35_linear_attention_core(
+    attention: &Qwen35LinearAttentionLayerPlan,
+    input: &[f32],
+    sequence_length: usize,
+    rms_norm_eps: f32,
+    mut state: Option<&mut LinearAttentionState>,
 ) -> Result<Vec<f32>, E2eError> {
     let hidden_features = attention.ssm_out_weight_values.len() / attention.inner_size;
     let expected_input_len = checked_mul(hidden_features, sequence_length)?;
@@ -57,6 +79,11 @@ pub(super) fn qwen35_linear_attention_inference(
         attention.conv_kernel,
         &attention.conv_weight_values,
     )?;
+
+    // Capture pre-conv QKV into conv buffer for future decode steps.
+    if let Some(ref mut state) = state {
+        state.capture_conv_buffer(&qkv, sequence_length)?;
+    }
 
     let mut q_heads = vec![
         0.0_f32;
@@ -201,6 +228,11 @@ pub(super) fn qwen35_linear_attention_inference(
         }
     }
 
+    // Capture SSM states after processing all tokens.
+    if let Some(state) = state {
+        state.capture_ssm_states(&states);
+    }
+
     project_sequence(
         &output,
         sequence_length,
@@ -247,6 +279,217 @@ pub(super) fn causal_depthwise_conv(
         }
     }
     Ok(output)
+}
+
+/// Convolve a single new QKV row using the conv buffer from previous tokens.
+///
+/// The buffer holds the last `kernel_size - 1` pre-conv QKV rows. The new row
+/// is the "current" sample. After computing the output, the new row is pushed
+/// into the buffer (shifting out the oldest if full).
+pub(super) fn causal_depthwise_conv_decode_step(
+    new_row: &[f32],
+    state: &mut LinearAttentionState,
+    weight: &[f32],
+) -> Result<Vec<f32>, E2eError> {
+    let channels = state.conv_channels;
+    let kernel_size = state.conv_kernel;
+    if new_row.len() != channels {
+        return Err(E2eError::BufferLengthMismatch {
+            expected: channels,
+            actual: new_row.len(),
+        });
+    }
+    let expected_weight_len = checked_mul(kernel_size, channels)?;
+    if weight.len() != expected_weight_len {
+        return Err(E2eError::BufferLengthMismatch {
+            expected: expected_weight_len,
+            actual: weight.len(),
+        });
+    }
+
+    let mut output = vec![0.0_f32; channels];
+    for channel in 0..channels {
+        let mut sum = 0.0_f32;
+        for tap in 0..kernel_size {
+            let lookback = kernel_size - 1 - tap;
+            let value = if lookback == 0 {
+                new_row[channel]
+            } else {
+                let buffer_idx = state.conv_valid as isize - lookback as isize;
+                if buffer_idx < 0 {
+                    0.0 // zero padding for positions before start
+                } else {
+                    state.conv_buffer[buffer_idx as usize * channels + channel]
+                }
+            };
+            sum += value * weight[channel * kernel_size + tap];
+        }
+        output[channel] = silu_scalar(sum);
+    }
+
+    // Push new row into buffer for the next decode step.
+    state.push_conv_row(new_row)?;
+    Ok(output)
+}
+
+/// Single-token decode step for Qwen3.5 linear attention.
+///
+/// Uses the conv buffer for convolution and the SSM states for the recurrence.
+/// Both are updated in-place.
+pub(super) fn qwen35_linear_attention_decode_step(
+    attention: &Qwen35LinearAttentionLayerPlan,
+    input: &[f32],
+    rms_norm_eps: f32,
+    state: &mut LinearAttentionState,
+) -> Result<Vec<f32>, E2eError> {
+    let hidden_features = attention.ssm_out_weight_values.len() / attention.inner_size;
+    if input.len() != hidden_features {
+        return Err(E2eError::BufferLengthMismatch {
+            expected: hidden_features,
+            actual: input.len(),
+        });
+    }
+
+    let conv_channels = attention.inner_size
+        + checked_mul(checked_mul(attention.group_count, attention.state_size)?, 2)?;
+
+    // Project single token.
+    let qkv = project_sequence(
+        input,
+        1,
+        hidden_features,
+        conv_channels,
+        &attention.qkv_weight_values,
+    )?;
+    let z = project_sequence(
+        input,
+        1,
+        hidden_features,
+        attention.inner_size,
+        &attention.gate_weight_values,
+    )?;
+    let alpha = project_sequence(
+        input,
+        1,
+        hidden_features,
+        attention.time_step_rank,
+        &attention.alpha_weight_values,
+    )?;
+    let beta = project_sequence(
+        input,
+        1,
+        hidden_features,
+        attention.time_step_rank,
+        &attention.beta_weight_values,
+    )?;
+
+    // Conv: use buffer + new QKV row.
+    let conv = causal_depthwise_conv_decode_step(&qkv, state, &attention.conv_weight_values)?;
+
+    // Split conv output into Q, K, V for a single token.
+    let qk_features = checked_mul(attention.group_count, attention.state_size)?;
+    let q_raw = &conv[..qk_features];
+    let k_raw = &conv[qk_features..checked_mul(qk_features, 2)?];
+    let v_raw = &conv[checked_mul(qk_features, 2)?..conv_channels];
+
+    // L2 norm Q and K.
+    let q_heads = per_head_l2_norm(
+        q_raw,
+        1,
+        attention.group_count,
+        attention.state_size,
+        rms_norm_eps,
+    )?;
+    let k_heads = per_head_l2_norm(
+        k_raw,
+        1,
+        attention.group_count,
+        attention.state_size,
+        rms_norm_eps,
+    )?;
+
+    // One SSM recurrence step per head, using persisted states.
+    let scale = 1.0_f32 / (attention.state_size as f32).sqrt();
+    let mut output = vec![0.0_f32; attention.inner_size];
+
+    for head in 0..attention.time_step_rank {
+        let src_group = head % attention.group_count;
+        let q = head_slice(
+            &q_heads,
+            0,
+            src_group,
+            attention.group_count,
+            attention.state_size,
+        );
+        let k = head_slice(
+            &k_heads,
+            0,
+            src_group,
+            attention.group_count,
+            attention.state_size,
+        );
+        let v = head_slice(
+            v_raw,
+            0,
+            head,
+            attention.time_step_rank,
+            attention.state_size,
+        );
+        let z_head = head_slice(&z, 0, head, attention.time_step_rank, attention.state_size);
+
+        let gate = softplus_scalar(alpha[head] + attention.dt_bias_values[head])
+            * attention.ssm_a_values[head];
+        let beta_value = sigmoid_scalar(beta[head]);
+
+        let state_size_sq = checked_mul(attention.state_size, attention.state_size)?;
+        let state_offset = checked_mul(head, state_size_sq)?;
+        let ssm_state = &mut state.ssm_states[state_offset..state_offset + state_size_sq];
+
+        // decay → sk → delta → update → read (exact same order as sequence path)
+        let decay = gate.exp();
+        let mut sk = vec![0.0_f32; attention.state_size];
+        for row in 0..attention.state_size {
+            for col in 0..attention.state_size {
+                ssm_state[row * attention.state_size + col] *= decay;
+                sk[col] += ssm_state[row * attention.state_size + col] * k[row];
+            }
+        }
+        let mut delta = vec![0.0_f32; attention.state_size];
+        for index in 0..attention.state_size {
+            delta[index] = (v[index] - sk[index]) * beta_value;
+        }
+        for row in 0..attention.state_size {
+            for col in 0..attention.state_size {
+                ssm_state[row * attention.state_size + col] += k[row] * delta[col];
+            }
+        }
+        let mut out = vec![0.0_f32; attention.state_size];
+        for col in 0..attention.state_size {
+            for row in 0..attention.state_size {
+                out[col] += ssm_state[row * attention.state_size + col] * (q[row] * scale);
+            }
+        }
+
+        let normalized = rms_norm_single(&out, &attention.ssm_norm_values, rms_norm_eps)?;
+        let dst = head_slice_mut(
+            &mut output,
+            0,
+            head,
+            attention.time_step_rank,
+            attention.state_size,
+        );
+        for index in 0..attention.state_size {
+            dst[index] = normalized[index] * silu_scalar(z_head[index]);
+        }
+    }
+
+    project_sequence(
+        &output,
+        1,
+        attention.inner_size,
+        hidden_features,
+        &attention.ssm_out_weight_values,
+    )
 }
 
 #[cfg(test)]
@@ -329,5 +572,115 @@ mod tests {
             "should fail with indivisible group_count"
         );
         let _ = plan_no_repeat;
+    }
+
+    #[test]
+    fn conv_decode_step_matches_full_conv_last_token() {
+        let channels = 4;
+        let kernel_size = 3;
+        let weight: Vec<f32> = (0..channels * kernel_size)
+            .map(|i| (i as f32 + 1.0) * 0.1)
+            .collect();
+
+        // 4-token sequence through full conv.
+        let input: Vec<f32> = (0..4 * channels).map(|i| (i as f32 + 1.0) * 0.05).collect();
+        let full = causal_depthwise_conv(&input, 4, channels, kernel_size, &weight).unwrap();
+
+        // Decode: feed tokens one at a time through the conv decode step.
+        let mut state =
+            super::super::state::LinearAttentionState::new(kernel_size, channels, 1, 1).unwrap();
+        let mut last_output = vec![];
+        for token in 0..4 {
+            let row = &input[token * channels..(token + 1) * channels];
+            last_output = causal_depthwise_conv_decode_step(row, &mut state, &weight).unwrap();
+        }
+
+        // The last decode output should match the last token from full conv.
+        let expected = &full[3 * channels..4 * channels];
+        for (i, (a, b)) in last_output.iter().zip(expected).enumerate() {
+            assert!((a - b).abs() < 1e-6, "channel {i}: decode={a} vs full={b}");
+        }
+    }
+
+    #[test]
+    fn linear_attention_prefill_then_decode_matches_full_reprocess() {
+        let group_count = 2_usize;
+        let time_step_rank = 4_usize;
+        let state_size = 2_usize;
+        let inner_size = time_step_rank * state_size;
+        let hidden = inner_size;
+        let conv_channels = inner_size + 2 * group_count * state_size;
+        let conv_kernel = 2_usize;
+
+        // Build a deterministic plan with non-trivial weights.
+        let mut qkv_weight = vec![0.0_f32; hidden * conv_channels];
+        for i in 0..hidden.min(conv_channels) {
+            qkv_weight[i * conv_channels + i] = 1.0;
+        }
+        let mut gate_weight = vec![0.0_f32; hidden * inner_size];
+        for i in 0..hidden.min(inner_size) {
+            gate_weight[i * inner_size + i] = 0.5;
+        }
+        let alpha_weight = vec![0.01_f32; hidden * time_step_rank];
+        let beta_weight = vec![0.01_f32; hidden * time_step_rank];
+        let mut conv_weight = vec![0.0_f32; conv_channels * conv_kernel];
+        for ch in 0..conv_channels {
+            conv_weight[ch * conv_kernel + (conv_kernel - 1)] = 1.0;
+        }
+        let dt_bias = vec![0.0_f32; time_step_rank];
+        let ssm_a = vec![-1.0_f32; time_step_rank];
+        let ssm_norm = vec![1.0_f32; state_size];
+        let mut ssm_out_weight = vec![0.0_f32; inner_size * hidden];
+        for i in 0..inner_size.min(hidden) {
+            ssm_out_weight[i * hidden + i] = 1.0;
+        }
+
+        let plan = Qwen35LinearAttentionLayerPlan {
+            norm_values: vec![1.0_f32; hidden],
+            qkv_weight_values: qkv_weight,
+            gate_weight_values: gate_weight,
+            alpha_weight_values: alpha_weight,
+            beta_weight_values: beta_weight,
+            conv_weight_values: conv_weight,
+            dt_bias_values: dt_bias,
+            ssm_a_values: ssm_a,
+            ssm_norm_values: ssm_norm,
+            ssm_out_weight_values: ssm_out_weight,
+            state_size,
+            group_count,
+            time_step_rank,
+            inner_size,
+            conv_kernel,
+        };
+
+        // 3-token prompt + 1 decode token.
+        let prompt: Vec<f32> = (0..3 * hidden).map(|i| (i as f32 + 1.0) * 0.02).collect();
+        let new_token: Vec<f32> = (0..hidden).map(|i| (i as f32 + 100.0) * 0.01).collect();
+
+        // Full reprocess: all 4 tokens at once.
+        let full_input: Vec<f32> = prompt.iter().chain(new_token.iter()).copied().collect();
+        let full_output = qwen35_linear_attention_inference(&plan, &full_input, 4, 1e-5).unwrap();
+        let expected = &full_output[3 * hidden..4 * hidden];
+
+        // Prefill 3 tokens, then decode 1 token.
+        let mut state = super::super::state::LinearAttentionState::new(
+            conv_kernel,
+            conv_channels,
+            time_step_rank,
+            state_size,
+        )
+        .unwrap();
+        let _prefill_output =
+            qwen35_linear_attention_prefill(&plan, &prompt, 3, 1e-5, &mut state).unwrap();
+        let decode_output =
+            qwen35_linear_attention_decode_step(&plan, &new_token, 1e-5, &mut state).unwrap();
+
+        for (i, (a, b)) in decode_output.iter().zip(expected).enumerate() {
+            assert!(
+                (a - b).abs() < 1e-5,
+                "feature {i}: decode={a} vs full={b}, diff={}",
+                (a - b).abs()
+            );
+        }
     }
 }

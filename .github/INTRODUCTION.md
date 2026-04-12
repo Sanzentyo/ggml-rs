@@ -19,7 +19,8 @@ And you should write rusty code(ADT, enum, type state pattern)
 3. ~~Implement MRoPE for full attention layers (required for multi-token prompts).~~ **DONE** — multi-token parity achieved.
 4. ~~Causal depthwise conv & QKV packing comparison.~~ **DONE** — documented in `docs/llama-rs/worklog/2026-04-13-conv-qkv-comparison.md`.
 5. ~~Continue review_3 refactor items (generic inference, ND tensor, semantic wrapper dedup).~~ **10/12 DONE** — test coverage 122 tests (zero warnings), backend examples exist.
-6. Merge back to `main` only after validation and runtime checks pass.
+6. ~~Autoregressive decode state management (prefill/decode split).~~ **DONE** — KV cache for full attention, conv buffer + SSM states for linear attention, decode equivalence tests pass.
+7. Merge back to `main` only after validation and runtime checks pass.
 
 ## Completed refactor items
 
@@ -36,6 +37,15 @@ And you should write rusty code(ADT, enum, type state pattern)
   `GgufTensorInfo` now stores `ggml_type: Type` instead of raw `i32` + `String`.
   Decode APIs (`decode_tensor_data_to`, `tensor_element_count`) accept `Type`.
   `HostElement` sealed via private `Sealed` supertrait (eliminates `private_bounds` warning).
+- **e2e.rs module split**: Monolithic 2412-line file split into 13 focused submodules
+  (error, config, numeric, tensor_ops, resolve, decode, plan, planner, attention,
+  linear_attention, mlp, generation, state). Public API unchanged.
+- **Autoregressive decode infrastructure**: `state.rs` with `Qwen35FullAttentionState`
+  (KV cache), `LinearAttentionState` (conv buffer + SSM states), `GenerationState`.
+  `attention.rs` gains `qwen35_full_attention_prefill` + `decode_step`.
+  `linear_attention.rs` gains `qwen35_linear_attention_prefill` + `decode_step` +
+  `causal_depthwise_conv_decode_step`. RoPE `position_offset` parameter added.
+  Decode equivalence tests verify prefill+decode = full reprocess.
 
 ## Validation checkpoints completed on this branch
 

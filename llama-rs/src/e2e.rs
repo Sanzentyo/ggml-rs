@@ -29,6 +29,7 @@ mod numeric;
 mod plan;
 mod planner;
 mod resolve;
+mod state;
 mod tensor_ops;
 
 pub use config::{E2eGenerationConfig, E2eGenerationReport, MixedLayerPolicy};

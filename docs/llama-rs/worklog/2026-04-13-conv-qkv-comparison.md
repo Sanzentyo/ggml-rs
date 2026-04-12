@@ -163,10 +163,14 @@ llama-rs uses explicit `copy_from_slice`.
    `[1088,35790,90,16,14728]`, 3-prompt+5-gen `[31,2,5,1,271]`,
    5-prompt+5-gen `[6,24218,10,4838,1665]` — all match.
 2. **llama-rs is functionally complete for prefill** (prompt processing).
-3. **Autoregressive decode** for linear attention requires conv state management
-   (not yet implemented in llama-rs).
-4. **Performance**: llama-rs uses scalar loops with explicit copies; llama.cpp
+3. **Autoregressive decode** for linear attention conv state management is now
+   implemented (`causal_depthwise_conv_decode_step` + `LinearAttentionState`).
+   Decode equivalence tests verify prefill+decode matches full reprocess.
+4. **Full attention decode** is also implemented (`qwen35_full_attention_decode_step`
+   + `Qwen35FullAttentionState` KV cache). RoPE `position_offset` parameter
+   enables correct position encoding for decode tokens.
+5. **Performance**: llama-rs uses scalar loops with explicit copies; llama.cpp
    uses graph-level zero-copy views and multi-threaded kernels. This is
    expected for a reference implementation vs production runtime.
-5. **Future optimization**: Replace `copy_from_slice` splits with strided
+6. **Future optimization**: Replace `copy_from_slice` splits with strided
    iterators or views when the ggml-rs safe API supports it.
