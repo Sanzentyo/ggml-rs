@@ -1,7 +1,7 @@
 //! GGUF metadata parsing for architecture-aware inference configuration.
 
 use crate::model::GgufModel;
-use ggml_rs::GgufValue;
+use ggml_rs::{GgufArrayValue, GgufValue};
 use std::collections::HashMap;
 use std::error::Error as StdError;
 use std::fmt;
@@ -49,6 +49,7 @@ pub struct TransformerMetadata {
     rope_freq_base: f32,
     rope_freq_scale: f32,
     rope_original_context_length: Option<NonZeroUsize>,
+    rope_dimension_sections: Option<[i32; 4]>,
     full_attention_interval: Option<NonZeroUsize>,
     ssm_conv_kernel: Option<NonZeroUsize>,
     ssm_state_size: Option<NonZeroUsize>,
@@ -116,6 +117,10 @@ impl TransformerMetadata {
 
     pub fn rope_original_context_length(&self) -> Option<usize> {
         self.rope_original_context_length.map(NonZeroUsize::get)
+    }
+
+    pub fn rope_dimension_sections(&self) -> Option<[i32; 4]> {
+        self.rope_dimension_sections
     }
 
     pub fn full_attention_interval(&self) -> Option<usize> {
@@ -426,6 +431,7 @@ fn parse_transformer_metadata(
     let rope_base_key = format!("{prefix}.rope.freq_base");
     let rope_scale_key = format!("{prefix}.rope.freq_scale");
     let rope_original_context_length_key = format!("{prefix}.rope.scaling.original_context_length");
+    let rope_dimension_sections_key = format!("{prefix}.rope.dimension_sections");
     let full_attention_interval_key = format!("{prefix}.full_attention_interval");
     let ssm_conv_kernel_key = format!("{prefix}.ssm.conv_kernel");
     let ssm_state_size_key = format!("{prefix}.ssm.state_size");
@@ -449,6 +455,7 @@ fn parse_transformer_metadata(
     let rope_freq_scale = optional_f32(kv, &rope_scale_key)?.unwrap_or(1.0);
     let rope_original_context_length =
         optional_non_zero_usize(kv, &rope_original_context_length_key)?;
+    let rope_dimension_sections = optional_i32_array_4(kv, &rope_dimension_sections_key)?;
     let full_attention_interval = optional_non_zero_usize(kv, &full_attention_interval_key)?;
     let ssm_conv_kernel = optional_non_zero_usize(kv, &ssm_conv_kernel_key)?;
     let ssm_state_size = optional_non_zero_usize(kv, &ssm_state_size_key)?;
@@ -482,6 +489,7 @@ fn parse_transformer_metadata(
         rope_freq_base,
         rope_freq_scale,
         rope_original_context_length,
+        rope_dimension_sections,
         full_attention_interval,
         ssm_conv_kernel,
         ssm_state_size,
@@ -519,6 +527,30 @@ fn optional_f32(kv: &HashMap<&str, &GgufValue>, key: &str) -> Result<Option<f32>
         .copied()
         .map(|value| to_f32(key, value))
         .transpose()
+}
+
+fn optional_i32_array_4(
+    kv: &HashMap<&str, &GgufValue>,
+    key: &str,
+) -> Result<Option<[i32; 4]>, MetadataError> {
+    let Some(value) = kv.get(key).copied() else {
+        return Ok(None);
+    };
+    match value {
+        GgufValue::Array(GgufArrayValue::I32(values)) if values.len() == 4 => {
+            Ok(Some([values[0], values[1], values[2], values[3]]))
+        }
+        GgufValue::Array(GgufArrayValue::I32(_)) => Err(MetadataError::InvalidValueType {
+            key: key.to_string(),
+            expected: "i32 array of length 4",
+            actual: "i32 array of wrong length",
+        }),
+        other => Err(MetadataError::InvalidValueType {
+            key: key.to_string(),
+            expected: "i32 array of length 4",
+            actual: other.type_name(),
+        }),
+    }
 }
 
 fn to_non_zero_usize(key: &str, value: &GgufValue) -> Result<NonZeroUsize, MetadataError> {
@@ -746,5 +778,42 @@ mod tests {
         assert_eq!(resolved.ssm_group_count(), Some(16));
         assert_eq!(resolved.ssm_time_step_rank(), Some(32));
         assert_eq!(resolved.ssm_inner_size(), Some(4096));
+    }
+
+    #[test]
+    fn parses_rope_dimension_sections() {
+        let kv = [
+            (
+                "general.architecture",
+                GgufValue::String("qwen35".to_string()),
+            ),
+            ("qwen35.block_count", GgufValue::U32(32)),
+            ("qwen35.embedding_length", GgufValue::U32(2560)),
+            ("qwen35.attention.head_count", GgufValue::U32(16)),
+            ("qwen35.attention.head_count_kv", GgufValue::U32(4)),
+            (
+                "qwen35.rope.dimension_sections",
+                GgufValue::Array(ggml_rs::GgufArrayValue::I32(vec![11, 11, 10, 0])),
+            ),
+        ];
+        let resolved = resolve_transformer_metadata_from_kv(kv.iter().map(|(k, v)| (*k, v)))
+            .expect("transformer metadata should parse");
+        assert_eq!(resolved.rope_dimension_sections(), Some([11, 11, 10, 0]));
+    }
+
+    #[test]
+    fn rope_dimension_sections_absent_returns_none() {
+        let kv = [
+            (
+                "general.architecture",
+                GgufValue::String("llama".to_string()),
+            ),
+            ("llama.block_count", GgufValue::U32(24)),
+            ("llama.embedding_length", GgufValue::U32(4096)),
+            ("llama.attention.head_count", GgufValue::U32(32)),
+        ];
+        let resolved = resolve_transformer_metadata_from_kv(kv.iter().map(|(k, v)| (*k, v)))
+            .expect("transformer metadata should parse");
+        assert_eq!(resolved.rope_dimension_sections(), None);
     }
 }

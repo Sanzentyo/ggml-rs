@@ -110,6 +110,13 @@ pub enum E2eError {
     BufferLengthMismatch { expected: usize, actual: usize },
     #[error("memory size overflow while building generation graph")]
     MemorySizeOverflow,
+    #[error(
+        "invalid RoPE config: rope_n_dims={rope_n_dims} must be even and <= head_dimension={head_dimension}"
+    )]
+    RopeConfigInvalid {
+        rope_n_dims: usize,
+        head_dimension: usize,
+    },
 }
 
 impl E2eError {
@@ -249,6 +256,9 @@ struct Qwen35FullAttentionLayerPlan {
     kv_head_count: usize,
     head_dimension: usize,
     attention_scale: f32,
+    rope_n_dims: usize,
+    rope_freq_base: f32,
+    rope_freq_scale: f32,
 }
 
 #[derive(Debug, Clone)]
@@ -724,6 +734,14 @@ fn build_qwen35_full_attention_layer_plan(
         )
     })?;
 
+    let rope_n_dims = metadata.rope_dimension_count().unwrap_or(head_dimension);
+    if rope_n_dims > head_dimension || !rope_n_dims.is_multiple_of(2) {
+        return Err(E2eError::RopeConfigInvalid {
+            rope_n_dims,
+            head_dimension,
+        });
+    }
+
     Ok(AttentionLayerPlan::Qwen35Full(
         Qwen35FullAttentionLayerPlan {
             norm_values: decode_norm_tensor(model, &names.attn_norm, hidden_features, "attn_norm")?,
@@ -763,6 +781,9 @@ fn build_qwen35_full_attention_layer_plan(
             attention_scale: metadata
                 .attention_scale()
                 .unwrap_or(1.0 / (head_dimension as f32).sqrt()),
+            rope_n_dims,
+            rope_freq_base: metadata.rope_freq_base(),
+            rope_freq_scale: metadata.rope_freq_scale(),
         },
     ))
 }
@@ -1274,10 +1295,6 @@ fn qwen35_full_attention_inference(
             actual: q_full.len(),
         });
     }
-    // TODO: RoPE (MRoPE with sections) is applied to Q and K in llama.cpp after
-    // normalization. At position 0, RoPE is identity (cos(0)=1, sin(0)=0), so it
-    // doesn't affect single-token-at-position-0 parity. Must be implemented for
-    // multi-token prompts and autoregressive decode beyond the first step.
     for token in 0..sequence_length {
         let token_base = token * per_token_qg_features;
         let dst_token_base = token * query_features;
@@ -1292,7 +1309,7 @@ fn qwen35_full_attention_inference(
         }
     }
 
-    let q_values = per_head_rms_norm(
+    let mut q_values = per_head_rms_norm(
         &q_values,
         sequence_length,
         attention.head_count,
@@ -1300,13 +1317,36 @@ fn qwen35_full_attention_inference(
         &attention.q_norm_values,
         rms_norm_eps,
     )?;
-    let k_values = per_head_rms_norm(
+    let mut k_values = per_head_rms_norm(
         &k_proj,
         sequence_length,
         attention.kv_head_count,
         attention.head_dimension,
         &attention.k_norm_values,
         rms_norm_eps,
+    )?;
+
+    // Apply NeoX-style RoPE to Q and K after normalization.
+    // For text-only Qwen3.5 IMROPE with sections=[11,11,10,0], all three
+    // temporal/spatial position components are equal, simplifying to standard
+    // NeoX RoPE on the first n_rot dimensions.
+    apply_neox_rope_in_place(
+        &mut q_values,
+        sequence_length,
+        attention.head_count,
+        attention.head_dimension,
+        attention.rope_n_dims,
+        attention.rope_freq_base,
+        attention.rope_freq_scale,
+    )?;
+    apply_neox_rope_in_place(
+        &mut k_values,
+        sequence_length,
+        attention.kv_head_count,
+        attention.head_dimension,
+        attention.rope_n_dims,
+        attention.rope_freq_base,
+        attention.rope_freq_scale,
     )?;
 
     let groups = attention.head_count / attention.kv_head_count;
@@ -1651,6 +1691,73 @@ fn causal_depthwise_conv(
         }
     }
     Ok(output)
+}
+
+/// Apply NeoX-style rotary position embedding in-place.
+///
+/// For each token at position `pos`, rotates dimension pairs `(x[k], x[k + n_rot/2])`
+/// for `k` in `0..n_rot/2` using angle `theta_k = pos * freq_base^(-2k / n_rot)`.
+/// Dimensions beyond `n_rot` are left unchanged.
+///
+/// The RoPE cache (cos/sin per position per dimension pair) is computed once and
+/// reused across all heads.
+fn apply_neox_rope_in_place(
+    values: &mut [f32],
+    sequence_length: usize,
+    head_count: usize,
+    head_dimension: usize,
+    n_rot: usize,
+    freq_base: f32,
+    freq_scale: f32,
+) -> Result<(), E2eError> {
+    let total_features = checked_mul(head_count, head_dimension)?;
+    let expected_len = checked_mul(sequence_length, total_features)?;
+    if values.len() != expected_len {
+        return Err(E2eError::BufferLengthMismatch {
+            expected: expected_len,
+            actual: values.len(),
+        });
+    }
+    debug_assert!(n_rot <= head_dimension && n_rot.is_multiple_of(2));
+
+    let half_rot = n_rot / 2;
+    let theta_scale = freq_base.powf(-2.0 / n_rot as f32);
+
+    // Build per-position RoPE cache: cos_theta[pos][k] and sin_theta[pos][k]
+    // for k in 0..half_rot, reused across all heads.
+    let cache_size = checked_mul(sequence_length, half_rot)?;
+    let mut cos_cache = vec![0.0_f32; cache_size];
+    let mut sin_cache = vec![0.0_f32; cache_size];
+    for pos in 0..sequence_length {
+        let mut theta = pos as f32;
+        for k in 0..half_rot {
+            let cache_idx = pos * half_rot + k;
+            let angle = theta * freq_scale;
+            cos_cache[cache_idx] = angle.cos();
+            sin_cache[cache_idx] = angle.sin();
+            theta *= theta_scale;
+        }
+    }
+
+    // Apply rotation in-place across all tokens and heads
+    for pos in 0..sequence_length {
+        let token_base = pos * total_features;
+        for head in 0..head_count {
+            let head_base = token_base + head * head_dimension;
+            for k in 0..half_rot {
+                let cache_idx = pos * half_rot + k;
+                let cos_t = cos_cache[cache_idx];
+                let sin_t = sin_cache[cache_idx];
+                let idx0 = head_base + k;
+                let idx1 = head_base + k + half_rot;
+                let x0 = values[idx0];
+                let x1 = values[idx1];
+                values[idx0] = x0 * cos_t - x1 * sin_t;
+                values[idx1] = x0 * sin_t + x1 * cos_t;
+            }
+        }
+    }
+    Ok(())
 }
 
 fn per_head_rms_norm(
@@ -2211,5 +2318,95 @@ mod tests {
         assert_eq!(q_values, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]);
         // Token 0: [10,20, 30,40], Token 1: [50,60, 70,80]
         assert_eq!(q_gate, vec![10.0, 20.0, 30.0, 40.0, 50.0, 60.0, 70.0, 80.0]);
+    }
+
+    #[test]
+    fn rope_identity_at_position_zero() {
+        // At position 0, all theta values are 0, so cos=1, sin=0 → identity
+        // 1 token, 1 head, head_dim=4, n_rot=4
+        let mut values = vec![1.0, 2.0, 3.0, 4.0];
+        let original = values.clone();
+        super::apply_neox_rope_in_place(&mut values, 1, 1, 4, 4, 10000.0, 1.0).unwrap();
+        for (a, b) in values.iter().zip(original.iter()) {
+            assert!((a - b).abs() < 1e-6, "expected {b}, got {a}");
+        }
+    }
+
+    #[test]
+    fn rope_rotates_at_nonzero_position() {
+        // 1 token at position 1, 1 head, head_dim=4, n_rot=4, freq_base=1.0
+        // With freq_base=1.0: theta_scale = 1.0^(-2/4) = 1.0
+        // All theta values = position * 1.0^k = 1.0
+        // So cos(1)=0.5403, sin(1)=0.8415
+        // NeoX pairs: (x[0], x[2]) and (x[1], x[3])
+        // After rotation of pair (x0, x2): x0' = x0*cos - x2*sin, x2' = x0*sin + x2*cos
+        let mut values = vec![
+            // position 0 (identity)
+            1.0, 2.0, 3.0, 4.0, // position 1
+            1.0, 0.0, 0.0, 0.0,
+        ];
+        super::apply_neox_rope_in_place(&mut values, 2, 1, 4, 4, 1.0, 1.0).unwrap();
+
+        // Position 0: should be unchanged (identity)
+        assert!((values[0] - 1.0).abs() < 1e-6);
+        assert!((values[1] - 2.0).abs() < 1e-6);
+        assert!((values[2] - 3.0).abs() < 1e-6);
+        assert!((values[3] - 4.0).abs() < 1e-6);
+
+        // Position 1 with freq_base=1.0:
+        // theta = 1.0 for pair 0 (k=0): theta_scale = 1.0^(-2/4) = 1.0
+        // theta = 1.0 for pair 1 (k=1): theta = 1.0 * 1.0 = 1.0
+        // x=[1,0,0,0], pairs (x[0],x[2]) and (x[1],x[3])
+        // x[0]' = 1*cos(1) - 0*sin(1) = cos(1) ≈ 0.5403
+        // x[2]' = 1*sin(1) + 0*cos(1) = sin(1) ≈ 0.8415
+        // x[1]' = 0*cos(1) - 0*sin(1) = 0
+        // x[3]' = 0*sin(1) + 0*cos(1) = 0
+        let cos1 = 1.0_f32.cos();
+        let sin1 = 1.0_f32.sin();
+        assert!(
+            (values[4] - cos1).abs() < 1e-6,
+            "expected {cos1}, got {}",
+            values[4]
+        );
+        assert!((values[5]).abs() < 1e-6);
+        assert!(
+            (values[6] - sin1).abs() < 1e-6,
+            "expected {sin1}, got {}",
+            values[6]
+        );
+        assert!((values[7]).abs() < 1e-6);
+    }
+
+    #[test]
+    fn rope_preserves_dims_beyond_n_rot() {
+        // 2 tokens, 1 head, head_dim=6, n_rot=4 → dims 4,5 should stay untouched
+        let mut values = [
+            // Token 0 (pos=0): identity
+            1.0_f32, 2.0, 3.0, 4.0, 99.0, 88.0,
+            // Token 1 (pos=1): RoPE applied to first 4 dims, last 2 preserved
+            1.0, 2.0, 3.0, 4.0, 99.0, 88.0,
+        ];
+        super::apply_neox_rope_in_place(&mut values, 2, 1, 6, 4, 10000.0, 1.0).unwrap();
+        // Position 0: all identity
+        assert!((values[4] - 99.0).abs() < 1e-6);
+        assert!((values[5] - 88.0).abs() < 1e-6);
+        // Position 1: dims 4,5 untouched
+        assert!((values[10] - 99.0).abs() < 1e-6);
+        assert!((values[11] - 88.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn rope_multi_head_applies_same_rotation_per_head() {
+        // 2 tokens, 2 heads, head_dim=4, n_rot=4, freq_base=1.0
+        // Both heads at same position should get the same rotation
+        let mut buf = [
+            // Token 0: 2 heads (pos=0, identity)
+            0.0_f32, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+            // Token 1: 2 heads (pos=1, rotated)
+            1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0,
+        ];
+        super::apply_neox_rope_in_place(&mut buf, 2, 2, 4, 4, 1.0, 1.0).unwrap();
+        // Token 1, Head 0 and Head 1 should be identical
+        assert_eq!(&buf[8..12], &buf[12..16]);
     }
 }
