@@ -18,7 +18,7 @@ And you should write rusty code(ADT, enum, type state pattern)
 2. ~~Expand `Type` enum to all ggml types, seal `HostElement`, update decode APIs.~~ **DONE** — zero clippy warnings.
 3. ~~Implement MRoPE for full attention layers (required for multi-token prompts).~~ **DONE** — multi-token parity achieved.
 4. ~~Causal depthwise conv & QKV packing comparison.~~ **DONE** — documented in `docs/llama-rs/worklog/2026-04-13-conv-qkv-comparison.md`.
-5. Continue review_3 refactor items (generic inference, ND tensor, semantic wrapper dedup).
+5. ~~Continue review_3 refactor items (generic inference, ND tensor, semantic wrapper dedup).~~ **10/12 DONE** — test coverage 122 tests (zero warnings), backend examples exist.
 6. Merge back to `main` only after validation and runtime checks pass.
 
 ## Completed refactor items

@@ -159,6 +159,9 @@ llama-rs uses explicit `copy_from_slice`.
 ## 3. Key Takeaways
 
 1. **Numerical parity is confirmed** across both paths — the math is identical.
+   Extended parity testing: single-token `[5328]`, 5-gen from prompt `[3]`
+   `[1088,35790,90,16,14728]`, 3-prompt+5-gen `[31,2,5,1,271]`,
+   5-prompt+5-gen `[6,24218,10,4838,1665]` — all match.
 2. **llama-rs is functionally complete for prefill** (prompt processing).
 3. **Autoregressive decode** for linear attention requires conv state management
    (not yet implemented in llama-rs).
