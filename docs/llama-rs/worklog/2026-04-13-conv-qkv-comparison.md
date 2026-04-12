@@ -175,3 +175,10 @@ llama-rs uses explicit `copy_from_slice`.
    expected for a reference implementation vs production runtime.
 6. **Future optimization**: Replace `copy_from_slice` splits with strided
    iterators or views when the ggml-rs safe API supports it.
+7. **Multi-layer orchestration verified**: `generation.rs` extracted a
+   `GenerationMode` enum (`Auto | FullReprocess | TwoPhase`) and a
+   `generate_from_plans` helper.  Integration test
+   `two_phase_matches_full_reprocess_multi_layer` runs a 3-layer synthetic
+   model (Qwen35Linear → Qwen35Full → Qwen35Linear) through both paths
+   and asserts identical token sequences.  This validates the residual
+   connections, MLP pass-through, and state orchestration across layers.

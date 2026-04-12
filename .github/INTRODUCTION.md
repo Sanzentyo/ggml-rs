@@ -55,6 +55,11 @@ And you should write rusty code(ADT, enum, type state pattern)
 - **Backend examples + README** (review_3 items 11, 12): `backend_ops.rs` multi-op graph
   example (matmul + bias on CPU/Metal), fixed stale API names in README, added multi-op
   and Metal parity backend tests. Updated EXAMPLE_PARITY_MATRIX.md.
+- **Generation loop refactor**: Extracted `GenerationMode` enum
+  (`Auto | FullReprocess | TwoPhase`), `GenerationInputs` bundle, and
+  `generate_from_plans` core loop. Integration test
+  `two_phase_matches_full_reprocess_multi_layer` verifies both execution
+  paths produce identical token sequences on a 3-layer synthetic model.
 
 ## Validation checkpoints completed on this branch
 
