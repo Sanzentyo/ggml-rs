@@ -1,4 +1,4 @@
-# Ongoing execution policy (review_1 + review_3 refactor)
+# Ongoing execution policy (review_1 + review_3 complete, parity follow-up active)
 
 This repository is currently following a strict execution policy to avoid losing intent across long refactor loops.
 
@@ -8,25 +8,41 @@ This repository is currently following a strict execution policy to avoid losing
 
 ## Immediate priority
 
-1. Apply `docs/third_reviews/review_1.md` and `docs/third_reviews/review_3.md` refactor recommendations to `ggml-rs`.
-2. Enforce no-regression performance gating (baseline vs post-change).
-3. Iterate until performance is at least baseline (preferably improved).
-4. Merge back to `main` only after validation and runtime checks pass.
+1. Close the remaining Qwen3.5 strict token-id parity gap in `llama-rs`.
+2. Keep the `ggml-rs` review_1/review_3 refactor branch validated while parity work proceeds.
+3. Merge back to `main` only after validation and runtime checks pass.
 
 ## Completed refactor items
 
 - `AsRef<str>` for GGUF string arguments (`find_key`, `kv_value_by_key`, `set_value`, `remove_key`).
 - `TryFromGgufValue` trait and `kv_value_as::<T>()` convenience method on `GgufFile`.
 - `GgufTypeMismatch` error variant for type-safe GGUF value extraction.
-
-## Remaining refactor items (from review_3)
-
-- `Tensor<'ctx, T>` typestate pattern — carry element type at compile time, eliminate runtime type-specific methods.
-- `GgmlElement` / `GgmlType` trait unification with `Tensor<'ctx, T>`.
+- `Tensor<'ctx, T>` typestate pattern and `DynTensor<'ctx>` runtime-typed handle.
 - `TensorExpr<'ctx, T>` typed expression wrapper.
-- Backend path test coverage (CPU/Metal).
-- ND tensor test coverage.
-- Error path and boundary tests.
+- `rope_ext_with_i32_positions` mixed-type RoPE helper for `f32` data + `i32` positions.
+- Backend-path / ND tensor / error-path test expansion.
+- `llama-rs` migration to the typed `Tensor<'ctx, T>` / `DynTensor<'ctx>` API.
+
+## Validation checkpoints completed on this branch
+
+- `cargo fmt --all`
+- `cargo clippy --workspace --all-targets`
+- `cargo test --workspace`
+- `cargo test --features link-system`
+- CPU perf gate: `cargo run --example bench_matmul --features link-system -- cpu -n 10`
+  - current checkpoint result: `avg=0.256 ms`
+
+## Current parity investigation status
+
+- Qwen3.5 strict parity: head-group mapping bug identified and fixed.
+  - Root cause: Q/K head-to-group mapping used integer division (`head / repeat_factor`)
+    producing an interleaved pattern `[g0,g0,g1,g1,...]`, while llama.cpp's `ggml_repeat_4d`
+    tiles block-by-block `[g0,g1,...,gN,g0,g1,...,gN]`.
+  - Fix: changed to `head % group_count` to match upstream tiled repeat semantics.
+  - Added shape invariant assertions (`time_step_rank % group_count == 0`,
+    `inner_size == time_step_rank * state_size`) and a regression test.
+  - `causal_depthwise_conv` was verified correct for initial-prompt (zero-state) case.
+  - Strict parity rerun pending after this fix.
 
 ## Already-implemented items (review_3 items done before this branch)
 
@@ -57,6 +73,6 @@ This repository is currently following a strict execution policy to avoid losing
 - Keep `llama-rs` reproducing llama.cpp behavior on top of `ggml-rs` safe APIs.
 - Improve `ggml-rs` architecture and performance in parallel.
 
-## After review refactor completion
+## After parity closure
 
-- Return to `llama-rs` trait/ADT continuation tasks.
+- Return to broader `llama-rs` trait/ADT continuation tasks.

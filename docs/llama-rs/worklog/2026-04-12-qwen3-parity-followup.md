@@ -141,3 +141,132 @@ All passed on this checkpoint.
   - implication:
     - the remaining blocker has moved from naming/planning into qwen35 block
       math parity itself (delta-net / fused-q-gate / exact operator semantics).
+
+## Progress checkpoint after review_3 closure
+
+- The branch work that was interleaved with this parity pass is now complete:
+  - `ggml-rs` review_1 / review_3 refactor items landed on `exp/oh-my`
+  - typed tensor migration is complete:
+    - `Tensor<'ctx, T>`
+    - `DynTensor<'ctx>`
+    - typed `TensorExpr<'ctx, T>`
+  - GGUF ergonomics landed:
+    - `AsRef<str>` key APIs
+    - `TryFromGgufValue`
+    - `kv_value_as::<T>()`
+  - additional validation/test coverage landed:
+    - backend compute path tests
+    - ND tensor tests
+    - error-path / boundary tests
+
+## Validation checkpoint on `exp/oh-my`
+
+- `cargo fmt --all`
+- `cargo clippy --workspace --all-targets`
+- `cargo test --workspace`
+- `cargo test --features link-system`
+- CPU perf gate:
+  - command:
+    - `cargo run --example bench_matmul --features link-system -- cpu -n 10`
+  - current result:
+    - `[CPU] matmul 256x256 · 256x256 avg=0.256 ms, checksum=956.435547`
+- Metal backend path is covered by the new link-system tests, but the current
+  local benchmark invocation still needs the matching `ggml-metal` shared-lib
+  link path before a clean bench rerun can be recorded.
+
+## Qwen3.5 parity narrowing after upstream comparison
+
+- Compared the Rust qwen3.5 implementation against upstream references in:
+  - `/tmp/llama.cpp/src/models/qwen35.cpp`
+  - `/tmp/llama.cpp/src/models/delta-net-base.cpp`
+  - `/tmp/llama.cpp/ggml/src/ggml-cuda/gated_delta_net.cu`
+  - `/tmp/llama.cpp/vendor/ggml/src/ggml-cpu/ops.cpp`
+  - `/tmp/llama.cpp/vendor/ggml/src/ggml-cuda/ssm-scan.cu`
+- Current conclusion:
+  - the Rust gated delta-net recurrence is not the leading mismatch candidate
+    for the scalar-gated Qwen3.5 path
+  - rewriting the recurrence into the CUDA-style update order is expected to be
+    algebraically equivalent and is unlikely to flip the generated token by
+    itself
+- The leading remaining suspects have therefore narrowed to pre-recurrence tensor
+  preparation:
+  - `causal_depthwise_conv` layout / boundary semantics
+  - Q/K/V packing, group repetition, or head reshaping before the delta-net block
+
+## Head-group mapping comparison (causal_depthwise_conv + QKV packing)
+
+### Investigation scope
+
+Compared llama-rs vs llama.cpp on all tensor-preparation steps in the qwen3.5
+linear-attention block:
+- post-conv channel ordering
+- split points for `q`, `k`, `v`
+- head/group packing layout before L2 norm and recurrence
+
+### causal_depthwise_conv — verified correct
+
+- Conv weight layout: `weight[channel * kernel_size + tap]` matches ggml's
+  `src1` layout of `[d_conv, d_inner]` (fastest dim = tap).
+- Boundary semantics for initial prompt (zero conv states): llama-rs zero-pads
+  missing taps, which is equivalent to ggml_ssm_conv prepending zero conv_states.
+- SiLU is applied inside the conv function in llama-rs, separately after
+  `ggml_ssm_conv` in llama.cpp — mathematically equivalent.
+
+### QKV split — verified correct
+
+- Per token, conv output is split as:
+  - Q: first `num_k_heads * head_k_dim` elements
+  - K: next `num_k_heads * head_k_dim` elements
+  - V: remaining `num_v_heads * head_v_dim` elements
+- This matches llama.cpp `ggml_view_4d` offsets in `build_layer_attn_linear`.
+
+### L2 norm — verified correct
+
+- `per_head_l2_norm` normalizes along `head_dimension` per head,
+  matching `ggml_l2_norm` along dimension 0.
+
+### Head-group mapping — **BUG FOUND AND FIXED**
+
+- Qwen3.5 8B has `num_k_heads=16`, `num_v_heads=32`.
+  Q/K are projected with 16 heads; V has 32 heads.
+  Q/K must be "repeated" to 32 for the per-head delta-net recurrence.
+
+- **llama.cpp** uses `ggml_repeat_4d` which tiles block-by-block:
+  ```
+  [g0,g1,...,g15, g0,g1,...,g15]
+  ```
+  (Implementation: outer loop over repeat blocks, inner loop over source elements.)
+
+- **llama-rs (before fix)** used `head / repeat_factor`:
+  ```
+  [g0,g0, g1,g1, ..., g15,g15]
+  ```
+  (Interleaved: consecutive V-heads shared the same Q/K group.)
+
+- **Fix**: changed to `head % attention.group_count`:
+  ```
+  [g0,g1,...,g15, g0,g1,...,g15]
+  ```
+  This produces the same tiled pattern as `ggml_repeat_4d`.
+
+- Added shape invariant assertions:
+  - `time_step_rank % group_count == 0`
+  - `inner_size == time_step_rank * state_size`
+
+- Added regression test `qwen35_linear_head_group_mapping_is_tiled` covering:
+  - Successful execution with `group_count < time_step_rank`
+  - Error on indivisible `group_count`
+
+### Validation
+
+- `cargo fmt --all`
+- `cargo clippy --workspace --all-targets`
+- `cargo test --workspace`
+
+All passed.
+
+### Next
+
+- Strict parity rerun on Qwen3.5 with the head-mapping fix.
+- If parity closes, update INTRODUCTION.md status to resolved.
+- If residual delta remains, investigate non-initial-prompt conv state handling.
