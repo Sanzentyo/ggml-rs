@@ -14,9 +14,10 @@ And you should write rusty code(ADT, enum, type state pattern)
 
 ## Immediate priority
 
-1. Close the remaining Qwen3.5 strict token-id parity gap in `llama-rs`.
-2. Keep the `ggml-rs` review_1/review_3 refactor branch validated while parity work proceeds.
-3. Merge back to `main` only after validation and runtime checks pass.
+1. ~~Close the remaining Qwen3.5 strict token-id parity gap in `llama-rs`.~~ **DONE** — parity achieved.
+2. Implement MRoPE for full attention layers (required for multi-token prompts).
+3. Keep the `ggml-rs` review_1/review_3 refactor branch validated while parity work proceeds.
+4. Merge back to `main` only after validation and runtime checks pass.
 
 ## Completed refactor items
 
