@@ -111,14 +111,14 @@ impl Qwen35FullAttentionState {
     }
 
     /// Get a K slice for a specific token.
-    #[allow(dead_code)] // Used in tests; public API for consumers
+    #[cfg(test)]
     pub(super) fn k_at(&self, token: usize) -> &[f32] {
         let offset = token * self.kv_features;
         &self.k_cache[offset..offset + self.kv_features]
     }
 
     /// Get a V slice for a specific token.
-    #[allow(dead_code)] // Used in tests; public API for consumers
+    #[cfg(test)]
     pub(super) fn v_at(&self, token: usize) -> &[f32] {
         let offset = token * self.kv_features;
         &self.v_cache[offset..offset + self.kv_features]
@@ -293,5 +293,101 @@ mod tests {
         assert_eq!(state.conv_valid, 1);
         // First 2 rows should be zero, last row should be the token
         assert_eq!(&state.conv_buffer, &[0.0, 0.0, 0.0, 0.0, 10.0, 20.0]);
+    }
+
+    #[test]
+    fn generation_state_new_creates_correct_layer_states() {
+        use super::super::plan::{
+            AttentionLayerPlan, LayerPlan, MlpLayerPlan, Qwen35FullAttentionLayerPlan,
+            Qwen35LinearAttentionLayerPlan,
+        };
+        use crate::inference::{MlpInferenceConfig, MlpWeights};
+
+        let dummy_mlp = MlpLayerPlan {
+            weights: MlpWeights::deterministic(MlpInferenceConfig::new(4, 8).unwrap()),
+            norm_values: vec![1.0; 4],
+        };
+
+        let plans = vec![
+            // Layer 0: Qwen35Full → KV cache
+            LayerPlan {
+                attention: Some(AttentionLayerPlan::Qwen35Full(
+                    Qwen35FullAttentionLayerPlan {
+                        norm_values: vec![],
+                        q_norm_values: vec![],
+                        k_norm_values: vec![],
+                        q_weight_values: vec![],
+                        k_weight_values: vec![],
+                        v_weight_values: vec![],
+                        output_weight_values: vec![],
+                        head_count: 4,
+                        kv_head_count: 2,
+                        head_dimension: 8,
+                        attention_scale: 1.0,
+                        rope_n_dims: 8,
+                        rope_freq_base: 10000.0,
+                        rope_freq_scale: 1.0,
+                    },
+                )),
+                mlp: dummy_mlp.clone(),
+            },
+            // Layer 1: Qwen35Linear → conv buffer + SSM states
+            LayerPlan {
+                attention: Some(AttentionLayerPlan::Qwen35Linear(
+                    Qwen35LinearAttentionLayerPlan {
+                        norm_values: vec![],
+                        qkv_weight_values: vec![],
+                        gate_weight_values: vec![],
+                        alpha_weight_values: vec![],
+                        beta_weight_values: vec![],
+                        conv_weight_values: vec![],
+                        dt_bias_values: vec![],
+                        ssm_a_values: vec![],
+                        ssm_norm_values: vec![],
+                        ssm_out_weight_values: vec![],
+                        state_size: 2,
+                        group_count: 2,
+                        time_step_rank: 4,
+                        inner_size: 8,
+                        conv_kernel: 3,
+                    },
+                )),
+                mlp: dummy_mlp.clone(),
+            },
+            // Layer 2: MLP-only → no attention state
+            LayerPlan {
+                attention: None,
+                mlp: dummy_mlp,
+            },
+        ];
+
+        let state = GenerationState::new(&plans, 16).unwrap();
+        assert_eq!(state.layers.len(), 3);
+        assert!(matches!(
+            state.layers[0],
+            LayerAttentionState::Qwen35Full(_)
+        ));
+        assert!(matches!(
+            state.layers[1],
+            LayerAttentionState::Qwen35Linear(_)
+        ));
+        assert!(matches!(state.layers[2], LayerAttentionState::None));
+
+        // Verify KV cache dimensions
+        if let LayerAttentionState::Qwen35Full(ref kv) = state.layers[0] {
+            assert_eq!(kv.kv_features, 16); // 2 kv_heads × 8 head_dim
+            assert_eq!(kv.cached_len, 0);
+        }
+
+        // Verify linear state dimensions
+        if let LayerAttentionState::Qwen35Linear(ref lin) = state.layers[1] {
+            // conv_channels = inner_size + 2 * group_count * state_size = 8 + 2*2*2 = 16
+            assert_eq!(lin.conv_channels, 16);
+            // buffer rows = conv_kernel - 1 = 2
+            assert_eq!(lin.conv_buffer.len(), 32); // 2 × 16
+            assert_eq!(lin.conv_valid, 0);
+            // ssm_size = time_step_rank * state_size^2 = 4 * 4 = 16
+            assert_eq!(lin.ssm_states.len(), 16);
+        }
     }
 }

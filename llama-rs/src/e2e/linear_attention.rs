@@ -1,3 +1,9 @@
+//! Qwen3.5 linear attention with causal depthwise convolution and delta-net
+//! recurrence.
+//!
+//! Provides full-sequence inference, prefill (capturing conv buffer and SSM
+//! states), and single-token decode step.
+
 use super::error::E2eError;
 use super::numeric::{checked_mul, sigmoid_scalar, silu_scalar, softplus_scalar};
 use super::plan::Qwen35LinearAttentionLayerPlan;

@@ -1,3 +1,8 @@
+//! Layer plan ADTs describing the structure and weights of each transformer layer.
+//!
+//! Plans are built once from GGUF tensors by the [`super::planner`] module and
+//! then consumed by the generation loop.
+
 use crate::inference::{AttentionWeights, MlpWeights};
 
 #[derive(Debug, Clone)]

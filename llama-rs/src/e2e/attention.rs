@@ -1,3 +1,8 @@
+//! Qwen3.5 full (standard-style) attention with gated Q and NeoX RoPE.
+//!
+//! Provides full-sequence inference, prefill (capturing KV cache), and
+//! single-token decode step using cached state.
+
 use super::error::E2eError;
 use super::numeric::{checked_mul, dot, sigmoid_scalar, softmax_prefix};
 use super::plan::Qwen35FullAttentionLayerPlan;

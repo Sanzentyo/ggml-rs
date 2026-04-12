@@ -1,3 +1,11 @@
+//! `llama-rs` — architecture-aware inference on GGUF models, built on `ggml-rs`.
+//!
+//! This crate provides tokenization, metadata extraction, and end-to-end token
+//! generation for transformer architectures (Qwen3.5 full/linear attention,
+//! standard attention, MLP).  The [`e2e`] module implements a two-phase
+//! generation loop (prefill + autoregressive decode) with verified token-ID
+//! parity against llama.cpp.
+
 pub mod backend;
 pub mod batched;
 pub mod bench;

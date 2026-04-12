@@ -1,3 +1,10 @@
+//! Token generation loop with greedy sampling.
+//!
+//! Public entry points: [`generate_token_ids_from_path`] and
+//! [`generate_token_ids_from_model`].  Internally the loop dispatches via
+//! [`GenerationMode`]: `TwoPhase` (prefill + incremental decode) when all
+//! layers support cached state, or `FullReprocess` as a fallback.
+
 use super::attention::{
     qwen35_full_attention_decode_step, qwen35_full_attention_inference,
     qwen35_full_attention_prefill,
