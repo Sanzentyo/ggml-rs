@@ -30,16 +30,17 @@ pub fn type_size(ty: Type) -> usize {
     unsafe { ffi::ggml_type_size(ty.as_raw() as _) }
 }
 
-fn resolve_ggml_type(ggml_type_raw: c_int) -> Result<ffi::ggml_type> {
-    if !(0..ffi::GGML_TYPE_COUNT).contains(&ggml_type_raw) {
-        return Err(Error::UnsupportedType(ggml_type_raw));
+fn resolve_ggml_type(ty: Type) -> Result<ffi::ggml_type> {
+    let raw = ty.as_raw();
+    if ty.is_unknown() || !(0..ffi::GGML_TYPE_COUNT).contains(&raw) {
+        return Err(Error::UnsupportedType(raw));
     }
-    Ok(ggml_type_raw as ffi::ggml_type)
+    Ok(raw as ffi::ggml_type)
 }
 
 /// Returns the number of scalar values represented by a tensor payload.
-pub fn tensor_element_count(ggml_type_raw: c_int, payload_bytes: usize) -> Result<usize> {
-    let ggml_type = resolve_ggml_type(ggml_type_raw)?;
+pub fn tensor_element_count(ty: Type, payload_bytes: usize) -> Result<usize> {
+    let ggml_type = resolve_ggml_type(ty)?;
     let block_size = unsafe { ffi::ggml_blck_size(ggml_type) }
         .try_into_checked()
         .map_err(|source: std::num::TryFromIntError| {
@@ -47,7 +48,7 @@ pub fn tensor_element_count(ggml_type_raw: c_int, payload_bytes: usize) -> Resul
         })?;
     let type_size = unsafe { ffi::ggml_type_size(ggml_type) };
     if block_size == 0 || type_size == 0 {
-        return Err(Error::UnsupportedType(ggml_type_raw));
+        return Err(Error::UnsupportedType(ty.as_raw()));
     }
     if !payload_bytes.is_multiple_of(type_size) {
         let expected = (payload_bytes / type_size)
@@ -67,16 +68,16 @@ pub fn tensor_element_count(ggml_type_raw: c_int, payload_bytes: usize) -> Resul
 }
 
 /// Decodes GGML tensor payload bytes into `f32` values via GGML type traits.
-fn decode_tensor_data_to_float(ggml_type_raw: c_int, payload: &[u8]) -> Result<Vec<f32>> {
-    let ggml_type = resolve_ggml_type(ggml_type_raw)?;
-    let element_count = tensor_element_count(ggml_type_raw, payload.len())
+fn decode_tensor_data_to_float(ty: Type, payload: &[u8]) -> Result<Vec<f32>> {
+    let ggml_type = resolve_ggml_type(ty)?;
+    let element_count = tensor_element_count(ty, payload.len())
         .map_err(|source| source.with_context("decode_tensor_data_to_float"))?;
 
     let type_traits =
         NonNull::new(unsafe { ffi::ggml_get_type_traits(ggml_type) as *mut ffi::ggml_type_traits })
             .ok_or_else(|| Error::null_pointer("ggml_get_type_traits"))?;
     let to_float =
-        unsafe { type_traits.as_ref().to_float }.ok_or(Error::UnsupportedType(ggml_type_raw))?;
+        unsafe { type_traits.as_ref().to_float }.ok_or(Error::UnsupportedType(ty.as_raw()))?;
 
     if element_count == 0 {
         return Ok(Vec::new());
@@ -108,18 +109,18 @@ fn decode_tensor_data_to_float(ggml_type_raw: c_int, payload: &[u8]) -> Result<V
 /// For matching plain tensor types (`f32`, `i32`) this performs a direct copy.
 /// For other GGML element types (including quantized payloads), values are
 /// decoded through GGML's `to_float` conversion and then cast to `T`.
-pub fn decode_tensor_data_to<T>(ggml_type_raw: c_int, payload: &[u8]) -> Result<Vec<T>>
+pub fn decode_tensor_data_to<T>(ty: Type, payload: &[u8]) -> Result<Vec<T>>
 where
     T: GgmlElement + NumCast,
 {
-    let element_count = tensor_element_count(ggml_type_raw, payload.len())?;
+    let element_count = tensor_element_count(ty, payload.len())?;
     let expected_nbytes = element_count.checked_mul_checked(std::mem::size_of::<T>())?;
 
     if element_count == 0 {
         return Ok(Vec::new());
     }
 
-    if ggml_type_raw == T::GGML_TYPE as c_int && payload.len() == expected_nbytes {
+    if ty == T::GGML_TYPE && payload.len() == expected_nbytes {
         let mut out = Vec::with_capacity(element_count);
         unsafe {
             // SAFETY:
@@ -133,7 +134,7 @@ where
         return Ok(out);
     }
 
-    let decoded = decode_tensor_data_to_float(ggml_type_raw, payload)?;
+    let decoded = decode_tensor_data_to_float(ty, payload)?;
     let len = decoded.len();
     let mut out = Vec::<T>::with_capacity(len);
     unsafe {
@@ -144,7 +145,7 @@ where
         //   so the Vec is dropped with length 0 and capacity `len` (no UB).
         let dst = out.spare_capacity_mut().as_mut_ptr();
         for (i, value) in decoded.iter().enumerate() {
-            let casted = NumCast::from(*value).ok_or(Error::UnsupportedType(ggml_type_raw))?;
+            let casted = NumCast::from(*value).ok_or(Error::UnsupportedType(ty.as_raw()))?;
             dst.add(i).write(MaybeUninit::new(casted));
         }
         out.set_len(len);

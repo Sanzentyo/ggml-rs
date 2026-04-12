@@ -2,6 +2,7 @@
 
 use crate::ffi;
 use crate::num_ext::TryIntoChecked;
+use crate::types::Type;
 use crate::{DynTensor, Error, Result, Tensor};
 use std::ffi::{CStr, CString};
 use std::marker::PhantomData;
@@ -150,8 +151,7 @@ pub struct GgufTensorInfo {
     pub name: String,
     pub offset: usize,
     pub size: usize,
-    pub ggml_type_raw: i32,
-    pub ggml_type_name: String,
+    pub ggml_type: Type,
 }
 
 /// RAII owner for a GGUF context.
@@ -287,11 +287,7 @@ impl GgufFile {
         let name = unsafe { CStr::from_ptr(name_ptr) }.to_str()?.to_owned();
 
         let ggml_type_raw = unsafe { ffi::gguf_get_tensor_type(self.raw.as_ptr(), index_i64) };
-        let type_ptr = unsafe { ffi::ggml_type_name(ggml_type_raw as _) };
-        if type_ptr.is_null() {
-            return Err(Error::null_pointer("ggml_type_name"));
-        }
-        let ggml_type_name = unsafe { CStr::from_ptr(type_ptr) }.to_str()?.to_owned();
+        let ggml_type = Type::from_raw(ggml_type_raw as c_int);
 
         let offset = unsafe { ffi::gguf_get_tensor_offset(self.raw.as_ptr(), index_i64) };
         let size = unsafe { ffi::gguf_get_tensor_size(self.raw.as_ptr(), index_i64) };
@@ -300,8 +296,7 @@ impl GgufFile {
             name,
             offset,
             size,
-            ggml_type_raw: ggml_type_raw as c_int,
-            ggml_type_name,
+            ggml_type,
         })
     }
 

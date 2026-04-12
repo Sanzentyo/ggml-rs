@@ -10,11 +10,21 @@ impl BackendElement for i32 {}
 
 /// Low-level host accessor contract for 1D element read/write.
 ///
-/// This trait provides the raw FFI accessors that underpin `GgmlElement` I/O.
-/// It is sealed in practice because only `f32` and `i32` implement it within this crate.
-pub(crate) trait HostElement: Copy + Default {
+/// This trait is sealed: only `f32` and `i32` implement it within this crate.
+/// External crates can *see* the trait (so `GgmlElement`'s supertrait bound is
+/// satisfied publicly) but cannot implement it because the required method
+/// signature uses a private type from `sealed`.
+pub trait HostElement: Copy + Default + sealed::Sealed {
+    #[doc(hidden)]
     fn set_1d_raw(raw: *mut ffi::ggml_tensor, index: i32, value: Self);
+    #[doc(hidden)]
     fn get_1d_raw(raw: *mut ffi::ggml_tensor, index: i32) -> Self;
+}
+
+mod sealed {
+    pub trait Sealed {}
+    impl Sealed for f32 {}
+    impl Sealed for i32 {}
 }
 
 impl HostElement for f32 {

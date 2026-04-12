@@ -255,8 +255,8 @@ fn read_fixture_metadata(path: &str) -> Result<GgufReport, Box<dyn StdError>> {
     println!("gguf_ex_read_0: n_tensors: {}", report.tensors.len());
     for (index, tensor) in report.tensors.iter().enumerate() {
         println!(
-            "gguf_ex_read_0: tensor[{index}]: name = {}, size = {}, offset = {}, type = {} ({})",
-            tensor.name, tensor.size, tensor.offset, tensor.ggml_type_name, tensor.ggml_type_raw
+            "gguf_ex_read_0: tensor[{index}]: name = {}, size = {}, offset = {}, type = {}",
+            tensor.name, tensor.size, tensor.offset, tensor.ggml_type
         );
     }
 
@@ -371,10 +371,10 @@ fn validate_fixture_tensor_values(
             .iter()
             .find(|tensor| tensor.name == tensor_name)
             .ok_or_else(|| io_error(format!("missing tensor `{tensor_name}`")))?;
-        if tensor.ggml_type_name != "f32" {
+        if tensor.ggml_type != ggml_rs::Type::F32 {
             return Err(io_error(format!(
-                "tensor `{tensor_name}` expected f32 type, got {} ({})",
-                tensor.ggml_type_name, tensor.ggml_type_raw
+                "tensor `{tensor_name}` expected f32 type, got {}",
+                tensor.ggml_type
             )));
         }
 

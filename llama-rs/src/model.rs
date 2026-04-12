@@ -43,11 +43,10 @@ pub enum ModelError {
         end: usize,
         file_size: usize,
     },
-    #[error("tensor `{tensor_name}` is not decodable (type={ggml_type_name} raw={ggml_type_raw})")]
+    #[error("tensor `{tensor_name}` is not decodable (type={ggml_type})")]
     UnsupportedTensorType {
         tensor_name: String,
-        ggml_type_name: String,
-        ggml_type_raw: i32,
+        ggml_type: ggml_rs::Type,
     },
     #[error("tensor `{tensor_name}` payload length is not element-aligned: {bytes} bytes")]
     InvalidTensorByteLength { tensor_name: String, bytes: usize },
@@ -251,16 +250,15 @@ impl GgufModel {
     {
         let tensor = self.tensor_info_by_handle(handle);
         let payload = self.tensor_payload_internal(tensor)?;
-        ggml_rs::decode_tensor_data_to::<T>(tensor.ggml_type_raw, payload).map_err(|source| {
-            match source {
+        ggml_rs::decode_tensor_data_to::<T>(tensor.ggml_type, payload).map_err(
+            |source| match source {
                 ggml_rs::Error::UnsupportedType(_) => ModelError::UnsupportedTensorType {
                     tensor_name: tensor.name.clone(),
-                    ggml_type_name: tensor.ggml_type_name.clone(),
-                    ggml_type_raw: tensor.ggml_type_raw,
+                    ggml_type: tensor.ggml_type,
                 },
                 other => ModelError::ggml("decode_tensor_data_to", other),
-            }
-        })
+            },
+        )
     }
 
     /// Iterates all tensor names in file order.
@@ -324,16 +322,15 @@ impl GgufModel {
     pub fn tensor_len_by_handle(&self, handle: TensorHandle) -> Result<usize, ModelError> {
         let tensor = self.tensor_info_by_handle(handle);
         let payload = self.tensor_payload_internal(tensor)?;
-        ggml_rs::tensor_element_count(tensor.ggml_type_raw, payload.len()).map_err(|source| {
-            match source {
+        ggml_rs::tensor_element_count(tensor.ggml_type, payload.len()).map_err(
+            |source| match source {
                 ggml_rs::Error::UnsupportedType(_) => ModelError::UnsupportedTensorType {
                     tensor_name: tensor.name.clone(),
-                    ggml_type_name: tensor.ggml_type_name.clone(),
-                    ggml_type_raw: tensor.ggml_type_raw,
+                    ggml_type: tensor.ggml_type,
                 },
                 other => ModelError::ggml("tensor_element_count", other),
-            }
-        })
+            },
+        )
     }
 
     fn tensor_payload_internal<'a>(
