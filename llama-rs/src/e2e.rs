@@ -1831,7 +1831,7 @@ fn mlp_sequence_inference_with_weights(
         .compute(&mut graph)
         .map_err(|source| E2eError::ggml("Backend::compute", source))?;
 
-    y.read_data_backend::<f32>()
+    y.read_data_backend()
         .map_err(|source| E2eError::ggml("Tensor::read_data_backend<Y>", source))
 }
 

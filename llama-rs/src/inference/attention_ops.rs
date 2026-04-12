@@ -1,5 +1,5 @@
 use super::{AttentionInferenceConfig, InferenceError, RotaryEmbedding};
-use ggml_rs::{Context, RopeExtParams, Tensor};
+use ggml_rs::{Context, RopeExtParams};
 
 #[derive(Debug, Clone, Copy)]
 pub(super) struct HeadConcatMetadata {
@@ -22,10 +22,10 @@ pub(super) trait HeadConcatStrategy {
     fn concat<'ctx>(
         &self,
         ctx: &'ctx Context,
-        tensors: Vec<Tensor<'ctx>>,
+        tensors: Vec<ggml_rs::Tensor<'ctx, f32>>,
         dim: usize,
         metadata: HeadConcatMetadata,
-    ) -> Result<Tensor<'ctx>, InferenceError>;
+    ) -> Result<ggml_rs::Tensor<'ctx, f32>, InferenceError>;
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -38,10 +38,10 @@ impl HeadConcatStrategy for LeftFoldHeadConcat {
     fn concat<'ctx>(
         &self,
         ctx: &'ctx Context,
-        tensors: Vec<Tensor<'ctx>>,
+        tensors: Vec<ggml_rs::Tensor<'ctx, f32>>,
         dim: usize,
         metadata: HeadConcatMetadata,
-    ) -> Result<Tensor<'ctx>, InferenceError> {
+    ) -> Result<ggml_rs::Tensor<'ctx, f32>, InferenceError> {
         let mut tensors = tensors.into_iter();
         let first = tensors
             .next()
@@ -58,10 +58,10 @@ impl HeadConcatStrategy for BalancedHeadConcat {
     fn concat<'ctx>(
         &self,
         ctx: &'ctx Context,
-        mut tensors: Vec<Tensor<'ctx>>,
+        mut tensors: Vec<ggml_rs::Tensor<'ctx, f32>>,
         dim: usize,
         metadata: HeadConcatMetadata,
-    ) -> Result<Tensor<'ctx>, InferenceError> {
+    ) -> Result<ggml_rs::Tensor<'ctx, f32>, InferenceError> {
         if tensors.is_empty() {
             return Err(invalid_attention_layout(metadata));
         }
@@ -90,21 +90,21 @@ pub(super) trait RotaryApplier {
     fn apply_single_with_sequence<'ctx>(
         &self,
         ctx: &'ctx Context,
-        tensor: &Tensor<'ctx>,
-        positions: Option<&Tensor<'ctx>>,
+        tensor: &ggml_rs::Tensor<'ctx, f32>,
+        positions: Option<&ggml_rs::Tensor<'ctx, i32>>,
         config: AttentionInferenceConfig,
         sequence_length: usize,
-    ) -> Result<Tensor<'ctx>, InferenceError>;
+    ) -> Result<ggml_rs::Tensor<'ctx, f32>, InferenceError>;
 
     fn apply_multi_head_with_sequence<'ctx>(
         &self,
         ctx: &'ctx Context,
-        tensor: &Tensor<'ctx>,
-        positions: Option<&Tensor<'ctx>>,
+        tensor: &ggml_rs::Tensor<'ctx, f32>,
+        positions: Option<&ggml_rs::Tensor<'ctx, i32>>,
         config: AttentionInferenceConfig,
         head_count: usize,
         sequence_length: usize,
-    ) -> Result<Tensor<'ctx>, InferenceError>;
+    ) -> Result<ggml_rs::Tensor<'ctx, f32>, InferenceError>;
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -114,11 +114,11 @@ impl RotaryApplier for LlamaRotaryApplier {
     fn apply_single_with_sequence<'ctx>(
         &self,
         ctx: &'ctx Context,
-        tensor: &Tensor<'ctx>,
-        positions: Option<&Tensor<'ctx>>,
+        tensor: &ggml_rs::Tensor<'ctx, f32>,
+        positions: Option<&ggml_rs::Tensor<'ctx, i32>>,
         config: AttentionInferenceConfig,
         sequence_length: usize,
-    ) -> Result<Tensor<'ctx>, InferenceError> {
+    ) -> Result<ggml_rs::Tensor<'ctx, f32>, InferenceError> {
         apply_rotary_with_head_count(
             ctx,
             tensor,
@@ -138,12 +138,12 @@ impl RotaryApplier for LlamaRotaryApplier {
     fn apply_multi_head_with_sequence<'ctx>(
         &self,
         ctx: &'ctx Context,
-        tensor: &Tensor<'ctx>,
-        positions: Option<&Tensor<'ctx>>,
+        tensor: &ggml_rs::Tensor<'ctx, f32>,
+        positions: Option<&ggml_rs::Tensor<'ctx, i32>>,
         config: AttentionInferenceConfig,
         head_count: usize,
         sequence_length: usize,
-    ) -> Result<Tensor<'ctx>, InferenceError> {
+    ) -> Result<ggml_rs::Tensor<'ctx, f32>, InferenceError> {
         apply_rotary_with_head_count(
             ctx,
             tensor,
@@ -171,13 +171,13 @@ struct RopeContextNames {
 
 fn apply_rotary_with_head_count<'ctx>(
     ctx: &'ctx Context,
-    tensor: &Tensor<'ctx>,
-    positions: Option<&Tensor<'ctx>>,
+    tensor: &ggml_rs::Tensor<'ctx, f32>,
+    positions: Option<&ggml_rs::Tensor<'ctx, i32>>,
     config: AttentionInferenceConfig,
     head_count: usize,
     sequence_length: usize,
     names: RopeContextNames,
-) -> Result<Tensor<'ctx>, InferenceError> {
+) -> Result<ggml_rs::Tensor<'ctx, f32>, InferenceError> {
     match (config.rotary, positions) {
         (RotaryEmbedding::Disabled, _) => Ok(*tensor),
         (RotaryEmbedding::Llama(params), Some(positions)) => {
@@ -213,7 +213,7 @@ fn apply_rotary_with_head_count<'ctx>(
                 )
                 .map_err(|source| InferenceError::ggml(names.reshape_3d, source))?;
             let rotated = ctx
-                .rope_ext(&reshaped, positions, None, rope_params)
+                .rope_ext_with_i32_positions(&reshaped, positions, None, rope_params)
                 .map_err(|source| InferenceError::ggml(names.rope_ext, source))?;
             let total_features = config
                 .head_dimension()

@@ -390,9 +390,9 @@ pub fn batched_matmul_with_workload(
             // sync overhead while still keeping a deterministic checksum.
             if item_index.is_multiple_of(config.readback_every.get()) {
                 let values = graph
-                    .last_node()
+                    .last_node_typed::<f32>()
                     .map_err(|source| BatchedError::ggml("Graph::last_node", source))?
-                    .read_data_backend::<f32>()
+                    .read_data_backend()
                     .map_err(|source| BatchedError::ggml("Tensor::read_data_backend", source))?;
                 checksum += values
                     .iter()
