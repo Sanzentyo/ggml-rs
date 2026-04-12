@@ -16,9 +16,10 @@ And you should write rusty code(ADT, enum, type state pattern)
 
 1. ~~Close the remaining Qwen3.5 strict token-id parity gap in `llama-rs`.~~ **DONE** — parity achieved.
 2. ~~Expand `Type` enum to all ggml types, seal `HostElement`, update decode APIs.~~ **DONE** — zero clippy warnings.
-3. Implement MRoPE for full attention layers (required for multi-token prompts).
-4. Keep the `ggml-rs` review_1/review_3 refactor branch validated while parity work proceeds.
-5. Merge back to `main` only after validation and runtime checks pass.
+3. ~~Implement MRoPE for full attention layers (required for multi-token prompts).~~ **DONE** — multi-token parity achieved.
+4. ~~Causal depthwise conv & QKV packing comparison.~~ **DONE** — documented in `docs/llama-rs/worklog/2026-04-13-conv-qkv-comparison.md`.
+5. Continue review_3 refactor items (generic inference, ND tensor, semantic wrapper dedup).
+6. Merge back to `main` only after validation and runtime checks pass.
 
 ## Completed refactor items
 
@@ -47,17 +48,19 @@ And you should write rusty code(ADT, enum, type state pattern)
 
 ## Current parity investigation status
 
-- **Qwen3.5 strict parity: ACHIEVED** (prompt `[1]`, `max_new_tokens=1`).
-  - Both llama-rs and llama.cpp produce `[5328]`.
+- **Qwen3.5 strict parity: ACHIEVED** (single-token AND multi-token).
+  - Single-token: prompt `[1]`, `max_new_tokens=1` → both produce `[5328]`.
+  - Multi-token: prompt `[3]`, `max_new_tokens=3` → both produce `[1088, 35790, 90]`.
   - Bug 1 (linear attention): Head-group mapping used `head / repeat_factor` (interleaved),
     while llama.cpp's `ggml_repeat_4d` tiles block-by-block. Fixed to `head % group_count`.
   - Bug 2 (full attention): Q/gate split treated ggml's interleaved layout
     `[Q_h0(D), G_h0(D), Q_h1(D), ...]` as two flat halves with dim-major indexing.
     Fixed to head-major interleaved extraction: `head * 2D + dim` for Q, `head * 2D + D + dim` for gate.
-  - `causal_depthwise_conv` verified correct. Delta-net recurrence math verified correct.
-  - Known gap: RoPE (MRoPE) not yet implemented for full attention layers.
-    At position 0, RoPE is identity, so single-token parity passes. Multi-token and
-    autoregressive decode beyond step 0 will require RoPE implementation.
+  - `causal_depthwise_conv` verified correct (comparison documented).
+  - Delta-net recurrence math verified correct.
+  - NeoX RoPE for full attention implemented and verified at non-zero positions.
+  - `causal_depthwise_conv` and QKV packing comparison completed — see
+    `docs/llama-rs/worklog/2026-04-13-conv-qkv-comparison.md`.
 
 ## Already-implemented items (review_3 items done before this branch)
 

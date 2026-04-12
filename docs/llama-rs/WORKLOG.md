@@ -31,6 +31,7 @@ Detailed logs live under `docs/llama-rs/worklog/`.
 | 2026-03-15 | `docs/llama-rs/worklog/2026-03-15-migration-log.md` | Stepwise optimization loop continuation, review2 cleanup, generic host-I/O refactor, dependency-management alignment, recent hotspot A/B passes |
 | 2026-03-18 | `docs/llama-rs/worklog/2026-03-18-e2e-inference-comparison.md` | True-E2E status, tokenizer completion, mixed-layer fallback runtime verification on CPU/Metal |
 | 2026-04-12 | `docs/llama-rs/worklog/2026-04-12-qwen3-parity-followup.md` | Qwen3 parity follow-up: q/k head norms, metadata-driven RMS epsilon/attention scale, RoPE original-context threading, **head-group mapping fix** |
+| 2026-04-13 | `docs/llama-rs/worklog/2026-04-13-conv-qkv-comparison.md` | Causal depthwise conv & QKV packing: llama-rs vs llama.cpp comparison, gap analysis, autoregressive decode considerations |
 
 ## Latest status snapshot
 
