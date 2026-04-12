@@ -54,10 +54,13 @@ git submodule update --init --recursive
 - For benchmark timing, call `Backend::synchronize()` after compute loops to
   ensure queued backend work is fully completed before measuring/reporting.
 - Quantized tensor decode helpers are available in safe API:
-  - `decode_tensor_data_to::<T>(ggml_type_raw, payload) -> Vec<T>`
-  - `tensor_element_count(ggml_type_raw, payload_bytes)`
+  - `decode_tensor_data_to::<T>(ggml_type: Type, payload) -> Vec<T>`
+  - `tensor_element_count(ggml_type: Type, payload_bytes)`
   These use GGML type traits (`ggml_get_type_traits`) and are useful for GGUF
   model paths that need typed views over quantized payloads.
+  The `Type` enum covers all ~32 ggml tensor types (native floats, integers,
+  and quantized block formats) with `from_raw(i32)` / `as_raw()` conversion
+  and classification helpers (`is_quantized()`, `is_float()`, `is_integer()`).
 - Decode API ownership refactor was assembly-verified (`2026-03-15`):
   - focused snippets: `target/benchmarks/review3_decode_asm_snippets.md`
   - before/after line-count summary: `target/benchmarks/review3_decode_asm_compare.md`

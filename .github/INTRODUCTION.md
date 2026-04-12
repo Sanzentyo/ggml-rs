@@ -1,8 +1,8 @@
-# After you read this introduction, you read markdown in directory allocated this md, then, you read some new markdown in ./docs dir. Then, update docs content and, unify these introduction. the intro should have policy that you update intro and docs content.
-
-# Ongoing execution policy (review_1 + review_3 complete, parity follow-up active)
+# Ongoing execution policy
 
 This repository is currently following a strict execution policy to avoid losing intent across long refactor loops.
+
+**Docs-update policy**: After every significant change (API refactor, bug fix, feature addition), update this file and relevant docs under `./docs/` to reflect the new state. Read all markdown in `.github/` and `./docs/` at session start.
 
 ## Skills you should use
 - rust-best-practices
@@ -15,9 +15,10 @@ And you should write rusty code(ADT, enum, type state pattern)
 ## Immediate priority
 
 1. ~~Close the remaining Qwen3.5 strict token-id parity gap in `llama-rs`.~~ **DONE** — parity achieved.
-2. Implement MRoPE for full attention layers (required for multi-token prompts).
-3. Keep the `ggml-rs` review_1/review_3 refactor branch validated while parity work proceeds.
-4. Merge back to `main` only after validation and runtime checks pass.
+2. ~~Expand `Type` enum to all ggml types, seal `HostElement`, update decode APIs.~~ **DONE** — zero clippy warnings.
+3. Implement MRoPE for full attention layers (required for multi-token prompts).
+4. Keep the `ggml-rs` review_1/review_3 refactor branch validated while parity work proceeds.
+5. Merge back to `main` only after validation and runtime checks pass.
 
 ## Completed refactor items
 
@@ -29,6 +30,11 @@ And you should write rusty code(ADT, enum, type state pattern)
 - `rope_ext_with_i32_positions` mixed-type RoPE helper for `f32` data + `i32` positions.
 - Backend-path / ND tensor / error-path test expansion.
 - `llama-rs` migration to the typed `Tensor<'ctx, T>` / `DynTensor<'ctx>` API.
+- **Type consolidation**: `Type` expanded from 2 variants (F32, I32) to all 32+ ggml
+  tensor types (quantized Q4_K, Q8_0, etc. + native floats/ints + Unknown(i32)).
+  `GgufTensorInfo` now stores `ggml_type: Type` instead of raw `i32` + `String`.
+  Decode APIs (`decode_tensor_data_to`, `tensor_element_count`) accept `Type`.
+  `HostElement` sealed via private `Sealed` supertrait (eliminates `private_bounds` warning).
 
 ## Validation checkpoints completed on this branch
 

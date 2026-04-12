@@ -41,11 +41,11 @@ let out = expr?.into_tensor();
 
 - `src/error.rs`: crate error type (`Error`, `Result`)
 - `src/shape.rs`: semantic newtypes and static-shape traits
-- `src/types.rs`: `Type`, `BackendKind`, `BackendDeviceType`, `ComputeStatus`, `RopeExtParams`
+- `src/types.rs`: `Type` (all ggml tensor types), `GgmlType`, `BackendKind`, `BackendDeviceType`, `ComputeStatus`, `RopeExtParams`
 - `src/num_ext.rs`: checked conversion/arithmetic helpers
 - `src/gguf.rs`: safe GGUF inspection and writing helpers (`GgufFile`, `GgufWriter`, `TryFromGgufValue`)
 - `src/tensor_expr.rs`: expression wrapper, element traits (`BackendElement`,
-  `GgmlElement`) and operator impls
+  `GgmlElement`, sealed `HostElement`) and operator impls
 - `src/typed_tensor.rs`: typed tensor wrappers (`Tensor1D..Tensor4D` and const aliases)
 - `src/compute.rs`: context/backend/tensor/graph implementations
 - `src/ffi.rs`: minimal C FFI declarations
