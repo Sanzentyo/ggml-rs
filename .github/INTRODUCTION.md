@@ -20,7 +20,9 @@ And you should write rusty code(ADT, enum, type state pattern)
 4. ~~Causal depthwise conv & QKV packing comparison.~~ **DONE** — documented in `docs/llama-rs/worklog/2026-04-13-conv-qkv-comparison.md`.
 5. ~~Continue review_3 refactor items (generic inference, ND tensor, semantic wrapper dedup).~~ **10/12 DONE** — test coverage 122 tests (zero warnings), backend examples exist.
 6. ~~Autoregressive decode state management (prefill/decode split).~~ **DONE** — KV cache for full attention, conv buffer + SSM states for linear attention, decode equivalence tests pass.
-7. Merge back to `main` only after validation and runtime checks pass.
+7. ~~Two-phase generation loop (prefill + incremental decode).~~ **DONE** — generation.rs branches on layer types: all-Qwen3.5 → two-phase (prefill all prompt tokens, then decode one-at-a-time), otherwise → full-reprocess fallback.
+8. Backend example enhancement (review_3 item 11) + README (item 12).
+9. Merge back to `main` only after validation and runtime checks pass.
 
 ## Completed refactor items
 
@@ -46,6 +48,10 @@ And you should write rusty code(ADT, enum, type state pattern)
   `linear_attention.rs` gains `qwen35_linear_attention_prefill` + `decode_step` +
   `causal_depthwise_conv_decode_step`. RoPE `position_offset` parameter added.
   Decode equivalence tests verify prefill+decode = full reprocess.
+- **Two-phase generation loop**: `generation.rs` branches on layer types: all-Qwen3.5
+  → prefill + incremental decode (one token at a time with cached state); Standard
+  attention present → full-reprocess fallback. Handles `max_new_tokens==0`, EOS on
+  first generated token, MLP-only layers.
 
 ## Validation checkpoints completed on this branch
 

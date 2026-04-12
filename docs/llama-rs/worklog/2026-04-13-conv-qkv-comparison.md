@@ -63,20 +63,21 @@ Key characteristics:
 | Convolution math | Identical (dot product per channel per token) | Identical |
 | SiLU activation | Fused in conv loop | Separate graph node |
 | Causal padding | Implicit skip via guard | Explicit state prepend |
-| State management | None (full-seq only) | Conv cache in KV store |
-| Decode support | Prefill only | Prefill + autoregressive |
+| State management | Conv buffer + SSM states | Conv cache in KV store |
+| Decode support | Prefill + autoregressive (two-phase) | Prefill + autoregressive |
 | Parallelism | Single-threaded scalar | Multi-threaded (row parallel) |
 | Weight layout | `[channels, kernel_size]` | `[d_conv, d_inner]` (same) |
 
-### 1.4 Gap: Autoregressive Decode
+### 1.4 Gap: ~~Autoregressive Decode~~ CLOSED
 
-The main functional gap is that llama-rs has no conv state cache. For
-autoregressive token-by-token decode, llama.cpp carries forward the last
-`d_conv - 1` token activations. llama-rs would need to either:
-1. Keep a `Vec<f32>` conv state per layer and prepend it, or
-2. Reprocess the full context each step (inefficient but correct).
-
-This is a known limitation for the current prefill-only design.
+The conv state gap is now fully closed:
+- `causal_depthwise_conv_decode_step` convolves a single new token using a
+  ring buffer of the last `d_conv - 1` pre-conv activations.
+- `LinearAttentionState` holds both the conv buffer and SSM recurrence states.
+- `qwen35_linear_attention_prefill` captures state after full-sequence processing.
+- `qwen35_linear_attention_decode_step` processes one token using cached state.
+- `generation.rs` two-phase loop wires prefill → decode for all Qwen3.5 layers.
+- Decode equivalence tests verify numerical parity (prefill+decode = full reprocess).
 
 ## 2. QKV Packing / Split
 

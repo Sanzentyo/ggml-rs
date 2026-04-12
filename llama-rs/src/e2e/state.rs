@@ -111,12 +111,14 @@ impl Qwen35FullAttentionState {
     }
 
     /// Get a K slice for a specific token.
+    #[allow(dead_code)] // Used in tests; public API for consumers
     pub(super) fn k_at(&self, token: usize) -> &[f32] {
         let offset = token * self.kv_features;
         &self.k_cache[offset..offset + self.kv_features]
     }
 
     /// Get a V slice for a specific token.
+    #[allow(dead_code)] // Used in tests; public API for consumers
     pub(super) fn v_at(&self, token: usize) -> &[f32] {
         let offset = token * self.kv_features;
         &self.v_cache[offset..offset + self.kv_features]
