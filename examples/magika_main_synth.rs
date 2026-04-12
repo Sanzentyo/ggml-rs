@@ -235,7 +235,7 @@ fn main() -> AppResult<()> {
     graph.build_forward_expand(&probs);
     ctx.compute(&mut graph, 1)?;
 
-    let probs = graph.last_node()?.read_data::<f32>()?;
+    let probs = graph.last_node_typed::<f32>()?.read_data()?;
     let elapsed_us = started.elapsed().as_micros();
 
     let label_count = MAGIKA_LABELS.len();

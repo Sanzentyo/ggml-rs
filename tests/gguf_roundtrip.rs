@@ -29,7 +29,7 @@ fn gguf_writer_roundtrip_kv_and_tensor_metadata() -> Result<(), ggml_rs::Error> 
         writer.set_values(kv_entries.iter().map(|(key, value)| (key.as_str(), value)))?;
         writer.set_value("test.remove_me", &GgufValue::I32(-1))?;
         assert!(writer.remove_key("test.remove_me")?.is_some());
-        writer.add_tensor(&tensor);
+        writer.add_typed_tensor(&tensor);
         writer.write_data_to_file(&output_path)?;
     }
 

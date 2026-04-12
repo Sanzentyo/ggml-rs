@@ -81,6 +81,9 @@ pub enum Error {
         expected: &'static str,
         actual: &'static str,
     },
+
+    #[error("tensor type mismatch: expected type {expected} but got type {actual}")]
+    TypeMismatch { expected: c_int, actual: c_int },
 }
 
 impl Error {

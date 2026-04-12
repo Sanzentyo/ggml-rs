@@ -18,7 +18,7 @@ fn cont_after_transpose_matches_reference() -> Result<(), ggml_rs::Error> {
     graph.build_forward_expand(&contiguous);
     ctx.compute_with_threads(&mut graph, ThreadCount::new(1))?;
 
-    let out = graph.last_node()?.read_data::<f32>()?;
+    let out = graph.last_node_typed::<f32>()?.read_data()?;
     assert_eq!(out, vec![1.0, 2.0]);
 
     Ok(())

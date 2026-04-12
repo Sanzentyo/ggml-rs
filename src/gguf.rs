@@ -2,7 +2,7 @@
 
 use crate::ffi;
 use crate::num_ext::TryIntoChecked;
-use crate::{Error, Result, Tensor};
+use crate::{DynTensor, Error, Result, Tensor};
 use std::ffi::{CStr, CString};
 use std::marker::PhantomData;
 use std::os::raw::{c_char, c_int};
@@ -524,10 +524,15 @@ impl GgufWriter {
         }
     }
 
-    pub fn add_tensor(&mut self, tensor: &Tensor<'_>) {
+    pub fn add_tensor(&mut self, tensor: &DynTensor<'_>) {
         unsafe {
             ffi::gguf_add_tensor(self.raw.as_ptr(), tensor.raw_ptr().cast_const());
         }
+    }
+
+    /// Adds a typed tensor to the GGUF context, converting to dynamic form.
+    pub fn add_typed_tensor<T: crate::GgmlElement>(&mut self, tensor: &Tensor<'_, T>) {
+        self.add_tensor(&tensor.into_dyn())
     }
 
     pub fn write_to_file<P: AsRef<Path>>(&self, path: P, only_meta: bool) -> Result<()> {

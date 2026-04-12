@@ -31,8 +31,8 @@ fn main() -> Result<()> {
     graph.build_forward_expand(&result);
     ctx.compute(&mut graph, 1)?;
 
-    let output = graph.last_node()?;
-    let values = output.read_data::<f32>()?;
+    let output = graph.last_node_typed::<f32>()?;
+    let values = output.read_data()?;
     let shape = output.shape()?;
     let cols = shape.cols.get();
     let rows = shape.rows.get();

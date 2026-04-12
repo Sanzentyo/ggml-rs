@@ -80,8 +80,8 @@ fn main() -> Result<()> {
     let avg_ms = elapsed_ms / n_iter as f64;
     println!("main: time = {avg_ms:.6} ms");
 
-    let result = graph.last_node()?;
-    let values = result.read_data_backend::<f32>()?;
+    let result = graph.last_node_typed::<f32>()?;
+    let values = result.read_data_backend()?;
     let checksum: f64 = values.iter().copied().map(f64::from).sum();
     println!("main: checksum = {checksum:.6}");
 

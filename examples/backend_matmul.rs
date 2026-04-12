@@ -85,8 +85,8 @@ fn run_backend(kind: BackendKind) -> Result<()> {
     backend.compute(&mut graph)?;
 
     // `graph.last_node()` is the result tensor of this simple single-op graph.
-    let output = graph.last_node()?;
-    let values = output.read_data_backend::<f32>()?;
+    let output = graph.last_node_typed::<f32>()?;
+    let values = output.read_data_backend()?;
     assert_expected(&values, backend_name);
     let checksum: f64 = values.iter().copied().map(f64::from).sum();
 

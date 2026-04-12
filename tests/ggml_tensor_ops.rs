@@ -14,11 +14,11 @@ fn scoped_context_helpers_work() -> Result<(), Error> {
     let element_count = with_context(mem, |ctx| {
         let tensor = ctx.new_tensor_2d::<f32>(lhs)?;
         tensor.write_data(&[1.0, 2.0, 3.0, 4.0])?;
-        assert_eq!(tensor.read_data_at::<f32>(1, 2)?, vec![2.0, 3.0]);
+        assert_eq!(tensor.read_data_at(1, 2)?, vec![2.0, 3.0]);
         tensor.write_data_at(2, &[9.0, 8.0])?;
-        assert_eq!(tensor.read_data::<f32>()?, vec![1.0, 2.0, 9.0, 8.0]);
+        assert_eq!(tensor.read_data()?, vec![1.0, 2.0, 9.0, 8.0]);
         let err = tensor
-            .read_data_at::<f32>(4, 1)
+            .read_data_at(4, 1)
             .expect_err("host read range past end should error");
         assert!(matches!(err, Error::IndexOutOfBounds { .. }));
         let err = tensor
@@ -35,7 +35,7 @@ fn scoped_context_helpers_work() -> Result<(), Error> {
         let tensor = ctx.new_tensor_2d::<f32>(lhs)?;
         let _buffer = ctx.allocate_tensors(&backend)?;
         tensor.write_data_backend(&[1.0, 2.0, 3.0, 4.0])?;
-        let out = tensor.read_data_backend::<f32>()?;
+        let out = tensor.read_data_backend()?;
         assert_eq!(out, vec![1.0, 2.0, 3.0, 4.0]);
         Ok(())
     })?;
@@ -73,7 +73,7 @@ fn reshape_view_permute_smoke() -> Result<(), Error> {
 
         let viewed = ctx.view_1d(&base, 4, 0)?;
         assert_eq!(viewed.element_count()?, 4);
-        assert_eq!(viewed.get_data::<f32>(TensorIndex::new(3))?, 3.0);
+        assert_eq!(viewed.get_data(TensorIndex::new(3))?, 3.0);
 
         let tensor4 = ctx.new_tensor_4d::<f32>(Shape4D::new(3, 2, 2, 2))?;
         let permuted = ctx.permute(&tensor4, 1, 0, 2, 3)?;
@@ -92,17 +92,14 @@ fn backend_roundtrip_and_bounds_checks() -> Result<(), Error> {
 
         let values = [10, 20, 30, 40, 50, 60, 70, 80];
         tensor.write_data_backend(&values)?;
-        assert_eq!(tensor.read_data_backend::<i32>()?, values.to_vec());
+        assert_eq!(tensor.read_data_backend()?, values.to_vec());
 
         tensor.write_data_backend_at(2, &[111, 222])?;
         assert_eq!(
-            tensor.read_data_backend::<i32>()?,
+            tensor.read_data_backend()?,
             vec![10, 20, 111, 222, 50, 60, 70, 80]
         );
-        assert_eq!(
-            tensor.read_data_backend_at::<i32>(2, 3)?,
-            vec![111, 222, 50]
-        );
+        assert_eq!(tensor.read_data_backend_at(2, 3)?, vec![111, 222, 50]);
 
         let err = tensor
             .write_data_backend_at(8, &[1])
@@ -110,7 +107,7 @@ fn backend_roundtrip_and_bounds_checks() -> Result<(), Error> {
         assert!(matches!(err, Error::IndexOutOfBounds { .. }));
 
         let err = tensor
-            .read_data_backend_at::<i32>(7, 2)
+            .read_data_backend_at(7, 2)
             .expect_err("read range past end should error");
         assert!(matches!(err, Error::IndexOutOfBounds { .. }));
 

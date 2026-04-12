@@ -31,7 +31,7 @@ fn main() -> Result<(), Box<dyn StdError>> {
     graph.build_forward_expand(&out);
     ctx.compute(&mut graph, 1)?;
 
-    let values = out.read_data::<f32>()?;
+    let values = out.read_data()?;
     let expected = expected_values();
     for (index, (actual, expected)) in values.iter().zip(expected.iter()).enumerate() {
         let delta = (actual - expected).abs();

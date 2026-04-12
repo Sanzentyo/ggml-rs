@@ -85,7 +85,7 @@ fn run_bench(kind: BackendKind, iters: usize) -> Result<(), ggml_rs::Error> {
     let elapsed = start.elapsed();
     let avg_ms = elapsed.as_secs_f64() * 1000.0 / iters as f64;
 
-    let out = graph.last_node()?.read_data_backend::<f32>()?;
+    let out = graph.last_node_typed::<f32>()?.read_data_backend()?;
     let checksum: f64 = out.iter().take(16).map(|v| f64::from(*v)).sum();
 
     println!(
