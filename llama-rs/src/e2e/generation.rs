@@ -1,13 +1,20 @@
-use super::attention::qwen35_full_attention_inference;
+use super::attention::{
+    qwen35_full_attention_decode_step, qwen35_full_attention_inference,
+    qwen35_full_attention_prefill,
+};
 use super::config::{E2eGenerationConfig, E2eGenerationReport};
 use super::decode::decode_norm_tensor;
 use super::error::E2eError;
-use super::linear_attention::qwen35_linear_attention_inference;
+use super::linear_attention::{
+    qwen35_linear_attention_decode_step, qwen35_linear_attention_inference,
+    qwen35_linear_attention_prefill,
+};
 use super::mlp::mlp_sequence_inference_with_weights;
 use super::numeric::{checked_mul, validate_token_id, value_to_i32};
 use super::plan::AttentionLayerPlan;
 use super::planner::build_layer_plans;
 use super::resolve::resolve_global_tensor_names;
+use super::state::{GenerationState, LayerAttentionState};
 use super::tensor_ops::{add_in_place, gather_embeddings, rms_norm_with_weight};
 use crate::backend::ensure_backends_loaded;
 use crate::inference::attention_inference_with_weights_on_backend_repeats_with_length;
@@ -137,70 +144,179 @@ pub fn generate_token_ids_from_model(
         .map_err(|source| E2eError::ggml("Backend::name", source))?;
 
     let start = Instant::now();
-    for _step in 0..config.max_new_tokens {
-        let active_token_ids = &all_token_ids[..current_token_count];
+    let has_standard_attention = layer_plans
+        .iter()
+        .any(|p| matches!(p.attention, Some(AttentionLayerPlan::Standard(_))));
+
+    if has_standard_attention || config.max_new_tokens == 0 {
+        // Full-reprocess loop: processes all tokens from scratch each step.
+        // Required when Standard attention layers are present (no incremental decode).
+        for _step in 0..config.max_new_tokens {
+            let active_token_ids = &all_token_ids[..current_token_count];
+            let mut hidden = gather_embeddings(
+                &token_embedding_values,
+                hidden_features,
+                vocab_size,
+                active_token_ids,
+            )?;
+
+            for layer_plan in &layer_plans {
+                if let Some(attention) = &layer_plan.attention {
+                    let attention_output = match attention {
+                        AttentionLayerPlan::Standard(attention) => {
+                            let normalized_attn = rms_norm_with_weight(
+                                &hidden,
+                                hidden_features,
+                                current_token_count,
+                                &attention.norm_values,
+                                rms_norm_eps,
+                            )?;
+                            attention_inference_with_weights_on_backend_repeats_with_length(
+                                &attention.weights,
+                                &normalized_attn,
+                                current_token_count,
+                                &backend,
+                                1,
+                            )
+                            .map_err(|source| {
+                                E2eError::inference(
+                                    "attention_inference_with_weights_on_backend_repeats_with_length",
+                                    source,
+                                )
+                            })?
+                        }
+                        AttentionLayerPlan::Qwen35Full(attention) => {
+                            let normalized_attn = rms_norm_with_weight(
+                                &hidden,
+                                hidden_features,
+                                current_token_count,
+                                &attention.norm_values,
+                                rms_norm_eps,
+                            )?;
+                            qwen35_full_attention_inference(
+                                attention,
+                                &normalized_attn,
+                                current_token_count,
+                                rms_norm_eps,
+                            )?
+                        }
+                        AttentionLayerPlan::Qwen35Linear(attention) => {
+                            let normalized_attn = rms_norm_with_weight(
+                                &hidden,
+                                hidden_features,
+                                current_token_count,
+                                &attention.norm_values,
+                                rms_norm_eps,
+                            )?;
+                            qwen35_linear_attention_inference(
+                                attention,
+                                &normalized_attn,
+                                current_token_count,
+                                rms_norm_eps,
+                            )?
+                        }
+                    };
+                    add_in_place(&mut hidden, &attention_output)?;
+                }
+
+                let normalized_ffn = rms_norm_with_weight(
+                    &hidden,
+                    hidden_features,
+                    current_token_count,
+                    &layer_plan.mlp.norm_values,
+                    rms_norm_eps,
+                )?;
+                let mlp_output = mlp_sequence_inference_with_weights(
+                    &layer_plan.mlp.weights,
+                    &normalized_ffn,
+                    current_token_count,
+                    &backend,
+                )?;
+                add_in_place(&mut hidden, &mlp_output)?;
+            }
+
+            let normalized_output = rms_norm_with_weight(
+                &hidden,
+                hidden_features,
+                current_token_count,
+                &output_norm_values,
+                rms_norm_eps,
+            )?;
+            let last_index = current_token_count
+                .checked_sub(1)
+                .ok_or(E2eError::EmptyPrompt)?;
+            let next_token_id = greedy_next_token_id(
+                &normalized_output,
+                last_index,
+                hidden_features,
+                output_weight_values,
+                vocab_size,
+            )?;
+
+            generated_token_ids.push(next_token_id);
+            if current_token_count < total_sequence_length {
+                all_token_ids[current_token_count] = next_token_id;
+                current_token_count += 1;
+            }
+
+            if config.eos_token_id.is_some_and(|eos| eos == next_token_id) {
+                break;
+            }
+        }
+    } else {
+        // Two-phase loop: prefill all prompt tokens, then decode one token at a time.
+        let mut state = GenerationState::new(&layer_plans, total_sequence_length)?;
+
+        // Phase 1: Prefill — process all prompt tokens at once, capturing state.
+        let prompt_ids = &all_token_ids[..prompt_token_count];
         let mut hidden = gather_embeddings(
             &token_embedding_values,
             hidden_features,
             vocab_size,
-            active_token_ids,
+            prompt_ids,
         )?;
 
-        for layer_plan in &layer_plans {
+        for (layer_idx, layer_plan) in layer_plans.iter().enumerate() {
             if let Some(attention) = &layer_plan.attention {
-                let attention_output = match attention {
-                    AttentionLayerPlan::Standard(attention) => {
+                let attention_output = match (attention, &mut state.layers[layer_idx]) {
+                    (AttentionLayerPlan::Qwen35Full(attn), LayerAttentionState::Qwen35Full(s)) => {
                         let normalized_attn = rms_norm_with_weight(
                             &hidden,
                             hidden_features,
-                            current_token_count,
-                            &attention.norm_values,
+                            prompt_token_count,
+                            &attn.norm_values,
                             rms_norm_eps,
                         )?;
-                        attention_inference_with_weights_on_backend_repeats_with_length(
-                            &attention.weights,
+                        qwen35_full_attention_prefill(
+                            attn,
                             &normalized_attn,
-                            current_token_count,
-                            &backend,
-                            1,
-                        )
-                        .map_err(|source| {
-                            E2eError::inference(
-                                "attention_inference_with_weights_on_backend_repeats_with_length",
-                                source,
-                            )
-                        })?
-                    }
-                    AttentionLayerPlan::Qwen35Full(attention) => {
-                        let normalized_attn = rms_norm_with_weight(
-                            &hidden,
-                            hidden_features,
-                            current_token_count,
-                            &attention.norm_values,
+                            prompt_token_count,
                             rms_norm_eps,
-                        )?;
-                        qwen35_full_attention_inference(
-                            attention,
-                            &normalized_attn,
-                            current_token_count,
-                            rms_norm_eps,
+                            s,
                         )?
                     }
-                    AttentionLayerPlan::Qwen35Linear(attention) => {
+                    (
+                        AttentionLayerPlan::Qwen35Linear(attn),
+                        LayerAttentionState::Qwen35Linear(s),
+                    ) => {
                         let normalized_attn = rms_norm_with_weight(
                             &hidden,
                             hidden_features,
-                            current_token_count,
-                            &attention.norm_values,
+                            prompt_token_count,
+                            &attn.norm_values,
                             rms_norm_eps,
                         )?;
-                        qwen35_linear_attention_inference(
-                            attention,
+                        qwen35_linear_attention_prefill(
+                            attn,
                             &normalized_attn,
-                            current_token_count,
+                            prompt_token_count,
                             rms_norm_eps,
+                            s,
                         )?
                     }
+                    _ => unreachable!(
+                        "two-phase loop should not encounter Standard or mismatched state"
+                    ),
                 };
                 add_in_place(&mut hidden, &attention_output)?;
             }
@@ -208,30 +324,31 @@ pub fn generate_token_ids_from_model(
             let normalized_ffn = rms_norm_with_weight(
                 &hidden,
                 hidden_features,
-                current_token_count,
+                prompt_token_count,
                 &layer_plan.mlp.norm_values,
                 rms_norm_eps,
             )?;
             let mlp_output = mlp_sequence_inference_with_weights(
                 &layer_plan.mlp.weights,
                 &normalized_ffn,
-                current_token_count,
+                prompt_token_count,
                 &backend,
             )?;
             add_in_place(&mut hidden, &mlp_output)?;
         }
 
+        // Sample first token from the last prompt position.
         let normalized_output = rms_norm_with_weight(
             &hidden,
             hidden_features,
-            current_token_count,
+            prompt_token_count,
             &output_norm_values,
             rms_norm_eps,
         )?;
-        let last_index = current_token_count
+        let last_index = prompt_token_count
             .checked_sub(1)
             .ok_or(E2eError::EmptyPrompt)?;
-        let next_token_id = greedy_next_token_id(
+        let first_token_id = greedy_next_token_id(
             &normalized_output,
             last_index,
             hidden_features,
@@ -239,14 +356,111 @@ pub fn generate_token_ids_from_model(
             vocab_size,
         )?;
 
-        generated_token_ids.push(next_token_id);
-        if current_token_count < total_sequence_length {
-            all_token_ids[current_token_count] = next_token_id;
-            current_token_count += 1;
-        }
+        generated_token_ids.push(first_token_id);
+        all_token_ids[prompt_token_count] = first_token_id;
+        current_token_count = prompt_token_count + 1;
 
-        if config.eos_token_id.is_some_and(|eos| eos == next_token_id) {
-            break;
+        // Check EOS before entering decode loop.
+        let eos_hit = config.eos_token_id.is_some_and(|eos| eos == first_token_id);
+
+        // Phase 2: Decode — one token at a time using cached state.
+        if !eos_hit {
+            for _step in 1..config.max_new_tokens {
+                let new_token_id = all_token_ids[current_token_count - 1];
+                let mut hidden = gather_embeddings(
+                    &token_embedding_values,
+                    hidden_features,
+                    vocab_size,
+                    &[new_token_id],
+                )?;
+
+                for (layer_idx, layer_plan) in layer_plans.iter().enumerate() {
+                    if let Some(attention) = &layer_plan.attention {
+                        let attention_output = match (attention, &mut state.layers[layer_idx]) {
+                            (
+                                AttentionLayerPlan::Qwen35Full(attn),
+                                LayerAttentionState::Qwen35Full(s),
+                            ) => {
+                                let normalized_attn = rms_norm_with_weight(
+                                    &hidden,
+                                    hidden_features,
+                                    1,
+                                    &attn.norm_values,
+                                    rms_norm_eps,
+                                )?;
+                                qwen35_full_attention_decode_step(
+                                    attn,
+                                    &normalized_attn,
+                                    rms_norm_eps,
+                                    s,
+                                )?
+                            }
+                            (
+                                AttentionLayerPlan::Qwen35Linear(attn),
+                                LayerAttentionState::Qwen35Linear(s),
+                            ) => {
+                                let normalized_attn = rms_norm_with_weight(
+                                    &hidden,
+                                    hidden_features,
+                                    1,
+                                    &attn.norm_values,
+                                    rms_norm_eps,
+                                )?;
+                                qwen35_linear_attention_decode_step(
+                                    attn,
+                                    &normalized_attn,
+                                    rms_norm_eps,
+                                    s,
+                                )?
+                            }
+                            _ => unreachable!(
+                                "two-phase loop should not encounter Standard or mismatched state"
+                            ),
+                        };
+                        add_in_place(&mut hidden, &attention_output)?;
+                    }
+
+                    let normalized_ffn = rms_norm_with_weight(
+                        &hidden,
+                        hidden_features,
+                        1,
+                        &layer_plan.mlp.norm_values,
+                        rms_norm_eps,
+                    )?;
+                    let mlp_output = mlp_sequence_inference_with_weights(
+                        &layer_plan.mlp.weights,
+                        &normalized_ffn,
+                        1,
+                        &backend,
+                    )?;
+                    add_in_place(&mut hidden, &mlp_output)?;
+                }
+
+                let normalized_output = rms_norm_with_weight(
+                    &hidden,
+                    hidden_features,
+                    1,
+                    &output_norm_values,
+                    rms_norm_eps,
+                )?;
+                let next_token_id = greedy_next_token_id(
+                    &normalized_output,
+                    0,
+                    hidden_features,
+                    output_weight_values,
+                    vocab_size,
+                )?;
+
+                generated_token_ids.push(next_token_id);
+                if current_token_count < total_sequence_length {
+                    all_token_ids[current_token_count] = next_token_id;
+                    current_token_count += 1;
+                }
+
+                if config.eos_token_id.is_some_and(|eos| eos == next_token_id) {
+                    break;
+                }
+            }
         }
     }
     let elapsed = start.elapsed();
