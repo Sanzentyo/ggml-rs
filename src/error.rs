@@ -73,8 +73,14 @@ pub enum Error {
     #[error("ggml graph compute failed with status {0}")]
     ComputeFailed(i32),
 
-    #[error("gguf_write_to_file reported failure")]
+    #[error("gguf write reported failure")]
     GgufWriteFailed,
+
+    #[error("gguf type mismatch: expected {expected}, got {actual}")]
+    GgufTypeMismatch {
+        expected: &'static str,
+        actual: &'static str,
+    },
 }
 
 impl Error {

@@ -37,7 +37,9 @@ pub use compute::{
     with_context, with_no_alloc_context,
 };
 pub use error::{Error, Result};
-pub use gguf::{GgufArrayValue, GgufFile, GgufTensorInfo, GgufType, GgufValue, GgufWriter};
+pub use gguf::{
+    GgufArrayValue, GgufFile, GgufTensorInfo, GgufType, GgufValue, GgufWriter, TryFromGgufValue,
+};
 pub use shape::{
     Bytes, Cols, Dims, Length, LengthSpec, Rows, Shape2D, Shape2DSpec, Shape3D, Shape3DSpec,
     Shape4D, Shape4DSpec, StaticLength, StaticShape2D, StaticShape3D, StaticShape4D, TensorIndex,
@@ -57,7 +59,7 @@ pub mod prelude {
         GgufWriter, Graph, Length, LengthSpec, RopeExtParams, Rows, Shape2D, Shape2DSpec, Shape3D,
         Shape3DSpec, Shape4D, Shape4DSpec, StaticLength, StaticShape2D, StaticShape3D,
         StaticShape4D, Tensor, Tensor1D, Tensor1DConst, Tensor2D, Tensor2DConst, Tensor3D,
-        Tensor3DConst, Tensor4D, Tensor4DConst, TensorExpr, TensorIndex, ThreadCount, Type,
-        with_context, with_no_alloc_context,
+        Tensor3DConst, Tensor4D, Tensor4DConst, TensorExpr, TensorIndex, ThreadCount,
+        TryFromGgufValue, Type, with_context, with_no_alloc_context,
     };
 }
