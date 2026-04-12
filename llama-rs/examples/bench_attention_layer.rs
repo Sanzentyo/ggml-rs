@@ -259,7 +259,7 @@ fn main() -> Result<(), ExampleError> {
             continue;
         }
 
-        for (block_layer, block_mlp_weights) in block_mlp_layers.iter().copied() {
+        for (block_layer, block_mlp_weights) in block_mlp_layers.iter() {
             for backend in parsed.backends.iter().copied() {
                 let layer_repeat =
                     model_layer_repeat.unwrap_or_else(|| parsed.layer_repeat_for_backend(backend));

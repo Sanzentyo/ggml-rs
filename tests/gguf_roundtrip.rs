@@ -1,7 +1,7 @@
 #![cfg(feature = "link-system")]
 #![allow(clippy::approx_constant)]
 
-use ggml_rs::{Context, GgufArrayValue, GgufFile, GgufValue, GgufWriter, Length, TryFromGgufValue};
+use ggml_rs::{Context, GgufArrayValue, GgufFile, GgufValue, GgufWriter, Length};
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -16,7 +16,7 @@ fn gguf_writer_roundtrip_kv_and_tensor_metadata() -> Result<(), ggml_rs::Error> 
         tensor.write_data(&[1.0, 2.0, 3.0, 4.0])?;
 
         let mut writer = GgufWriter::new()?;
-        let kv_entries = vec![
+        let kv_entries = [
             (
                 "general.architecture".to_owned(),
                 GgufValue::String("llama".to_owned()),

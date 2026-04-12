@@ -25,7 +25,7 @@ fn scoped_context_helpers_work() -> Result<(), Error> {
             .write_data_at(4, &[1.0])
             .expect_err("host write range past end should error");
         assert!(matches!(err, Error::IndexOutOfBounds { .. }));
-        Ok(tensor.element_count()?)
+        tensor.element_count()
     })?;
     assert_eq!(element_count, 4);
 
