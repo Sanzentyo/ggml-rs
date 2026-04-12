@@ -1,6 +1,12 @@
+# After you read this introduction, you read markdown in directory allocated this md, then, you read some new markdown in ./docs dir. Then, update docs content and, unify these introduction. the intro should have policy that you update intro and docs content.
+
 # Ongoing execution policy (review_1 + review_3 complete, parity follow-up active)
 
 This repository is currently following a strict execution policy to avoid losing intent across long refactor loops.
+
+## Skills you should use
+- rust-best-practices
+And you should write rusty code(ADT, enum, type state pattern)
 
 ## Current branch
 
@@ -34,15 +40,17 @@ This repository is currently following a strict execution policy to avoid losing
 
 ## Current parity investigation status
 
-- Qwen3.5 strict parity: head-group mapping bug identified and fixed.
-  - Root cause: Q/K head-to-group mapping used integer division (`head / repeat_factor`)
-    producing an interleaved pattern `[g0,g0,g1,g1,...]`, while llama.cpp's `ggml_repeat_4d`
-    tiles block-by-block `[g0,g1,...,gN,g0,g1,...,gN]`.
-  - Fix: changed to `head % group_count` to match upstream tiled repeat semantics.
-  - Added shape invariant assertions (`time_step_rank % group_count == 0`,
-    `inner_size == time_step_rank * state_size`) and a regression test.
-  - `causal_depthwise_conv` was verified correct for initial-prompt (zero-state) case.
-  - Strict parity rerun pending after this fix.
+- **Qwen3.5 strict parity: ACHIEVED** (prompt `[1]`, `max_new_tokens=1`).
+  - Both llama-rs and llama.cpp produce `[5328]`.
+  - Bug 1 (linear attention): Head-group mapping used `head / repeat_factor` (interleaved),
+    while llama.cpp's `ggml_repeat_4d` tiles block-by-block. Fixed to `head % group_count`.
+  - Bug 2 (full attention): Q/gate split treated ggml's interleaved layout
+    `[Q_h0(D), G_h0(D), Q_h1(D), ...]` as two flat halves with dim-major indexing.
+    Fixed to head-major interleaved extraction: `head * 2D + dim` for Q, `head * 2D + D + dim` for gate.
+  - `causal_depthwise_conv` verified correct. Delta-net recurrence math verified correct.
+  - Known gap: RoPE (MRoPE) not yet implemented for full attention layers.
+    At position 0, RoPE is identity, so single-token parity passes. Multi-token and
+    autoregressive decode beyond step 0 will require RoPE implementation.
 
 ## Already-implemented items (review_3 items done before this branch)
 

@@ -270,3 +270,78 @@ All passed.
 - Strict parity rerun on Qwen3.5 with the head-mapping fix.
 - If parity closes, update INTRODUCTION.md status to resolved.
 - If residual delta remains, investigate non-initial-prompt conv state handling.
+
+## Full-attention Q/gate split fix (continued)
+
+### Context
+
+After the head-group mapping fix, parity was still mismatched:
+`llama-rs [6]` vs `llama.cpp [5328]`. Deep comparison of the delta-net
+recurrence math showed all linear-attention steps were correct. The
+remaining suspect was the full-attention layer's Q/gate extraction.
+
+### Bug: Q/gate split used wrong memory layout
+
+In llama.cpp, the joint Q+gate projection outputs interleaved per head:
+```
+[Q_h0(D), G_h0(D), Q_h1(D), G_h1(D), ...]
+```
+Each head occupies `2*D` contiguous elements (D for Q, D for gate).
+The `ggml_view_3d` stride of `n_embd_head * 2` extracts Q and gate
+independently from this interleaved layout.
+
+Our Rust code incorrectly:
+1. Split the output into two equal halves (first half = "Q", second = "gate")
+2. For multi-token sequences, `half_len = total_len / 2` crossed token
+   boundaries — token 0's gate would read from token 1's data
+3. Used dim-major indexing `dim * head_count + head` instead of head-major
+   `head * 2D + dim`
+
+### Fix
+
+Replaced the extraction loop to match ggml's interleaved layout:
+```rust
+let per_token_qg_features = head_count * head_dimension * 2;
+for token in 0..sequence_length {
+    let token_base = token * per_token_qg_features;
+    for head in 0..head_count {
+        for dim in 0..hd {
+            let src_q = token_base + head * 2 * hd + dim;
+            let src_g = token_base + head * 2 * hd + hd + dim;
+            q_values[dst] = q_full[src_q];
+            q_gate[dst]   = q_full[src_g];
+        }
+    }
+}
+```
+
+Added a shape invariant check: `q_full.len() == sequence_length * per_token_qg_features`.
+
+### Also noted: missing RoPE
+
+llama.cpp applies MRoPE (`ggml_rope_multi` with sections) to Q and K after
+normalization. Our code has no RoPE. At position 0, RoPE is identity
+(`cos(0)=1, sin(0)=0`), so single-token parity passes. This is an
+architectural gap that must be addressed for multi-token prompts.
+
+### Parity result
+
+```
+llama_rs_generated_token_ids=[5328] llama_cpp_generated_token_ids=[5328] match=true
+```
+
+**Qwen3.5 strict parity achieved** for prompt `[1]`, `max_new_tokens=1`.
+
+### Tests added
+
+- `qwen35_full_attention_qgate_split_is_head_interleaved`: single token,
+  2 heads, hd=3, verifies correct extraction from `[Q_h0, G_h0, Q_h1, G_h1]`
+- `qwen35_full_attention_qgate_split_multi_token`: two tokens, verifies
+  each token reads from its own block
+
+### Validation
+
+- `cargo fmt --all` — pass
+- `cargo clippy --workspace --all-targets` — pass (pre-existing `private_bounds` warning only)
+- `cargo test --workspace` — 37 tests pass
+- Parity harness — match=true
