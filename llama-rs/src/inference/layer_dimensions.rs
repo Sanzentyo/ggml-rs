@@ -19,9 +19,12 @@ pub struct LlamaLayerDimensions {
     pub query_head_count: usize,
     pub kv_head_count: usize,
     pub head_dimension: usize,
+    pub attention_scale: Option<f32>,
+    pub attention_layer_norm_rms_epsilon: f32,
     pub rope_dimension_count: Option<usize>,
     pub rope_freq_base: f32,
     pub rope_freq_scale: f32,
+    pub rope_original_context_length: Option<usize>,
 }
 
 /// Resolves per-layer dimensions from GGUF metadata and tensor lengths.
@@ -67,6 +70,9 @@ fn resolve_llama_layer_dimensions_from_names(
     let kv_head_count = metadata.map_or(inferred_layout.kv_head_count, |metadata| {
         metadata.attention_head_count_kv()
     });
+    let head_dimension = metadata
+        .and_then(LlamaModelMetadata::attention_key_length)
+        .unwrap_or_else(|| hidden_features / query_head_count);
     if hidden_features == 0
         || query_head_count == 0
         || kv_head_count == 0
@@ -79,7 +85,6 @@ fn resolve_llama_layer_dimensions_from_names(
             kv_head_count,
         });
     }
-    let head_dimension = hidden_features / query_head_count;
     let rope_dimension_count = metadata.and_then(LlamaModelMetadata::rope_dimension_count);
     if let Some(rope_dimensions) = rope_dimension_count
         && rope_dimensions > head_dimension
@@ -112,9 +117,14 @@ fn resolve_llama_layer_dimensions_from_names(
         query_head_count,
         kv_head_count,
         head_dimension,
+        attention_scale: metadata.and_then(LlamaModelMetadata::attention_scale),
+        attention_layer_norm_rms_epsilon: metadata
+            .map_or(1e-5, LlamaModelMetadata::attention_layer_norm_rms_epsilon),
         rope_dimension_count,
         rope_freq_base: metadata.map_or(10_000.0, LlamaModelMetadata::rope_freq_base),
         rope_freq_scale: metadata.map_or(1.0, LlamaModelMetadata::rope_freq_scale),
+        rope_original_context_length: metadata
+            .and_then(LlamaModelMetadata::rope_original_context_length),
     })
 }
 

@@ -19,7 +19,6 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 use thiserror::Error;
 
-const RMS_NORM_EPS: f32 = 1e-5;
 const MLP_BACKEND_SLACK_BYTES: usize = 4 * 1024 * 1024;
 
 #[derive(Debug, Error)]
@@ -225,9 +224,50 @@ struct LayerPlan {
 }
 
 #[derive(Debug, Clone)]
-struct AttentionLayerPlan {
+enum AttentionLayerPlan {
+    Standard(StandardAttentionLayerPlan),
+    Qwen35Full(Qwen35FullAttentionLayerPlan),
+    Qwen35Linear(Qwen35LinearAttentionLayerPlan),
+}
+
+#[derive(Debug, Clone)]
+struct StandardAttentionLayerPlan {
     weights: AttentionWeights<f32>,
     norm_values: Vec<f32>,
+}
+
+#[derive(Debug, Clone)]
+struct Qwen35FullAttentionLayerPlan {
+    norm_values: Vec<f32>,
+    q_norm_values: Vec<f32>,
+    k_norm_values: Vec<f32>,
+    q_weight_values: Vec<f32>,
+    k_weight_values: Vec<f32>,
+    v_weight_values: Vec<f32>,
+    output_weight_values: Vec<f32>,
+    head_count: usize,
+    kv_head_count: usize,
+    head_dimension: usize,
+    attention_scale: f32,
+}
+
+#[derive(Debug, Clone)]
+struct Qwen35LinearAttentionLayerPlan {
+    norm_values: Vec<f32>,
+    qkv_weight_values: Vec<f32>,
+    gate_weight_values: Vec<f32>,
+    alpha_weight_values: Vec<f32>,
+    beta_weight_values: Vec<f32>,
+    conv_weight_values: Vec<f32>,
+    dt_bias_values: Vec<f32>,
+    ssm_a_values: Vec<f32>,
+    ssm_norm_values: Vec<f32>,
+    ssm_out_weight_values: Vec<f32>,
+    state_size: usize,
+    group_count: usize,
+    time_step_rank: usize,
+    inner_size: usize,
+    conv_kernel: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -280,6 +320,7 @@ pub fn generate_token_ids_from_model(
     }
 
     let hidden_features = metadata.embedding_length();
+    let rms_norm_eps = metadata.attention_layer_norm_rms_epsilon();
     let global_names = resolve_global_tensor_names(model)?;
 
     let token_embedding_values = model
@@ -322,7 +363,7 @@ pub fn generate_token_ids_from_model(
     )?;
     let layer_plans = build_layer_plans(
         model,
-        metadata.block_count(),
+        &metadata,
         hidden_features,
         total_sequence_length,
         config.mixed_layer_policy,
@@ -365,26 +406,60 @@ pub fn generate_token_ids_from_model(
 
         for layer_plan in &layer_plans {
             if let Some(attention) = &layer_plan.attention {
-                let normalized_attn = rms_norm_with_weight(
-                    &hidden,
-                    hidden_features,
-                    current_token_count,
-                    &attention.norm_values,
-                )?;
-                let attention_output =
-                    attention_inference_with_weights_on_backend_repeats_with_length(
-                        &attention.weights,
-                        &normalized_attn,
-                        current_token_count,
-                        &backend,
-                        1,
-                    )
-                    .map_err(|source| {
-                        E2eError::inference(
-                            "attention_inference_with_weights_on_backend_repeats_with_length",
-                            source,
+                let attention_output = match attention {
+                    AttentionLayerPlan::Standard(attention) => {
+                        let normalized_attn = rms_norm_with_weight(
+                            &hidden,
+                            hidden_features,
+                            current_token_count,
+                            &attention.norm_values,
+                            rms_norm_eps,
+                        )?;
+                        attention_inference_with_weights_on_backend_repeats_with_length(
+                            &attention.weights,
+                            &normalized_attn,
+                            current_token_count,
+                            &backend,
+                            1,
                         )
-                    })?;
+                        .map_err(|source| {
+                            E2eError::inference(
+                                "attention_inference_with_weights_on_backend_repeats_with_length",
+                                source,
+                            )
+                        })?
+                    }
+                    AttentionLayerPlan::Qwen35Full(attention) => {
+                        let normalized_attn = rms_norm_with_weight(
+                            &hidden,
+                            hidden_features,
+                            current_token_count,
+                            &attention.norm_values,
+                            rms_norm_eps,
+                        )?;
+                        qwen35_full_attention_inference(
+                            attention,
+                            &normalized_attn,
+                            current_token_count,
+                            rms_norm_eps,
+                        )?
+                    }
+                    AttentionLayerPlan::Qwen35Linear(attention) => {
+                        let normalized_attn = rms_norm_with_weight(
+                            &hidden,
+                            hidden_features,
+                            current_token_count,
+                            &attention.norm_values,
+                            rms_norm_eps,
+                        )?;
+                        qwen35_linear_attention_inference(
+                            attention,
+                            &normalized_attn,
+                            current_token_count,
+                            rms_norm_eps,
+                        )?
+                    }
+                };
                 add_in_place(&mut hidden, &attention_output)?;
             }
 
@@ -393,6 +468,7 @@ pub fn generate_token_ids_from_model(
                 hidden_features,
                 current_token_count,
                 &layer_plan.mlp.norm_values,
+                rms_norm_eps,
             )?;
             let mlp_output = mlp_sequence_inference_with_weights(
                 &layer_plan.mlp.weights,
@@ -408,6 +484,7 @@ pub fn generate_token_ids_from_model(
             hidden_features,
             current_token_count,
             &output_norm_values,
+            rms_norm_eps,
         )?;
         let last_index = current_token_count
             .checked_sub(1)
@@ -445,40 +522,46 @@ pub fn generate_token_ids_from_model(
 
 fn build_layer_plans(
     model: &GgufModel,
-    block_count: usize,
+    metadata: &crate::metadata::TransformerMetadata,
     hidden_features: usize,
     total_sequence_length: usize,
     mixed_layer_policy: MixedLayerPolicy,
 ) -> Result<Vec<LayerPlan>, E2eError> {
+    let block_count = metadata.block_count();
     let mut layer_plans = Vec::with_capacity(block_count);
     for layer in 0..block_count {
-        match resolve_llama_layer_tensor_names(model, layer) {
-            Ok(names) => {
-                match build_full_layer_plan(model, names, hidden_features, total_sequence_length) {
-                    Ok(full_plan) => layer_plans.push(full_plan),
-                    Err(source) => match mixed_layer_policy {
-                        MixedLayerPolicy::Strict => return Err(source),
-                        MixedLayerPolicy::SkipUnsupportedAttention => {
-                            layer_plans.push(build_mlp_only_layer_plan(
-                                model,
-                                layer,
-                                hidden_features,
-                            )?);
-                        }
-                    },
-                }
-            }
-            Err(source) => match mixed_layer_policy {
+        match try_build_attention_layer_plan(
+            model,
+            metadata,
+            layer,
+            hidden_features,
+            total_sequence_length,
+        ) {
+            Ok(Some(attention)) => layer_plans.push(LayerPlan {
+                attention: Some(attention),
+                mlp: build_layer_mlp_plan(model, layer, hidden_features)?,
+            }),
+            Ok(None) => match mixed_layer_policy {
                 MixedLayerPolicy::Strict => {
-                    return Err(E2eError::naming("resolve_llama_layer_tensor_names", source));
+                    return Err(E2eError::naming(
+                        "try_build_attention_layer_plan",
+                        NamingError::MissingLayerTensor {
+                            layer,
+                            role: "attention",
+                            tried: vec![
+                                format!("blk.{layer}.attn_q.weight"),
+                                format!("blk.{layer}.attn_qkv.weight"),
+                            ],
+                        },
+                    ));
                 }
                 MixedLayerPolicy::SkipUnsupportedAttention => {
-                    if matches!(
-                        source,
-                        NamingError::NoLayersDetected | NamingError::LayerNotFound { .. }
-                    ) {
-                        return Err(E2eError::naming("resolve_llama_layer_tensor_names", source));
-                    }
+                    layer_plans.push(build_mlp_only_layer_plan(model, layer, hidden_features)?);
+                }
+            },
+            Err(source) => match mixed_layer_policy {
+                MixedLayerPolicy::Strict => return Err(source),
+                MixedLayerPolicy::SkipUnsupportedAttention => {
                     layer_plans.push(build_mlp_only_layer_plan(model, layer, hidden_features)?);
                 }
             },
@@ -487,12 +570,51 @@ fn build_layer_plans(
     Ok(layer_plans)
 }
 
-fn build_full_layer_plan(
+fn try_build_attention_layer_plan(
+    model: &GgufModel,
+    metadata: &crate::metadata::TransformerMetadata,
+    layer: usize,
+    hidden_features: usize,
+    total_sequence_length: usize,
+) -> Result<Option<AttentionLayerPlan>, E2eError> {
+    match resolve_llama_layer_tensor_names(model, layer) {
+        Ok(names) => {
+            if metadata.architecture().as_str() == "qwen35" {
+                build_qwen35_full_attention_layer_plan(model, metadata, names, hidden_features)
+                    .map(Some)
+            } else {
+                build_standard_attention_layer_plan(
+                    model,
+                    names,
+                    hidden_features,
+                    total_sequence_length,
+                )
+                .map(Some)
+            }
+        }
+        Err(source)
+            if metadata.architecture().as_str() == "qwen35"
+                && matches!(
+                    source,
+                    NamingError::MissingLayerTensor { role: "attn_q", .. }
+                ) =>
+        {
+            if resolve_first_tensor_name(model, &layer_attn_qkv_candidates(layer)).is_none() {
+                return Ok(None);
+            }
+            build_qwen35_linear_attention_layer_plan(model, metadata, layer, hidden_features)
+                .map(Some)
+        }
+        Err(source) => Err(E2eError::naming("resolve_llama_layer_tensor_names", source)),
+    }
+}
+
+fn build_standard_attention_layer_plan(
     model: &GgufModel,
     names: LlamaLayerTensorNames,
     hidden_features: usize,
     total_sequence_length: usize,
-) -> Result<LayerPlan, E2eError> {
+) -> Result<AttentionLayerPlan, E2eError> {
     let layer = names.layer;
     let dimensions = resolve_llama_layer_dimensions(model, layer)
         .map_err(|source| E2eError::inference("resolve_llama_layer_dimensions", source))?;
@@ -511,29 +633,20 @@ fn build_full_layer_plan(
             .with_mask(AttentionMaskPolicy::Causal { past_tokens: 0 });
     let attention_weights = AttentionWeights::from_model_layer(model, &names, attention_config)
         .map_err(|source| E2eError::inference("AttentionWeights::from_model_layer", source))?;
-    let mlp_weights = MlpWeights::from_model_layer(model, &names, hidden_features)
-        .map_err(|source| E2eError::inference("MlpWeights::from_model_layer", source))?;
     let attn_norm_values =
         decode_norm_tensor(model, &names.attn_norm, hidden_features, "attn_norm")?;
-    let ffn_norm_values = decode_norm_tensor(model, &names.ffn_norm, hidden_features, "ffn_norm")?;
 
-    Ok(LayerPlan {
-        attention: Some(AttentionLayerPlan {
-            weights: attention_weights,
-            norm_values: attn_norm_values,
-        }),
-        mlp: MlpLayerPlan {
-            weights: mlp_weights,
-            norm_values: ffn_norm_values,
-        },
-    })
+    Ok(AttentionLayerPlan::Standard(StandardAttentionLayerPlan {
+        weights: attention_weights,
+        norm_values: attn_norm_values,
+    }))
 }
 
-fn build_mlp_only_layer_plan(
+fn build_layer_mlp_plan(
     model: &GgufModel,
     layer: usize,
     hidden_features: usize,
-) -> Result<LayerPlan, E2eError> {
+) -> Result<MlpLayerPlan, E2eError> {
     let ffn_norm = resolve_required_layer_tensor_name(
         model,
         layer,
@@ -572,12 +685,234 @@ fn build_mlp_only_layer_plan(
         .map_err(|source| E2eError::inference("MlpWeights::from_model", source))?;
     let ffn_norm_values = decode_norm_tensor(model, &ffn_norm, hidden_features, "ffn_norm")?;
 
+    Ok(MlpLayerPlan {
+        weights: mlp_weights,
+        norm_values: ffn_norm_values,
+    })
+}
+
+fn build_qwen35_full_attention_layer_plan(
+    model: &GgufModel,
+    metadata: &crate::metadata::TransformerMetadata,
+    names: LlamaLayerTensorNames,
+    hidden_features: usize,
+) -> Result<AttentionLayerPlan, E2eError> {
+    let head_dimension = required_transformer_usize(
+        metadata.attention_key_length(),
+        "qwen35.attention.key_length",
+    )?;
+    let head_count = metadata.attention_head_count();
+    let kv_head_count = metadata.attention_head_count_kv();
+    let q_norm_name = names.attn_q_norm.as_deref().ok_or_else(|| {
+        E2eError::naming(
+            "build_qwen35_full_attention_layer_plan",
+            NamingError::MissingLayerTensor {
+                layer: names.layer,
+                role: "attn_q_norm",
+                tried: vec![format!("blk.{}.attn_q_norm.weight", names.layer)],
+            },
+        )
+    })?;
+    let k_norm_name = names.attn_k_norm.as_deref().ok_or_else(|| {
+        E2eError::naming(
+            "build_qwen35_full_attention_layer_plan",
+            NamingError::MissingLayerTensor {
+                layer: names.layer,
+                role: "attn_k_norm",
+                tried: vec![format!("blk.{}.attn_k_norm.weight", names.layer)],
+            },
+        )
+    })?;
+
+    Ok(AttentionLayerPlan::Qwen35Full(
+        Qwen35FullAttentionLayerPlan {
+            norm_values: decode_norm_tensor(model, &names.attn_norm, hidden_features, "attn_norm")?,
+            q_norm_values: decode_exact_tensor(model, q_norm_name, head_dimension, "attn_q_norm")?,
+            k_norm_values: decode_exact_tensor(model, k_norm_name, head_dimension, "attn_k_norm")?,
+            q_weight_values: decode_matrix_tensor(
+                model,
+                &names.attn_q,
+                hidden_features,
+                checked_mul(head_count, checked_mul(head_dimension, 2)?)?,
+                "attn_q",
+            )?,
+            k_weight_values: decode_matrix_tensor(
+                model,
+                &names.attn_k,
+                hidden_features,
+                checked_mul(kv_head_count, head_dimension)?,
+                "attn_k",
+            )?,
+            v_weight_values: decode_matrix_tensor(
+                model,
+                &names.attn_v,
+                hidden_features,
+                checked_mul(kv_head_count, head_dimension)?,
+                "attn_v",
+            )?,
+            output_weight_values: decode_matrix_tensor(
+                model,
+                &names.attn_output,
+                checked_mul(head_count, head_dimension)?,
+                hidden_features,
+                "attn_output",
+            )?,
+            head_count,
+            kv_head_count,
+            head_dimension,
+            attention_scale: metadata
+                .attention_scale()
+                .unwrap_or(1.0 / (head_dimension as f32).sqrt()),
+        },
+    ))
+}
+
+fn build_qwen35_linear_attention_layer_plan(
+    model: &GgufModel,
+    metadata: &crate::metadata::TransformerMetadata,
+    layer: usize,
+    hidden_features: usize,
+) -> Result<AttentionLayerPlan, E2eError> {
+    let state_size =
+        required_transformer_usize(metadata.ssm_state_size(), "qwen35.ssm.state_size")?;
+    let group_count =
+        required_transformer_usize(metadata.ssm_group_count(), "qwen35.ssm.group_count")?;
+    let time_step_rank =
+        required_transformer_usize(metadata.ssm_time_step_rank(), "qwen35.ssm.time_step_rank")?;
+    let inner_size =
+        required_transformer_usize(metadata.ssm_inner_size(), "qwen35.ssm.inner_size")?;
+    let conv_kernel =
+        required_transformer_usize(metadata.ssm_conv_kernel(), "qwen35.ssm.conv_kernel")?;
+    let conv_channels = inner_size + checked_mul(checked_mul(group_count, state_size)?, 2)?;
+    let attn_qkv = resolve_required_layer_tensor_name(
+        model,
+        layer,
+        "attn_qkv",
+        layer_attn_qkv_candidates(layer),
+    )?;
+    let attn_gate = resolve_required_layer_tensor_name(
+        model,
+        layer,
+        "attn_gate",
+        layer_attn_gate_candidates(layer),
+    )?;
+    let attn_norm = resolve_required_layer_tensor_name(
+        model,
+        layer,
+        "attn_norm",
+        layer_attn_norm_candidates(layer),
+    )?;
+    let ssm_alpha = resolve_required_layer_tensor_name(
+        model,
+        layer,
+        "ssm_alpha",
+        layer_ssm_alpha_candidates(layer),
+    )?;
+    let ssm_beta = resolve_required_layer_tensor_name(
+        model,
+        layer,
+        "ssm_beta",
+        layer_ssm_beta_candidates(layer),
+    )?;
+    let ssm_conv1d = resolve_required_layer_tensor_name(
+        model,
+        layer,
+        "ssm_conv1d",
+        layer_ssm_conv1d_candidates(layer),
+    )?;
+    let ssm_dt =
+        resolve_required_layer_tensor_name(model, layer, "ssm_dt", layer_ssm_dt_candidates(layer))?;
+    let ssm_a =
+        resolve_required_layer_tensor_name(model, layer, "ssm_a", layer_ssm_a_candidates(layer))?;
+    let ssm_norm = resolve_required_layer_tensor_name(
+        model,
+        layer,
+        "ssm_norm",
+        layer_ssm_norm_candidates(layer),
+    )?;
+    let ssm_out = resolve_required_layer_tensor_name(
+        model,
+        layer,
+        "ssm_out",
+        layer_ssm_out_candidates(layer),
+    )?;
+
+    Ok(AttentionLayerPlan::Qwen35Linear(
+        Qwen35LinearAttentionLayerPlan {
+            norm_values: decode_norm_tensor(model, &attn_norm, hidden_features, "attn_norm")?,
+            qkv_weight_values: decode_matrix_tensor(
+                model,
+                &attn_qkv,
+                hidden_features,
+                conv_channels,
+                "attn_qkv",
+            )?,
+            gate_weight_values: decode_matrix_tensor(
+                model,
+                &attn_gate,
+                hidden_features,
+                inner_size,
+                "attn_gate",
+            )?,
+            alpha_weight_values: decode_matrix_tensor(
+                model,
+                &ssm_alpha,
+                hidden_features,
+                time_step_rank,
+                "ssm_alpha",
+            )?,
+            beta_weight_values: decode_matrix_tensor(
+                model,
+                &ssm_beta,
+                hidden_features,
+                time_step_rank,
+                "ssm_beta",
+            )?,
+            conv_weight_values: decode_matrix_tensor(
+                model,
+                &ssm_conv1d,
+                conv_kernel,
+                conv_channels,
+                "ssm_conv1d",
+            )?,
+            dt_bias_values: decode_exact_tensor(model, &ssm_dt, time_step_rank, "ssm_dt")?,
+            ssm_a_values: decode_exact_tensor(model, &ssm_a, time_step_rank, "ssm_a")?,
+            ssm_norm_values: decode_exact_tensor(model, &ssm_norm, state_size, "ssm_norm")?,
+            ssm_out_weight_values: decode_matrix_tensor(
+                model,
+                &ssm_out,
+                inner_size,
+                hidden_features,
+                "ssm_out",
+            )?,
+            state_size,
+            group_count,
+            time_step_rank,
+            inner_size,
+            conv_kernel,
+        },
+    ))
+}
+
+fn required_transformer_usize(value: Option<usize>, key: &str) -> Result<usize, E2eError> {
+    value.ok_or_else(|| {
+        E2eError::metadata(
+            "required_transformer_usize",
+            MetadataError::MissingRequiredKey {
+                key: key.to_string(),
+            },
+        )
+    })
+}
+
+fn build_mlp_only_layer_plan(
+    model: &GgufModel,
+    layer: usize,
+    hidden_features: usize,
+) -> Result<LayerPlan, E2eError> {
     Ok(LayerPlan {
         attention: None,
-        mlp: MlpLayerPlan {
-            weights: mlp_weights,
-            norm_values: ffn_norm_values,
-        },
+        mlp: build_layer_mlp_plan(model, layer, hidden_features)?,
     })
 }
 
@@ -706,6 +1041,50 @@ fn layer_ffn_down_candidates(layer: usize) -> Vec<String> {
     ]
 }
 
+fn layer_attn_norm_candidates(layer: usize) -> Vec<String> {
+    vec![
+        format!("blk.{layer}.attn_norm.weight"),
+        format!("layers.{layer}.attention_norm.weight"),
+        format!("model.layers.{layer}.input_layernorm.weight"),
+    ]
+}
+
+fn layer_attn_qkv_candidates(layer: usize) -> Vec<String> {
+    vec![format!("blk.{layer}.attn_qkv.weight")]
+}
+
+fn layer_attn_gate_candidates(layer: usize) -> Vec<String> {
+    vec![format!("blk.{layer}.attn_gate.weight")]
+}
+
+fn layer_ssm_alpha_candidates(layer: usize) -> Vec<String> {
+    vec![format!("blk.{layer}.ssm_alpha.weight")]
+}
+
+fn layer_ssm_beta_candidates(layer: usize) -> Vec<String> {
+    vec![format!("blk.{layer}.ssm_beta.weight")]
+}
+
+fn layer_ssm_conv1d_candidates(layer: usize) -> Vec<String> {
+    vec![format!("blk.{layer}.ssm_conv1d.weight")]
+}
+
+fn layer_ssm_dt_candidates(layer: usize) -> Vec<String> {
+    vec![format!("blk.{layer}.ssm_dt.bias")]
+}
+
+fn layer_ssm_a_candidates(layer: usize) -> Vec<String> {
+    vec![format!("blk.{layer}.ssm_a")]
+}
+
+fn layer_ssm_norm_candidates(layer: usize) -> Vec<String> {
+    vec![format!("blk.{layer}.ssm_norm.weight")]
+}
+
+fn layer_ssm_out_candidates(layer: usize) -> Vec<String> {
+    vec![format!("blk.{layer}.ssm_out.weight")]
+}
+
 fn decode_norm_tensor(
     model: &GgufModel,
     tensor_name: &str,
@@ -719,6 +1098,46 @@ fn decode_norm_tensor(
         return Err(E2eError::NormWeightLengthMismatch {
             tensor_name: format!("{role}:{tensor_name}"),
             expected: hidden_features,
+            actual: values.len(),
+        });
+    }
+    Ok(values)
+}
+
+fn decode_exact_tensor(
+    model: &GgufModel,
+    tensor_name: &str,
+    expected_len: usize,
+    role: &'static str,
+) -> Result<Vec<f32>, E2eError> {
+    let values = model
+        .tensor_values::<f32>(tensor_name)
+        .map_err(|source| E2eError::model("GgufModel::tensor_values(exact)", source))?;
+    if values.len() != expected_len {
+        return Err(E2eError::NormWeightLengthMismatch {
+            tensor_name: format!("{role}:{tensor_name}"),
+            expected: expected_len,
+            actual: values.len(),
+        });
+    }
+    Ok(values)
+}
+
+fn decode_matrix_tensor(
+    model: &GgufModel,
+    tensor_name: &str,
+    input_features: usize,
+    output_features: usize,
+    role: &'static str,
+) -> Result<Vec<f32>, E2eError> {
+    let values = model
+        .tensor_values::<f32>(tensor_name)
+        .map_err(|source| E2eError::model("GgufModel::tensor_values(matrix)", source))?;
+    let expected = checked_mul(input_features, output_features)?;
+    if values.len() != expected {
+        return Err(E2eError::OutputWeightLengthMismatch {
+            tensor_name: format!("{role}:{tensor_name}"),
+            expected,
             actual: values.len(),
         });
     }
@@ -755,6 +1174,7 @@ fn rms_norm_with_weight(
     hidden_features: usize,
     sequence_length: usize,
     weight: &[f32],
+    eps: f32,
 ) -> Result<Vec<f32>, E2eError> {
     if weight.len() != hidden_features {
         return Err(E2eError::BufferLengthMismatch {
@@ -780,7 +1200,7 @@ fn rms_norm_with_weight(
             .map(|value| f64::from(value) * f64::from(value))
             .sum::<f64>()
             / hidden_features as f64;
-        let inv_rms = 1.0_f32 / ((mean_square as f32) + RMS_NORM_EPS).sqrt();
+        let inv_rms = 1.0_f32 / ((mean_square as f32) + eps).sqrt();
         for (index, value) in slice.iter().copied().enumerate() {
             output[offset + index] = value * inv_rms * weight[index];
         }
@@ -799,6 +1219,540 @@ fn add_in_place(accumulator: &mut [f32], addend: &[f32]) -> Result<(), E2eError>
         *lhs += rhs;
     }
     Ok(())
+}
+
+fn qwen35_full_attention_inference(
+    attention: &Qwen35FullAttentionLayerPlan,
+    input: &[f32],
+    sequence_length: usize,
+    rms_norm_eps: f32,
+) -> Result<Vec<f32>, E2eError> {
+    let hidden_features =
+        attention.output_weight_values.len() / attention.head_count / attention.head_dimension;
+    let expected_input_len = checked_mul(hidden_features, sequence_length)?;
+    if input.len() != expected_input_len {
+        return Err(E2eError::BufferLengthMismatch {
+            expected: expected_input_len,
+            actual: input.len(),
+        });
+    }
+
+    let query_features = checked_mul(attention.head_count, attention.head_dimension)?;
+    let kv_features = checked_mul(attention.kv_head_count, attention.head_dimension)?;
+    let q_full = project_sequence(
+        input,
+        sequence_length,
+        hidden_features,
+        checked_mul(query_features, 2)?,
+        &attention.q_weight_values,
+    )?;
+    let k_proj = project_sequence(
+        input,
+        sequence_length,
+        hidden_features,
+        kv_features,
+        &attention.k_weight_values,
+    )?;
+    let v_proj = project_sequence(
+        input,
+        sequence_length,
+        hidden_features,
+        kv_features,
+        &attention.v_weight_values,
+    )?;
+
+    let mut q_values = vec![0.0_f32; checked_mul(sequence_length, query_features)?];
+    let mut q_gate = vec![0.0_f32; checked_mul(sequence_length, query_features)?];
+    for token in 0..sequence_length {
+        let q_full_offset = checked_mul(token, checked_mul(query_features, 2)?)?;
+        let q_offset = checked_mul(token, query_features)?;
+        for head in 0..attention.head_count {
+            let src_head_offset =
+                q_full_offset + checked_mul(head, checked_mul(attention.head_dimension, 2)?)?;
+            let dst_head_offset = q_offset + checked_mul(head, attention.head_dimension)?;
+            let mid = src_head_offset + attention.head_dimension;
+            q_values[dst_head_offset..dst_head_offset + attention.head_dimension]
+                .copy_from_slice(&q_full[src_head_offset..mid]);
+            q_gate[dst_head_offset..dst_head_offset + attention.head_dimension]
+                .copy_from_slice(&q_full[mid..mid + attention.head_dimension]);
+        }
+    }
+
+    let q_values = per_head_rms_norm(
+        &q_values,
+        sequence_length,
+        attention.head_count,
+        attention.head_dimension,
+        &attention.q_norm_values,
+        rms_norm_eps,
+    )?;
+    let k_values = per_head_rms_norm(
+        &k_proj,
+        sequence_length,
+        attention.kv_head_count,
+        attention.head_dimension,
+        &attention.k_norm_values,
+        rms_norm_eps,
+    )?;
+
+    let groups = attention.head_count / attention.kv_head_count;
+    let mut head_outputs = vec![0.0_f32; checked_mul(sequence_length, query_features)?];
+    for token in 0..sequence_length {
+        for head in 0..attention.head_count {
+            let kv_head = head / groups;
+            let mut scores = vec![f32::NEG_INFINITY; sequence_length];
+            for (source, score) in scores.iter_mut().enumerate().take(token + 1) {
+                let q = head_slice(
+                    &q_values,
+                    token,
+                    head,
+                    attention.head_count,
+                    attention.head_dimension,
+                );
+                let k = head_slice(
+                    &k_values,
+                    source,
+                    kv_head,
+                    attention.kv_head_count,
+                    attention.head_dimension,
+                );
+                *score = dot(q, k) * attention.attention_scale;
+            }
+            let weights = softmax_prefix(&scores, token + 1);
+            let dst = head_slice_mut(
+                &mut head_outputs,
+                token,
+                head,
+                attention.head_count,
+                attention.head_dimension,
+            );
+            for (source, weight) in weights.iter().copied().enumerate() {
+                let v = head_slice(
+                    &v_proj,
+                    source,
+                    kv_head,
+                    attention.kv_head_count,
+                    attention.head_dimension,
+                );
+                for index in 0..attention.head_dimension {
+                    dst[index] += v[index] * weight;
+                }
+            }
+            let gate = head_slice(
+                &q_gate,
+                token,
+                head,
+                attention.head_count,
+                attention.head_dimension,
+            );
+            for index in 0..attention.head_dimension {
+                dst[index] *= sigmoid_scalar(gate[index]);
+            }
+        }
+    }
+
+    project_sequence(
+        &head_outputs,
+        sequence_length,
+        query_features,
+        hidden_features,
+        &attention.output_weight_values,
+    )
+}
+
+fn qwen35_linear_attention_inference(
+    attention: &Qwen35LinearAttentionLayerPlan,
+    input: &[f32],
+    sequence_length: usize,
+    rms_norm_eps: f32,
+) -> Result<Vec<f32>, E2eError> {
+    let hidden_features = attention.ssm_out_weight_values.len() / attention.inner_size;
+    let expected_input_len = checked_mul(hidden_features, sequence_length)?;
+    if input.len() != expected_input_len {
+        return Err(E2eError::BufferLengthMismatch {
+            expected: expected_input_len,
+            actual: input.len(),
+        });
+    }
+
+    let conv_channels = attention.inner_size
+        + checked_mul(checked_mul(attention.group_count, attention.state_size)?, 2)?;
+    let qkv = project_sequence(
+        input,
+        sequence_length,
+        hidden_features,
+        conv_channels,
+        &attention.qkv_weight_values,
+    )?;
+    let z = project_sequence(
+        input,
+        sequence_length,
+        hidden_features,
+        attention.inner_size,
+        &attention.gate_weight_values,
+    )?;
+    let alpha = project_sequence(
+        input,
+        sequence_length,
+        hidden_features,
+        attention.time_step_rank,
+        &attention.alpha_weight_values,
+    )?;
+    let beta = project_sequence(
+        input,
+        sequence_length,
+        hidden_features,
+        attention.time_step_rank,
+        &attention.beta_weight_values,
+    )?;
+    let conv = causal_depthwise_conv(
+        &qkv,
+        sequence_length,
+        conv_channels,
+        attention.conv_kernel,
+        &attention.conv_weight_values,
+    )?;
+
+    let mut q_heads = vec![
+        0.0_f32;
+        checked_mul(
+            sequence_length,
+            checked_mul(attention.group_count, attention.state_size)?
+        )?
+    ];
+    let mut k_heads = vec![0.0_f32; q_heads.len()];
+    let mut v_heads = vec![0.0_f32; checked_mul(sequence_length, attention.inner_size)?];
+    let qk_features = checked_mul(attention.group_count, attention.state_size)?;
+    for token in 0..sequence_length {
+        let src_offset = checked_mul(token, conv_channels)?;
+        let q_offset = checked_mul(token, qk_features)?;
+        let v_offset = checked_mul(token, attention.inner_size)?;
+        q_heads[q_offset..q_offset + qk_features]
+            .copy_from_slice(&conv[src_offset..src_offset + qk_features]);
+        k_heads[q_offset..q_offset + qk_features].copy_from_slice(
+            &conv[src_offset + qk_features..src_offset + checked_mul(qk_features, 2)?],
+        );
+        v_heads[v_offset..v_offset + attention.inner_size].copy_from_slice(
+            &conv[src_offset + checked_mul(qk_features, 2)?..src_offset + conv_channels],
+        );
+    }
+
+    let q_heads = per_head_l2_norm(
+        &q_heads,
+        sequence_length,
+        attention.group_count,
+        attention.state_size,
+        rms_norm_eps,
+    )?;
+    let k_heads = per_head_l2_norm(
+        &k_heads,
+        sequence_length,
+        attention.group_count,
+        attention.state_size,
+        rms_norm_eps,
+    )?;
+    let repeat_factor = attention.time_step_rank / attention.group_count;
+    let mut output = vec![0.0_f32; checked_mul(sequence_length, attention.inner_size)?];
+    let mut states = vec![
+        0.0_f32;
+        checked_mul(
+            attention.time_step_rank,
+            checked_mul(attention.state_size, attention.state_size)?
+        )?
+    ];
+    let scale = 1.0_f32 / (attention.state_size as f32).sqrt();
+
+    for token in 0..sequence_length {
+        for head in 0..attention.time_step_rank {
+            let src_group = head / repeat_factor;
+            let q = head_slice(
+                &q_heads,
+                token,
+                src_group,
+                attention.group_count,
+                attention.state_size,
+            );
+            let k = head_slice(
+                &k_heads,
+                token,
+                src_group,
+                attention.group_count,
+                attention.state_size,
+            );
+            let v = head_slice(
+                &v_heads,
+                token,
+                head,
+                attention.time_step_rank,
+                attention.state_size,
+            );
+            let z_head = head_slice(
+                &z,
+                token,
+                head,
+                attention.time_step_rank,
+                attention.state_size,
+            );
+            let gate = softplus_scalar(
+                alpha[checked_mul(token, attention.time_step_rank)? + head]
+                    + attention.dt_bias_values[head],
+            ) * attention.ssm_a_values[head];
+            let beta_value =
+                sigmoid_scalar(beta[checked_mul(token, attention.time_step_rank)? + head]);
+            let state_offset = checked_mul(
+                head,
+                checked_mul(attention.state_size, attention.state_size)?,
+            )?;
+            let state = &mut states[state_offset
+                ..state_offset + checked_mul(attention.state_size, attention.state_size)?];
+            let mut sk = vec![0.0_f32; attention.state_size];
+            let decay = gate.exp();
+            for row in 0..attention.state_size {
+                for col in 0..attention.state_size {
+                    state[row * attention.state_size + col] *= decay;
+                    sk[col] += state[row * attention.state_size + col] * k[row];
+                }
+            }
+            let mut delta = vec![0.0_f32; attention.state_size];
+            for index in 0..attention.state_size {
+                delta[index] = (v[index] - sk[index]) * beta_value;
+            }
+            for row in 0..attention.state_size {
+                for col in 0..attention.state_size {
+                    state[row * attention.state_size + col] += k[row] * delta[col];
+                }
+            }
+            let mut out = vec![0.0_f32; attention.state_size];
+            for col in 0..attention.state_size {
+                for row in 0..attention.state_size {
+                    out[col] += state[row * attention.state_size + col] * (q[row] * scale);
+                }
+            }
+            let normalized = rms_norm_single(&out, &attention.ssm_norm_values, rms_norm_eps)?;
+            let dst = head_slice_mut(
+                &mut output,
+                token,
+                head,
+                attention.time_step_rank,
+                attention.state_size,
+            );
+            for index in 0..attention.state_size {
+                dst[index] = normalized[index] * silu_scalar(z_head[index]);
+            }
+        }
+    }
+
+    project_sequence(
+        &output,
+        sequence_length,
+        attention.inner_size,
+        hidden_features,
+        &attention.ssm_out_weight_values,
+    )
+}
+
+fn project_sequence(
+    input: &[f32],
+    sequence_length: usize,
+    input_features: usize,
+    output_features: usize,
+    weight: &[f32],
+) -> Result<Vec<f32>, E2eError> {
+    let expected_input_len = checked_mul(sequence_length, input_features)?;
+    if input.len() != expected_input_len {
+        return Err(E2eError::BufferLengthMismatch {
+            expected: expected_input_len,
+            actual: input.len(),
+        });
+    }
+    let expected_weight_len = checked_mul(input_features, output_features)?;
+    if weight.len() != expected_weight_len {
+        return Err(E2eError::BufferLengthMismatch {
+            expected: expected_weight_len,
+            actual: weight.len(),
+        });
+    }
+
+    let mut output = vec![0.0_f32; checked_mul(sequence_length, output_features)?];
+    for token in 0..sequence_length {
+        let input_row =
+            &input[checked_mul(token, input_features)?..checked_mul(token + 1, input_features)?];
+        let dst_row = &mut output
+            [checked_mul(token, output_features)?..checked_mul(token + 1, output_features)?];
+        for (feature, weights_row) in weight.chunks_exact(input_features).enumerate() {
+            dst_row[feature] = dot(input_row, weights_row);
+        }
+    }
+    Ok(output)
+}
+
+fn causal_depthwise_conv(
+    input: &[f32],
+    sequence_length: usize,
+    channels: usize,
+    kernel_size: usize,
+    weight: &[f32],
+) -> Result<Vec<f32>, E2eError> {
+    let expected_input_len = checked_mul(sequence_length, channels)?;
+    if input.len() != expected_input_len {
+        return Err(E2eError::BufferLengthMismatch {
+            expected: expected_input_len,
+            actual: input.len(),
+        });
+    }
+    let expected_weight_len = checked_mul(kernel_size, channels)?;
+    if weight.len() != expected_weight_len {
+        return Err(E2eError::BufferLengthMismatch {
+            expected: expected_weight_len,
+            actual: weight.len(),
+        });
+    }
+    let mut output = vec![0.0_f32; input.len()];
+    for token in 0..sequence_length {
+        for channel in 0..channels {
+            let mut sum = 0.0_f32;
+            for tap in 0..kernel_size {
+                if token + 1 < kernel_size - tap {
+                    continue;
+                }
+                let src_token = token + tap + 1 - kernel_size;
+                sum += input[checked_mul(src_token, channels)? + channel]
+                    * weight[checked_mul(channel, kernel_size)? + tap];
+            }
+            output[checked_mul(token, channels)? + channel] = silu_scalar(sum);
+        }
+    }
+    Ok(output)
+}
+
+fn per_head_rms_norm(
+    input: &[f32],
+    sequence_length: usize,
+    head_count: usize,
+    head_dimension: usize,
+    weight: &[f32],
+    eps: f32,
+) -> Result<Vec<f32>, E2eError> {
+    if weight.len() != head_dimension {
+        return Err(E2eError::BufferLengthMismatch {
+            expected: head_dimension,
+            actual: weight.len(),
+        });
+    }
+    let mut output = input.to_vec();
+    for token in 0..sequence_length {
+        for head in 0..head_count {
+            let slice = head_slice_mut(&mut output, token, head, head_count, head_dimension);
+            let normalized = rms_norm_single(slice, weight, eps)?;
+            slice.copy_from_slice(&normalized);
+        }
+    }
+    Ok(output)
+}
+
+fn per_head_l2_norm(
+    input: &[f32],
+    sequence_length: usize,
+    head_count: usize,
+    head_dimension: usize,
+    eps: f32,
+) -> Result<Vec<f32>, E2eError> {
+    let mut output = input.to_vec();
+    for token in 0..sequence_length {
+        for head in 0..head_count {
+            let slice = head_slice_mut(&mut output, token, head, head_count, head_dimension);
+            let norm = slice.iter().map(|value| value * value).sum::<f32>();
+            let inv = 1.0_f32 / norm.sqrt().max(eps);
+            for value in slice.iter_mut() {
+                *value *= inv;
+            }
+        }
+    }
+    Ok(output)
+}
+
+fn rms_norm_single(input: &[f32], weight: &[f32], eps: f32) -> Result<Vec<f32>, E2eError> {
+    if input.len() != weight.len() {
+        return Err(E2eError::BufferLengthMismatch {
+            expected: weight.len(),
+            actual: input.len(),
+        });
+    }
+    let mean_square = input
+        .iter()
+        .copied()
+        .map(|value| f64::from(value) * f64::from(value))
+        .sum::<f64>()
+        / input.len() as f64;
+    let inv_rms = 1.0_f32 / ((mean_square as f32) + eps).sqrt();
+    Ok(input
+        .iter()
+        .copied()
+        .zip(weight.iter().copied())
+        .map(|(value, scale)| value * inv_rms * scale)
+        .collect())
+}
+
+fn head_slice(
+    values: &[f32],
+    token: usize,
+    head: usize,
+    head_count: usize,
+    head_dimension: usize,
+) -> &[f32] {
+    let token_offset = token * head_count * head_dimension;
+    let head_offset = token_offset + head * head_dimension;
+    &values[head_offset..head_offset + head_dimension]
+}
+
+fn head_slice_mut(
+    values: &mut [f32],
+    token: usize,
+    head: usize,
+    head_count: usize,
+    head_dimension: usize,
+) -> &mut [f32] {
+    let token_offset = token * head_count * head_dimension;
+    let head_offset = token_offset + head * head_dimension;
+    &mut values[head_offset..head_offset + head_dimension]
+}
+
+fn dot(lhs: &[f32], rhs: &[f32]) -> f32 {
+    lhs.iter()
+        .copied()
+        .zip(rhs.iter().copied())
+        .fold(0.0_f32, |acc, (lhs, rhs)| acc + lhs * rhs)
+}
+
+fn softmax_prefix(scores: &[f32], len: usize) -> Vec<f32> {
+    let max_score = scores[..len]
+        .iter()
+        .copied()
+        .fold(f32::NEG_INFINITY, f32::max);
+    let mut exp_scores = Vec::with_capacity(len);
+    let mut denom = 0.0_f32;
+    for value in scores[..len].iter().copied() {
+        let exp_value = (value - max_score).exp();
+        denom += exp_value;
+        exp_scores.push(exp_value);
+    }
+    exp_scores.into_iter().map(|value| value / denom).collect()
+}
+
+fn sigmoid_scalar(value: f32) -> f32 {
+    1.0_f32 / (1.0_f32 + (-value).exp())
+}
+
+fn silu_scalar(value: f32) -> f32 {
+    value * sigmoid_scalar(value)
+}
+
+fn softplus_scalar(value: f32) -> f32 {
+    if value > 20.0 {
+        value
+    } else {
+        (1.0_f32 + value.exp()).ln()
+    }
 }
 
 fn mlp_sequence_inference_with_weights(
@@ -1005,7 +1959,8 @@ mod tests {
     fn rms_norm_applies_weight_per_position() {
         let input = vec![1.0_f32, 2.0, 3.0, 4.0];
         let weight = vec![1.0_f32, 0.25];
-        let output = rms_norm_with_weight(&input, 2, 2, &weight).expect("rms norm should succeed");
+        let output =
+            rms_norm_with_weight(&input, 2, 2, &weight, 1e-5).expect("rms norm should succeed");
         assert_eq!(output.len(), input.len());
         // Ensure both positions are normalized independently and weighted.
         assert!(output[0].is_finite());
@@ -1013,6 +1968,15 @@ mod tests {
         assert!(output[2].is_finite());
         assert!(output[3].is_finite());
         assert!(output[0].abs() > output[1].abs());
+    }
+
+    #[test]
+    fn rms_norm_eps_changes_scaled_output() {
+        let input = vec![1.0_f32, 2.0];
+        let weight = vec![1.0_f32, 1.0];
+        let loose = rms_norm_with_weight(&input, 2, 1, &weight, 1e-5).expect("rms norm");
+        let tight = rms_norm_with_weight(&input, 2, 1, &weight, 1e-6).expect("rms norm");
+        assert_ne!(loose, tight);
     }
 
     #[test]

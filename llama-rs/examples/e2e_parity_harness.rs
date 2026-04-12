@@ -13,6 +13,7 @@ use std::error::Error as StdError;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::str::FromStr;
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -110,9 +111,12 @@ struct Cli {
     /// Path to GGUF model.
     #[arg(long)]
     model: PathBuf,
+    /// Comma-separated prompt token IDs, e.g. `1,123,456`.
+    #[arg(long, conflicts_with = "prompt_text")]
+    prompt_tokens: Option<String>,
     /// Prompt text used by both llama-rs and llama.cpp.
-    #[arg(long)]
-    prompt_text: String,
+    #[arg(long, conflicts_with = "prompt_tokens")]
+    prompt_text: Option<String>,
     /// Maximum number of generated tokens.
     #[arg(long, default_value_t = 1)]
     max_new_tokens: usize,
@@ -169,7 +173,7 @@ fn main() -> Result<(), Box<dyn StdError>> {
 fn run(cli: Cli) -> Result<(), ExampleError> {
     ensure_llama_token_ids_binary(&cli)?;
     let model = GgufModel::open(&cli.model)?;
-    let prompt_token_ids = tokenize_prompt_text(&model, &cli.prompt_text)?;
+    let prompt_token_ids = resolve_prompt_token_ids(&cli, &model)?;
     let eos_token_id = resolve_eos_token_id(&model);
     let mixed_layer_policy: MixedLayerPolicy = cli.mixed_layer_policy.into();
 
@@ -236,7 +240,8 @@ fn run_parity_case(
     let llama_rs_report = generate_token_ids_from_model(model, &config)?;
 
     let llama_cpp_report = run_llama_token_ids_helper(
-        &cli.prompt_text,
+        cli,
+        prompt_token_ids,
         &cli.model,
         &cli.llama_token_ids_bin,
         cli.max_new_tokens,
@@ -350,7 +355,8 @@ fn ensure_llama_token_ids_binary(cli: &Cli) -> Result<(), ExampleError> {
 }
 
 fn run_llama_token_ids_helper(
-    prompt_text: &str,
+    cli: &Cli,
+    prompt_token_ids: &[i32],
     model_path: &Path,
     llama_token_ids_bin: &Path,
     max_new_tokens: usize,
@@ -376,7 +382,7 @@ fn run_llama_token_ids_helper(
         .arg(max_new_tokens.to_string())
         .arg("-ngl")
         .arg(n_gpu_layers.to_string())
-        .arg(prompt_text)
+        .args(llama_cpp_prompt_args(cli, prompt_token_ids))
         .env("DYLD_FALLBACK_LIBRARY_PATH", dylib_fallback)
         .output()?;
 
@@ -393,6 +399,52 @@ fn run_llama_token_ids_helper(
         prompt_token_ids: parse_token_ids_marker(&stdout, backend, "prompt_token_ids=[")?,
         generated_token_ids: parse_token_ids_marker(&stdout, backend, "generated_token_ids=[")?,
     })
+}
+
+fn resolve_prompt_token_ids(cli: &Cli, model: &GgufModel) -> Result<Vec<i32>, ExampleError> {
+    match (&cli.prompt_tokens, &cli.prompt_text) {
+        (Some(tokens), None) => parse_prompt_tokens(tokens).map_err(invalid_input),
+        (None, Some(text)) => tokenize_prompt_text(model, text).map_err(Into::into),
+        _ => Err(invalid_input(
+            "provide exactly one of --prompt-tokens or --prompt-text",
+        )),
+    }
+}
+
+fn parse_prompt_tokens(value: &str) -> Result<Vec<i32>, String> {
+    let tokens: Vec<i32> = value
+        .split(',')
+        .map(str::trim)
+        .filter(|token| !token.is_empty())
+        .map(|token| {
+            i32::from_str(token).map_err(|error| format!("invalid token id `{token}`: {error}"))
+        })
+        .collect::<Result<_, _>>()?;
+    if tokens.is_empty() {
+        return Err("--prompt-tokens must include at least one token id".to_owned());
+    }
+    Ok(tokens)
+}
+
+fn invalid_input(message: impl Into<String>) -> ExampleError {
+    ExampleError::Io(std::io::Error::new(
+        std::io::ErrorKind::InvalidInput,
+        message.into(),
+    ))
+}
+
+fn llama_cpp_prompt_args(cli: &Cli, prompt_token_ids: &[i32]) -> Vec<String> {
+    if let Some(prompt_text) = &cli.prompt_text {
+        return vec![prompt_text.clone()];
+    }
+    vec![
+        "--prompt-tokens".to_owned(),
+        prompt_token_ids
+            .iter()
+            .map(i32::to_string)
+            .collect::<Vec<_>>()
+            .join(","),
+    ]
 }
 
 fn parse_token_ids_marker(

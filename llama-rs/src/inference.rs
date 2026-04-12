@@ -941,6 +941,7 @@ define_non_zero_count!(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 /// Attention topology expressed with explicit query/KV head counts.
 pub struct AttentionLayout {
+    hidden_features: NonZeroUsize,
     query_head_count: AttentionHeadCount,
     kv_head_count: AttentionHeadCount,
     head_dimension: AttentionHeadDimension,
@@ -954,8 +955,31 @@ impl AttentionLayout {
     ) -> Result<Self, InferenceError> {
         if hidden_features == 0
             || query_head_count == 0
-            || kv_head_count == 0
             || !hidden_features.is_multiple_of(query_head_count)
+        {
+            return Err(InferenceError::InvalidAttentionLayout {
+                hidden_features,
+                query_head_count,
+                kv_head_count,
+            });
+        }
+        Self::from_projection_dimensions(
+            hidden_features,
+            query_head_count,
+            kv_head_count,
+            hidden_features / query_head_count,
+        )
+    }
+
+    pub fn from_projection_dimensions(
+        hidden_features: usize,
+        query_head_count: usize,
+        kv_head_count: usize,
+        head_dimension: usize,
+    ) -> Result<Self, InferenceError> {
+        if hidden_features == 0
+            || query_head_count == 0
+            || kv_head_count == 0
             || !query_head_count.is_multiple_of(kv_head_count)
         {
             return Err(InferenceError::InvalidAttentionLayout {
@@ -965,8 +989,8 @@ impl AttentionLayout {
             });
         }
 
-        let head_dimension = hidden_features / query_head_count;
         Ok(Self {
+            hidden_features: NonZeroUsize::new(hidden_features).expect("validated non-zero"),
             query_head_count: AttentionHeadCount::new(query_head_count)?,
             kv_head_count: AttentionHeadCount::new(kv_head_count)?,
             head_dimension: AttentionHeadDimension::new(head_dimension)?,
@@ -986,11 +1010,11 @@ impl AttentionLayout {
     }
 
     pub const fn hidden_features(self) -> usize {
-        self.query_head_count.get() * self.head_dimension.get()
+        self.hidden_features.get()
     }
 
     pub const fn query_features(self) -> usize {
-        self.hidden_features()
+        self.query_head_count.get() * self.head_dimension.get()
     }
 
     pub const fn kv_features(self) -> usize {
@@ -1032,6 +1056,8 @@ pub struct AttentionInferenceConfig {
     pub sequence_length: NonZeroUsize,
     pub mask: AttentionMaskPolicy,
     pub rotary: RotaryEmbedding,
+    pub attention_scale: f32,
+    pub rms_norm_eps: f32,
 }
 
 impl AttentionInferenceConfig {
@@ -1055,6 +1081,8 @@ impl AttentionInferenceConfig {
             sequence_length,
             mask: AttentionMaskPolicy::None,
             rotary: RotaryEmbedding::Disabled,
+            attention_scale: 1.0 / (layout.head_dimension() as f32).sqrt(),
+            rms_norm_eps: 1e-5,
         })
     }
 
@@ -1062,10 +1090,11 @@ impl AttentionInferenceConfig {
         dimensions: LlamaLayerDimensions,
         sequence_length: usize,
     ) -> Result<Self, InferenceError> {
-        let layout = AttentionLayout::from_hidden_features(
+        let layout = AttentionLayout::from_projection_dimensions(
             dimensions.hidden_features,
             dimensions.query_head_count,
             dimensions.kv_head_count,
+            dimensions.head_dimension,
         )?;
         let mut config = Self::from_layout(layout, sequence_length)?;
         if let Some(rope_dimensions) = dimensions.rope_dimension_count {
@@ -1074,10 +1103,17 @@ impl AttentionInferenceConfig {
                 dimensions: rope_dimensions,
                 base: dimensions.rope_freq_base,
                 scale: dimensions.rope_freq_scale,
-                original_context: None,
+                original_context: dimensions
+                    .rope_original_context_length
+                    .and_then(NonZeroUsize::new),
             }));
         }
-        Ok(config)
+        let config = if let Some(attention_scale) = dimensions.attention_scale {
+            config.with_attention_scale(attention_scale)
+        } else {
+            config
+        };
+        Ok(config.with_rms_norm_eps(dimensions.attention_layer_norm_rms_epsilon))
     }
 
     pub const fn with_mask(mut self, mask: AttentionMaskPolicy) -> Self {
@@ -1087,6 +1123,16 @@ impl AttentionInferenceConfig {
 
     pub const fn with_rotary(mut self, rotary: RotaryEmbedding) -> Self {
         self.rotary = rotary;
+        self
+    }
+
+    pub const fn with_attention_scale(mut self, attention_scale: f32) -> Self {
+        self.attention_scale = attention_scale;
+        self
+    }
+
+    pub const fn with_rms_norm_eps(mut self, rms_norm_eps: f32) -> Self {
+        self.rms_norm_eps = rms_norm_eps;
         self
     }
 
@@ -1104,6 +1150,14 @@ impl AttentionInferenceConfig {
 
     pub const fn sequence_length(self) -> usize {
         self.sequence_length.get()
+    }
+
+    pub const fn attention_scale(self) -> f32 {
+        self.attention_scale
+    }
+
+    pub const fn rms_norm_eps(self) -> f32 {
+        self.rms_norm_eps
     }
 
     pub const fn query_head_count(self) -> usize {
@@ -1138,11 +1192,15 @@ pub struct AttentionWeights<T = f32> {
     pub k_tensor_name: String,
     pub v_tensor_name: String,
     pub o_tensor_name: String,
+    pub q_norm_tensor_name: Option<String>,
+    pub k_norm_tensor_name: Option<String>,
     pub config: AttentionInferenceConfig,
     q_values: Vec<T>,
     k_values: Vec<T>,
     v_values: Vec<T>,
     o_values: Vec<T>,
+    q_norm_values: Option<Vec<T>>,
+    k_norm_values: Option<Vec<T>>,
 }
 
 impl AttentionWeights<f32> {
@@ -1165,11 +1223,15 @@ impl AttentionWeights<f32> {
             k_tensor_name: "<deterministic-attn-k>".to_string(),
             v_tensor_name: "<deterministic-attn-v>".to_string(),
             o_tensor_name: "<deterministic-attn-o>".to_string(),
+            q_norm_tensor_name: None,
+            k_norm_tensor_name: None,
             config,
             q_values,
             k_values,
             v_values,
             o_values,
+            q_norm_values: None,
+            k_norm_values: None,
         }
     }
 }
@@ -1198,6 +1260,24 @@ where
             .map_err(|source| {
                 InferenceError::model("GgufModel::tensor_values(attn_output)", source)
             })?;
+        let q_norm_values = layer
+            .attn_q_norm
+            .as_deref()
+            .map(|tensor_name| {
+                model.tensor_values::<T>(tensor_name).map_err(|source| {
+                    InferenceError::model("GgufModel::tensor_values(attn_q_norm)", source)
+                })
+            })
+            .transpose()?;
+        let k_norm_values = layer
+            .attn_k_norm
+            .as_deref()
+            .map(|tensor_name| {
+                model.tensor_values::<T>(tensor_name).map_err(|source| {
+                    InferenceError::model("GgufModel::tensor_values(attn_k_norm)", source)
+                })
+            })
+            .transpose()?;
 
         for (name, expected, actual) in [
             (
@@ -1229,17 +1309,35 @@ where
                 });
             }
         }
+        for (name, values) in [
+            (layer.attn_q_norm.as_deref(), q_norm_values.as_ref()),
+            (layer.attn_k_norm.as_deref(), k_norm_values.as_ref()),
+        ] {
+            if let (Some(name), Some(values)) = (name, values)
+                && values.len() != config.head_dimension()
+            {
+                return Err(InferenceError::InvalidAttentionWeightShape {
+                    tensor_name: name.to_string(),
+                    expected: config.head_dimension(),
+                    actual: values.len(),
+                });
+            }
+        }
 
         Ok(Self {
             q_tensor_name: layer.attn_q.clone(),
             k_tensor_name: layer.attn_k.clone(),
             v_tensor_name: layer.attn_v.clone(),
             o_tensor_name: layer.attn_output.clone(),
+            q_norm_tensor_name: layer.attn_q_norm.clone(),
+            k_norm_tensor_name: layer.attn_k_norm.clone(),
             config,
             q_values,
             k_values,
             v_values,
             o_values,
+            q_norm_values,
+            k_norm_values,
         })
     }
 
@@ -1257,6 +1355,14 @@ where
 
     fn o_values(&self) -> &[T] {
         &self.o_values
+    }
+
+    fn q_norm_values(&self) -> Option<&[T]> {
+        self.q_norm_values.as_deref()
+    }
+
+    fn k_norm_values(&self) -> Option<&[T]> {
+        self.k_norm_values.as_deref()
     }
 }
 
@@ -1343,6 +1449,16 @@ mod tests {
     }
 
     #[test]
+    fn attention_layout_supports_projection_width_larger_than_hidden_per_head() {
+        let layout = AttentionLayout::from_projection_dimensions(3072, 32, 8, 128)
+            .expect("layout should accept metadata-derived projection width");
+        assert_eq!(layout.hidden_features(), 3072);
+        assert_eq!(layout.head_dimension(), 128);
+        assert_eq!(layout.query_features(), 4096);
+        assert_eq!(layout.kv_features(), 1024);
+    }
+
+    #[test]
     fn causal_mask_blocks_future_tokens() {
         let mask = build_causal_mask_values(3, 3, 0);
         assert_eq!(
@@ -1364,6 +1480,7 @@ mod tests {
         assert_eq!(config.kv_head_count(), 1);
         assert_eq!(config.head_dimension(), 16);
         assert_eq!(config.sequence_length(), 5);
+        assert_eq!(config.attention_scale(), 0.25);
     }
 
     #[test]

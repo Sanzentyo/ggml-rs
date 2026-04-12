@@ -707,16 +707,58 @@ cmake --build "$LLAMA_CPP_DIR/build" --target llama-bench -j
 Model download (session command, `uv` + HF Hub):
 
 ```bash
-uv run --with huggingface_hub python - <<'PY'
-from huggingface_hub import hf_hub_download
-# download selected GGUF files into target/models/*
-PY
+uv run scripts/fetch_model_assets.py
 ```
 
-Latest inventory verification (`uv`):
+Current script:
 
-- `target/benchmarks/review4_model_asset_uv_check.txt`
-- confirmed six required GGUF assets are present (`missing_count=0`).
+- `scripts/fetch_model_assets.py`
+- Uses `uv` inline script metadata (`huggingface_hub` dependency embedded in file).
+- Downloads the six required GGUF assets into the HF cache, then creates
+  canonical local symlinks under `target/models/*` using the repository-local
+  filenames expected by the existing docs and examples:
+  - `target/models/qwen3_8b_q4_k_m/Qwen3-8B-Q4_K_M.gguf`
+  - `target/models/qwen3_5_4b_q4_k_m/Qwen3.5-4B-Q4_K_M.gguf`
+  - `target/models/elyza_llama3_jp_8b_q4_k_m/Llama-3-ELYZA-JP-8B-q4_k_m.gguf`
+  - `target/models/llama_minitron_4b_q4_0/Llama-3.1-Minitron-4B-Width-Base-Q4_0.gguf`
+  - `target/models/kalm_embedding_gemma3_12b_2511_q2_k/KaLM-Embedding-Gemma3-12B-2511.Q2_K.gguf`
+  - `target/models/internvl3_8b_q4_k_m/InternVL3-8B-Q4_K_M.gguf`
+- The current script sets `HF_HUB_DISABLE_XET=1` before download because the
+  direct `local_dir` workflow produced unstable self-referential symlinks in
+  this environment; downloading into cache first, then linking from
+  `target/models/*`, was the stable path.
+
+Recommended first-pass invocation on a fresh machine:
+
+```bash
+export HF_HUB_DISABLE_XET=1
+uv run scripts/fetch_model_assets.py
+```
+
+Detached invocation used in this session after the foreground path was
+validated:
+
+```bash
+nohup /bin/zsh -lc 'export HF_HUB_DISABLE_XET=1; uv run scripts/fetch_model_assets.py' \
+  >> target/benchmarks/review4_model_asset_uv_fetch.txt 2>&1 < /dev/null &
+```
+
+Progress log:
+
+- `target/benchmarks/review4_model_asset_uv_fetch.txt`
+
+Inventory verification:
+
+- No committed verification artifact should be assumed.
+- Recompute the local inventory after the fetch finishes, for example:
+
+```bash
+find target/models -maxdepth 3 \( -type f -o -type l \) | sort
+```
+
+- For long downloads, prefer the foreground form first; if the detached run
+  stalls or exits early, inspect:
+  - `target/benchmarks/review4_model_asset_uv_fetch.txt`
 
 Recent architecture cleanup (role split + ADT/trait):
 

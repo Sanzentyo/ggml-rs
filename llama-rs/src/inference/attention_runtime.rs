@@ -216,6 +216,26 @@ fn attention_inference_with_weights_with_context(
     } else {
         None
     };
+    let q_norm_weight = if weights.q_norm_values().is_some() {
+        Some(
+            ctx.new_tensor_1d::<f32>(Length::new(config.head_dimension()))
+                .map_err(|source| {
+                    InferenceError::ggml("Context::new_f32_tensor_1d_len<Q_NORM>", source)
+                })?,
+        )
+    } else {
+        None
+    };
+    let k_norm_weight = if weights.k_norm_values().is_some() {
+        Some(
+            ctx.new_tensor_1d::<f32>(Length::new(config.head_dimension()))
+                .map_err(|source| {
+                    InferenceError::ggml("Context::new_f32_tensor_1d_len<K_NORM>", source)
+                })?,
+        )
+    } else {
+        None
+    };
 
     let mut output_projection = None;
     let bytes_per_element = std::mem::size_of::<f32>();
@@ -226,7 +246,7 @@ fn attention_inference_with_weights_with_context(
         .checked_mul(bytes_per_element)
         .ok_or(InferenceError::MemorySizeOverflow)?;
     let o_row_stride = q_row_stride;
-    let attention_scale = 1.0 / (config.head_dimension() as f32).sqrt();
+    let attention_scale = config.attention_scale();
     let rotary_applier = LlamaRotaryApplier;
 
     for head in 0..config.query_head_count() {
@@ -267,6 +287,20 @@ fn attention_inference_with_weights_with_context(
                 kv_offset,
             )
             .map_err(|source| InferenceError::ggml("Context::view_2d(V_HEAD)", source))?;
+        let q_head = apply_optional_head_rms_norm(
+            ctx,
+            &q_head,
+            q_norm_weight.as_ref(),
+            config.rms_norm_eps(),
+            "Q_HEAD",
+        )?;
+        let k_head = apply_optional_head_rms_norm(
+            ctx,
+            &k_head,
+            k_norm_weight.as_ref(),
+            config.rms_norm_eps(),
+            "K_HEAD",
+        )?;
 
         let q_head = rotary_applier.apply_single_with_sequence(
             ctx,
@@ -342,6 +376,16 @@ fn attention_inference_with_weights_with_context(
         .map_err(|source| InferenceError::ggml("Tensor::write_data_backend<W_V>", source))?;
     w_o.write_data_backend(weights.o_values())
         .map_err(|source| InferenceError::ggml("Tensor::write_data_backend<W_O>", source))?;
+    if let (Some(weight), Some(values)) = (q_norm_weight.as_ref(), weights.q_norm_values()) {
+        weight
+            .write_data_backend(values)
+            .map_err(|source| InferenceError::ggml("Tensor::write_data_backend<Q_NORM>", source))?;
+    }
+    if let (Some(weight), Some(values)) = (k_norm_weight.as_ref(), weights.k_norm_values()) {
+        weight
+            .write_data_backend(values)
+            .map_err(|source| InferenceError::ggml("Tensor::write_data_backend<K_NORM>", source))?;
+    }
     x.write_data_backend(input)
         .map_err(|source| InferenceError::ggml("Tensor::write_data_backend<X>", source))?;
 
@@ -505,6 +549,26 @@ pub(crate) fn attention_decode_proxy_with_cache_repeats_inner(
     } else {
         None
     };
+    let q_norm_weight = if weights.q_norm_values().is_some() {
+        Some(
+            ctx.new_tensor_1d::<f32>(Length::new(config.head_dimension()))
+                .map_err(|source| {
+                    InferenceError::ggml("Context::new_f32_tensor_1d_len<Q_NORM>", source)
+                })?,
+        )
+    } else {
+        None
+    };
+    let k_norm_weight = if weights.k_norm_values().is_some() {
+        Some(
+            ctx.new_tensor_1d::<f32>(Length::new(config.head_dimension()))
+                .map_err(|source| {
+                    InferenceError::ggml("Context::new_f32_tensor_1d_len<K_NORM>", source)
+                })?,
+        )
+    } else {
+        None
+    };
 
     let mut output_projection = None;
     let bytes_per_element = std::mem::size_of::<f32>();
@@ -515,7 +579,7 @@ pub(crate) fn attention_decode_proxy_with_cache_repeats_inner(
         .checked_mul(bytes_per_element)
         .ok_or(InferenceError::MemorySizeOverflow)?;
     let o_row_stride = q_row_stride;
-    let attention_scale = 1.0 / (config.head_dimension() as f32).sqrt();
+    let attention_scale = config.attention_scale();
     let rotary_applier = LlamaRotaryApplier;
 
     for head in 0..config.query_head_count() {
@@ -556,6 +620,20 @@ pub(crate) fn attention_decode_proxy_with_cache_repeats_inner(
                 kv_offset,
             )
             .map_err(|source| InferenceError::ggml("Context::view_2d(V_HEAD)", source))?;
+        let q_head = apply_optional_head_rms_norm(
+            &ctx,
+            &q_head,
+            q_norm_weight.as_ref(),
+            config.rms_norm_eps(),
+            "Q_HEAD",
+        )?;
+        let k_head = apply_optional_head_rms_norm(
+            &ctx,
+            &k_head,
+            k_norm_weight.as_ref(),
+            config.rms_norm_eps(),
+            "K_HEAD",
+        )?;
 
         let q_head = rotary_applier.apply_single_with_sequence(
             &ctx,
@@ -626,6 +704,16 @@ pub(crate) fn attention_decode_proxy_with_cache_repeats_inner(
         .map_err(|source| InferenceError::ggml("Tensor::write_data_backend<W_Q>", source))?;
     w_o.write_data_backend(weights.o_values())
         .map_err(|source| InferenceError::ggml("Tensor::write_data_backend<W_O>", source))?;
+    if let (Some(weight), Some(values)) = (q_norm_weight.as_ref(), weights.q_norm_values()) {
+        weight
+            .write_data_backend(values)
+            .map_err(|source| InferenceError::ggml("Tensor::write_data_backend<Q_NORM>", source))?;
+    }
+    if let (Some(weight), Some(values)) = (k_norm_weight.as_ref(), weights.k_norm_values()) {
+        weight
+            .write_data_backend(values)
+            .map_err(|source| InferenceError::ggml("Tensor::write_data_backend<K_NORM>", source))?;
+    }
     x_q.write_data_backend(query_input)
         .map_err(|source| InferenceError::ggml("Tensor::write_data_backend<X_Q>", source))?;
     k.write_data_backend(&cache.projected_k_values)
@@ -694,6 +782,30 @@ pub(crate) fn build_causal_mask_values(
     let mut values = vec![0.0_f32; query_length * key_value_length];
     fill_causal_mask_values(&mut values, query_length, key_value_length, past_tokens);
     values
+}
+
+fn apply_optional_head_rms_norm<'ctx>(
+    ctx: &'ctx Context,
+    tensor: &ggml_rs::Tensor<'ctx>,
+    weight: Option<&ggml_rs::Tensor<'ctx>>,
+    eps: f32,
+    label: &'static str,
+) -> Result<ggml_rs::Tensor<'ctx>, InferenceError> {
+    let Some(weight) = weight else {
+        return Ok(*tensor);
+    };
+    let normalized = ctx
+        .rms_norm(tensor, eps)
+        .map_err(|source| InferenceError::ggml("Context::rms_norm(head)", source))?;
+    let repeated_weight = ctx
+        .repeat(weight, &normalized)
+        .map_err(|source| InferenceError::ggml("Context::repeat(head_norm_weight)", source))?;
+    ctx.mul(&normalized, &repeated_weight)
+        .map_err(|source| match label {
+            "Q_HEAD" => InferenceError::ggml("Context::mul(Q_HEAD_NORM)", source),
+            "K_HEAD" => InferenceError::ggml("Context::mul(K_HEAD_NORM)", source),
+            _ => InferenceError::ggml("Context::mul(HEAD_NORM)", source),
+        })
 }
 
 pub(crate) fn fill_causal_mask_values(

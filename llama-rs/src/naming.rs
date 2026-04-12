@@ -10,6 +10,8 @@ use std::fmt;
 pub struct LlamaLayerTensorNames {
     pub layer: usize,
     pub attn_norm: String,
+    pub attn_q_norm: Option<String>,
+    pub attn_k_norm: Option<String>,
     pub attn_q: String,
     pub attn_k: String,
     pub attn_v: String,
@@ -215,6 +217,14 @@ fn resolve_layer(
             format!("model.layers.{layer}.self_attn.q_proj.weight"),
         ],
     )?;
+    let attn_q_norm = resolve_optional_layer(
+        names,
+        vec![
+            format!("blk.{layer}.attn_q_norm.weight"),
+            format!("layers.{layer}.attention.q_norm.weight"),
+            format!("model.layers.{layer}.self_attn.q_norm.weight"),
+        ],
+    );
     let attn_k = resolve_required_layer(
         names,
         layer,
@@ -225,6 +235,14 @@ fn resolve_layer(
             format!("model.layers.{layer}.self_attn.k_proj.weight"),
         ],
     )?;
+    let attn_k_norm = resolve_optional_layer(
+        names,
+        vec![
+            format!("blk.{layer}.attn_k_norm.weight"),
+            format!("layers.{layer}.attention.k_norm.weight"),
+            format!("model.layers.{layer}.self_attn.k_norm.weight"),
+        ],
+    );
     let attn_v = resolve_required_layer(
         names,
         layer,
@@ -291,6 +309,8 @@ fn resolve_layer(
     Ok(LlamaLayerTensorNames {
         layer,
         attn_norm,
+        attn_q_norm,
+        attn_k_norm,
         attn_q,
         attn_k,
         attn_v,
@@ -342,6 +362,10 @@ fn resolve_required_layer(
     })
 }
 
+fn resolve_optional_layer(names: &HashSet<&str>, candidates: Vec<String>) -> Option<String> {
+    resolve_first(names, &candidates)
+}
+
 fn resolve_first(names: &HashSet<&str>, candidates: &[String]) -> Option<String> {
     candidates
         .iter()
@@ -378,6 +402,7 @@ mod tests {
         assert_eq!(resolved.token_embedding, "token_embd.weight");
         assert_eq!(resolved.layers.len(), 1);
         assert_eq!(resolved.layers[0].layer, 0);
+        assert_eq!(resolved.layers[0].attn_q_norm, None);
         assert_eq!(resolved.layers[0].ffn_gate, "blk.0.ffn_gate.weight");
     }
 
@@ -388,6 +413,8 @@ mod tests {
             "model.norm.weight",
             "model.lm_head.weight",
             "model.layers.3.input_layernorm.weight",
+            "model.layers.3.self_attn.q_norm.weight",
+            "model.layers.3.self_attn.k_norm.weight",
             "model.layers.3.self_attn.q_proj.weight",
             "model.layers.3.self_attn.k_proj.weight",
             "model.layers.3.self_attn.v_proj.weight",
@@ -404,6 +431,14 @@ mod tests {
         assert_eq!(resolved.output_norm, "model.norm.weight");
         assert_eq!(resolved.layers.len(), 1);
         assert_eq!(resolved.layers[0].layer, 3);
+        assert_eq!(
+            resolved.layers[0].attn_q_norm.as_deref(),
+            Some("model.layers.3.self_attn.q_norm.weight")
+        );
+        assert_eq!(
+            resolved.layers[0].attn_k_norm.as_deref(),
+            Some("model.layers.3.self_attn.k_norm.weight")
+        );
     }
 
     #[test]

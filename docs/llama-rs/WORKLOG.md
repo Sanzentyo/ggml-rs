@@ -30,11 +30,26 @@ Detailed logs live under `docs/llama-rs/worklog/`.
 | 2026-03-13 | `docs/llama-rs/worklog/2026-03-13-migration-log.md` | Backend bring-up, GGUF/model foundations, metadata-first resolver hardening, attention ADT migration, benchmark harness expansion, CPU/Metal runtime verification |
 | 2026-03-15 | `docs/llama-rs/worklog/2026-03-15-migration-log.md` | Stepwise optimization loop continuation, review2 cleanup, generic host-I/O refactor, dependency-management alignment, recent hotspot A/B passes |
 | 2026-03-18 | `docs/llama-rs/worklog/2026-03-18-e2e-inference-comparison.md` | True-E2E status, tokenizer completion, mixed-layer fallback runtime verification on CPU/Metal |
+| 2026-04-12 | `docs/llama-rs/worklog/2026-04-12-qwen3-parity-followup.md` | Qwen3 parity follow-up: q/k head norms, metadata-driven RMS epsilon/attention scale, RoPE original-context threading |
 
 ## Latest status snapshot
 
 - `ggml` is now managed as a submodule at `vendor/ggml`.
 - `llama.cpp` remains an external comparison reference (not an in-repo dependency); repro steps are documented in `docs/llama-rs/KNOWLEDGE_BASE.md`.
+- Latest Qwen3 true-E2E parity follow-up is implemented in code:
+  - optional `attn_q_norm` / `attn_k_norm` tensors are now resolved and applied,
+  - GGUF `attention.layer_norm_rms_epsilon`, `attention.scale`, and `rope.scaling.original_context_length` are now threaded into runtime config,
+  - full local validation (`fmt` / `test` / `clippy -D warnings`) passed,
+  - local comparison helpers are now prepared at `/tmp/llama.cpp/build/bin`,
+  - canonical model bootstrap is now documented as `uv run scripts/fetch_model_assets.py`,
+  - strict runtime parity rerun is now complete for Qwen3 on CPU/MTL0:
+    - prompt `"Hello"` matched at `[82]`,
+    - prompt `"Hello "` also now matches at `[17]`,
+    - evidence: `target/benchmarks/review4_e2e_parity_harness_qwen3_8b_cpu_metal_v4_{hello,hello_space}.txt`.
+  - parity tooling now also accepts explicit `--prompt-tokens`, which unblocked strict llama.cpp comparison for non-text-tokenizer cases:
+    - ELYZA prompt `[1]` exposes an upstream backend split (`llama.cpp`: CPU `[1811]`, MTL0 `[29295]`; `llama-rs`: CPU/MTL0 `[29295]`),
+    - Minitron prompt `[1]` is now fixed by metadata-derived projection head width support (`attention.key_length=128`) and matches on CPU/MTL0 at `[726]`.
+    - Qwen3.5 prompt `[1]` now reaches strict full-layer execution (`attention_layers=32`, `mlp_only_layers=0`) via qwen35-specific full-attention + linear-delta planning, but still mismatches (`llama-rs [198]` vs `llama.cpp [5328]` on CPU/MTL0).
 - Recent stepwise checks (ELYZA/Qwen3.5 layer sweeps) were captured with checksum parity preserved (`0.0` deltas).
 - User-requested 6-model balanced `mask_host_elide` sweep on current lock completed:
   - aggregate `on/base`: CPU `~1.001`, MTL0 `~1.004`, overall `~1.002`;
@@ -217,9 +232,15 @@ Detailed logs live under `docs/llama-rs/worklog/`.
   - API/config: `E2eGenerationConfig::with_mixed_layer_policy`,
   - CLI: `--mixed-layer-policy {strict|skip-unsupported-attention}` in `e2e_generate_tokens`.
 - Runtime verification for `Qwen3.5-4B-Q4_K_M.gguf`:
-  - strict mode remains blocked at layer-role resolution (`MissingLayerTensor attn_q` at layer `0`),
-  - fallback mode now executes on both CPU/MTL0 with matched generated token IDs (`[220]`),
-  - current fallback execution shape: `attention_layers=0`, `mlp_only_layers=32`,
+  - fallback mode executes on both CPU/MTL0 with matched generated token IDs (`[220]`),
+  - fallback execution shape remains: `attention_layers=0`, `mlp_only_layers=32`,
+  - strict mode is no longer blocked at `MissingLayerTensor attn_q`,
+  - current strict artifact:
+    - `target/benchmarks/review4_e2e_parity_harness_qwen35_cpu_metal_v2_prompt1.txt`
+  - strict execution shape is now: `attention_layers=32`, `mlp_only_layers=0`,
+  - current strict result on prompt `[1]`:
+    - CPU/MTL0 `llama-rs [198]` vs `llama.cpp [5328]`,
+  - blocker has moved from tensor-role resolution to qwen35 block math parity,
   - evidence:
     - `target/benchmarks/review4_e2e_mixed_block_qwen35_cpu_metal.txt`.
 - Updated E2E comparison report to reflect tokenizer completion + mixed-layer fallback status:
