@@ -1263,18 +1263,21 @@ fn qwen35_full_attention_inference(
 
     let mut q_values = vec![0.0_f32; checked_mul(sequence_length, query_features)?];
     let mut q_gate = vec![0.0_f32; checked_mul(sequence_length, query_features)?];
+    let q_full_len = q_full.len();
+    let half_len = q_full_len / 2;
+    let hd = attention.head_dimension;
     for token in 0..sequence_length {
-        let q_full_offset = checked_mul(token, checked_mul(query_features, 2)?)?;
-        let q_offset = checked_mul(token, query_features)?;
-        for head in 0..attention.head_count {
-            let src_head_offset =
-                q_full_offset + checked_mul(head, checked_mul(attention.head_dimension, 2)?)?;
-            let dst_head_offset = q_offset + checked_mul(head, attention.head_dimension)?;
-            let mid = src_head_offset + attention.head_dimension;
-            q_values[dst_head_offset..dst_head_offset + attention.head_dimension]
-                .copy_from_slice(&q_full[src_head_offset..mid]);
-            q_gate[dst_head_offset..dst_head_offset + attention.head_dimension]
-                .copy_from_slice(&q_full[mid..mid + attention.head_dimension]);
+        let token_q_start = token * half_len;
+        let token_gate_start = token_q_start + half_len;
+        let dst_token_base = token * query_features;
+        for dim in 0..hd {
+            for head in 0..attention.head_count {
+                let src_q_pos = token_q_start + dim * attention.head_count + head;
+                let src_gate_pos = token_gate_start + dim * attention.head_count + head;
+                let dst_pos = dst_token_base + head * hd + dim;
+                q_values[dst_pos] = q_full[src_q_pos];
+                q_gate[dst_pos] = q_full[src_gate_pos];
+            }
         }
     }
 
