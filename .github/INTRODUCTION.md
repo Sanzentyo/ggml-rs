@@ -48,9 +48,13 @@ And you should write rusty code(ADT, enum, type state pattern)
 
 ## Current parity investigation status
 
-- **Qwen3.5 strict parity: ACHIEVED** (single-token AND multi-token).
+- **Qwen3.5 strict parity: ACHIEVED** (single-token AND multi-token, up to 5-token prompts).
   - Single-token: prompt `[1]`, `max_new_tokens=1` → both produce `[5328]`.
-  - Multi-token: prompt `[3]`, `max_new_tokens=3` → both produce `[1088, 35790, 90]`.
+  - Multi-token (single prompt): prompt `[3]`, `max_new_tokens=5` → both produce `[1088, 35790, 90, 16, 14728]`.
+  - Multi-token (3 prompt tokens): prompt `[1,2,3]`, `max_new_tokens=5` → both produce `[31, 2, 5, 1, 271]`.
+  - Multi-token (5 prompt tokens): prompt `[1,2,3,4,5]`, `max_new_tokens=5` → both produce `[6, 24218, 10, 4838, 1665]`.
+  - Known precision edge: prompt `[5]` diverges at token 5 only (23 vs 24 — adjacent logits,
+    numerical precision difference, not a systematic bug).
   - Bug 1 (linear attention): Head-group mapping used `head / repeat_factor` (interleaved),
     while llama.cpp's `ggml_repeat_4d` tiles block-by-block. Fixed to `head % group_count`.
   - Bug 2 (full attention): Q/gate split treated ggml's interleaved layout

@@ -419,6 +419,133 @@ mod tests {
         assert!(ComputeStatus::is_success(ComputeStatus::Success as i32));
         assert!(!ComputeStatus::is_success(-1));
     }
+
+    #[test]
+    fn unknown_negative_raw_roundtrips() {
+        let ty = Type::from_raw(-1);
+        assert!(ty.is_unknown());
+        assert_eq!(ty.as_raw(), -1);
+
+        let ty2 = Type::from_raw(i32::MIN);
+        assert!(ty2.is_unknown());
+        assert_eq!(ty2.as_raw(), i32::MIN);
+    }
+
+    #[test]
+    fn unknown_equality_by_raw_value() {
+        assert_eq!(Type::Unknown(9999), Type::Unknown(9999));
+        assert_ne!(Type::Unknown(9999), Type::Unknown(9998));
+        assert_ne!(Type::Unknown(0), Type::F32); // raw 0 is F32, but Unknown(0) ≠ F32
+    }
+
+    #[test]
+    fn all_float_types_classified() {
+        let floats = [Type::F32, Type::F16, Type::BF16, Type::F64];
+        for ty in floats {
+            assert!(ty.is_float(), "{ty:?} should be float");
+            assert!(!ty.is_integer(), "{ty:?} should not be integer");
+            assert!(!ty.is_quantized(), "{ty:?} should not be quantized");
+            assert!(!ty.is_unknown(), "{ty:?} should not be unknown");
+        }
+    }
+
+    #[test]
+    fn all_integer_types_classified() {
+        let ints = [Type::I8, Type::I16, Type::I32, Type::I64];
+        for ty in ints {
+            assert!(ty.is_integer(), "{ty:?} should be integer");
+            assert!(!ty.is_float(), "{ty:?} should not be float");
+            assert!(!ty.is_quantized(), "{ty:?} should not be quantized");
+            assert!(!ty.is_unknown(), "{ty:?} should not be unknown");
+        }
+    }
+
+    #[test]
+    fn all_quantized_types_classified() {
+        let quants = [
+            Type::Q4_0,
+            Type::Q4_1,
+            Type::Q5_0,
+            Type::Q5_1,
+            Type::Q8_0,
+            Type::Q8_1,
+            Type::Q2K,
+            Type::Q3K,
+            Type::Q4K,
+            Type::Q5K,
+            Type::Q6K,
+            Type::Q8K,
+            Type::IQ2XXS,
+            Type::IQ2XS,
+            Type::IQ3XXS,
+            Type::IQ1S,
+            Type::IQ4NL,
+            Type::IQ3S,
+            Type::IQ2S,
+            Type::IQ4XS,
+            Type::IQ1M,
+            Type::TQ1_0,
+            Type::TQ2_0,
+            Type::MXFP4,
+        ];
+        for ty in quants {
+            assert!(ty.is_quantized(), "{ty:?} should be quantized");
+            assert!(!ty.is_float(), "{ty:?} should not be float");
+            assert!(!ty.is_integer(), "{ty:?} should not be integer");
+            assert!(!ty.is_unknown(), "{ty:?} should not be unknown");
+        }
+    }
+
+    #[test]
+    fn unknown_classification_all_false() {
+        let ty = Type::Unknown(12345);
+        assert!(!ty.is_float());
+        assert!(!ty.is_integer());
+        assert!(!ty.is_quantized());
+        assert!(ty.is_unknown());
+    }
+
+    #[test]
+    fn every_known_variant_is_exactly_one_category() {
+        for raw in 0..ffi::GGML_TYPE_COUNT {
+            let ty = Type::from_raw(raw);
+            if ty.is_unknown() {
+                continue;
+            }
+            let categories = [ty.is_float(), ty.is_integer(), ty.is_quantized()];
+            let active = categories.iter().filter(|&&b| b).count();
+            assert_eq!(
+                active, 1,
+                "{ty:?} (raw={raw}) should belong to exactly 1 category, got {active}"
+            );
+        }
+    }
+
+    #[test]
+    fn debug_format_known_vs_unknown() {
+        assert_eq!(format!("{:?}", Type::F32), "Type::F32");
+        assert_eq!(format!("{:?}", Type::Q4K), "Type::Q4K");
+        assert_eq!(format!("{:?}", Type::Unknown(42)), "Type::Unknown(42)");
+    }
+
+    #[test]
+    fn type_of_maps_rust_scalars() {
+        assert_eq!(Type::of::<f32>(), Type::F32);
+        assert_eq!(Type::of::<i32>(), Type::I32);
+    }
+
+    #[test]
+    fn hash_consistency() {
+        use std::collections::HashSet;
+        let mut set = HashSet::new();
+        set.insert(Type::F32);
+        set.insert(Type::F32);
+        assert_eq!(set.len(), 1);
+
+        set.insert(Type::Unknown(999));
+        set.insert(Type::Unknown(999));
+        assert_eq!(set.len(), 2);
+    }
 }
 
 #[derive(Debug, Clone, Copy)]

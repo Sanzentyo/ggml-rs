@@ -29,7 +29,7 @@ Baseline readiness check:
 | passkey | Not started | No | No |  |
 | retrieval | Not started | No | No |  |
 | save-load-state | Not started | No | No |  |
-| simple | In progress | Yes | Yes | `simple` + `min_infer_linear` + `min_infer_mlp` + `min_infer_mlp_layer` + `min_infer_attention_layer` まで拡張。name resolver + metadata resolver 連携で layer index 実行を自動化（`FullMetadata` / `TensorHeuristic` を可視化）。attention は ADT 化（layout/mask/rope）し multi-head + causal(CPU) 経路を追加。**Qwen3.5 E2E parity 達成**: single-token `[5328]` + multi-token `[1088, 35790, 90]` match。NeoX RoPE, causal depthwise conv, delta-net recurrence, Q/gate split 全て実装・検証済み。autoregressive decode は未実装（prefill only）|
+| simple | In progress | Yes | Yes | `simple` + `min_infer_linear` + `min_infer_mlp` + `min_infer_mlp_layer` + `min_infer_attention_layer` まで拡張。name resolver + metadata resolver 連携で layer index 実行を自動化（`FullMetadata` / `TensorHeuristic` を可視化）。attention は ADT 化（layout/mask/rope）し multi-head + causal(CPU) 経路を追加。**Qwen3.5 E2E parity 達成**: single-token `[5328]`, multi-token 5生成 `[1088,35790,90,16,14728]`, 3-prompt+5-gen `[31,2,5,1,271]`, 5-prompt+5-gen `[6,24218,10,4838,1665]` 全 match。精度限界: prompt `[5]` の token 5 のみ diverge (23 vs 24, adjacent logits)。NeoX RoPE, causal depthwise conv, delta-net recurrence, Q/gate split 全て実装・検証済み。autoregressive decode は未実装（prefill only）|
 | simple-chat | Not started | No | No |  |
 | speculative | Not started | No | No |  |
 | speculative-simple | Not started | No | No |  |

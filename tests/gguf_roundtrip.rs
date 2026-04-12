@@ -1,4 +1,5 @@
 #![cfg(feature = "link-system")]
+#![allow(clippy::approx_constant)]
 
 use ggml_rs::{Context, GgufArrayValue, GgufFile, GgufValue, GgufWriter, Length, TryFromGgufValue};
 use std::path::PathBuf;

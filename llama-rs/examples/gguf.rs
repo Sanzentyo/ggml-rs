@@ -191,7 +191,7 @@ fn expected_kv_entries() -> Vec<(String, GgufValue)> {
         ),
         (
             "some.parameter.arr.f32".to_owned(),
-            GgufValue::Array(GgufArrayValue::F32(vec![3.145, 2.718, 1.414])),
+            GgufValue::Array(GgufArrayValue::F32(vec![3.145, 2.719, 1.414])),
         ),
         (
             "some.parameter.arr.str".to_owned(),
@@ -220,7 +220,7 @@ fn write_fixture(path: &str) -> Result<(), Box<dyn StdError>> {
 
     let tensors = build_fixture_tensors(&ctx)?;
     for tensor in &tensors {
-        writer.add_tensor(tensor);
+        writer.add_typed_tensor(tensor);
     }
     writer.write_data_to_file(path)?;
 
@@ -292,7 +292,7 @@ fn read_fixture_data(path: &str, policy: ReadCheckPolicy) -> Result<(), Box<dyn 
     Ok(())
 }
 
-fn build_fixture_tensors<'ctx>(ctx: &'ctx Context) -> ggml_rs::Result<Vec<Tensor<'ctx>>> {
+fn build_fixture_tensors<'ctx>(ctx: &'ctx Context) -> ggml_rs::Result<Vec<Tensor<'ctx, f32>>> {
     let mut rng = Lcg::new(RNG_SEED);
     let mut tensors = Vec::with_capacity(TEST_TENSOR_COUNT);
 
@@ -321,7 +321,7 @@ fn build_fixture_tensors<'ctx>(ctx: &'ctx Context) -> ggml_rs::Result<Vec<Tensor
     Ok(tensors)
 }
 
-fn fill_named_tensor(tensor: Tensor<'_>, name: &str, fill: f32) -> ggml_rs::Result<()> {
+fn fill_named_tensor(tensor: Tensor<'_, f32>, name: &str, fill: f32) -> ggml_rs::Result<()> {
     tensor.set_name(name)?;
     let values = vec![fill; tensor.element_count()?];
     tensor.write_data(&values)

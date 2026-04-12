@@ -1020,6 +1020,8 @@ fn resolve_block_mlp_weights_for_layer(
     let names = LlamaLayerTensorNames {
         layer,
         attn_norm: String::new(),
+        attn_q_norm: None,
+        attn_k_norm: None,
         attn_q: String::new(),
         attn_k: String::new(),
         attn_v: String::new(),

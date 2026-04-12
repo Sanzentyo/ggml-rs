@@ -1,4 +1,5 @@
 #![cfg(feature = "link-system")]
+#![allow(clippy::approx_constant)]
 
 //! Error path and boundary tests: validates that all Error variants are
 //! reachable through the public API under the expected conditions.
@@ -123,7 +124,8 @@ fn length_mismatch_write_data() {
 fn unsupported_type_decode_tensor_data_to() {
     // GGML_TYPE_COUNT or any large invalid type ID should fail
     let payload = vec![0u8; 16];
-    let err = decode_tensor_data_to::<f32>(9999, &payload).expect_err("invalid type should error");
+    let err = decode_tensor_data_to::<f32>(Type::Unknown(9999), &payload)
+        .expect_err("invalid type should error");
     assert!(matches!(err, Error::UnsupportedType(9999)));
 }
 
@@ -233,7 +235,7 @@ fn unexpected_tensor_byte_size_decode() {
     // decode_tensor_data_to with a payload whose byte size is not a multiple
     // of the type size triggers UnexpectedTensorByteSize
     let payload = vec![0u8; 3]; // 3 bytes is not a multiple of f32's 4 bytes
-    let err = decode_tensor_data_to::<f32>(Type::F32 as i32, &payload)
+    let err = decode_tensor_data_to::<f32>(Type::F32, &payload)
         .expect_err("misaligned payload should error");
     assert!(matches!(err, Error::UnexpectedTensorByteSize { .. }));
 }
