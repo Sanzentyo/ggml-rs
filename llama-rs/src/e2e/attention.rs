@@ -702,24 +702,31 @@ fn deinterleave_q_gate(
     Ok((q_values, q_gate))
 }
 
+/// NeoX-style RoPE configuration shared across Q and K rotations.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct RopeParams {
+    /// Number of dimensions to rotate (must be even, ≤ head_dimension).
+    pub n_rot: usize,
+    /// Base frequency for position encoding (e.g. 10000.0).
+    pub freq_base: f32,
+    /// Frequency scaling factor (typically 1.0).
+    pub freq_scale: f32,
+    /// Position offset for decode (0 for prefill, prompt_len for decode).
+    pub position_offset: usize,
+}
+
 /// Apply NeoX-style rotary position embedding in-place.
 ///
-/// For each token at position `position_offset + pos`, rotates dimension pairs
+/// For each token at position `rope.position_offset + pos`, rotates dimension pairs
 /// `(x[k], x[k + n_rot/2])` for `k` in `0..n_rot/2` using angle
 /// `theta_k = pos * freq_base^(-2k / n_rot)`.
 /// Dimensions beyond `n_rot` are left unchanged.
-///
-/// `position_offset` shifts the starting position (0 for prefill, prompt_len for decode).
-#[allow(clippy::too_many_arguments)]
 pub(super) fn apply_neox_rope_in_place(
     values: &mut [f32],
     sequence_length: usize,
     head_count: usize,
     head_dimension: usize,
-    n_rot: usize,
-    freq_base: f32,
-    freq_scale: f32,
-    position_offset: usize,
+    rope: &RopeParams,
 ) -> Result<(), E2eError> {
     let total_features = checked_mul(head_count, head_dimension)?;
     let expected_len = checked_mul(sequence_length, total_features)?;
@@ -729,19 +736,19 @@ pub(super) fn apply_neox_rope_in_place(
             actual: values.len(),
         });
     }
-    debug_assert!(n_rot <= head_dimension && n_rot.is_multiple_of(2));
+    debug_assert!(rope.n_rot <= head_dimension && rope.n_rot.is_multiple_of(2));
 
-    let half_rot = n_rot / 2;
-    let theta_scale = freq_base.powf(-2.0 / n_rot as f32);
+    let half_rot = rope.n_rot / 2;
+    let theta_scale = rope.freq_base.powf(-2.0 / rope.n_rot as f32);
 
     let cache_size = checked_mul(sequence_length, half_rot)?;
     let mut cos_cache = vec![0.0_f32; cache_size];
     let mut sin_cache = vec![0.0_f32; cache_size];
     for pos in 0..sequence_length {
-        let mut theta = (position_offset + pos) as f32;
+        let mut theta = (rope.position_offset + pos) as f32;
         for k in 0..half_rot {
             let cache_idx = pos * half_rot + k;
-            let angle = theta * freq_scale;
+            let angle = theta * rope.freq_scale;
             cos_cache[cache_idx] = angle.cos();
             sin_cache[cache_idx] = angle.sin();
             theta *= theta_scale;
@@ -1258,26 +1265,26 @@ pub(super) fn full_attention_decode_core(
 
     let hd = attention.head_dimension;
 
-    let position_offset = state.token_count();
+    let rope = RopeParams {
+        n_rot: attention.rope_n_dims,
+        freq_base: attention.rope_freq_base,
+        freq_scale: attention.rope_freq_scale,
+        position_offset: state.token_count(),
+    };
+
     apply_neox_rope_in_place(
         &mut q_values,
         1,
         attention.head_count,
         attention.head_dimension,
-        attention.rope_n_dims,
-        attention.rope_freq_base,
-        attention.rope_freq_scale,
-        position_offset,
+        &rope,
     )?;
     apply_neox_rope_in_place(
         &mut k_values,
         1,
         attention.kv_head_count,
         attention.head_dimension,
-        attention.rope_n_dims,
-        attention.rope_freq_base,
-        attention.rope_freq_scale,
-        position_offset,
+        &rope,
     )?;
 
     state.append_batch(&k_values, &v_proj, 1)?;
@@ -1411,7 +1418,19 @@ mod tests {
     fn rope_identity_at_position_zero() {
         let mut values = vec![1.0, 2.0, 3.0, 4.0];
         let original = values.clone();
-        apply_neox_rope_in_place(&mut values, 1, 1, 4, 4, 10000.0, 1.0, 0).unwrap();
+        apply_neox_rope_in_place(
+            &mut values,
+            1,
+            1,
+            4,
+            &RopeParams {
+                n_rot: 4,
+                freq_base: 10000.0,
+                freq_scale: 1.0,
+                position_offset: 0,
+            },
+        )
+        .unwrap();
         for (a, b) in values.iter().zip(original.iter()) {
             assert!((a - b).abs() < 1e-6, "expected {b}, got {a}");
         }
@@ -1420,7 +1439,19 @@ mod tests {
     #[test]
     fn rope_rotates_at_nonzero_position() {
         let mut values = vec![1.0, 2.0, 3.0, 4.0, 1.0, 0.0, 0.0, 0.0];
-        apply_neox_rope_in_place(&mut values, 2, 1, 4, 4, 1.0, 1.0, 0).unwrap();
+        apply_neox_rope_in_place(
+            &mut values,
+            2,
+            1,
+            4,
+            &RopeParams {
+                n_rot: 4,
+                freq_base: 1.0,
+                freq_scale: 1.0,
+                position_offset: 0,
+            },
+        )
+        .unwrap();
 
         assert!((values[0] - 1.0).abs() < 1e-6);
         assert!((values[1] - 2.0).abs() < 1e-6);
@@ -1448,7 +1479,19 @@ mod tests {
         let mut values = [
             1.0_f32, 2.0, 3.0, 4.0, 99.0, 88.0, 1.0, 2.0, 3.0, 4.0, 99.0, 88.0,
         ];
-        apply_neox_rope_in_place(&mut values, 2, 1, 6, 4, 10000.0, 1.0, 0).unwrap();
+        apply_neox_rope_in_place(
+            &mut values,
+            2,
+            1,
+            6,
+            &RopeParams {
+                n_rot: 4,
+                freq_base: 10000.0,
+                freq_scale: 1.0,
+                position_offset: 0,
+            },
+        )
+        .unwrap();
         assert!((values[4] - 99.0).abs() < 1e-6);
         assert!((values[5] - 88.0).abs() < 1e-6);
         assert!((values[10] - 99.0).abs() < 1e-6);
@@ -1460,7 +1503,19 @@ mod tests {
         let mut buf = [
             0.0_f32, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0,
         ];
-        apply_neox_rope_in_place(&mut buf, 2, 2, 4, 4, 1.0, 1.0, 0).unwrap();
+        apply_neox_rope_in_place(
+            &mut buf,
+            2,
+            2,
+            4,
+            &RopeParams {
+                n_rot: 4,
+                freq_base: 1.0,
+                freq_scale: 1.0,
+                position_offset: 0,
+            },
+        )
+        .unwrap();
         assert_eq!(&buf[8..12], &buf[12..16]);
     }
 
@@ -1472,10 +1527,34 @@ mod tests {
         batch[2 * 4 + 1] = 2.0;
         batch[2 * 4 + 2] = 3.0;
         batch[2 * 4 + 3] = 4.0;
-        apply_neox_rope_in_place(&mut batch, 3, 1, 4, 4, 10000.0, 1.0, 0).unwrap();
+        apply_neox_rope_in_place(
+            &mut batch,
+            3,
+            1,
+            4,
+            &RopeParams {
+                n_rot: 4,
+                freq_base: 10000.0,
+                freq_scale: 1.0,
+                position_offset: 0,
+            },
+        )
+        .unwrap();
 
         let mut single = vec![1.0, 2.0, 3.0, 4.0];
-        apply_neox_rope_in_place(&mut single, 1, 1, 4, 4, 10000.0, 1.0, 2).unwrap();
+        apply_neox_rope_in_place(
+            &mut single,
+            1,
+            1,
+            4,
+            &RopeParams {
+                n_rot: 4,
+                freq_base: 10000.0,
+                freq_scale: 1.0,
+                position_offset: 2,
+            },
+        )
+        .unwrap();
 
         for (i, (a, b)) in single.iter().zip(&batch[8..12]).enumerate() {
             assert!((a - b).abs() < 1e-6, "dim {i}: offset={a} vs batch={b}");
