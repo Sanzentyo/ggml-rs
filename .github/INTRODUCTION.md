@@ -119,6 +119,12 @@ And you should write rusty code(ADT, enum, type state pattern)
   extracted to `tensor_ops.rs`. Backend threaded through all attention functions.
   Parity test confirms host vs graph output matches within 1e-5. 192 tests pass.
 
+- **Example directory reorganization**: All examples reorganized from flat layouts
+  into categorized subdirectories (basics/, backends/, benchmarks/, models/ for root
+  crate; basics/, benchmarks/, gguf/, inference/, models/, applications/ for llama-rs).
+  Added missing `save_load_state` and `simple_chat` Cargo.toml entries. All 192 tests
+  pass. File history preserved via `git mv`.
+
 ## Validation checkpoints completed on this branch
 
 - `cargo fmt --all`
