@@ -262,6 +262,12 @@ And you should write rusty code(ADT, enum, type state pattern)
   at T=4000 across 8 FA layers). Uses `view_4d_of` cross-context views for
   ephemeral scoring graphs. Three-level fallback: persistent GPU → ephemeral
   GPU → host scoring. See comparison doc item 26.
+- **Causal depthwise conv vs QKV packing comparison** (item 27):
+  Detailed architectural analysis of how Qwen3.5's two attention types
+  (full + linear) differ in projection storage, convolution handling,
+  state management, and GPU offloading. Covers separate vs unified QKV,
+  Q+gate interleaving, sliding window buffer, fused projection+conv graph,
+  and `ggml_ssm_conv` primitive usage. See comparison doc item 27.
 
 ## Validation checkpoints completed on this branch
 

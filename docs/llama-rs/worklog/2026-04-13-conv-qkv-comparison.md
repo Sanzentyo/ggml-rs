@@ -1556,4 +1556,294 @@ determined by `inputs.total_sequence_length`, not a hardcoded constant.
 - **Item 22** (KV transfer analysis): Identified the bottleneck this solves
 - **Item 25** (cross-context view API): Foundation for `decode_scoring_gpu_persistent`
 - **Item 27** (next): causal_depthwise_conv vs QKV packing comparison
+
+---
+
+## 27. Causal Depthwise Conv vs QKV Packing: Architecture Comparison
+
+This item is the comparison this worklog was originally scoped for — a
+detailed analysis of how the two attention types in Qwen3.5 handle
+projection, convolution, and state management, and how llama-rs's approach
+relates to the ggml primitives.
+
+### 27.1 Two Attention Types in Qwen3.5
+
+Qwen3.5 interleaves two fundamentally different attention mechanisms:
+
+| Property | Full Attention (FA) | Linear Attention (LA) |
+|----------|--------------------|-----------------------|
+| Plan struct | `Qwen35FullAttentionLayerPlan` | `Qwen35LinearAttentionLayerPlan` |
+| Mechanism | Softmax QKV attention | Delta-net SSM recurrence |
+| Complexity (inference) | O(T²·D) per layer | O(T·D·S) per layer |
+| Complexity (decode) | O(T·D) per step | O(D·S²) per step |
+| KV cache | Quadratic (grows with T) | Constant (SSM state) |
+| Uses convolution | No | Yes (causal depthwise) |
+| Position encoding | NeoX RoPE | None (implicit via SSM) |
+
+### 27.2 QKV Weight Storage: Separate vs Unified
+
+**Full Attention — Separate matrices:**
+```
+plan.q_weight_values: [hidden × query_features×2]   // Q + gate interleaved
+plan.k_weight_values: [hidden × kv_features]
+plan.v_weight_values: [hidden × kv_features]
+```
+
+Three independent `mul_mat` ops (batched in one graph):
+```
+Q_full = W_q · X    → [query_features×2 × seq_len]
+K      = W_k · X    → [kv_features × seq_len]
+V      = W_v · X    → [kv_features × seq_len]
+```
+
+**Linear Attention — Unified matrix:**
+```
+plan.qkv_weight_values: [hidden × conv_channels]
+plan.gate_weight_values: [hidden × inner_size]
+plan.alpha_weight_values: [hidden × time_step_rank]
+plan.beta_weight_values: [hidden × time_step_rank]
+```
+
+Where `conv_channels = inner_size + 2 × group_count × state_size` — Q, K, V
+are packed into a single projection, split *after* convolution.
+
+**Design rationale:** In linear attention, Q/K/V pass through a shared causal
+conv before they diverge. Projecting into a single vector and convolving once
+is cheaper than three separate projections + three convolutions.
+
+### 27.3 Full Attention Q+Gate Interleaving
+
+Qwen3.5 full attention adds a **gating mechanism** where Q and its gate are
+interleaved per-head in the weight matrix output:
+
+```
+W_q projection output layout (per token):
+  [Q_h0_d0..Q_h0_dD, G_h0_d0..G_h0_dD,   ← head 0: Q then gate
+   Q_h1_d0..Q_h1_dD, G_h1_d0..G_h1_dD,   ← head 1: Q then gate
+   ...]
+```
+
+`deinterleave_q_gate` (attention.rs:570-605) separates these into two flat
+buffers:
+```rust
+q_dst[head*hd..(head+1)*hd] = src[head*2*hd .. head*2*hd + hd]     // Q
+g_dst[head*hd..(head+1)*hd] = src[head*2*hd + hd .. (head+1)*2*hd] // gate
+```
+
+The gate is applied after attention scoring: `output = sigmoid(gate) ⊙ attn`.
+
+**llama.cpp comparison:** llama.cpp typically stores Q and gate as separate
+weight tensors (or splits a fused QKV tensor at tensor-load time). llama-rs
+stores a single `query_features×2` matrix and splits on host after projection —
+this avoids duplicating the hidden→query matmul but adds a strided copy.
+
+### 27.4 Linear Attention: Post-Conv QKV Split
+
+After the unified QKV projection passes through causal depthwise convolution
+and SiLU activation, the output is split:
+
+```
+conv_output[t, :] = [Q₀..Q_{qk-1}, K₀..K_{qk-1}, V₀..V_{inner-1}]
+                     ├─ qk_features ─┤├─ qk_features ─┤├─ inner_size ─┤
+```
+
+`split_and_norm_qk` (linear_attention.rs:451-487):
+```rust
+q_dst.copy_from_slice(&conv_row[..qk_features]);
+k_dst.copy_from_slice(&conv_row[qk_features..qk_features * 2]);
+// V = conv_row[2*qk_features .. conv_channels] (used in-place)
+```
+
+**Normalization difference:**
+- Full attention: **RMS norm** per-head on Q and K (pre-RoPE)
+- Linear attention: **L2 norm** per-group on Q and K (post-conv)
+
+### 27.5 Causal Depthwise Convolution: Three Implementations
+
+llama-rs implements causal depthwise conv at three levels:
+
+#### (a) Host reference (prefill): `causal_depthwise_conv`
+
+```rust
+fn causal_depthwise_conv(
+    input: &[f32],          // [seq_len × channels]
+    sequence_length, channels, kernel_size,
+    weight: &[f32],         // [channels × kernel_size]
+) -> Vec<f32>
+```
+
+Triple nested loop: token → channel → tap. Causal constraint: `start_tap =
+kernel_size - min(kernel_size, t+1)` ensures token `t` only reads
+`[max(0, t-K+1), ..., t]`.
+
+#### (b) Graph-accelerated (prefill): `ggml_ssm_conv`
+
+Uses the GGML `ssm_conv` primitive. Requires pre-processing:
+
+1. **Transpose** input from `[seq_len, channels]` (channels-fast) to
+   `[channels, padded_len]` (time-fast)
+2. **Left-pad** with `kernel_size - 1` zeros per channel (causal mask)
+3. **Reshape** to 3D: `[padded_len, channels, 1]` for `ggml_ssm_conv`
+
+```rust
+let conv_out = ctx.ssm_conv(&sx, &c)?;   // [channels, seq_len, 1]
+let result = ctx.silu(&conv_out)?;
+```
+
+**ggml_ssm_conv contract** (ggml.c:5430-5454):
+- `sx`: `[d_conv-1+n_t, d_inner, n_s]` — pre-padded input
+- `c`: `[d_conv, d_inner]` — per-channel kernel weights
+- Output: `[d_inner, n_t, n_s]` — channels-fast, no padding
+
+#### (c) Decode step (single token): `causal_depthwise_conv_decode_step`
+
+```rust
+fn causal_depthwise_conv_decode_step(
+    new_row: &[f32],         // [conv_channels] — current token
+    state: &mut LinearAttentionState,
+    weight: &[f32],          // [channels × kernel_size]
+) -> Vec<f32>
+```
+
+Uses sliding window buffer (`state.conv_buffer`) storing last `kernel_size-1`
+pre-conv QKV rows. O(channels × kernel_size) per step.
+
+### 27.6 Conv State: Sliding Window Buffer
+
+```rust
+pub struct LinearAttentionState {
+    pub conv_buffer: Vec<f32>,   // [(kernel_size-1) × conv_channels]
+    pub conv_valid: usize,       // actual filled rows (< kernel_size-1 for short seqs)
+    pub conv_channels: usize,
+    pub conv_kernel: usize,
+    // + ssm_states for recurrence
+}
+```
+
+**Lifecycle:**
+1. **Prefill** → `capture_conv_buffer`: copies last `kernel_size-1` rows of
+   raw QKV (pre-conv) from the fused graph's output
+2. **Decode** → `push_conv_row`: appends new token, shifts left when full
+3. **Decode conv** → reads from buffer + current token, applies kernel
+
+**Key design:** The buffer stores **pre-convolution** QKV. Post-conv values
+cannot be reversed, so the raw projection output must be preserved for the
+sliding window.
+
+### 27.7 Prefill: Fused Graph vs Separate Round-Trips
+
+**Full attention prefill** (two round-trips):
+```
+Graph 1: matmul(W_q, X), matmul(W_k, X), matmul(W_v, X) → read back Q,K,V
+Host: deinterleave_q_gate, per_head_rms_norm, RoPE, KV cache append
+Graph 2: flash_attn_ext(Q, K, V) → read back attention output
+Host: sigmoid(gate) ⊙ attn → output projection
+```
+
+**Linear attention prefill** (one round-trip for projection+conv):
+```
+Graph 1 (fused): 
+  norm(X) → matmul(W_qkv, X), matmul(W_z, X), matmul(W_α, X), matmul(W_β, X)
+  → transpose(QKV) → left_pad → ssm_conv(padded, kernel) → silu
+  → read back conv_output, z, alpha, beta, pre_conv_qkv
+Host: split Q/K/V, L2 norm, SSM recurrence loop, z-gating
+Host: capture_conv_buffer, capture_ssm_states
+```
+
+The fused graph eliminates the host↔device round-trip between projection and
+convolution — a key advantage of using `ggml_ssm_conv` as a native graph op.
+
+### 27.8 Decode: Host-Heavy vs GPU-Heavy
+
+**Full attention decode** (persistent GPU):
+```
+GPU: persistent projection matmuls (O(hidden×features))
+Host: deinterleave, RMS norm, RoPE
+GPU: persistent KV append (O(D×Hkv))
+GPU: flash_attn_ext via cross-context views (O(T) on-device)
+GPU: output projection
+```
+
+**Linear attention decode** (host-dominated):
+```
+GPU: 4 small projection matmuls (O(hidden×features))
+Host: causal_depthwise_conv_decode_step (O(channels×kernel_size))
+Host: split_and_norm_qk (O(qk_features))
+Host: SSM recurrence loop (O(time_step_rank × state_size²))
+GPU: output projection (O(inner_size×hidden))
+```
+
+Full attention decode has been progressively offloaded to GPU (items 21, 26).
+Linear attention decode remains host-dominated because:
+1. Conv is O(channels×K) — tiny, not worth a kernel launch
+2. SSM recurrence is inherently sequential (state-dependent)
+3. Only the projection matmuls and output projection benefit from GPU
+
+### 27.9 Memory Layout Comparison
+
+| Layout | Full Attention | Linear Attention |
+|--------|---------------|-----------------|
+| Input | `[hidden × seq_len]` channels-fast | Same |
+| Q projection | `[query_features×2 × seq_len]` | Packed in `[conv_channels × seq_len]` |
+| K projection | `[kv_features × seq_len]` | Packed in same QKV |
+| V projection | `[kv_features × seq_len]` | Packed in same QKV |
+| Conv input | N/A | `[channels × padded_len]` time-fast |
+| Conv weight | N/A | `[channels × kernel_size]` channel-major |
+| KV cache | `[D × Hkv × T]` grows with T | Constant SSM state `[time_step_rank × state_size²]` |
+
+The layout transpose (channels-fast → time-fast) is required because
+`ggml_ssm_conv` expects time-fast layout for efficient sliding-window
+convolution.
+
+### 27.10 ggml Primitive Usage Summary
+
+| ggml Op | Full Attention | Linear Attention |
+|---------|---------------|-----------------|
+| `mul_mat` | Q,K,V projection; output proj | QKV,Z,α,β projection; output proj |
+| `flash_attn_ext` | Scoring (Q·K+softmax+V) | Not used |
+| `ssm_conv` | Not used | Prefill conv (fused graph) |
+| `silu` | Not used | Post-conv activation (graph) |
+| `permute` | K/V layout for flash_attn | QKV transpose (in fused graph) |
+| `cont` | After permute | After transpose |
+| `view_4d_of` | Persistent KV cache views | Not used |
+| `sigmoid` | Gate activation (scoring graph) | Not used |
+| `rms_norm` | Fused graph pre-norm | Fused graph pre-norm |
+
+### 27.11 Key Architectural Differences from llama.cpp
+
+| Aspect | llama-rs | llama.cpp |
+|--------|---------|-----------|
+| QKV storage | Separate W_q(+gate), W_k, W_v (FA); Unified W_qkv (LA) | Loaded from GGUF as-is (separate or packed per model) |
+| Q+gate split | Host-side `deinterleave_q_gate` per-head | Typically tensor-level split at load time |
+| Conv weight layout | `[channels × kernel_size]` channel-major | `[d_conv × d_inner]` — same via `ggml_ssm_conv` |
+| Conv in decode | Host-side sliding window | Graph-level or host, implementation-dependent |
+| Prefill conv | Fused projection+conv graph | Similar (graph-level `ggml_ssm_conv`) |
+| KV cache | Dual host+GPU persistent | Typically GPU-only KV cache |
+| Scoring | `flash_attn_ext` (same) | `flash_attn_ext` or custom attention |
+| Norm per head | Host `per_head_rms_norm` / `per_head_l2_norm` | Often graph-level norm |
+
+### 27.12 Performance Characteristics
+
+**Full Attention:**
+- Prefill: GPU-bound (matmuls dominate, O(T²·D))
+- Decode bottleneck was KV transfer (O(T) per step) — **solved by item 26**
+- Now bottleneck shifts to flash_attn_ext compute time (O(T·D))
+
+**Linear Attention:**
+- Prefill: GPU-bound (fused projection+conv graph)
+- Decode: CPU-bound (SSM recurrence is O(time_step_rank × state_size²))
+- Conv is negligible (O(channels × kernel_size) ≈ O(4K × 4) = 16K flops)
+- Potential future offload: batch multiple decode steps for GPU SSM
+
+### 27.13 Files Referenced
+
+| File | Content |
+|------|---------|
+| `llama-rs/src/e2e/attention.rs` | Full attention: projections, deinterleave, RoPE, scoring |
+| `llama-rs/src/e2e/linear_attention.rs` | Linear attention: conv, SSM recurrence, fused graph |
+| `llama-rs/src/e2e/state.rs` | Both: KV cache (`Qwen35FullAttentionState`), conv buffer (`LinearAttentionState`) |
+| `llama-rs/src/e2e/plan.rs` | Plan structs defining dimensions and weights |
+| `llama-rs/src/e2e/generation.rs` | Dispatch: persistent projections, persistent KV cache |
+| `vendor/ggml/src/ggml.c` | `ggml_ssm_conv` definition (L5430-5454) |
+| `vendor/ggml/src/ggml-cpu/ops.cpp` | CPU `ssm_conv` kernel (L9191-9259) |
 - `DecodeStrategy` preserved as reference implementation for `full_reprocess_loop`
