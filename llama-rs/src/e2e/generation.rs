@@ -125,12 +125,20 @@ impl AttentionStrategy for InferenceStrategy {
                     )
                 })
             }
-            AttentionLayerPlan::Qwen35Full(attn) => {
-                qwen35_full_attention_inference(attn, normalized_input, seq_len, rms_norm_eps)
-            }
-            AttentionLayerPlan::Qwen35Linear(attn) => {
-                qwen35_linear_attention_inference(attn, normalized_input, seq_len, rms_norm_eps)
-            }
+            AttentionLayerPlan::Qwen35Full(attn) => qwen35_full_attention_inference(
+                attn,
+                normalized_input,
+                seq_len,
+                rms_norm_eps,
+                backend,
+            ),
+            AttentionLayerPlan::Qwen35Linear(attn) => qwen35_linear_attention_inference(
+                attn,
+                normalized_input,
+                seq_len,
+                rms_norm_eps,
+                backend,
+            ),
         }
     }
 }
@@ -148,14 +156,28 @@ impl AttentionStrategy for PrefillStrategy<'_> {
         normalized_input: &[f32],
         seq_len: usize,
         rms_norm_eps: f32,
-        _backend: &Backend,
+        backend: &Backend,
     ) -> Result<Vec<f32>, E2eError> {
         match (attention, &mut self.state.layers[layer_idx]) {
             (AttentionLayerPlan::Qwen35Full(attn), LayerAttentionState::Qwen35Full(s)) => {
-                qwen35_full_attention_prefill(attn, normalized_input, seq_len, rms_norm_eps, s)
+                qwen35_full_attention_prefill(
+                    attn,
+                    normalized_input,
+                    seq_len,
+                    rms_norm_eps,
+                    s,
+                    backend,
+                )
             }
             (AttentionLayerPlan::Qwen35Linear(attn), LayerAttentionState::Qwen35Linear(s)) => {
-                qwen35_linear_attention_prefill(attn, normalized_input, seq_len, rms_norm_eps, s)
+                qwen35_linear_attention_prefill(
+                    attn,
+                    normalized_input,
+                    seq_len,
+                    rms_norm_eps,
+                    s,
+                    backend,
+                )
             }
             _ => Err(E2eError::UnsupportedTwoPhase),
         }

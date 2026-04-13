@@ -7,15 +7,27 @@ use super::error::E2eError;
 use super::numeric::{checked_mul, dot, sigmoid_scalar, softmax_prefix};
 use super::plan::Qwen35FullAttentionLayerPlan;
 use super::state::Qwen35FullAttentionState;
-use super::tensor_ops::{head_slice, head_slice_mut, per_head_rms_norm, project_sequence};
+use super::tensor_ops::{
+    PROJECTION_SLACK_BYTES, head_slice, head_slice_mut, per_head_rms_norm, project_sequence,
+    project_sequence_graph,
+};
+use ggml_rs::{Backend, Bytes, Context, Shape2D};
 
 pub(super) fn qwen35_full_attention_inference(
     attention: &Qwen35FullAttentionLayerPlan,
     input: &[f32],
     sequence_length: usize,
     rms_norm_eps: f32,
+    backend: &Backend,
 ) -> Result<Vec<f32>, E2eError> {
-    qwen35_full_attention_core(attention, input, sequence_length, rms_norm_eps, None)
+    qwen35_full_attention_core(
+        attention,
+        input,
+        sequence_length,
+        rms_norm_eps,
+        None,
+        backend,
+    )
 }
 
 /// Prefill variant: computes full attention AND stores post-RoPE K + raw V in `state`.
@@ -25,8 +37,16 @@ pub(super) fn qwen35_full_attention_prefill(
     sequence_length: usize,
     rms_norm_eps: f32,
     state: &mut Qwen35FullAttentionState,
+    backend: &Backend,
 ) -> Result<Vec<f32>, E2eError> {
-    qwen35_full_attention_core(attention, input, sequence_length, rms_norm_eps, Some(state))
+    qwen35_full_attention_core(
+        attention,
+        input,
+        sequence_length,
+        rms_norm_eps,
+        Some(state),
+        backend,
+    )
 }
 
 /// Projected and normalized Q, K, V + gate vectors (pre-RoPE).
@@ -39,13 +59,135 @@ struct PreparedAttention {
     query_features: usize,
 }
 
+/// Estimate the backend memory needed for attention QKV projections.
+///
+/// Sums the memory for three independent matmuls (Q, K, V) sharing the same
+/// input tensor, plus a slack constant for graph/tensor overhead.
+fn recommended_qkv_projection_memory(
+    hidden_features: usize,
+    query_features_x2: usize,
+    kv_features: usize,
+    sequence_length: usize,
+) -> Result<Bytes, E2eError> {
+    let q_mem = Context::recommended_backend_matmul_memory::<f32>(
+        Shape2D::new(hidden_features, query_features_x2),
+        Shape2D::new(hidden_features, sequence_length),
+    )
+    .map_err(|source| E2eError::ggml("recommended_backend_matmul_memory(Q)", source))?;
+    let k_mem = Context::recommended_backend_matmul_memory::<f32>(
+        Shape2D::new(hidden_features, kv_features),
+        Shape2D::new(hidden_features, sequence_length),
+    )
+    .map_err(|source| E2eError::ggml("recommended_backend_matmul_memory(K)", source))?;
+    let v_mem = Context::recommended_backend_matmul_memory::<f32>(
+        Shape2D::new(hidden_features, kv_features),
+        Shape2D::new(hidden_features, sequence_length),
+    )
+    .map_err(|source| E2eError::ggml("recommended_backend_matmul_memory(V)", source))?;
+    let total = q_mem
+        .get()
+        .checked_add(k_mem.get())
+        .and_then(|v| v.checked_add(v_mem.get()))
+        .and_then(|v| v.checked_add(PROJECTION_SLACK_BYTES))
+        .ok_or(E2eError::MemorySizeOverflow)?;
+    Ok(Bytes::new(total))
+}
+
+/// Compute Q, K, V projections using a single ggml compute graph.
+///
+/// Batches three `mul_mat` operations sharing the same input tensor into one
+/// graph execution. Returns `(q_full, k_proj, v_proj)` as host vectors.
+fn project_qkv_graph(
+    input: &[f32],
+    sequence_length: usize,
+    hidden_features: usize,
+    query_features_x2: usize,
+    kv_features: usize,
+    q_weights: &[f32],
+    k_weights: &[f32],
+    v_weights: &[f32],
+    backend: &Backend,
+) -> Result<(Vec<f32>, Vec<f32>, Vec<f32>), E2eError> {
+    let ctx_size = recommended_qkv_projection_memory(
+        hidden_features,
+        query_features_x2,
+        kv_features,
+        sequence_length,
+    )?;
+    let ctx = Context::new_no_alloc_bytes(ctx_size)
+        .map_err(|source| E2eError::ggml("Context::new_no_alloc_bytes(QKV)", source))?;
+
+    let w_q = ctx
+        .new_tensor_2d::<f32>(Shape2D::new(hidden_features, query_features_x2))
+        .map_err(|source| E2eError::ggml("new_tensor_2d<W_Q>", source))?;
+    let w_k = ctx
+        .new_tensor_2d::<f32>(Shape2D::new(hidden_features, kv_features))
+        .map_err(|source| E2eError::ggml("new_tensor_2d<W_K>", source))?;
+    let w_v = ctx
+        .new_tensor_2d::<f32>(Shape2D::new(hidden_features, kv_features))
+        .map_err(|source| E2eError::ggml("new_tensor_2d<W_V>", source))?;
+    let x = ctx
+        .new_tensor_2d::<f32>(Shape2D::new(hidden_features, sequence_length))
+        .map_err(|source| E2eError::ggml("new_tensor_2d<X>", source))?;
+
+    let q_out = ctx
+        .mul_mat(&w_q, &x)
+        .map_err(|source| E2eError::ggml("mul_mat(Q)", source))?;
+    let k_out = ctx
+        .mul_mat(&w_k, &x)
+        .map_err(|source| E2eError::ggml("mul_mat(K)", source))?;
+    let v_out = ctx
+        .mul_mat(&w_v, &x)
+        .map_err(|source| E2eError::ggml("mul_mat(V)", source))?;
+
+    let mut graph = ctx
+        .new_graph()
+        .map_err(|source| E2eError::ggml("new_graph(QKV)", source))?;
+    graph.build_forward_expand(&q_out);
+    graph.build_forward_expand(&k_out);
+    graph.build_forward_expand(&v_out);
+
+    let _buffer = ctx
+        .allocate_tensors(backend)
+        .map_err(|source| E2eError::ggml("allocate_tensors(QKV)", source))?;
+
+    w_q.write_data_backend(q_weights)
+        .map_err(|source| E2eError::ggml("write_data_backend<W_Q>", source))?;
+    w_k.write_data_backend(k_weights)
+        .map_err(|source| E2eError::ggml("write_data_backend<W_K>", source))?;
+    w_v.write_data_backend(v_weights)
+        .map_err(|source| E2eError::ggml("write_data_backend<W_V>", source))?;
+    x.write_data_backend(input)
+        .map_err(|source| E2eError::ggml("write_data_backend<X>", source))?;
+
+    backend
+        .compute(&mut graph)
+        .map_err(|source| E2eError::ggml("compute(QKV)", source))?;
+
+    let q_full = q_out
+        .read_data_backend()
+        .map_err(|source| E2eError::ggml("read_data_backend<Q>", source))?;
+    let k_proj = k_out
+        .read_data_backend()
+        .map_err(|source| E2eError::ggml("read_data_backend<K>", source))?;
+    let v_proj = v_out
+        .read_data_backend()
+        .map_err(|source| E2eError::ggml("read_data_backend<V>", source))?;
+    Ok((q_full, k_proj, v_proj))
+}
+
 /// Shared projection + deinterleave + per-head RMS norm for both core and
 /// decode paths. The caller applies RoPE with its own position_offset.
+///
+/// When `backend` is `Some`, uses ggml compute graphs for projections
+/// (prefill/inference path). When `None`, falls back to host-side scalar
+/// dot products (decode path, where graph overhead exceeds benefit).
 fn project_and_prepare_qkv(
     attention: &Qwen35FullAttentionLayerPlan,
     input: &[f32],
     sequence_length: usize,
     rms_norm_eps: f32,
+    backend: Option<&Backend>,
 ) -> Result<PreparedAttention, E2eError> {
     let total_output_elements = attention
         .head_count
@@ -71,27 +213,44 @@ fn project_and_prepare_qkv(
 
     let query_features = checked_mul(attention.head_count, attention.head_dimension)?;
     let kv_features = checked_mul(attention.kv_head_count, attention.head_dimension)?;
-    let q_full = project_sequence(
-        input,
-        sequence_length,
-        hidden_features,
-        checked_mul(query_features, 2)?,
-        &attention.q_weight_values,
-    )?;
-    let k_proj = project_sequence(
-        input,
-        sequence_length,
-        hidden_features,
-        kv_features,
-        &attention.k_weight_values,
-    )?;
-    let v_proj = project_sequence(
-        input,
-        sequence_length,
-        hidden_features,
-        kv_features,
-        &attention.v_weight_values,
-    )?;
+    let query_features_x2 = checked_mul(query_features, 2)?;
+
+    let (q_full, k_proj, v_proj) = if let Some(backend) = backend {
+        project_qkv_graph(
+            input,
+            sequence_length,
+            hidden_features,
+            query_features_x2,
+            kv_features,
+            &attention.q_weight_values,
+            &attention.k_weight_values,
+            &attention.v_weight_values,
+            backend,
+        )?
+    } else {
+        let q_full = project_sequence(
+            input,
+            sequence_length,
+            hidden_features,
+            query_features_x2,
+            &attention.q_weight_values,
+        )?;
+        let k_proj = project_sequence(
+            input,
+            sequence_length,
+            hidden_features,
+            kv_features,
+            &attention.k_weight_values,
+        )?;
+        let v_proj = project_sequence(
+            input,
+            sequence_length,
+            hidden_features,
+            kv_features,
+            &attention.v_weight_values,
+        )?;
+        (q_full, k_proj, v_proj)
+    };
 
     let (q_values, q_gate) = deinterleave_q_gate(
         &q_full,
@@ -133,6 +292,7 @@ fn qwen35_full_attention_core(
     sequence_length: usize,
     rms_norm_eps: f32,
     state: Option<&mut Qwen35FullAttentionState>,
+    backend: &Backend,
 ) -> Result<Vec<f32>, E2eError> {
     let PreparedAttention {
         mut q_values,
@@ -141,7 +301,13 @@ fn qwen35_full_attention_core(
         q_gate,
         hidden_features,
         query_features,
-    } = project_and_prepare_qkv(attention, input, sequence_length, rms_norm_eps)?;
+    } = project_and_prepare_qkv(
+        attention,
+        input,
+        sequence_length,
+        rms_norm_eps,
+        Some(backend),
+    )?;
 
     // Apply NeoX-style RoPE to Q and K after normalization.
     apply_neox_rope_in_place(
@@ -226,12 +392,13 @@ fn qwen35_full_attention_core(
         }
     }
 
-    project_sequence(
+    project_sequence_graph(
         &head_outputs,
         sequence_length,
         query_features,
         hidden_features,
         &attention.output_weight_values,
+        backend,
     )
 }
 
@@ -361,7 +528,7 @@ pub(super) fn qwen35_full_attention_decode_step(
         q_gate,
         hidden_features,
         query_features,
-    } = project_and_prepare_qkv(attention, input, 1, rms_norm_eps)?;
+    } = project_and_prepare_qkv(attention, input, 1, rms_norm_eps, None)?;
 
     let hd = attention.head_dimension;
 
@@ -575,15 +742,20 @@ mod tests {
         let prompt: Vec<f32> = (0..3 * hidden).map(|i| (i as f32 + 1.0) * 0.1).collect();
         let new_token: Vec<f32> = (0..hidden).map(|i| (i as f32 + 50.0) * 0.05).collect();
 
+        crate::backend::ensure_backends_loaded();
+        let backend =
+            Backend::new(ggml_rs::BackendKind::Cpu).expect("CPU backend should be available");
+
         // Full reprocess: 4 tokens at once.
         let full_input: Vec<f32> = prompt.iter().chain(new_token.iter()).copied().collect();
-        let full_output = qwen35_full_attention_inference(&plan, &full_input, 4, 1e-5).unwrap();
+        let full_output =
+            qwen35_full_attention_inference(&plan, &full_input, 4, 1e-5, &backend).unwrap();
         let expected = &full_output[3 * hidden..4 * hidden];
 
         // Prefill 3 tokens, then decode 1.
         let mut state = Qwen35FullAttentionState::new(4, kv_head_count, hd).unwrap();
         let _prefill_out =
-            qwen35_full_attention_prefill(&plan, &prompt, 3, 1e-5, &mut state).unwrap();
+            qwen35_full_attention_prefill(&plan, &prompt, 3, 1e-5, &mut state, &backend).unwrap();
         let decode_out =
             qwen35_full_attention_decode_step(&plan, &new_token, 1e-5, &mut state).unwrap();
 

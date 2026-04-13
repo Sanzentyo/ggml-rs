@@ -109,6 +109,16 @@ And you should write rusty code(ADT, enum, type state pattern)
   paths, and OOB rejection. Enables future graph-level zero-copy QKV splits
   in llama-rs.
 
+- **Graph-level attention projections** (full + linear attention):
+  Replaced host-side scalar dot-product projections (`project_sequence`) with
+  ggml `mul_mat` compute graphs for prefill/inference paths in both full and
+  linear attention. Full attention batches 3 matmuls (Q, K, V) in a single graph;
+  linear attention batches 4 (QKV, gate, alpha, beta). Output projections also
+  use graph path. Decode (seq_len=1) stays on host-side to avoid graph overhead.
+  Shared `project_sequence_graph` and `recommended_single_projection_memory`
+  extracted to `tensor_ops.rs`. Backend threaded through all attention functions.
+  Parity test confirms host vs graph output matches within 1e-5. 192 tests pass.
+
 ## Validation checkpoints completed on this branch
 
 - `cargo fmt --all`

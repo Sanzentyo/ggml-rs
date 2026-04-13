@@ -184,6 +184,11 @@ llama-rs uses explicit `copy_from_slice`.
    element count, bounds). Existing `view_1d`/`view_2d`/`reshape_2d`/`reshape_3d`
    also gained validation. Graph-level zero-copy QKV splits are now feasible
    as a follow-up optimization.
+   **Update 2**: Graph-level projections implemented. Full attention uses a single
+   ggml graph with 3 `mul_mat` ops (Q, K, V); linear attention uses 4 (QKV, Z,
+   alpha, beta). Output projections also use graph path. Decode (seq_len=1)
+   stays host-side. Shared `project_sequence_graph` extracted to `tensor_ops.rs`.
+   Parity test confirms host vs graph output matches within 1e-5.
 7. **Multi-layer orchestration verified**: `generation.rs` extracted a
    `GenerationMode` enum (`Auto | FullReprocess | TwoPhase`) and a
    `generate_from_plans` helper.  Integration test

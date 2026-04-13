@@ -1,5 +1,9 @@
 use super::error::E2eError;
 use super::numeric::checked_mul;
+use ggml_rs::{Backend, Bytes, Context, Shape2D};
+
+/// Slack constant added to memory estimates for ggml graph/tensor overhead.
+pub(super) const PROJECTION_SLACK_BYTES: usize = 4 * 1024 * 1024;
 
 pub(super) fn rms_norm_with_weight(
     input: &[f32],
@@ -208,6 +212,74 @@ pub(super) fn gather_embeddings(
     Ok(output)
 }
 
+/// Estimate the backend memory needed for a single matmul projection.
+pub(super) fn recommended_single_projection_memory(
+    input_features: usize,
+    output_features: usize,
+    sequence_length: usize,
+) -> Result<Bytes, E2eError> {
+    let mem = Context::recommended_backend_matmul_memory::<f32>(
+        Shape2D::new(input_features, output_features),
+        Shape2D::new(input_features, sequence_length),
+    )
+    .map_err(|source| E2eError::ggml("recommended_backend_matmul_memory(single)", source))?;
+    let total = mem
+        .get()
+        .checked_add(PROJECTION_SLACK_BYTES)
+        .ok_or(E2eError::MemorySizeOverflow)?;
+    Ok(Bytes::new(total))
+}
+
+/// Compute a single matmul projection using a ggml compute graph.
+///
+/// General-purpose replacement for `project_sequence` when a backend is
+/// available.  Used for output projections in both full and linear attention.
+pub(super) fn project_sequence_graph(
+    input: &[f32],
+    sequence_length: usize,
+    input_features: usize,
+    output_features: usize,
+    weight: &[f32],
+    backend: &Backend,
+) -> Result<Vec<f32>, E2eError> {
+    let ctx_size =
+        recommended_single_projection_memory(input_features, output_features, sequence_length)?;
+    let ctx = Context::new_no_alloc_bytes(ctx_size)
+        .map_err(|source| E2eError::ggml("Context::new_no_alloc_bytes(proj)", source))?;
+
+    let w = ctx
+        .new_tensor_2d::<f32>(Shape2D::new(input_features, output_features))
+        .map_err(|source| E2eError::ggml("new_tensor_2d<W>", source))?;
+    let x = ctx
+        .new_tensor_2d::<f32>(Shape2D::new(input_features, sequence_length))
+        .map_err(|source| E2eError::ggml("new_tensor_2d<X>", source))?;
+
+    let y = ctx
+        .mul_mat(&w, &x)
+        .map_err(|source| E2eError::ggml("mul_mat(proj)", source))?;
+
+    let mut graph = ctx
+        .new_graph()
+        .map_err(|source| E2eError::ggml("new_graph(proj)", source))?;
+    graph.build_forward_expand(&y);
+
+    let _buffer = ctx
+        .allocate_tensors(backend)
+        .map_err(|source| E2eError::ggml("allocate_tensors(proj)", source))?;
+
+    w.write_data_backend(weight)
+        .map_err(|source| E2eError::ggml("write_data_backend<W>", source))?;
+    x.write_data_backend(input)
+        .map_err(|source| E2eError::ggml("write_data_backend<X>", source))?;
+
+    backend
+        .compute(&mut graph)
+        .map_err(|source| E2eError::ggml("compute(proj)", source))?;
+
+    y.read_data_backend()
+        .map_err(|source| E2eError::ggml("read_data_backend<Y>", source))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -233,5 +305,48 @@ mod tests {
         let loose = rms_norm_with_weight(&input, 2, 1, &weight, 1e-5).expect("rms norm");
         let tight = rms_norm_with_weight(&input, 2, 1, &weight, 1e-6).expect("rms norm");
         assert_ne!(loose, tight);
+    }
+
+    #[test]
+    fn project_sequence_graph_matches_host_projection() {
+        use crate::backend::ensure_backends_loaded;
+        use ggml_rs::BackendKind;
+
+        let input_features = 8_usize;
+        let output_features = 4_usize;
+        let seq_len = 3_usize;
+
+        let weight: Vec<f32> = (0..output_features * input_features)
+            .map(|i| ((i % 7) as f32 - 3.0) * 0.1)
+            .collect();
+        let input: Vec<f32> = (0..seq_len * input_features)
+            .map(|i| (i as f32 + 1.0) * 0.05)
+            .collect();
+
+        let host_result =
+            project_sequence(&input, seq_len, input_features, output_features, &weight)
+                .expect("host projection");
+
+        ensure_backends_loaded();
+        let backend = Backend::new(BackendKind::Cpu).expect("CPU backend");
+
+        let graph_result = project_sequence_graph(
+            &input,
+            seq_len,
+            input_features,
+            output_features,
+            &weight,
+            &backend,
+        )
+        .expect("graph projection");
+
+        assert_eq!(host_result.len(), graph_result.len());
+        for (i, (h, g)) in host_result.iter().zip(graph_result.iter()).enumerate() {
+            assert!(
+                (h - g).abs() < 1e-5,
+                "element {i}: host={h} vs graph={g}, diff={}",
+                (h - g).abs()
+            );
+        }
     }
 }

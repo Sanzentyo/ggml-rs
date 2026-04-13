@@ -9,16 +9,26 @@ use super::numeric::{checked_mul, sigmoid_scalar, silu_scalar, softplus_scalar};
 use super::plan::Qwen35LinearAttentionLayerPlan;
 use super::state::LinearAttentionState;
 use super::tensor_ops::{
-    head_slice, head_slice_mut, per_head_l2_norm, project_sequence, rms_norm_single,
+    PROJECTION_SLACK_BYTES, head_slice, head_slice_mut, per_head_l2_norm, project_sequence,
+    project_sequence_graph, rms_norm_single,
 };
+use ggml_rs::{Backend, Bytes, Context, Shape2D};
 
 pub(super) fn qwen35_linear_attention_inference(
     attention: &Qwen35LinearAttentionLayerPlan,
     input: &[f32],
     sequence_length: usize,
     rms_norm_eps: f32,
+    backend: &Backend,
 ) -> Result<Vec<f32>, E2eError> {
-    qwen35_linear_attention_core(attention, input, sequence_length, rms_norm_eps, None)
+    qwen35_linear_attention_core(
+        attention,
+        input,
+        sequence_length,
+        rms_norm_eps,
+        None,
+        backend,
+    )
 }
 
 /// Prefill variant: runs the full sequence AND captures conv buffer + SSM states.
@@ -28,8 +38,16 @@ pub(super) fn qwen35_linear_attention_prefill(
     sequence_length: usize,
     rms_norm_eps: f32,
     state: &mut LinearAttentionState,
+    backend: &Backend,
 ) -> Result<Vec<f32>, E2eError> {
-    qwen35_linear_attention_core(attention, input, sequence_length, rms_norm_eps, Some(state))
+    qwen35_linear_attention_core(
+        attention,
+        input,
+        sequence_length,
+        rms_norm_eps,
+        Some(state),
+        backend,
+    )
 }
 
 /// Shared input projections for both core and decode paths.
@@ -42,12 +60,165 @@ struct LinearProjections {
     hidden_features: usize,
 }
 
+/// Estimate the backend memory needed for 4 linear-attention input projections.
+///
+/// Sums estimates for QKV, gate(Z), alpha, and beta matmuls sharing the same
+/// input tensor, plus slack for graph overhead.
+fn recommended_linear_projection_memory(
+    hidden_features: usize,
+    conv_channels: usize,
+    inner_size: usize,
+    time_step_rank: usize,
+    sequence_length: usize,
+) -> Result<Bytes, E2eError> {
+    let input_shape = Shape2D::new(hidden_features, sequence_length);
+    let qkv_mem = Context::recommended_backend_matmul_memory::<f32>(
+        Shape2D::new(hidden_features, conv_channels),
+        input_shape,
+    )
+    .map_err(|source| E2eError::ggml("recommended_backend_matmul_memory(QKV)", source))?;
+    let z_mem = Context::recommended_backend_matmul_memory::<f32>(
+        Shape2D::new(hidden_features, inner_size),
+        input_shape,
+    )
+    .map_err(|source| E2eError::ggml("recommended_backend_matmul_memory(Z)", source))?;
+    let alpha_mem = Context::recommended_backend_matmul_memory::<f32>(
+        Shape2D::new(hidden_features, time_step_rank),
+        input_shape,
+    )
+    .map_err(|source| E2eError::ggml("recommended_backend_matmul_memory(alpha)", source))?;
+    let beta_mem = Context::recommended_backend_matmul_memory::<f32>(
+        Shape2D::new(hidden_features, time_step_rank),
+        input_shape,
+    )
+    .map_err(|source| E2eError::ggml("recommended_backend_matmul_memory(beta)", source))?;
+    let total = qkv_mem
+        .get()
+        .checked_add(z_mem.get())
+        .and_then(|v| v.checked_add(alpha_mem.get()))
+        .and_then(|v| v.checked_add(beta_mem.get()))
+        .and_then(|v| v.checked_add(PROJECTION_SLACK_BYTES))
+        .ok_or(E2eError::MemorySizeOverflow)?;
+    Ok(Bytes::new(total))
+}
+
+/// Compute QKV, gate, alpha, and beta projections in a single ggml graph.
+///
+/// Batches four `mul_mat` operations sharing the same input tensor.
+#[allow(clippy::too_many_arguments)]
+fn project_linear_inputs_graph(
+    attention: &Qwen35LinearAttentionLayerPlan,
+    input: &[f32],
+    sequence_length: usize,
+    hidden_features: usize,
+    conv_channels: usize,
+    backend: &Backend,
+) -> Result<LinearProjections, E2eError> {
+    let inner_size = attention.inner_size;
+    let time_step_rank = attention.time_step_rank;
+
+    let ctx_size = recommended_linear_projection_memory(
+        hidden_features,
+        conv_channels,
+        inner_size,
+        time_step_rank,
+        sequence_length,
+    )?;
+    let ctx = Context::new_no_alloc_bytes(ctx_size)
+        .map_err(|source| E2eError::ggml("Context::new_no_alloc_bytes(linear_proj)", source))?;
+
+    let w_qkv = ctx
+        .new_tensor_2d::<f32>(Shape2D::new(hidden_features, conv_channels))
+        .map_err(|source| E2eError::ggml("new_tensor_2d<W_QKV>", source))?;
+    let w_z = ctx
+        .new_tensor_2d::<f32>(Shape2D::new(hidden_features, inner_size))
+        .map_err(|source| E2eError::ggml("new_tensor_2d<W_Z>", source))?;
+    let w_alpha = ctx
+        .new_tensor_2d::<f32>(Shape2D::new(hidden_features, time_step_rank))
+        .map_err(|source| E2eError::ggml("new_tensor_2d<W_alpha>", source))?;
+    let w_beta = ctx
+        .new_tensor_2d::<f32>(Shape2D::new(hidden_features, time_step_rank))
+        .map_err(|source| E2eError::ggml("new_tensor_2d<W_beta>", source))?;
+    let x = ctx
+        .new_tensor_2d::<f32>(Shape2D::new(hidden_features, sequence_length))
+        .map_err(|source| E2eError::ggml("new_tensor_2d<X>", source))?;
+
+    let qkv_out = ctx
+        .mul_mat(&w_qkv, &x)
+        .map_err(|source| E2eError::ggml("mul_mat(QKV)", source))?;
+    let z_out = ctx
+        .mul_mat(&w_z, &x)
+        .map_err(|source| E2eError::ggml("mul_mat(Z)", source))?;
+    let alpha_out = ctx
+        .mul_mat(&w_alpha, &x)
+        .map_err(|source| E2eError::ggml("mul_mat(alpha)", source))?;
+    let beta_out = ctx
+        .mul_mat(&w_beta, &x)
+        .map_err(|source| E2eError::ggml("mul_mat(beta)", source))?;
+
+    let mut graph = ctx
+        .new_graph()
+        .map_err(|source| E2eError::ggml("new_graph(linear_proj)", source))?;
+    graph.build_forward_expand(&qkv_out);
+    graph.build_forward_expand(&z_out);
+    graph.build_forward_expand(&alpha_out);
+    graph.build_forward_expand(&beta_out);
+
+    let _buffer = ctx
+        .allocate_tensors(backend)
+        .map_err(|source| E2eError::ggml("allocate_tensors(linear_proj)", source))?;
+
+    w_qkv
+        .write_data_backend(&attention.qkv_weight_values)
+        .map_err(|source| E2eError::ggml("write_data_backend<W_QKV>", source))?;
+    w_z.write_data_backend(&attention.gate_weight_values)
+        .map_err(|source| E2eError::ggml("write_data_backend<W_Z>", source))?;
+    w_alpha
+        .write_data_backend(&attention.alpha_weight_values)
+        .map_err(|source| E2eError::ggml("write_data_backend<W_alpha>", source))?;
+    w_beta
+        .write_data_backend(&attention.beta_weight_values)
+        .map_err(|source| E2eError::ggml("write_data_backend<W_beta>", source))?;
+    x.write_data_backend(input)
+        .map_err(|source| E2eError::ggml("write_data_backend<X>", source))?;
+
+    backend
+        .compute(&mut graph)
+        .map_err(|source| E2eError::ggml("compute(linear_proj)", source))?;
+
+    let qkv = qkv_out
+        .read_data_backend()
+        .map_err(|source| E2eError::ggml("read_data_backend<QKV>", source))?;
+    let z = z_out
+        .read_data_backend()
+        .map_err(|source| E2eError::ggml("read_data_backend<Z>", source))?;
+    let alpha = alpha_out
+        .read_data_backend()
+        .map_err(|source| E2eError::ggml("read_data_backend<alpha>", source))?;
+    let beta = beta_out
+        .read_data_backend()
+        .map_err(|source| E2eError::ggml("read_data_backend<beta>", source))?;
+
+    Ok(LinearProjections {
+        qkv,
+        z,
+        alpha,
+        beta,
+        conv_channels,
+        hidden_features,
+    })
+}
+
 /// Project input through QKV, gate, alpha, and beta weights. Validates
 /// input dimensions via checked arithmetic (catches malformed weights early).
+///
+/// When `backend` is `Some`, uses a single ggml compute graph for all four
+/// projections. When `None`, falls back to host-side scalar dot products.
 fn project_linear_inputs(
     attention: &Qwen35LinearAttentionLayerPlan,
     input: &[f32],
     sequence_length: usize,
+    backend: Option<&Backend>,
 ) -> Result<LinearProjections, E2eError> {
     let hidden_features = attention
         .inner_size
@@ -74,6 +245,18 @@ fn project_linear_inputs(
 
     let conv_channels = attention.inner_size
         + checked_mul(checked_mul(attention.group_count, attention.state_size)?, 2)?;
+
+    if let Some(backend) = backend {
+        return project_linear_inputs_graph(
+            attention,
+            input,
+            sequence_length,
+            hidden_features,
+            conv_channels,
+            backend,
+        );
+    }
+
     let qkv = project_sequence(
         input,
         sequence_length,
@@ -155,12 +338,14 @@ fn split_and_norm_qk(
     Ok((q_heads, k_heads))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn qwen35_linear_attention_core(
     attention: &Qwen35LinearAttentionLayerPlan,
     input: &[f32],
     sequence_length: usize,
     rms_norm_eps: f32,
     mut state: Option<&mut LinearAttentionState>,
+    backend: &Backend,
 ) -> Result<Vec<f32>, E2eError> {
     let LinearProjections {
         qkv,
@@ -169,7 +354,7 @@ fn qwen35_linear_attention_core(
         beta,
         conv_channels,
         hidden_features,
-    } = project_linear_inputs(attention, input, sequence_length)?;
+    } = project_linear_inputs(attention, input, sequence_length, Some(backend))?;
 
     let conv = causal_depthwise_conv(
         &qkv,
@@ -303,12 +488,13 @@ fn qwen35_linear_attention_core(
         state.capture_ssm_states(&states);
     }
 
-    project_sequence(
+    project_sequence_graph(
         &output,
         sequence_length,
         attention.inner_size,
         hidden_features,
         &attention.ssm_out_weight_values,
+        backend,
     )
 }
 
@@ -500,7 +686,7 @@ pub(super) fn qwen35_linear_attention_decode_step(
         beta,
         conv_channels,
         hidden_features,
-    } = project_linear_inputs(attention, input, 1)?;
+    } = project_linear_inputs(attention, input, 1, None)?;
 
     // Conv: use buffer + new QKV row.
     let conv = causal_depthwise_conv_decode_step(&qkv, state, &attention.conv_weight_values)?;
@@ -639,7 +825,12 @@ mod tests {
         let input: Vec<f32> = (0..inner_size).map(|i| (i + 1) as f32 * 0.1).collect();
         let sequence_length = 1;
 
-        let result = qwen35_linear_attention_inference(&plan, &input, sequence_length, 1e-5);
+        crate::backend::ensure_backends_loaded();
+        let backend =
+            Backend::new(ggml_rs::BackendKind::Cpu).expect("CPU backend should be available");
+
+        let result =
+            qwen35_linear_attention_inference(&plan, &input, sequence_length, 1e-5, &backend);
         assert!(
             result.is_ok(),
             "inference should succeed: {:?}",
@@ -658,7 +849,7 @@ mod tests {
             ..plan.clone()
         };
         let bad_result =
-            qwen35_linear_attention_inference(&plan_bad, &input, sequence_length, 1e-5);
+            qwen35_linear_attention_inference(&plan_bad, &input, sequence_length, 1e-5, &backend);
         assert!(
             bad_result.is_err(),
             "should fail with indivisible group_count"
@@ -749,9 +940,14 @@ mod tests {
         let prompt: Vec<f32> = (0..3 * hidden).map(|i| (i as f32 + 1.0) * 0.02).collect();
         let new_token: Vec<f32> = (0..hidden).map(|i| (i as f32 + 100.0) * 0.01).collect();
 
+        crate::backend::ensure_backends_loaded();
+        let backend =
+            Backend::new(ggml_rs::BackendKind::Cpu).expect("CPU backend should be available");
+
         // Full reprocess: all 4 tokens at once.
         let full_input: Vec<f32> = prompt.iter().chain(new_token.iter()).copied().collect();
-        let full_output = qwen35_linear_attention_inference(&plan, &full_input, 4, 1e-5).unwrap();
+        let full_output =
+            qwen35_linear_attention_inference(&plan, &full_input, 4, 1e-5, &backend).unwrap();
         let expected = &full_output[3 * hidden..4 * hidden];
 
         // Prefill 3 tokens, then decode 1 token.
@@ -763,7 +959,7 @@ mod tests {
         )
         .unwrap();
         let _prefill_output =
-            qwen35_linear_attention_prefill(&plan, &prompt, 3, 1e-5, &mut state).unwrap();
+            qwen35_linear_attention_prefill(&plan, &prompt, 3, 1e-5, &mut state, &backend).unwrap();
         let decode_output =
             qwen35_linear_attention_decode_step(&plan, &new_token, 1e-5, &mut state).unwrap();
 
