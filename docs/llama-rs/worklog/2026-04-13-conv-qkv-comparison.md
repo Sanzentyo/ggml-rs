@@ -1416,4 +1416,144 @@ let k_prefix = graph_ctx.view_3d_of(&k_cache, d, t, hkv, nb1, nb2, 0)?;
 ```
 
 All 213 tests pass (208 existing + 5 new).
+
+---
+
+## 26. Persistent Backend-Resident KV Cache
+
+### 26.1 Problem: O(T) Per-Step KV Upload
+
+The ephemeral GPU scoring path (`decode_scoring_gpu`) uploads the **entire**
+host KV cache to the backend every decode step. Cost per step:
+
+```
+bytes = 2 × D × Hkv × T × sizeof(f32)
+      = 2 × 128 × 2 × T × 4
+      = 2048 × T bytes per FA layer
+```
+
+Across 8 full attention layers at T=1000: **~16 MB/step**.
+At T=4000 (realistic generation): **~64 MB/step** — PCIe/unified-memory
+transfer becomes the dominant bottleneck, not compute.
+
+`PersistentDecodeProjection` already solved the O(1) weight upload for
+QKV and output projections (item 21). The KV cache was the last remaining
+O(T) transfer.
+
+### 26.2 Solution: `PersistentKvCache` with Incremental Append
+
+**Architecture**: Loop-local parallel container (same pattern as
+`PersistentDecodeProjection`) — **not** embedded in `Qwen35FullAttentionState`.
+
+```
+two_phase_loop locals (drop order: LIFO, handles before contexts):
+├── kv_persistent: Option<(Vec<Option<Context>>, Vec<Option<PersistentKvCache<'static>>>)>
+├── decode_projs: Vec<Option<PersistentDecodeProjection<'static>>>
+├── _proj_ctxs: Vec<Option<Context>>
+└── state: GenerationState   (host KV cache — source of truth)
+```
+
+**Key design decisions**:
+1. Host `Vec<f32>` remains source of truth (checkpoint serialization, fallback)
+2. Backend tensors are a mirrored acceleration structure
+3. `'static` transmute follows same safety argument as `PersistentDecodeProjection`
+4. Linear attention layers get `None` slots (no quadratic KV cache)
+
+### 26.3 Per-Step Data Flow
+
+| Phase | Data transfer | Direction | Cost |
+|-------|--------------|-----------|------|
+| Prefill → seed | Full KV prefix upload | Host → Device | O(T_prompt) × once |
+| Decode step: host | `state.append_batch(k, v, 1)` | in-memory | O(D×Hkv) |
+| Decode step: device | `kv_cache.append_token(k, v, pos)` | Host → Device | O(D×Hkv) |
+| Decode step: scoring | `view_4d_of` + permute + flash_attn | Device only | O(T) on-device |
+
+**Improvement**: Host→Device transfer drops from O(T×D×Hkv) to O(D×Hkv) —
+constant per step regardless of sequence length.
+
+### 26.4 Tensor Layout
+
+```
+Persistent K/V tensors: [D, Hkv, MaxT, 1] — backend-allocated
+  D = head_dimension (128)
+  Hkv = kv_head_count (2)
+  MaxT = total_sequence_length (configurable)
+
+Per-step view: view_4d_of(tensor, D, Hkv, T, 1, nb1, nb2, nb3, offset=0)
+  nb1 = D × sizeof(f32)           stride between KV heads
+  nb2 = D × Hkv × sizeof(f32)     stride between time steps
+  nb3 = nb2 × T                    stride for dim3 (unused, dim3=1)
+```
+
+### 26.5 Scoring Path Priority
+
+`full_attention_decode_core` now has a 3-level fallback:
+
+1. **Persistent GPU** (`decode_scoring_gpu_persistent`): O(1) upload,
+   cross-context views, flash_attn_ext
+2. **Ephemeral GPU** (`decode_scoring_gpu`): O(T) upload, flash_attn_ext
+3. **Host scoring**: CPU dot-product loop (reference implementation)
+
+The `gpu_scoring_failed` flag is probe-once: first failure on either GPU
+path disables it for all subsequent steps in the same generation.
+
+### 26.6 `PersistentKvCache` API
+
+```rust
+pub(super) struct PersistentKvCache<'ctx> {
+    k_tensor: Tensor<'ctx, f32>,   // [D, Hkv, MaxT, 1] on backend
+    v_tensor: Tensor<'ctx, f32>,
+    _buffer: BackendBuffer<'ctx>,
+    kv_features: usize,            // D × Hkv
+    max_tokens: usize,
+}
+
+impl PersistentKvCache<'_> {
+    fn append_token(&self, k: &[f32], v: &[f32], pos: usize) -> Result<()>;
+    fn seed_from_host(&self, k_cache: &[f32], v_cache: &[f32], len: usize) -> Result<()>;
+}
+
+fn build_persistent_kv_cache(
+    attention: &Qwen35FullAttentionLayerPlan,
+    max_tokens: usize,
+    backend: &Backend,
+) -> Result<(Context, PersistentKvCache<'static>)>;
+```
+
+### 26.7 Integration in `generation.rs`
+
+```rust
+fn try_build_persistent_kv_caches(
+    layer_plans: &[LayerPlan], max_tokens: usize, backend: &Backend,
+) -> Option<PersistentKvCacheSets>
+```
+
+- Built after persistent projections succeed
+- Seeded from host state after prefill phase
+- Passed through `persistent_decode_all_layers` → `full_attention_decode_core`
+
+### 26.8 Memory Budget
+
+```
+Per FA layer: 2 × D(128) × Hkv(2) × MaxT × 4B
+At MaxT=4096: 2 × 128 × 2 × 4096 × 4 = 8 MB per layer
+Across 8 FA layers: ~64 MB total
+```
+
+Manageable on unified memory (M-series) and discrete GPU. The max is
+determined by `inputs.total_sequence_length`, not a hardcoded constant.
+
+### 26.9 Files Changed
+
+| File | Change |
+|------|--------|
+| `llama-rs/src/e2e/attention.rs` | `PersistentKvCache` struct, `build_persistent_kv_cache`, `decode_scoring_gpu_persistent`, `full_attention_decode_core` updated |
+| `llama-rs/src/e2e/generation.rs` | `try_build_persistent_kv_caches`, `persistent_decode_all_layers` updated, `two_phase_loop` seeding + pass-through |
+
+### 26.10 Relationship to Other Items
+
+- **Item 21** (persistent projections): Same ownership/transmute pattern
+- **Item 22** (KV transfer analysis): Identified the bottleneck this solves
+- **Item 25** (cross-context view API): Foundation for `decode_scoring_gpu_persistent`
+- **Item 27** (next): causal_depthwise_conv vs QKV packing comparison
 - `DecodeStrategy` preserved as reference implementation for `full_reprocess_loop`

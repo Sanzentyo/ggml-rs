@@ -256,6 +256,12 @@ And you should write rusty code(ADT, enum, type state pattern)
   lifetime bound replaces `'static` transmute. Unblocks persistent KV cache
   (item 22). 5 integration tests including compute graph scenario. 213 tests pass.
   See comparison doc item 25.
+- **Persistent backend-resident KV cache** (`PersistentKvCache`):
+  Pre-allocated K/V tensors on device with incremental O(1) per-step append
+  via `write_data_backend_at`. Eliminates O(T) per-step KV upload (~64 MB/step
+  at T=4000 across 8 FA layers). Uses `view_4d_of` cross-context views for
+  ephemeral scoring graphs. Three-level fallback: persistent GPU → ephemeral
+  GPU → host scoring. See comparison doc item 26.
 
 ## Validation checkpoints completed on this branch
 

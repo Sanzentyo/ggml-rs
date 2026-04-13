@@ -10,7 +10,229 @@ use super::state::Qwen35FullAttentionState;
 use super::tensor_ops::{
     PROJECTION_SLACK_BYTES, per_head_rms_norm, project_sequence, project_sequence_graph,
 };
-use ggml_rs::{Backend, Bytes, Context, Shape2D, Shape4D};
+use ggml_rs::{Backend, BackendBuffer, Bytes, Context, Shape2D, Shape4D, Tensor};
+
+/// Backend-resident KV cache for GPU-accelerated attention scoring.
+///
+/// Pre-allocates max-size K/V tensors on the backend. Each decode step:
+/// - Appends only the new token's K/V via `write_data_backend_at` (O(1))
+/// - Ephemeral scoring graph creates `view_4d_of` into these tensors
+///
+/// Host `Vec<f32>` KV cache in `Qwen35FullAttentionState` remains the
+/// source of truth (for checkpoint serialization and host-scoring fallback).
+/// This struct is runtime-only decode infrastructure — not serializable.
+pub(super) struct PersistentKvCache<'ctx> {
+    /// K values: `[D, Hkv, MaxT, 1]` on backend.
+    k_tensor: Tensor<'ctx, f32>,
+    /// V values: `[D, Hkv, MaxT, 1]` on backend.
+    v_tensor: Tensor<'ctx, f32>,
+    /// Backend buffer keeping tensors alive on device.
+    _buffer: BackendBuffer<'ctx>,
+    /// `kv_head_count × head_dimension`.
+    kv_features: usize,
+    /// Max tokens this cache can hold.
+    max_tokens: usize,
+}
+
+impl<'ctx> PersistentKvCache<'ctx> {
+    /// Append one token's K/V to the backend tensors at the given position.
+    ///
+    /// `cached_len` is the position index (0-based) of the new token. The
+    /// caller must ensure `cached_len < max_tokens`.
+    pub(super) fn append_token(
+        &self,
+        k_values: &[f32],
+        v_values: &[f32],
+        cached_len: usize,
+    ) -> Result<(), E2eError> {
+        if cached_len >= self.max_tokens {
+            return Err(E2eError::SequenceTooLong {
+                requested: cached_len + 1,
+                context_length: self.max_tokens,
+            });
+        }
+        let offset = cached_len * self.kv_features;
+        self.k_tensor
+            .write_data_backend_at(offset, k_values)
+            .map_err(|source| E2eError::ggml("append_token(K)", source))?;
+        self.v_tensor
+            .write_data_backend_at(offset, v_values)
+            .map_err(|source| E2eError::ggml("append_token(V)", source))?;
+        Ok(())
+    }
+
+    /// Bulk-upload existing KV prefix from host cache (used at initialization
+    /// after prefill populates the host cache).
+    pub(super) fn seed_from_host(
+        &self,
+        k_cache: &[f32],
+        v_cache: &[f32],
+        cached_len: usize,
+    ) -> Result<(), E2eError> {
+        let prefix_len = checked_mul(cached_len, self.kv_features)?;
+        self.k_tensor
+            .write_data_backend(&k_cache[..prefix_len])
+            .map_err(|source| E2eError::ggml("seed(K)", source))?;
+        self.v_tensor
+            .write_data_backend(&v_cache[..prefix_len])
+            .map_err(|source| E2eError::ggml("seed(V)", source))?;
+        Ok(())
+    }
+}
+
+/// Build a persistent backend-resident KV cache for one full attention layer.
+///
+/// Returns `(Context, PersistentKvCache<'static>)`. The context must be stored
+/// in a parallel container and outlive the cache handles (same pattern as
+/// `PersistentDecodeProjection`).
+pub(super) fn build_persistent_kv_cache(
+    attention: &Qwen35FullAttentionLayerPlan,
+    max_tokens: usize,
+    backend: &Backend,
+) -> Result<(Context, PersistentKvCache<'static>), E2eError> {
+    let d = attention.head_dimension;
+    let hkv = attention.kv_head_count;
+    let kv_features = checked_mul(hkv, d)?;
+
+    // Two 4D tensors: K + V, each [D, Hkv, MaxT, 1].
+    // Metadata context: ~256 KB is plenty for 2 tensors.
+    let ctx = Context::new_no_alloc(256 * 1024)
+        .map_err(|source| E2eError::ggml("Context(persistent_kv)", source))?;
+
+    let k_tensor = ctx
+        .new_tensor_4d::<f32>(Shape4D::new(d, hkv, max_tokens, 1))
+        .map_err(|source| E2eError::ggml("k_tensor(persistent_kv)", source))?;
+    let v_tensor = ctx
+        .new_tensor_4d::<f32>(Shape4D::new(d, hkv, max_tokens, 1))
+        .map_err(|source| E2eError::ggml("v_tensor(persistent_kv)", source))?;
+
+    let buffer = ctx
+        .allocate_tensors(backend)
+        .map_err(|source| E2eError::ggml("allocate(persistent_kv)", source))?;
+
+    // SAFETY: same argument as `PersistentDecodeProjection` — the Context is
+    // stored in a sibling container that drops after this struct. The lifetime
+    // parameter on `Tensor`/`BackendBuffer` is PhantomData-only; the real
+    // invariant (context outlives handles) is maintained by declaration order
+    // in the caller.
+    let cache = unsafe {
+        std::mem::transmute::<PersistentKvCache<'_>, PersistentKvCache<'static>>(
+            PersistentKvCache {
+                k_tensor,
+                v_tensor,
+                _buffer: buffer,
+                kv_features,
+                max_tokens,
+            },
+        )
+    };
+
+    Ok((ctx, cache))
+}
+
+/// GPU-accelerated scoring using persistent backend-resident KV cache.
+///
+/// Instead of uploading the entire KV cache each step, creates cross-context
+/// views into the persistent tensors for the active prefix `[D, Hkv, T]`.
+fn decode_scoring_gpu_persistent(
+    q_values: &[f32],
+    q_gate: &[f32],
+    total_tokens: usize,
+    attention: &Qwen35FullAttentionLayerPlan,
+    query_features: usize,
+    kv_cache: &PersistentKvCache<'static>,
+    backend: &Backend,
+) -> Result<Vec<f32>, E2eError> {
+    let d = attention.head_dimension;
+    let h = attention.head_count;
+    let hkv = attention.kv_head_count;
+    let t = total_tokens;
+    let elem = std::mem::size_of::<f32>();
+
+    // Ephemeral scoring context — creates views into persistent KV tensors.
+    let ctx = Context::new_no_alloc(2 * 1024 * 1024)
+        .map_err(|source| E2eError::ggml("ctx(scoring_persistent)", source))?;
+
+    // Q: [D, T_q=1, H, 1]
+    let q = ctx
+        .new_tensor_4d::<f32>(Shape4D::new(d, 1, h, 1))
+        .map_err(|source| E2eError::ggml("q_tensor", source))?;
+    // Gate: [D, H, 1, 1]
+    let gate = ctx
+        .new_tensor_4d::<f32>(Shape4D::new(d, h, 1, 1))
+        .map_err(|source| E2eError::ggml("gate_tensor", source))?;
+
+    // Cross-context views into persistent KV tensors for active prefix.
+    // Persistent layout: [D, Hkv, MaxT, 1]; we view [D, Hkv, T, 1].
+    let nb1 = d * elem; // stride between KV heads
+    let nb2 = d * hkv * elem; // stride between time steps
+    let k_view = ctx
+        .view_4d_of(&kv_cache.k_tensor, d, hkv, t, 1, nb1, nb2, nb2 * t, 0)
+        .map_err(|source| E2eError::ggml("view_4d_of(K)", source))?;
+    let v_view = ctx
+        .view_4d_of(&kv_cache.v_tensor, d, hkv, t, 1, nb1, nb2, nb2 * t, 0)
+        .map_err(|source| E2eError::ggml("view_4d_of(V)", source))?;
+
+    // Permute [D, Hkv, T, 1] → [D, T, Hkv, 1] + make contiguous.
+    let k_perm = ctx
+        .permute(&k_view, 0, 2, 1, 3)
+        .map_err(|source| E2eError::ggml("permute(K)", source))?;
+    let k = ctx
+        .cont(&k_perm)
+        .map_err(|source| E2eError::ggml("cont(K)", source))?;
+    let v_perm = ctx
+        .permute(&v_view, 0, 2, 1, 3)
+        .map_err(|source| E2eError::ggml("permute(V)", source))?;
+    let v = ctx
+        .cont(&v_perm)
+        .map_err(|source| E2eError::ggml("cont(V)", source))?;
+
+    // flash_attn_ext: Q·K scoring + softmax + V aggregation.
+    let attn = ctx
+        .flash_attn_ext(&q, &k, &v, None, attention.attention_scale, 0.0, 0.0)
+        .map_err(|source| E2eError::ggml("flash_attn_ext(persistent)", source))?;
+
+    // Gating: sigmoid(gate) ⊙ attn
+    let gate_sig = ctx
+        .sigmoid(&gate)
+        .map_err(|source| E2eError::ggml("sigmoid(gate)", source))?;
+    let gated = ctx
+        .mul(&attn, &gate_sig)
+        .map_err(|source| E2eError::ggml("mul(attn,gate)", source))?;
+
+    // Build graph → allocate ephemeral tensors (Q, gate, intermediates).
+    let mut graph = ctx
+        .new_graph()
+        .map_err(|source| E2eError::ggml("new_graph(scoring_persistent)", source))?;
+    graph.build_forward_expand(&gated);
+
+    let _buffer = ctx
+        .allocate_tensors(backend)
+        .map_err(|source| E2eError::ggml("allocate(scoring_persistent)", source))?;
+
+    // Upload only Q and gate — K/V are already on device.
+    q.write_data_backend(q_values)
+        .map_err(|source| E2eError::ggml("write(Q)", source))?;
+    gate.write_data_backend(q_gate)
+        .map_err(|source| E2eError::ggml("write(gate)", source))?;
+
+    backend
+        .compute(&mut graph)
+        .map_err(|source| E2eError::ggml("compute(scoring_persistent)", source))?;
+
+    let outputs = gated
+        .read_data_backend()
+        .map_err(|source| E2eError::ggml("read(gated)", source))?;
+
+    if outputs.len() != query_features {
+        return Err(E2eError::BufferLengthMismatch {
+            expected: query_features,
+            actual: outputs.len(),
+        });
+    }
+
+    Ok(outputs)
+}
 
 pub(super) fn qwen35_full_attention_inference(
     attention: &Qwen35FullAttentionLayerPlan,
@@ -908,13 +1130,15 @@ fn decode_scoring_gpu(
 /// Takes prepared QKV projections and returns gated head outputs (before output
 /// projection). The caller is responsible for projecting the output.
 ///
-/// When `backend` is `Some`, attempts GPU-accelerated scoring via `flash_attn_ext`.
-/// Falls back to the host scoring loop on any GPU failure.
+/// When `persistent_kv` is `Some`, uses persistent backend-resident KV cache
+/// (O(1) per-step upload). Otherwise falls back to `decode_scoring_gpu` (O(T)
+/// upload) or host scoring loop.
 pub(super) fn full_attention_decode_core(
     prepared: PreparedAttention,
     attention: &Qwen35FullAttentionLayerPlan,
     state: &mut Qwen35FullAttentionState,
     backend: Option<&Backend>,
+    persistent_kv: Option<&PersistentKvCache<'static>>,
 ) -> Result<Vec<f32>, E2eError> {
     let PreparedAttention {
         mut q_values,
@@ -960,8 +1184,32 @@ pub(super) fn full_attention_decode_core(
     state.append_batch(&k_values, &v_proj, 1)?;
     let total_tokens = state.token_count();
 
-    // Try GPU-accelerated scoring when a backend is available and a previous
-    // attempt hasn't already failed (probe-once: avoid repeated overhead).
+    // Also append to persistent backend KV cache (O(1) upload).
+    if let Some(kv) = persistent_kv {
+        // cached_len was incremented by append_batch, so the new token is at
+        // position `total_tokens - 1`.
+        let _ = kv.append_token(&k_values, &v_proj, total_tokens - 1);
+    }
+
+    // Try persistent GPU scoring first (O(1) upload, O(T) on-device permute).
+    if let (Some(kv), Some(backend)) = (persistent_kv, backend)
+        && !state.gpu_scoring_failed
+    {
+        if let Ok(outputs) = decode_scoring_gpu_persistent(
+            &q_values,
+            &q_gate,
+            total_tokens,
+            attention,
+            query_features,
+            kv,
+            backend,
+        ) {
+            return Ok(outputs);
+        }
+        state.gpu_scoring_failed = true;
+    }
+
+    // Fallback: try ephemeral GPU scoring (O(T) upload).
     if let Some(backend) = backend
         && !state.gpu_scoring_failed
     {
@@ -1024,7 +1272,7 @@ pub(super) fn qwen35_full_attention_decode_step(
     let prepared = project_and_prepare_qkv(attention, input, 1, rms_norm_eps, Some(backend))?;
     let hidden_features = prepared.hidden_features;
     let query_features = prepared.query_features;
-    let head_outputs = full_attention_decode_core(prepared, attention, state, Some(backend))?;
+    let head_outputs = full_attention_decode_core(prepared, attention, state, Some(backend), None)?;
 
     project_sequence_graph(
         &head_outputs,
@@ -1316,13 +1564,13 @@ mod tests {
         let prepared_host =
             project_and_prepare_qkv(&plan, &normalized, 1, 1e-5, Some(&backend)).unwrap();
         let host_out =
-            full_attention_decode_core(prepared_host, &plan, &mut state_host, None).unwrap();
+            full_attention_decode_core(prepared_host, &plan, &mut state_host, None, None).unwrap();
 
         // GPU scoring: backend = Some.
         let prepared_gpu =
             project_and_prepare_qkv(&plan, &normalized, 1, 1e-5, Some(&backend)).unwrap();
         let gpu_out =
-            full_attention_decode_core(prepared_gpu, &plan, &mut state_gpu, Some(&backend))
+            full_attention_decode_core(prepared_gpu, &plan, &mut state_gpu, Some(&backend), None)
                 .unwrap();
 
         assert_eq!(host_out.len(), gpu_out.len());

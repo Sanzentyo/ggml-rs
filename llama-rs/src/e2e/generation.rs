@@ -11,9 +11,9 @@
 //! [`PrefillStrategy`] (captures state), and [`DecodeStrategy`] (uses state).
 
 use super::attention::{
-    full_attention_decode_core, full_attention_hidden_features, prepare_qkv_from_raw,
-    qwen35_full_attention_decode_step, qwen35_full_attention_inference,
-    qwen35_full_attention_prefill,
+    PersistentKvCache, build_persistent_kv_cache, full_attention_decode_core,
+    full_attention_hidden_features, prepare_qkv_from_raw, qwen35_full_attention_decode_step,
+    qwen35_full_attention_inference, qwen35_full_attention_prefill,
 };
 use super::config::{E2eGenerationConfig, E2eGenerationReport};
 use super::decode::decode_norm_tensor;
@@ -508,6 +508,49 @@ fn build_one_persistent_linear(
     Ok((ctx, proj))
 }
 
+type PersistentKvCacheSets = (
+    Vec<Option<Context>>,
+    Vec<Option<PersistentKvCache<'static>>>,
+);
+
+/// Attempt to build persistent backend-resident KV caches for all full
+/// attention layers.
+///
+/// Returns `None` on any failure. Linear attention layers get `None` slots
+/// (they have no quadratic KV cache). The `max_tokens` budget is shared
+/// across all layers.
+fn try_build_persistent_kv_caches(
+    layer_plans: &[LayerPlan],
+    max_tokens: usize,
+    backend: &Backend,
+) -> Option<PersistentKvCacheSets> {
+    let mut contexts: Vec<Option<Context>> = Vec::with_capacity(layer_plans.len());
+    let mut caches: Vec<Option<PersistentKvCache<'static>>> = Vec::with_capacity(layer_plans.len());
+
+    for layer_plan in layer_plans {
+        match &layer_plan.attention {
+            Some(AttentionLayerPlan::Qwen35Full(attn)) => {
+                match build_persistent_kv_cache(attn, max_tokens, backend) {
+                    Ok((ctx, cache)) => {
+                        contexts.push(Some(ctx));
+                        caches.push(Some(cache));
+                    }
+                    Err(_) => return None,
+                }
+            }
+            _ => {
+                // Linear or missing — no persistent KV cache.
+                contexts.push(None);
+                caches.push(None);
+            }
+        }
+    }
+
+    debug_assert_eq!(contexts.len(), layer_plans.len());
+    debug_assert_eq!(caches.len(), layer_plans.len());
+    Some((contexts, caches))
+}
+
 /// Process all layers in decode mode using persistent projections.
 ///
 /// For each layer: host norm → persistent input proj → core logic → persistent
@@ -516,12 +559,14 @@ fn persistent_decode_all_layers(
     hidden: &mut [f32],
     layer_plans: &[LayerPlan],
     projections: &mut [Option<PersistentDecodeProjection<'static>>],
+    kv_caches: &[Option<PersistentKvCache<'static>>],
     state: &mut GenerationState,
     hidden_features: usize,
     rms_norm_eps: f32,
     backend: &Backend,
 ) -> Result<(), E2eError> {
     debug_assert_eq!(layer_plans.len(), projections.len());
+    debug_assert_eq!(layer_plans.len(), kv_caches.len());
 
     for (layer_idx, layer_plan) in layer_plans.iter().enumerate() {
         if let (Some(attention), Some(proj)) =
@@ -539,8 +584,13 @@ fn persistent_decode_all_layers(
                     let hf = full_attention_hidden_features(attn)?;
                     let prepared =
                         prepare_qkv_from_raw(attn, q_full, k_proj, v_proj, 1, hf, rms_norm_eps)?;
-                    let head_outputs =
-                        full_attention_decode_core(prepared, attn, s, Some(backend))?;
+                    let head_outputs = full_attention_decode_core(
+                        prepared,
+                        attn,
+                        s,
+                        Some(backend),
+                        kv_caches[layer_idx].as_ref(),
+                    )?;
                     proj.project_output(&head_outputs, backend)?
                 }
                 (AttentionLayerPlan::Qwen35Linear(attn), LayerAttentionState::Qwen35Linear(s)) => {
@@ -946,6 +996,40 @@ fn two_phase_loop(
     // Falls back to DecodeStrategy if build fails.
     let persistent = try_build_persistent_projections(inputs.layer_plans, inputs.backend);
     if let Some((_proj_ctxs, mut decode_projs)) = persistent {
+        // Attempt persistent KV caches (O(1) per-step KV upload).
+        // Use 4096 as default max token budget — covers typical generation
+        // while keeping memory usage reasonable (~64 MB for 8 layers).
+        let kv_max_tokens = inputs.total_sequence_length;
+        let kv_persistent =
+            try_build_persistent_kv_caches(inputs.layer_plans, kv_max_tokens, inputs.backend);
+
+        // Separate ownership: contexts keep tensors alive, caches are the handles.
+        // `_kv_ctxs` must live longer than `kv_caches` (drop order: LIFO).
+        let (_kv_ctxs, kv_caches) = match &kv_persistent {
+            Some((_ctxs_ref, caches_ref)) => {
+                // Seed from the host KV cache built during prefill.
+                for (layer_idx, cache) in caches_ref.iter().enumerate() {
+                    if let (Some(cache), Some(LayerAttentionState::Qwen35Full(s))) =
+                        (cache, state.layers.get(layer_idx))
+                    {
+                        let _ = cache.seed_from_host(&s.k_cache, &s.v_cache, s.token_count());
+                    }
+                }
+                // Create a view slice (caches are in the Option tuple above).
+                (None::<()>, caches_ref.as_slice())
+            }
+            None => (None, [].as_slice()),
+        };
+
+        // Build a padded vec if kv_caches slice is empty (no persistent KV).
+        let empty_kv: Vec<Option<PersistentKvCache<'static>>>;
+        let kv_caches_for_decode: &[Option<PersistentKvCache<'static>>] = if kv_caches.is_empty() {
+            empty_kv = (0..inputs.layer_plans.len()).map(|_| None).collect();
+            &empty_kv
+        } else {
+            kv_caches
+        };
+
         // Persistent path: no per-token weight upload.
         for _step in 1..inputs.max_new_tokens {
             let new_token_id = all_token_ids[*current_token_count - 1];
@@ -960,6 +1044,7 @@ fn two_phase_loop(
                 &mut hidden,
                 inputs.layer_plans,
                 &mut decode_projs,
+                kv_caches_for_decode,
                 &mut state,
                 inputs.hidden_features,
                 inputs.rms_norm_eps,
