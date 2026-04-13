@@ -606,6 +606,87 @@ fn try_build_persistent_mlps(
 }
 
 // ---------------------------------------------------------------------------
+// LmHeadResources: persistent LM head graph — build once, sample per token
+// ---------------------------------------------------------------------------
+
+/// Persistent LM head graph resources for GPU-accelerated greedy sampling.
+///
+/// Built once from model weights; reused every decode step. Encapsulates the
+/// ggml context, buffer, graph tensors, and graph in a self-contained struct
+/// with correct drop ordering (tensors/graph before context/buffer).
+pub(super) struct LmHeadResources {
+    // Graph tensors referencing _ctx (dropped first)
+    x_in: ggml_rs::Tensor<'static, f32>,
+    logits_t: ggml_rs::Tensor<'static, f32>,
+    graph: ggml_rs::Graph<'static>,
+    // Context + buffer (dropped last — keep tensor memory alive)
+    _buffer: ggml_rs::BackendBuffer<'static>,
+    _ctx: Context,
+}
+
+impl LmHeadResources {
+    /// Build persistent LM head graph and upload weights.
+    ///
+    /// Returns `None` if any step fails (context allocation, graph build,
+    /// weight upload). Callers fall back to host-side greedy sampling.
+    pub(super) fn try_build(
+        hidden_features: usize,
+        vocab_size: usize,
+        rms_norm_eps: f32,
+        output_weight_values: &[f32],
+        output_norm_values: &[f32],
+        backend: &Backend,
+    ) -> Option<Self> {
+        let ctx_size = recommended_lm_head_memory(hidden_features, vocab_size).ok()?;
+        let ctx = Context::new_no_alloc_bytes(ctx_size).ok()?;
+        let (w_out, norm_w, x_in, logits_t, graph) =
+            build_lm_head_graph(&ctx, hidden_features, vocab_size, rms_norm_eps).ok()?;
+        let buffer = ctx.allocate_tensors(backend).ok()?;
+        w_out.write_data_backend(output_weight_values).ok()?;
+        norm_w.write_data_backend(output_norm_values).ok()?;
+
+        // SAFETY: ctx and buffer kept alive as struct fields; drop order
+        // (declaration order, top→bottom) ensures tensors/graph drop before ctx/buffer.
+        let x_in = unsafe {
+            std::mem::transmute::<ggml_rs::Tensor<'_, f32>, ggml_rs::Tensor<'static, f32>>(x_in)
+        };
+        let logits_t = unsafe {
+            std::mem::transmute::<ggml_rs::Tensor<'_, f32>, ggml_rs::Tensor<'static, f32>>(logits_t)
+        };
+        let graph =
+            unsafe { std::mem::transmute::<ggml_rs::Graph<'_>, ggml_rs::Graph<'static>>(graph) };
+        let _buffer = unsafe {
+            std::mem::transmute::<ggml_rs::BackendBuffer<'_>, ggml_rs::BackendBuffer<'static>>(
+                buffer,
+            )
+        };
+
+        Some(Self {
+            x_in,
+            logits_t,
+            graph,
+            _buffer,
+            _ctx: ctx,
+        })
+    }
+
+    /// Sample one token from a single hidden state vector via the GPU graph.
+    pub(super) fn sample_hidden(
+        &mut self,
+        hidden_state: &[f32],
+        backend: &Backend,
+    ) -> Result<i32, E2eError> {
+        lm_head_sample_step(
+            hidden_state,
+            &self.x_in,
+            &self.logits_t,
+            &mut self.graph,
+            backend,
+        )
+    }
+}
+
+// ---------------------------------------------------------------------------
 // PersistentDecodeResources: unified persistent resource bundle
 // ---------------------------------------------------------------------------
 
@@ -626,14 +707,10 @@ pub(super) struct PersistentDecodeResources {
     pub decode_projs: Option<Vec<Option<PersistentDecodeProjection<'static>>>>,
     pub kv_caches: Vec<Option<PersistentKvCache<'static>>>,
 
-    // LM head: graph tensors that reference _lm_ctx
-    lm_x_in: ggml_rs::Tensor<'static, f32>,
-    lm_logits_t: ggml_rs::Tensor<'static, f32>,
-    lm_graph: ggml_rs::Graph<'static>,
+    // LM head (self-contained: owns its own context + buffer)
+    lm_head: LmHeadResources,
 
     // --- Contexts (dropped last — keeps tensor memory alive) ---
-    _lm_buffer: ggml_rs::BackendBuffer<'static>,
-    _lm_ctx: Context,
     _mlp_ctxs: Vec<Option<Context>>,
     _proj_ctxs: Vec<Option<Context>>,
     _kv_ctxs: Vec<Option<Context>>,
@@ -658,29 +735,14 @@ impl PersistentDecodeResources {
         backend: &Backend,
     ) -> Option<Self> {
         // 1. LM head (always required)
-        let lm_ctx_size = recommended_lm_head_memory(hidden_features, vocab_size).ok()?;
-        let lm_ctx = Context::new_no_alloc_bytes(lm_ctx_size).ok()?;
-        let (w_out, norm_w, x_in, logits_t, graph) =
-            build_lm_head_graph(&lm_ctx, hidden_features, vocab_size, rms_norm_eps).ok()?;
-        let lm_buffer = lm_ctx.allocate_tensors(backend).ok()?;
-        w_out.write_data_backend(output_weight_values).ok()?;
-        norm_w.write_data_backend(output_norm_values).ok()?;
-
-        // SAFETY: lm_ctx, lm_buffer kept alive as struct fields; drop order
-        // ensures resources drop before contexts (declaration order, top→bottom).
-        let lm_x_in = unsafe {
-            std::mem::transmute::<ggml_rs::Tensor<'_, f32>, ggml_rs::Tensor<'static, f32>>(x_in)
-        };
-        let lm_logits_t = unsafe {
-            std::mem::transmute::<ggml_rs::Tensor<'_, f32>, ggml_rs::Tensor<'static, f32>>(logits_t)
-        };
-        let lm_graph =
-            unsafe { std::mem::transmute::<ggml_rs::Graph<'_>, ggml_rs::Graph<'static>>(graph) };
-        let _lm_buffer = unsafe {
-            std::mem::transmute::<ggml_rs::BackendBuffer<'_>, ggml_rs::BackendBuffer<'static>>(
-                lm_buffer,
-            )
-        };
+        let lm_head = LmHeadResources::try_build(
+            hidden_features,
+            vocab_size,
+            rms_norm_eps,
+            output_weight_values,
+            output_norm_values,
+            backend,
+        )?;
 
         // 2. Persistent MLPs (per-layer opportunistic)
         let (_mlp_ctxs, persistent_mlps) =
@@ -737,11 +799,7 @@ impl PersistentDecodeResources {
             persistent_mlps,
             decode_projs,
             kv_caches,
-            lm_x_in,
-            lm_logits_t,
-            lm_graph,
-            _lm_buffer,
-            _lm_ctx: lm_ctx,
+            lm_head,
             _mlp_ctxs,
             _proj_ctxs,
             _kv_ctxs,
@@ -769,13 +827,7 @@ impl PersistentDecodeResources {
     ) -> Result<i32, E2eError> {
         let offset = checked_mul(token_index, hidden_features)?;
         let last_hidden = &hidden[offset..offset + hidden_features];
-        lm_head_sample_step(
-            last_hidden,
-            &self.lm_x_in,
-            &self.lm_logits_t,
-            &mut self.lm_graph,
-            backend,
-        )
+        self.lm_head.sample_hidden(last_hidden, backend)
     }
 
     /// Run one decode step through all layers using persistent resources.
@@ -915,21 +967,6 @@ fn persistent_decode_all_layers(
         add_in_place(hidden, &mlp_output)?;
     }
     Ok(())
-}
-
-/// Extract the last token's hidden state from a `[seq_len × hidden_features]` buffer
-/// and run a graph-level LM head sampling step.
-fn graph_sample_at(
-    hidden: &[f32],
-    token_index: usize,
-    inputs: &GenerationInputs<'_>,
-    x_in: &ggml_rs::Tensor<'_, f32>,
-    logits_t: &ggml_rs::Tensor<'_, f32>,
-    lm_graph: &mut ggml_rs::Graph<'_>,
-) -> Result<i32, E2eError> {
-    let offset = checked_mul(token_index, inputs.hidden_features)?;
-    let last_hidden = &hidden[offset..offset + inputs.hidden_features];
-    lm_head_sample_step(last_hidden, x_in, logits_t, lm_graph, inputs.backend)
 }
 
 /// Greedy sampling fallback when the persistent LM head graph is unavailable.
@@ -1182,24 +1219,14 @@ fn full_reprocess_loop(
     let mut strategy = InferenceStrategy;
 
     // Persistent LM head: build graph and upload weights once.
-    let lm_ctx_size = recommended_lm_head_memory(inputs.hidden_features, inputs.vocab_size)?;
-    let lm_ctx = Context::new_no_alloc_bytes(lm_ctx_size)
-        .map_err(|source| E2eError::ggml("Context::new_no_alloc_bytes(lm_head)", source))?;
-    let (w_out, norm_w, x_in, logits_t, mut lm_graph) = build_lm_head_graph(
-        &lm_ctx,
+    let mut lm_head = LmHeadResources::try_build(
         inputs.hidden_features,
         inputs.vocab_size,
         inputs.rms_norm_eps,
-    )?;
-    let _lm_buffer = lm_ctx
-        .allocate_tensors(inputs.backend)
-        .map_err(|source| E2eError::ggml("allocate_tensors(lm_head)", source))?;
-    w_out
-        .write_data_backend(inputs.output_weight_values)
-        .map_err(|source| E2eError::ggml("write<W_OUT>", source))?;
-    norm_w
-        .write_data_backend(inputs.output_norm_values)
-        .map_err(|source| E2eError::ggml("write<NORM_W>", source))?;
+        inputs.output_weight_values,
+        inputs.output_norm_values,
+        inputs.backend,
+    );
 
     for _step in 0..inputs.max_new_tokens {
         let active_token_ids = &all_token_ids[..*current_token_count];
@@ -1224,8 +1251,14 @@ fn full_reprocess_loop(
         let last_index = current_token_count
             .checked_sub(1)
             .ok_or(E2eError::EmptyPrompt)?;
-        let next_token_id =
-            graph_sample_at(&hidden, last_index, inputs, &x_in, &logits_t, &mut lm_graph)?;
+
+        let next_token_id = if let Some(ref mut lm) = lm_head {
+            let offset = checked_mul(last_index, inputs.hidden_features)?;
+            let last_hidden = &hidden[offset..offset + inputs.hidden_features];
+            lm.sample_hidden(last_hidden, inputs.backend)?
+        } else {
+            graph_sample_fallback(&hidden, last_index, inputs)?
+        };
 
         generated_token_ids.push(next_token_id);
         if *current_token_count < inputs.total_sequence_length {
