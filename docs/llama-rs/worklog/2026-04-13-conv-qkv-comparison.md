@@ -334,4 +334,58 @@ Key design decisions:
   one-shot graph result.
 - `argmax_picks_largest` / `argmax_empty_returns_error`: Unit tests for argmax.
 
+## 14. Decode-Path QKV Backend Offload
+
+### 14.1 Problem
+
+Both `qwen35_full_attention_decode_step` and `qwen35_linear_attention_decode_step`
+passed `None` as the backend argument to their projection helpers, forcing host-side
+scalar dot-product matmuls for every decode step:
+
+- **Full attention**: 3 sequential matmuls (Q, K, V projections) + 1 output projection
+- **Linear attention**: 4 sequential matmuls (QKV, gate, alpha, beta) + 1 output projection
+
+For Qwen3.5 0.6B (hidden=1536), each host matmul at seq_len=1 involves
+1536×N multiplications on a single core — the biggest serial bottleneck in the
+decode loop.
+
+### 14.2 Solution
+
+Thread `&Backend` into both decode_step functions and pass `Some(backend)` to
+the existing projection helpers, which already have graph-path support:
+
+- `project_and_prepare_qkv(…, Some(backend))` — batches 3 matmuls in a single ggml graph
+- `project_linear_inputs(…, Some(backend))` — batches 4 matmuls in a single ggml graph
+- Output projections (`project_sequence` → `project_sequence_graph`) — single matmul graph
+
+The `DecodeStrategy::process_attention` in `generation.rs` already received
+`backend` but discarded it (`_backend`). Now it forwards the reference to both
+decode_step callsites.
+
+### 14.3 Per-Step Cost Delta (Qwen3.5 0.6B, seq_len=1)
+
+| Matmul | Dimensions | Before | After |
+|--------|-----------|--------|-------|
+| Q proj | 1536 → 3072 | Host scalar | ggml graph (CPU/Metal) |
+| K proj | 1536 → 256 | Host scalar | ggml graph |
+| V proj | 1536 → 256 | Host scalar | ggml graph |
+| Output proj | 768 → 1536 | Host scalar | ggml graph |
+| Linear QKV | 1536 → conv_ch | Host scalar | ggml graph |
+| Linear gate/alpha/beta | 1536 → various | Host scalar | ggml graph |
+| Linear output | inner → 1536 | Host scalar | ggml graph |
+
+### 14.4 Files Changed
+
+| File | Changes |
+|------|---------|
+| `attention.rs` | `qwen35_full_attention_decode_step` gains `backend: &Backend`; QKV + output use graph path |
+| `linear_attention.rs` | `qwen35_linear_attention_decode_step` gains `backend: &Backend`; projections + output use graph path |
+| `generation.rs` | `DecodeStrategy` passes `backend` (was `_backend`) to both decode_step calls |
+
+### 14.5 Test Updates
+
+- `decode_step_matches_full_reprocess` (attention.rs): passes `&backend` to updated signature
+- `linear_decode_step_matches_full_reprocess` (linear_attention.rs): passes `&backend` to updated signature
+- All 205 tests pass, 0 new warnings
+
 

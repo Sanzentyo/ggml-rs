@@ -217,7 +217,7 @@ impl AttentionStrategy for DecodeStrategy<'_> {
         input: &[f32],
         seq_len: usize,
         rms_norm_eps: f32,
-        _backend: &Backend,
+        backend: &Backend,
     ) -> Result<Vec<f32>, E2eError> {
         debug_assert_eq!(seq_len, 1, "DecodeStrategy expects single-token input");
         let _ = seq_len;
@@ -231,10 +231,10 @@ impl AttentionStrategy for DecodeStrategy<'_> {
 
         match (attention, &mut self.state.layers[layer_idx]) {
             (AttentionLayerPlan::Qwen35Full(attn), LayerAttentionState::Qwen35Full(s)) => {
-                qwen35_full_attention_decode_step(attn, &normalized, rms_norm_eps, s)
+                qwen35_full_attention_decode_step(attn, &normalized, rms_norm_eps, s, backend)
             }
             (AttentionLayerPlan::Qwen35Linear(attn), LayerAttentionState::Qwen35Linear(s)) => {
-                qwen35_linear_attention_decode_step(attn, &normalized, rms_norm_eps, s)
+                qwen35_linear_attention_decode_step(attn, &normalized, rms_norm_eps, s, backend)
             }
             _ => Err(E2eError::UnsupportedTwoPhase),
         }

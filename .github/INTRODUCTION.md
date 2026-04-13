@@ -201,6 +201,14 @@ And you should write rusty code(ADT, enum, type state pattern)
   verify graph argmax matches host-side sampling. LM head benchmark added to
   `bench_graphs.rs`. See comparison doc item 13.
 
+- **Decode-path QKV backend offload**:
+  Both `qwen35_full_attention_decode_step` and `qwen35_linear_attention_decode_step`
+  now accept `backend: &Backend` and pass `Some(backend)` to their projection helpers.
+  QKV projections (3 matmuls for full, 4 for linear) and output projections are
+  offloaded from host-side scalar dot products to ggml compute graphs. The
+  `DecodeStrategy` in `generation.rs` forwards `backend` (was `_backend`) to both
+  callsites. All 205 tests pass. See comparison doc item 14.
+
 ## Validation checkpoints completed on this branch
 
 - `cargo fmt --all`

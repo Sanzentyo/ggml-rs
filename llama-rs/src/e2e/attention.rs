@@ -7,7 +7,9 @@ use super::error::E2eError;
 use super::numeric::{checked_mul, dot, sigmoid_scalar, softmax_prefix};
 use super::plan::Qwen35FullAttentionLayerPlan;
 use super::state::Qwen35FullAttentionState;
-use super::tensor_ops::{PROJECTION_SLACK_BYTES, per_head_rms_norm, project_sequence};
+use super::tensor_ops::{
+    PROJECTION_SLACK_BYTES, per_head_rms_norm, project_sequence, project_sequence_graph,
+};
 use ggml_rs::{Backend, Bytes, Context, Shape2D};
 
 pub(super) fn qwen35_full_attention_inference(
@@ -765,6 +767,7 @@ pub(super) fn qwen35_full_attention_decode_step(
     input: &[f32],
     rms_norm_eps: f32,
     state: &mut Qwen35FullAttentionState,
+    backend: &Backend,
 ) -> Result<Vec<f32>, E2eError> {
     let PreparedAttention {
         mut q_values,
@@ -773,7 +776,7 @@ pub(super) fn qwen35_full_attention_decode_step(
         q_gate,
         hidden_features,
         query_features,
-    } = project_and_prepare_qkv(attention, input, 1, rms_norm_eps, None)?;
+    } = project_and_prepare_qkv(attention, input, 1, rms_norm_eps, Some(backend))?;
 
     let hd = attention.head_dimension;
 
@@ -832,15 +835,15 @@ pub(super) fn qwen35_full_attention_decode_step(
         }
     }
 
-    project_sequence(
+    project_sequence_graph(
         &head_outputs,
         1,
         query_features,
         hidden_features,
         &attention.output_weight_values,
+        backend,
     )
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1023,7 +1026,8 @@ mod tests {
         )
         .unwrap();
         let decode_out =
-            qwen35_full_attention_decode_step(&plan, &normalized_token, 1e-5, &mut state).unwrap();
+            qwen35_full_attention_decode_step(&plan, &normalized_token, 1e-5, &mut state, &backend)
+                .unwrap();
 
         for (i, (a, b)) in decode_out.iter().zip(expected).enumerate() {
             assert!(

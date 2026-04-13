@@ -1088,6 +1088,7 @@ pub(super) fn qwen35_linear_attention_decode_step(
     input: &[f32],
     rms_norm_eps: f32,
     state: &mut LinearAttentionState,
+    backend: &Backend,
 ) -> Result<Vec<f32>, E2eError> {
     let LinearProjections {
         qkv,
@@ -1096,7 +1097,7 @@ pub(super) fn qwen35_linear_attention_decode_step(
         beta,
         conv_channels,
         hidden_features,
-    } = project_linear_inputs(attention, input, 1, None)?;
+    } = project_linear_inputs(attention, input, 1, Some(backend))?;
 
     // Conv: use buffer + new QKV row.
     let conv = causal_depthwise_conv_decode_step(&qkv, state, &attention.conv_weight_values)?;
@@ -1171,12 +1172,13 @@ pub(super) fn qwen35_linear_attention_decode_step(
             .for_each(|(d, (&n, &z))| *d = n * silu_scalar(z));
     }
 
-    project_sequence(
+    project_sequence_graph(
         &output,
         1,
         attention.inner_size,
         hidden_features,
         &attention.ssm_out_weight_values,
+        backend,
     )
 }
 
@@ -1403,9 +1405,14 @@ mod tests {
             1e-5,
         )
         .unwrap();
-        let decode_output =
-            qwen35_linear_attention_decode_step(&plan, &normalized_token, 1e-5, &mut state)
-                .unwrap();
+        let decode_output = qwen35_linear_attention_decode_step(
+            &plan,
+            &normalized_token,
+            1e-5,
+            &mut state,
+            &backend,
+        )
+        .unwrap();
 
         for (i, (a, b)) in decode_output.iter().zip(expected).enumerate() {
             assert!(
