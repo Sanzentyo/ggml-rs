@@ -194,6 +194,10 @@ llama-rs uses explicit `copy_from_slice`.
    alpha, beta). Output projections also use graph path. Decode (seq_len=1)
    stays host-side. Shared `project_sequence_graph` extracted to `tensor_ops.rs`.
    Parity test confirms host vs graph output matches within 1e-5.
+   **Update 3**: Fused projection + conv graph implemented. All 4 projections and
+   the causal conv + SiLU are now a single ggml graph (`project_and_conv_fused_graph`),
+   eliminating the host↔device round-trip between projection and conv stages.
+   See `docs/llama-rs/worklog/2026-04-19-fused-projection-conv.md`.
 7. **Multi-layer orchestration verified**: `generation.rs` extracted a
    `GenerationMode` enum (`Auto | FullReprocess | TwoPhase`) and a
    `generate_from_plans` helper.  Integration test

@@ -133,6 +133,16 @@ And you should write rusty code(ADT, enum, type state pattern)
   graph vs host-only numerical match. Original host function kept as `#[cfg(test)]`
   reference. 196 tests pass.
 
+- **Fused projection + conv graph** (single-graph linear attention prefill):
+  Merged the 4 linear projections (QKV, Z, alpha, beta) and causal depthwise
+  convolution + SiLU into a single ggml compute graph: `project_and_conv_fused_graph`.
+  Eliminates the host↔device round-trip between projection and conv stages.
+  In-graph chain: `mul_mat → transpose → cont → concat(zeros, ...) → reshape_3d
+  → ssm_conv → silu`. Pre-conv QKV still read back for `capture_conv_buffer`
+  (decode state continuity). Backend buffer lifetime correctly scoped to span all
+  reads. Standalone `causal_depthwise_conv_graph` demoted to `#[cfg(test)]`.
+  196 tests pass.
+
 ## Validation checkpoints completed on this branch
 
 - `cargo fmt --all`
