@@ -2731,4 +2731,171 @@ g.w_q.write_data_backend(&attn.q_weight_values)?;
 | `llama-rs/src/e2e/tensor_ops.rs` | Added 3 structs, updated 3 builder return types, updated 3 test call sites |
 | `llama-rs/src/e2e/generation.rs` | Updated 3 call sites (LmHeadResources::try_build, build_one_persistent_full, build_one_persistent_linear) |
 | `llama-rs/src/e2e/bench_graphs.rs` | Updated lm_head benchmark call site |
+
+---
+
+## Item 39 — Inline `persistent_decode_all_layers` as Method
+
+**Commit:** `5ac76a7 refactor(llama-rs): inline persistent_decode_all_layers into PersistentDecodeResources method (item 39)`
+
+### 39.1 Motivation
+
+`persistent_decode_all_layers` was a free function taking **11 parameters**, 5 of which were
+fields of `PersistentDecodeResources`. Clippy flagged it as `too_many_arguments(11/7)`.
+Converting to a method on `PersistentDecodeResources` eliminates 5 explicit params via `self`.
+
+### 39.2 Before → After
+
+```rust
+// Before (free function, 11 params):
+fn persistent_decode_all_layers(
+    hidden: &mut Vec<f32>,
+    layer_plans: &[LayerPlan],
+    state: &mut GenerationState,
+    hidden_features: usize,
+    rms_norm_eps: f32,
+    backend: &Backend,
+    projections: &[Option<PersistentDecodeProjection<'static>>],
+    kv_caches: &[Option<PersistentKvCache<'static>>],
+    persistent_mlps: &[Option<PersistentMlp<'static>>],
+    scoring_ctx: &Option<PersistentScoringContext>,
+    linear_scratch: &mut Option<LinearDecodeScratch>,
+) -> Result<(), E2eError>
+
+// After (method, 6 params — 5 come from self):
+impl PersistentDecodeResources {
+    fn persistent_decode_all_layers(
+        &mut self,
+        hidden: &mut Vec<f32>,
+        layer_plans: &[LayerPlan],
+        state: &mut GenerationState,
+        hidden_features: usize,
+        rms_norm_eps: f32,
+        backend: &Backend,
+    ) -> Result<(), E2eError>
+}
+```
+
+### 39.3 Call Site Change
+
+```rust
+// Before:
+persistent_decode_all_layers(
+    hidden, layer_plans, state, hidden_features, rms_norm_eps, backend,
+    &projs, &self.kv_caches, &self.persistent_mlps,
+    &self.scoring_ctx, &mut self.linear_scratch,
+)?;
+
+// After:
+self.persistent_decode_all_layers(
+    hidden, layer_plans, state, hidden_features, rms_norm_eps, backend,
+)?;
+```
+
+### 39.4 Files Modified
+
+| File | Changes |
+|------|---------|
+| `llama-rs/src/e2e/generation.rs` | Moved function into `impl PersistentDecodeResources`, updated `decode_step` call site |
+
+---
+
+## Item 40 — Extract `RopeParams` Struct
+
+**Commit:** `00d9b51 refactor(llama-rs): extract RopeParams struct from apply_neox_rope_in_place (item 40)`
+
+### 40.1 Motivation
+
+`apply_neox_rope_in_place` took **8 parameters**, 4 of which were logically grouped RoPE
+configuration values. Clippy flagged `too_many_arguments(8/7)`.
+
+### 40.2 New Struct
+
+```rust
+#[derive(Debug, Clone, Copy)]
+pub(super) struct RopeParams {
+    pub n_rot: usize,
+    pub freq_base: f32,
+    pub freq_scale: f32,
+    pub position_offset: usize,
+}
+```
+
+### 40.3 Signature Change
+
+```rust
+// Before (8 params):
+fn apply_neox_rope_in_place(
+    data: &mut [f32], head_dim: usize, n_heads: usize, seq_len: usize,
+    n_rot: usize, freq_base: f32, freq_scale: f32, position_offset: usize,
+) -> Result<(), E2eError>
+
+// After (5 params):
+fn apply_neox_rope_in_place(
+    data: &mut [f32], head_dim: usize, n_heads: usize, seq_len: usize,
+    rope: RopeParams,
+) -> Result<(), E2eError>
+```
+
+### 40.4 Files Modified
+
+| File | Changes |
+|------|---------|
+| `llama-rs/src/e2e/attention.rs` | Added `RopeParams` struct, updated function signature, updated 2 production call sites + 7 test call sites |
+
+---
+
+## Item 41 — Further Clippy `too_many_arguments` Reduction
+
+**Commit:** `f9b6e36 refactor(llama-rs): reduce clippy too_many_arguments in project_qkv_graph and try_build (item 41)`
+
+### 41.1 Motivation
+
+Two remaining `too_many_arguments` warnings in llama-rs:
+1. `project_qkv_graph` (9 params): Accepted 3 individual weight slice params (`q_weights`, `k_weights`, `v_weights`).
+2. `PersistentDecodeResources::try_build` (8 params): Accepted raw weight slices + dimensions to build `LmHeadResources` internally.
+
+### 41.2 `project_qkv_graph` Change (9→8 params)
+
+Replaced 3 individual weight slice params with a single `&Qwen35FullAttentionLayerPlan` reference.
+The function extracts `q_weight_values`, `k_weight_values`, `v_weight_values` from the plan.
+
+### 41.3 `try_build` Change (8→5 params)
+
+Moved LM head construction to the caller. `try_build` now accepts a pre-built `LmHeadResources`
+instead of raw `hidden_features`, `vocab_size`, `output_weight_values`, `output_norm_values`.
+Return type changed from `Option<Self>` to `Self` (LM head failure now handled by caller).
+
+```rust
+// Before (8 params, returns Option<Self>):
+fn try_build(
+    layer_plans, hidden_features, vocab_size, rms_norm_eps,
+    total_seq_len, output_weight_values, output_norm_values, backend,
+) -> Option<Self>
+
+// After (5 params, returns Self):
+fn try_build(
+    layer_plans, lm_head: LmHeadResources, rms_norm_eps,
+    total_seq_len, backend,
+) -> Self
+```
+
+Callers build `LmHeadResources` first, then use `Option::map` to create resources:
+```rust
+let mut resources = LmHeadResources::try_build(...)
+    .map(|lm_head| PersistentDecodeResources::try_build(layer_plans, lm_head, ...));
+```
+
+### 41.4 Result
+
+All `too_many_arguments` warnings eliminated from `llama-rs` crate. Remaining warnings are
+in `ggml-rs` (`flash_attn_ext`: 8/7, ggml API surface) and test helpers (low priority).
+
+### 41.5 Files Modified
+
+| File | Changes |
+|------|---------|
+| `llama-rs/src/e2e/attention.rs` | `project_qkv_graph` accepts `&Qwen35FullAttentionLayerPlan` instead of 3 weight slices |
+| `llama-rs/src/e2e/generation.rs` | `try_build` accepts `LmHeadResources`, returns `Self`; `two_phase_loop` caller updated |
+| `llama-rs/src/e2e/session.rs` | `ensure_persistent_resources` builds LM head first, uses `Option::map` pattern |
 | `llama-rs/Cargo.toml` | Added `postcard` + `serde` dependencies |

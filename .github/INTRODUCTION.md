@@ -359,6 +359,28 @@ And you should write rusty code(ADT, enum, type state pattern)
   positional destructuring.
   See comparison doc item 38.
 
+- **Inline `persistent_decode_all_layers` as method** (item 39):
+  Converted 11-parameter free function into `impl PersistentDecodeResources`
+  method. 5 params (`projections`, `kv_caches`, `persistent_mlps`,
+  `scoring_ctx`, `linear_scratch`) now accessed via `self`, leaving 6
+  explicit params. Eliminates `clippy::too_many_arguments(11/7)`.
+  See comparison doc item 39.
+
+- **`RopeParams` struct extraction** (item 40):
+  Grouped 4 RoPE configuration values (`n_rot`, `freq_base`, `freq_scale`,
+  `position_offset`) into `RopeParams`. `apply_neox_rope_in_place` reduced
+  from 8→5 params. Eliminates `clippy::too_many_arguments(8/7)`.
+  See comparison doc item 40.
+
+- **Further clippy `too_many_arguments` reduction** (item 41):
+  `project_qkv_graph` accepts `&Qwen35FullAttentionLayerPlan` instead of
+  3 individual weight slices (9→8 params). `PersistentDecodeResources::try_build`
+  accepts pre-built `LmHeadResources` instead of raw weight slices (8→5 params),
+  returns `Self` instead of `Option<Self>`. LM head construction moved to
+  callers with `Option::map` pattern. All `too_many_arguments` warnings
+  eliminated from `llama-rs` crate.
+  See comparison doc item 41.
+
 ## Validation checkpoints completed on this branch
 
 - `cargo fmt --all`
