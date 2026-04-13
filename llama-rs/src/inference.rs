@@ -682,9 +682,9 @@ where
     }
 
     let output = graph
-        .last_node()
+        .last_node_typed::<T>()
         .map_err(|source| InferenceError::ggml("Graph::last_node", source))?
-        .read_data_backend::<T>()
+        .read_data_backend()
         .map_err(|source| InferenceError::ggml("Tensor::read_data_backend", source))?;
 
     Ok(LinearInferenceReport {
@@ -878,9 +878,9 @@ where
     }
 
     let output = graph
-        .last_node()
+        .last_node_typed::<T>()
         .map_err(|source| InferenceError::ggml("Graph::last_node", source))?
-        .read_data_backend::<T>()
+        .read_data_backend()
         .map_err(|source| InferenceError::ggml("Tensor::read_data_backend", source))?;
 
     Ok(MlpInferenceReport {

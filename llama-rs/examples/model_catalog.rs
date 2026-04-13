@@ -27,10 +27,9 @@ fn run() -> Result<(), Box<dyn StdError>> {
     for tensor in report.tensors.iter().take(cli.head) {
         let payload = model.tensor_payload(&tensor.name)?;
         println!(
-            "- name={} type={}({}) size={} offset={} payload_len={}",
+            "- name={} type={} size={} offset={} payload_len={}",
             tensor.name,
-            tensor.ggml_type_name,
-            tensor.ggml_type_raw,
+            tensor.ggml_type,
             tensor.size,
             tensor.offset,
             payload.len()
@@ -43,9 +42,8 @@ fn run() -> Result<(), Box<dyn StdError>> {
             let info = model.tensor_info(&name)?;
             let payload = model.tensor_payload(&name)?;
             println!(
-                "- {name}: type={}({}) size={} payload_len={}",
-                info.ggml_type_name,
-                info.ggml_type_raw,
+                "- {name}: type={} size={} payload_len={}",
+                info.ggml_type,
                 info.size,
                 payload.len()
             );

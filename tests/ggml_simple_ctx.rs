@@ -36,7 +36,7 @@ fn matmul_simple_ctx_parity() -> Result<(), ggml_rs::Error> {
     graph.build_forward_expand(&result);
     ctx.compute_with_threads(&mut graph, ThreadCount::new(1))?;
 
-    let out = graph.last_node()?.read_data::<f32>()?;
+    let out = graph.last_node_typed::<f32>()?.read_data()?;
     assert_eq!(out.len(), EXPECTED.len());
     for (actual, expected) in out.iter().zip(EXPECTED) {
         assert!((actual - expected).abs() <= 1e-4);

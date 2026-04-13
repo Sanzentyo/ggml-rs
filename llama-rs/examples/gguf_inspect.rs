@@ -30,13 +30,8 @@ fn run() -> Result<(), Box<dyn StdError>> {
     println!("\n[tensors]");
     for (index, tensor) in report.tensors.iter().enumerate() {
         println!(
-            "- [{}] name={} type={}({}) size={} offset={}",
-            index,
-            tensor.name,
-            tensor.ggml_type_name,
-            tensor.ggml_type_raw,
-            tensor.size,
-            tensor.offset
+            "- [{}] name={} type={} size={} offset={}",
+            index, tensor.name, tensor.ggml_type, tensor.size, tensor.offset
         );
     }
 

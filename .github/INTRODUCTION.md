@@ -1,13 +1,164 @@
-# Ongoing execution policy (review_1 priority)
+# Ongoing execution policy
 
 This repository is currently following a strict execution policy to avoid losing intent across long refactor loops.
 
+**Docs-update policy**: After every significant change (API refactor, bug fix, feature addition), update this file and relevant docs under `./docs/` to reflect the new state. Read all markdown in `.github/` and `./docs/` at session start.
+
+## Skills you should use
+- rust-best-practices
+And you should write rusty code(ADT, enum, type state pattern)
+
+## Current branch
+
+- `exp/oh-my` — dedicated branch for review_1 + review_3 refactor of `ggml-rs`.
+
 ## Immediate priority
 
-1. Apply `docs/third_reviews/review_1.md` refactor recommendations to `ggml-rs` in a dedicated `git worktree` branch.
-2. Enforce no-regression performance gating (baseline vs post-change).
-3. Iterate until performance is at least baseline (preferably improved).
-4. Merge back to `main` only after validation and runtime checks pass.
+1. ~~Close the remaining Qwen3.5 strict token-id parity gap in `llama-rs`.~~ **DONE** — parity achieved.
+2. ~~Expand `Type` enum to all ggml types, seal `HostElement`, update decode APIs.~~ **DONE** — zero clippy warnings.
+3. ~~Implement MRoPE for full attention layers (required for multi-token prompts).~~ **DONE** — multi-token parity achieved.
+4. ~~Causal depthwise conv & QKV packing comparison.~~ **DONE** — documented in `docs/llama-rs/worklog/2026-04-13-conv-qkv-comparison.md`.
+5. ~~Continue review_3 refactor items (generic inference, ND tensor, semantic wrapper dedup).~~ **12/12 DONE** — test coverage 80+ tests (zero warnings), backend examples + README updated.
+6. ~~Autoregressive decode state management (prefill/decode split).~~ **DONE** — KV cache for full attention, conv buffer + SSM states for linear attention, decode equivalence tests pass.
+7. ~~Two-phase generation loop (prefill + incremental decode).~~ **DONE** — generation.rs branches on layer types: all-Qwen3.5 → two-phase (prefill all prompt tokens, then decode one-at-a-time), otherwise → full-reprocess fallback.
+8. ~~Backend example enhancement (review_3 item 11) + README (item 12).~~ **DONE** — `backend_ops.rs` example, fixed stale README snippets, multi-op + Metal parity tests added.
+9. Merge back to `main` only after validation and runtime checks pass. **READY** — PR #1 created, all validation passed. See `docs/llama-rs/worklog/2026-04-14-merge-prep.md`.
+
+## Completed refactor items
+
+- `AsRef<str>` for GGUF string arguments (`find_key`, `kv_value_by_key`, `set_value`, `remove_key`).
+- `TryFromGgufValue` trait and `kv_value_as::<T>()` convenience method on `GgufFile`.
+- `GgufTypeMismatch` error variant for type-safe GGUF value extraction.
+- `Tensor<'ctx, T>` typestate pattern and `DynTensor<'ctx>` runtime-typed handle.
+- `TensorExpr<'ctx, T>` typed expression wrapper.
+- `rope_ext_with_i32_positions` mixed-type RoPE helper for `f32` data + `i32` positions.
+- Backend-path / ND tensor / error-path test expansion.
+- `llama-rs` migration to the typed `Tensor<'ctx, T>` / `DynTensor<'ctx>` API.
+- **Type consolidation**: `Type` expanded from 2 variants (F32, I32) to all 32+ ggml
+  tensor types (quantized Q4_K, Q8_0, etc. + native floats/ints + Unknown(i32)).
+  `GgufTensorInfo` now stores `ggml_type: Type` instead of raw `i32` + `String`.
+  Decode APIs (`decode_tensor_data_to`, `tensor_element_count`) accept `Type`.
+  `HostElement` sealed via private `Sealed` supertrait (eliminates `private_bounds` warning).
+- **e2e.rs module split**: Monolithic 2412-line file split into 13 focused submodules
+  (error, config, numeric, tensor_ops, resolve, decode, plan, planner, attention,
+  linear_attention, mlp, generation, state). Public API unchanged.
+- **Autoregressive decode infrastructure**: `state.rs` with `Qwen35FullAttentionState`
+  (KV cache), `LinearAttentionState` (conv buffer + SSM states), `GenerationState`.
+  `attention.rs` gains `qwen35_full_attention_prefill` + `decode_step`.
+  `linear_attention.rs` gains `qwen35_linear_attention_prefill` + `decode_step` +
+  `causal_depthwise_conv_decode_step`. RoPE `position_offset` parameter added.
+  Decode equivalence tests verify prefill+decode = full reprocess.
+- **Two-phase generation loop**: `generation.rs` branches on layer types: all-Qwen3.5
+  → prefill + incremental decode (one token at a time with cached state); Standard
+  attention present → full-reprocess fallback. Handles `max_new_tokens==0`, EOS on
+  first generated token, MLP-only layers.
+- **Backend examples + README** (review_3 items 11, 12): `backend_ops.rs` multi-op graph
+  example (matmul + bias on CPU/Metal), fixed stale API names in README, added multi-op
+  and Metal parity backend tests. Updated EXAMPLE_PARITY_MATRIX.md.
+- **Generation loop refactor**: Extracted `GenerationMode` enum
+  (`Auto | FullReprocess | TwoPhase`), `GenerationInputs` bundle, and
+  `generate_from_plans` core loop. Integration test
+  `two_phase_matches_full_reprocess_multi_layer` verifies both execution
+  paths produce identical token sequences on a 3-layer synthetic model.
+- **`AttentionStrategy` trait extraction**: Unified per-layer processing logic
+  (norm → attention → residual → norm → MLP → residual) behind an
+  `AttentionStrategy` trait with three implementations: `InferenceStrategy`
+  (stateless), `PrefillStrategy` (captures state), `DecodeStrategy` (uses
+  cached state). Added `process_all_layers` + `sample_next_token` shared
+  helpers. Fixed crash paths: `TwoPhase + Standard` now returns
+  `UnsupportedTwoPhase` error; `TwoPhase + max_new_tokens=0` returns empty.
+  Two new regression tests added. 138 tests pass.
+- **Iterator/chunks_exact refactoring**: Replaced procedural index loops with
+  idiomatic Rust iterators across e2e modules. Extracted `SsmScratch` reusable
+  buffer + `ssm_recurrence_step` helper (eliminates 60-line duplication in
+  `linear_attention.rs`). Extracted `deinterleave_q_gate` helper with unified
+  validation (was duplicated in prefill + decode paths). QKV split uses
+  `chunks_exact` zip. Per-head norm functions use `chunks_exact_mut`.
+  Conv inner loop uses `saturating_sub` for tap range. All 136 tests pass.
+- **Shared projection/normalization helpers**: Extracted `project_and_prepare_qkv`
+  + `PreparedAttention` in `attention.rs` and `project_linear_inputs` +
+  `LinearProjections` + `split_and_norm_qk` in `linear_attention.rs`. Shared by
+  core and decode_step paths. Validates dimension divisibility upfront. Decode
+  path borrows `v_raw` directly from conv output (avoids extra copy).
+- **Resumable generation session + state serialization** (`save-load-state`):
+  `GenerationSession` (session.rs) provides step-by-step token generation via
+  `new()` → `next_token()` loop, with `checkpoint()` to snapshot state and
+  `resume(model, checkpoint)` to restore. `GenerationCheckpoint` (checkpoint.rs)
+  uses postcard binary format with `LRCK` magic, model fingerprint validation
+  (layer count, types, dims, vocab, rms_norm_eps), and KV cache trimming for
+  compact serialization. Separate DTO layer (`CheckpointV1`, `LayerStateDto`,
+  `ModelFingerprint`) keeps serde types distinct from runtime state. Session
+  reuses `AttentionStrategy` trait + `process_all_layers` shared infrastructure.
+  11 unit tests (7 checkpoint + 4 session) all passing.
+- **Detokenization + chat infrastructure** (`simple-chat`):
+  `tokenizer.rs` gains `decode()` / `decode_token()` (reverse GPT-2 byte-BPE),
+  `encode_with_special_tokens()` (direct vocab lookup for ChatML markers),
+  `special_token_id()`, and `StreamingDecoder` (buffered UTF-8 safe streaming).
+  New `chat.rs` module provides `ChatMessage` / `Role` / `ChatFormat` types,
+  `format_chat_prompt()` with ChatML support and content sanitization (sentinel
+  rejection). `simple_chat` example: interactive multi-turn loop with streaming
+  token output, `<|im_end|>` stop detection. 20+ unit tests.
+
+- **Safe view/reshape wrappers** (`view_3d`, `view_4d`, `reshape_1d`, `reshape_4d`):
+  Added missing safe API wrappers to `ggml-rs` that mirror the ggml C API for
+  zero-copy tensor views. Backfilled Rust-side validation on all existing wrappers
+  (`view_1d`, `view_2d`, `reshape_2d`, `reshape_3d`). Two new error variants:
+  `NotContiguous` (blocks reshape of non-contiguous tensors), `ViewOutOfBounds`
+  (blocks views that exceed source tensor bounds). Overflow-checked arithmetic
+  prevents C-level aborts. 13 new integration tests covering aliasing, error
+  paths, and OOB rejection. Enables future graph-level zero-copy QKV splits
+  in llama-rs.
+
+- **Graph-level attention projections** (full + linear attention):
+  Replaced host-side scalar dot-product projections (`project_sequence`) with
+  ggml `mul_mat` compute graphs for prefill/inference paths in both full and
+  linear attention. Full attention batches 3 matmuls (Q, K, V) in a single graph;
+  linear attention batches 4 (QKV, gate, alpha, beta). Output projections also
+  use graph path. Decode (seq_len=1) stays on host-side to avoid graph overhead.
+  Shared `project_sequence_graph` and `recommended_single_projection_memory`
+  extracted to `tensor_ops.rs`. Backend threaded through all attention functions.
+  Parity test confirms host vs graph output matches within 1e-5. 192 tests pass.
+
+## Validation checkpoints completed on this branch
+
+- `cargo fmt --all`
+- `cargo clippy --workspace --all-targets`
+- `cargo test --workspace`
+- `cargo test --features link-system`
+- CPU perf gate: `cargo run --example bench_matmul --features link-system -- cpu -n 10`
+  - current checkpoint result: `avg=0.256 ms`
+
+## Current parity investigation status
+
+- **Qwen3.5 strict parity: ACHIEVED** (single-token AND multi-token, up to 5-token prompts).
+  - Single-token: prompt `[1]`, `max_new_tokens=1` → both produce `[5328]`.
+  - Multi-token (single prompt): prompt `[3]`, `max_new_tokens=5` → both produce `[1088, 35790, 90, 16, 14728]`.
+  - Multi-token (3 prompt tokens): prompt `[1,2,3]`, `max_new_tokens=5` → both produce `[31, 2, 5, 1, 271]`.
+  - Multi-token (5 prompt tokens): prompt `[1,2,3,4,5]`, `max_new_tokens=5` → both produce `[6, 24218, 10, 4838, 1665]`.
+  - Known precision edge: prompt `[5]` diverges at token 5 only (23 vs 24 — adjacent logits,
+    numerical precision difference, not a systematic bug).
+  - Bug 1 (linear attention): Head-group mapping used `head / repeat_factor` (interleaved),
+    while llama.cpp's `ggml_repeat_4d` tiles block-by-block. Fixed to `head % group_count`.
+  - Bug 2 (full attention): Q/gate split treated ggml's interleaved layout
+    `[Q_h0(D), G_h0(D), Q_h1(D), ...]` as two flat halves with dim-major indexing.
+    Fixed to head-major interleaved extraction: `head * 2D + dim` for Q, `head * 2D + D + dim` for gate.
+  - `causal_depthwise_conv` verified correct (comparison documented).
+  - Delta-net recurrence math verified correct.
+  - NeoX RoPE for full attention implemented and verified at non-zero positions.
+  - `causal_depthwise_conv` and QKV packing comparison completed — see
+    `docs/llama-rs/worklog/2026-04-13-conv-qkv-comparison.md`.
+
+## Already-implemented items (review_3 items done before this branch)
+
+- `GgmlElement` trait with `f32`/`i32` impls.
+- `GgmlType` trait mapping Rust types to `Type`.
+- `BackendElement` / `HostElement` trait hierarchy.
+- `with_context` / `with_no_alloc_context` scoped helpers.
+- `Shape3D`, `Shape4D`, `Dims<const N>`, `new_tensor<const N>`, `rank()`, `dims()`, `shape_nd()`.
+- `decode_tensor_data_to::<T>()` generic GGUF decode.
+- `MaybeUninit` / `spare_capacity_mut` optimization on hot tensor readout paths.
+- `define_semantic_usize!` macro for newtype dedup.
+- Typed tensor wrappers (`Tensor1D`..`Tensor4D`).
 
 ## Safety rule
 
@@ -26,6 +177,6 @@ This repository is currently following a strict execution policy to avoid losing
 - Keep `llama-rs` reproducing llama.cpp behavior on top of `ggml-rs` safe APIs.
 - Improve `ggml-rs` architecture and performance in parallel.
 
-## After review_1 completion
+## After parity closure
 
-- Return to `llama-rs` trait/ADT continuation tasks.
+- Return to broader `llama-rs` trait/ADT continuation tasks.

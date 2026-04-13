@@ -2,7 +2,6 @@
 
 use crate::ffi;
 use crate::num_ext::{CheckedFieldOps, TryIntoChecked};
-use crate::tensor_expr::HostElement;
 use crate::{
     BackendDeviceType, BackendElement, BackendKind, Bytes, Cols, ComputeStatus, Dims, Error,
     GgmlElement, Length, Result, RopeExtParams, Rows, Shape2D, Shape3D, Shape4D, TensorExpr,
@@ -11,12 +10,66 @@ use crate::{
 use num_traits::NumCast;
 use std::ffi::{CStr, CString};
 use std::marker::PhantomData;
+use std::mem::MaybeUninit;
 use std::num::NonZeroUsize;
 use std::os::raw::c_int;
 use std::ptr::{self, NonNull};
 
 const SIMPLE_CONTEXT_SLACK_BYTES: usize = 1024;
 const CONTIGUOUS_BULK_COPY_MIN_ELEMS: usize = 256;
+
+/// Validates that a tensor is contiguous and its element count matches the
+/// product of the target dimensions. This prevents the C library from
+/// aborting on invalid reshape inputs.
+fn validate_reshape_source<T: GgmlElement>(a: &Tensor<'_, T>, target_dims: &[usize]) -> Result<()> {
+    let is_contiguous = unsafe { ffi::ggml_is_contiguous(a.raw.as_ptr()) as i32 != 0 };
+    if !is_contiguous {
+        return Err(Error::NotContiguous);
+    }
+    let target_count = target_dims
+        .iter()
+        .try_fold(1usize, |acc, &d| acc.checked_mul(d))
+        .ok_or(Error::Overflow)?;
+    let source_count = a.element_count()?;
+    if target_count != source_count {
+        return Err(Error::LengthMismatch {
+            expected: source_count,
+            actual: target_count,
+        });
+    }
+    Ok(())
+}
+
+/// Validates that a view's maximum addressed byte stays within the source
+/// tensor's byte size.
+///
+/// `outer_dims` contains `(ne_i, nb_i)` pairs for dimensions 1..N (outer to
+/// inner). `inner_row_bytes` is `ne0 * element_size`.
+fn validate_view_extent<T: GgmlElement>(
+    source: &Tensor<'_, T>,
+    offset: usize,
+    outer_dims: &[(usize, usize)],
+    inner_row_bytes: usize,
+) -> Result<()> {
+    let mut extent = inner_row_bytes;
+    for &(ne, nb) in outer_dims {
+        let stride_span = ne
+            .saturating_sub(1)
+            .checked_mul(nb)
+            .ok_or(Error::Overflow)?;
+        extent = extent.checked_add(stride_span).ok_or(Error::Overflow)?;
+    }
+    let max_byte = offset.checked_add(extent).ok_or(Error::Overflow)?;
+    let source_size = source.nbytes();
+    if max_byte > source_size {
+        return Err(Error::ViewOutOfBounds {
+            offset,
+            extent,
+            source_size,
+        });
+    }
+    Ok(())
+}
 
 /// Initializes ggml global timing infrastructure.
 pub fn init_timing() {
@@ -30,16 +83,17 @@ pub fn type_size(ty: Type) -> usize {
     unsafe { ffi::ggml_type_size(ty.as_raw() as _) }
 }
 
-fn resolve_ggml_type(ggml_type_raw: c_int) -> Result<ffi::ggml_type> {
-    if !(0..ffi::GGML_TYPE_COUNT).contains(&ggml_type_raw) {
-        return Err(Error::UnsupportedType(ggml_type_raw));
+fn resolve_ggml_type(ty: Type) -> Result<ffi::ggml_type> {
+    let raw = ty.as_raw();
+    if ty.is_unknown() || !(0..ffi::GGML_TYPE_COUNT).contains(&raw) {
+        return Err(Error::UnsupportedType(raw));
     }
-    Ok(ggml_type_raw as ffi::ggml_type)
+    Ok(raw as ffi::ggml_type)
 }
 
 /// Returns the number of scalar values represented by a tensor payload.
-pub fn tensor_element_count(ggml_type_raw: c_int, payload_bytes: usize) -> Result<usize> {
-    let ggml_type = resolve_ggml_type(ggml_type_raw)?;
+pub fn tensor_element_count(ty: Type, payload_bytes: usize) -> Result<usize> {
+    let ggml_type = resolve_ggml_type(ty)?;
     let block_size = unsafe { ffi::ggml_blck_size(ggml_type) }
         .try_into_checked()
         .map_err(|source: std::num::TryFromIntError| {
@@ -47,7 +101,7 @@ pub fn tensor_element_count(ggml_type_raw: c_int, payload_bytes: usize) -> Resul
         })?;
     let type_size = unsafe { ffi::ggml_type_size(ggml_type) };
     if block_size == 0 || type_size == 0 {
-        return Err(Error::UnsupportedType(ggml_type_raw));
+        return Err(Error::UnsupportedType(ty.as_raw()));
     }
     if !payload_bytes.is_multiple_of(type_size) {
         let expected = (payload_bytes / type_size)
@@ -67,16 +121,16 @@ pub fn tensor_element_count(ggml_type_raw: c_int, payload_bytes: usize) -> Resul
 }
 
 /// Decodes GGML tensor payload bytes into `f32` values via GGML type traits.
-fn decode_tensor_data_to_float(ggml_type_raw: c_int, payload: &[u8]) -> Result<Vec<f32>> {
-    let ggml_type = resolve_ggml_type(ggml_type_raw)?;
-    let element_count = tensor_element_count(ggml_type_raw, payload.len())
+fn decode_tensor_data_to_float(ty: Type, payload: &[u8]) -> Result<Vec<f32>> {
+    let ggml_type = resolve_ggml_type(ty)?;
+    let element_count = tensor_element_count(ty, payload.len())
         .map_err(|source| source.with_context("decode_tensor_data_to_float"))?;
 
     let type_traits =
         NonNull::new(unsafe { ffi::ggml_get_type_traits(ggml_type) as *mut ffi::ggml_type_traits })
             .ok_or_else(|| Error::null_pointer("ggml_get_type_traits"))?;
     let to_float =
-        unsafe { type_traits.as_ref().to_float }.ok_or(Error::UnsupportedType(ggml_type_raw))?;
+        unsafe { type_traits.as_ref().to_float }.ok_or(Error::UnsupportedType(ty.as_raw()))?;
 
     if element_count == 0 {
         return Ok(Vec::new());
@@ -108,36 +162,49 @@ fn decode_tensor_data_to_float(ggml_type_raw: c_int, payload: &[u8]) -> Result<V
 /// For matching plain tensor types (`f32`, `i32`) this performs a direct copy.
 /// For other GGML element types (including quantized payloads), values are
 /// decoded through GGML's `to_float` conversion and then cast to `T`.
-pub fn decode_tensor_data_to<T>(ggml_type_raw: c_int, payload: &[u8]) -> Result<Vec<T>>
+pub fn decode_tensor_data_to<T>(ty: Type, payload: &[u8]) -> Result<Vec<T>>
 where
     T: GgmlElement + NumCast,
 {
-    let element_count = tensor_element_count(ggml_type_raw, payload.len())?;
+    let element_count = tensor_element_count(ty, payload.len())?;
     let expected_nbytes = element_count.checked_mul_checked(std::mem::size_of::<T>())?;
 
     if element_count == 0 {
         return Ok(Vec::new());
     }
 
-    if ggml_type_raw == T::GGML_TYPE as c_int && payload.len() == expected_nbytes {
+    if ty == T::GGML_TYPE && payload.len() == expected_nbytes {
         let mut out = Vec::with_capacity(element_count);
         unsafe {
             // SAFETY:
-            // - `out` has capacity for `element_count` elements.
-            // - `payload.len()` matches exactly `element_count * size_of::<T>()`.
-            // - Source payload bytes are read-only and copied into owned `out` storage.
-            let dst = out.spare_capacity_mut().as_mut_ptr().cast::<T>();
-            ptr::copy_nonoverlapping(payload.as_ptr().cast::<T>(), dst, element_count);
+            // - `out` has capacity for `element_count` elements (= `expected_nbytes` bytes).
+            // - `payload.len()` matches exactly `expected_nbytes`.
+            // - We copy raw bytes (not typed elements) to avoid alignment requirements
+            //   on the source pointer — `payload` is a `&[u8]` that may not be aligned
+            //   for `T`. The destination (`spare_capacity_mut`) is a Vec allocation,
+            //   which is always properly aligned for `T`.
+            let dst = out.spare_capacity_mut().as_mut_ptr().cast::<u8>();
+            ptr::copy_nonoverlapping(payload.as_ptr(), dst, expected_nbytes);
             out.set_len(element_count);
         }
         return Ok(out);
     }
 
-    let decoded = decode_tensor_data_to_float(ggml_type_raw, payload)?;
-    let mut out = Vec::with_capacity(decoded.len());
-    for value in decoded {
-        let casted = NumCast::from(value).ok_or(Error::UnsupportedType(ggml_type_raw))?;
-        out.push(casted);
+    let decoded = decode_tensor_data_to_float(ty, payload)?;
+    let len = decoded.len();
+    let mut out = Vec::<T>::with_capacity(len);
+    unsafe {
+        // SAFETY:
+        // - `out` has capacity for `len` elements.
+        // - We write each cast value directly into spare capacity, then set length.
+        // - If any cast fails, the error is returned before `set_len` is called,
+        //   so the Vec is dropped with length 0 and capacity `len` (no UB).
+        let dst = out.spare_capacity_mut().as_mut_ptr();
+        for (i, value) in decoded.iter().enumerate() {
+            let casted = NumCast::from(*value).ok_or(Error::UnsupportedType(ty.as_raw()))?;
+            dst.add(i).write(MaybeUninit::new(casted));
+        }
+        out.set_len(len);
     }
     Ok(out)
 }
@@ -390,12 +457,20 @@ impl Context {
         })
     }
 
-    fn wrap_tensor<'ctx>(&'ctx self, raw: *mut ffi::ggml_tensor) -> Result<Tensor<'ctx>> {
-        Ok(Tensor {
+    fn wrap_dyn_tensor<'ctx>(&'ctx self, raw: *mut ffi::ggml_tensor) -> Result<DynTensor<'ctx>> {
+        Ok(DynTensor {
             raw: NonNull::new(raw)
                 .ok_or_else(|| Error::null_pointer("tensor-producing ggml op"))?,
             _ctx: PhantomData,
         })
+    }
+
+    fn wrap_typed_tensor<'ctx, T: GgmlElement>(
+        &'ctx self,
+        raw: *mut ffi::ggml_tensor,
+    ) -> Result<Tensor<'ctx, T>> {
+        let dyn_tensor = self.wrap_dyn_tensor(raw)?;
+        dyn_tensor.as_typed::<T>()
     }
 
     fn wrap_graph<'ctx>(&'ctx self, raw: *mut ffi::ggml_cgraph) -> Result<Graph<'ctx>> {
@@ -469,7 +544,7 @@ impl Context {
     }
 
     /// Creates a tensor for ranks `1..=4` from generic dimensions.
-    pub fn new_tensor<const N: usize>(&self, ty: Type, dims: Dims<N>) -> Result<Tensor<'_>> {
+    pub fn new_tensor<const N: usize>(&self, ty: Type, dims: Dims<N>) -> Result<DynTensor<'_>> {
         let dims = *dims.as_array();
         let dim = |index: usize| -> Result<_> {
             dims[index]
@@ -503,115 +578,147 @@ impl Context {
             },
             _ => return Err(Error::UnsupportedRank(N)),
         };
-        self.wrap_tensor(raw)
+        self.wrap_dyn_tensor(raw)
             .map_err(|error| error.with_context("ggml_new_tensor"))
     }
 
-    /// Creates a tensor for ranks `1..=4` from a generic element type.
+    /// Creates a typed tensor for ranks `1..=4` from a generic element type.
     pub fn new_tensor_typed<T: GgmlElement, const N: usize>(
         &self,
         dims: Dims<N>,
-    ) -> Result<Tensor<'_>> {
-        self.new_tensor(Type::of::<T>(), dims)
+    ) -> Result<Tensor<'_, T>> {
+        self.new_tensor(Type::of::<T>(), dims)?.as_typed::<T>()
     }
 
-    /// Creates a 1D tensor with semantic `Length`.
-    pub fn new_tensor_1d<T: GgmlElement>(&self, len: Length) -> Result<Tensor<'_>> {
+    /// Creates a typed 1D tensor with semantic `Length`.
+    pub fn new_tensor_1d<T: GgmlElement>(&self, len: Length) -> Result<Tensor<'_, T>> {
         self.new_tensor_typed::<T, 1>(Dims::new([len.get()]))
     }
 
-    /// Creates a 2D tensor using semantic shape newtypes.
-    pub fn new_tensor_2d<T: GgmlElement>(&self, shape: Shape2D) -> Result<Tensor<'_>> {
+    /// Creates a typed 2D tensor using semantic shape newtypes.
+    pub fn new_tensor_2d<T: GgmlElement>(&self, shape: Shape2D) -> Result<Tensor<'_, T>> {
         self.new_tensor_typed::<T, 2>(shape.dims())
     }
 
-    /// Creates a 3D tensor from semantic dimensions.
-    pub fn new_tensor_3d<T: GgmlElement>(&self, shape: Shape3D) -> Result<Tensor<'_>> {
+    /// Creates a typed 3D tensor from semantic dimensions.
+    pub fn new_tensor_3d<T: GgmlElement>(&self, shape: Shape3D) -> Result<Tensor<'_, T>> {
         self.new_tensor_typed::<T, 3>(shape.dims())
     }
 
-    /// Creates a 4D tensor from semantic dimensions.
-    pub fn new_tensor_4d<T: GgmlElement>(&self, shape: Shape4D) -> Result<Tensor<'_>> {
+    /// Creates a typed 4D tensor from semantic dimensions.
+    pub fn new_tensor_4d<T: GgmlElement>(&self, shape: Shape4D) -> Result<Tensor<'_, T>> {
         self.new_tensor_typed::<T, 4>(shape.dims())
     }
 
-    pub fn mul_mat<'ctx>(&'ctx self, a: &Tensor<'ctx>, b: &Tensor<'ctx>) -> Result<Tensor<'ctx>> {
+    pub fn mul_mat<'ctx, T: GgmlElement>(
+        &'ctx self,
+        a: &Tensor<'ctx, T>,
+        b: &Tensor<'ctx, T>,
+    ) -> Result<Tensor<'ctx, T>> {
         let (a_cols, _) = a.shape_2d()?;
         let (b_cols, _) = b.shape_2d()?;
         ensure_matmul_compatible(a_cols, b_cols)?;
 
         let raw = unsafe { ffi::ggml_mul_mat(self.raw.as_ptr(), a.raw.as_ptr(), b.raw.as_ptr()) };
-        self.wrap_tensor(raw)
+        self.wrap_typed_tensor(raw)
             .map_err(|error| error.with_context("ggml_mul_mat"))
     }
 
-    pub fn add<'ctx>(&'ctx self, a: &Tensor<'ctx>, b: &Tensor<'ctx>) -> Result<Tensor<'ctx>> {
+    pub fn add<'ctx, T: GgmlElement>(
+        &'ctx self,
+        a: &Tensor<'ctx, T>,
+        b: &Tensor<'ctx, T>,
+    ) -> Result<Tensor<'ctx, T>> {
         let raw = unsafe { ffi::ggml_add(self.raw.as_ptr(), a.raw.as_ptr(), b.raw.as_ptr()) };
-        self.wrap_tensor(raw)
+        self.wrap_typed_tensor(raw)
             .map_err(|error| error.with_context("ggml_add"))
     }
 
-    pub fn sub<'ctx>(&'ctx self, a: &Tensor<'ctx>, b: &Tensor<'ctx>) -> Result<Tensor<'ctx>> {
+    pub fn sub<'ctx, T: GgmlElement>(
+        &'ctx self,
+        a: &Tensor<'ctx, T>,
+        b: &Tensor<'ctx, T>,
+    ) -> Result<Tensor<'ctx, T>> {
         let raw = unsafe { ffi::ggml_sub(self.raw.as_ptr(), a.raw.as_ptr(), b.raw.as_ptr()) };
-        self.wrap_tensor(raw)
+        self.wrap_typed_tensor(raw)
             .map_err(|error| error.with_context("ggml_sub"))
     }
 
-    pub fn mul<'ctx>(&'ctx self, a: &Tensor<'ctx>, b: &Tensor<'ctx>) -> Result<Tensor<'ctx>> {
+    pub fn mul<'ctx, T: GgmlElement>(
+        &'ctx self,
+        a: &Tensor<'ctx, T>,
+        b: &Tensor<'ctx, T>,
+    ) -> Result<Tensor<'ctx, T>> {
         let raw = unsafe { ffi::ggml_mul(self.raw.as_ptr(), a.raw.as_ptr(), b.raw.as_ptr()) };
-        self.wrap_tensor(raw)
+        self.wrap_typed_tensor(raw)
             .map_err(|error| error.with_context("ggml_mul"))
     }
 
-    pub fn div<'ctx>(&'ctx self, a: &Tensor<'ctx>, b: &Tensor<'ctx>) -> Result<Tensor<'ctx>> {
+    pub fn div<'ctx, T: GgmlElement>(
+        &'ctx self,
+        a: &Tensor<'ctx, T>,
+        b: &Tensor<'ctx, T>,
+    ) -> Result<Tensor<'ctx, T>> {
         let raw = unsafe { ffi::ggml_div(self.raw.as_ptr(), a.raw.as_ptr(), b.raw.as_ptr()) };
-        self.wrap_tensor(raw)
+        self.wrap_typed_tensor(raw)
             .map_err(|error| error.with_context("ggml_div"))
     }
 
-    pub fn silu<'ctx>(&'ctx self, a: &Tensor<'ctx>) -> Result<Tensor<'ctx>> {
+    pub fn silu<'ctx, T: GgmlElement>(&'ctx self, a: &Tensor<'ctx, T>) -> Result<Tensor<'ctx, T>> {
         let raw = unsafe { ffi::ggml_silu(self.raw.as_ptr(), a.raw.as_ptr()) };
-        self.wrap_tensor(raw)
+        self.wrap_typed_tensor(raw)
             .map_err(|error| error.with_context("ggml_silu"))
     }
 
-    pub fn rms_norm<'ctx>(&'ctx self, a: &Tensor<'ctx>, eps: f32) -> Result<Tensor<'ctx>> {
+    pub fn rms_norm<'ctx, T: GgmlElement>(
+        &'ctx self,
+        a: &Tensor<'ctx, T>,
+        eps: f32,
+    ) -> Result<Tensor<'ctx, T>> {
         let raw = unsafe { ffi::ggml_rms_norm(self.raw.as_ptr(), a.raw.as_ptr(), eps) };
-        self.wrap_tensor(raw)
+        self.wrap_typed_tensor(raw)
             .map_err(|error| error.with_context("ggml_rms_norm"))
     }
 
-    pub fn scale<'ctx>(&'ctx self, a: &Tensor<'ctx>, scalar: f32) -> Result<Tensor<'ctx>> {
+    pub fn scale<'ctx, T: GgmlElement>(
+        &'ctx self,
+        a: &Tensor<'ctx, T>,
+        scalar: f32,
+    ) -> Result<Tensor<'ctx, T>> {
         let raw = unsafe { ffi::ggml_scale(self.raw.as_ptr(), a.raw.as_ptr(), scalar) };
-        self.wrap_tensor(raw)
+        self.wrap_typed_tensor(raw)
             .map_err(|error| error.with_context("ggml_scale"))
     }
 
-    pub fn get_rows<'ctx>(
+    pub fn get_rows<'ctx, T: GgmlElement>(
         &'ctx self,
-        data: &Tensor<'ctx>,
-        indices: &Tensor<'ctx>,
-    ) -> Result<Tensor<'ctx>> {
+        data: &Tensor<'ctx, T>,
+        indices: &Tensor<'ctx, i32>,
+    ) -> Result<Tensor<'ctx, T>> {
         let raw = unsafe {
             ffi::ggml_get_rows(self.raw.as_ptr(), data.raw.as_ptr(), indices.raw.as_ptr())
         };
-        self.wrap_tensor(raw)
+        self.wrap_typed_tensor(raw)
             .map_err(|error| error.with_context("ggml_get_rows"))
     }
 
-    pub fn repeat<'ctx>(&'ctx self, a: &Tensor<'ctx>, b: &Tensor<'ctx>) -> Result<Tensor<'ctx>> {
+    pub fn repeat<'ctx, T: GgmlElement>(
+        &'ctx self,
+        a: &Tensor<'ctx, T>,
+        b: &Tensor<'ctx, T>,
+    ) -> Result<Tensor<'ctx, T>> {
         let raw = unsafe { ffi::ggml_repeat(self.raw.as_ptr(), a.raw.as_ptr(), b.raw.as_ptr()) };
-        self.wrap_tensor(raw)
+        self.wrap_typed_tensor(raw)
             .map_err(|error| error.with_context("ggml_repeat"))
     }
 
     /// Concatenates two 2D tensors along the selected dimension (`0` = cols, `1` = rows).
-    pub fn concat<'ctx>(
+    pub fn concat<'ctx, T: GgmlElement>(
         &'ctx self,
-        a: &Tensor<'ctx>,
-        b: &Tensor<'ctx>,
+        a: &Tensor<'ctx, T>,
+        b: &Tensor<'ctx, T>,
         dim: usize,
-    ) -> Result<Tensor<'ctx>> {
+    ) -> Result<Tensor<'ctx, T>> {
         let (a_cols, a_rows) = a.shape_2d()?;
         let (b_cols, b_rows) = b.shape_2d()?;
         match dim {
@@ -625,34 +732,56 @@ impl Context {
             .map_err(|source| Error::int_conversion("concat dimension", source))?;
         let raw =
             unsafe { ffi::ggml_concat(self.raw.as_ptr(), a.raw.as_ptr(), b.raw.as_ptr(), dim) };
-        self.wrap_tensor(raw)
+        self.wrap_typed_tensor(raw)
             .map_err(|error| error.with_context("ggml_concat"))
     }
 
-    pub fn cpy<'ctx>(&'ctx self, a: &Tensor<'ctx>, b: &Tensor<'ctx>) -> Result<Tensor<'ctx>> {
-        let raw = unsafe { ffi::ggml_cpy(self.raw.as_ptr(), a.raw.as_ptr(), b.raw.as_ptr()) };
-        self.wrap_tensor(raw)
+    pub fn cpy<'ctx, S: GgmlElement, D: GgmlElement>(
+        &'ctx self,
+        src: &Tensor<'ctx, S>,
+        dst: &Tensor<'ctx, D>,
+    ) -> Result<Tensor<'ctx, D>> {
+        let raw = unsafe { ffi::ggml_cpy(self.raw.as_ptr(), src.raw.as_ptr(), dst.raw.as_ptr()) };
+        self.wrap_typed_tensor(raw)
             .map_err(|error| error.with_context("ggml_cpy"))
     }
 
-    pub fn cont<'ctx>(&'ctx self, a: &Tensor<'ctx>) -> Result<Tensor<'ctx>> {
+    pub fn cont<'ctx, T: GgmlElement>(&'ctx self, a: &Tensor<'ctx, T>) -> Result<Tensor<'ctx, T>> {
         let raw = unsafe { ffi::ggml_cont(self.raw.as_ptr(), a.raw.as_ptr()) };
-        self.wrap_tensor(raw)
+        self.wrap_typed_tensor(raw)
             .map_err(|error| error.with_context("ggml_cont"))
     }
 
-    pub fn transpose<'ctx>(&'ctx self, a: &Tensor<'ctx>) -> Result<Tensor<'ctx>> {
+    pub fn transpose<'ctx, T: GgmlElement>(
+        &'ctx self,
+        a: &Tensor<'ctx, T>,
+    ) -> Result<Tensor<'ctx, T>> {
         let raw = unsafe { ffi::ggml_transpose(self.raw.as_ptr(), a.raw.as_ptr()) };
-        self.wrap_tensor(raw)
+        self.wrap_typed_tensor(raw)
             .map_err(|error| error.with_context("ggml_transpose"))
     }
 
-    pub fn reshape_2d<'ctx>(
+    pub fn reshape_1d<'ctx, T: GgmlElement>(
         &'ctx self,
-        a: &Tensor<'ctx>,
+        a: &Tensor<'ctx, T>,
+        ne0: usize,
+    ) -> Result<Tensor<'ctx, T>> {
+        validate_reshape_source(a, &[ne0])?;
+        let ne0 = (ne0)
+            .try_into_checked()
+            .map_err(|source| Error::int_conversion("tensor dimension", source))?;
+        let raw = unsafe { ffi::ggml_reshape_1d(self.raw.as_ptr(), a.raw.as_ptr(), ne0) };
+        self.wrap_typed_tensor(raw)
+            .map_err(|error| error.with_context("ggml_reshape_1d"))
+    }
+
+    pub fn reshape_2d<'ctx, T: GgmlElement>(
+        &'ctx self,
+        a: &Tensor<'ctx, T>,
         ne0: usize,
         ne1: usize,
-    ) -> Result<Tensor<'ctx>> {
+    ) -> Result<Tensor<'ctx, T>> {
+        validate_reshape_source(a, &[ne0, ne1])?;
         let ne0 = (ne0)
             .try_into_checked()
             .map_err(|source| Error::int_conversion("tensor dimension", source))?;
@@ -660,17 +789,18 @@ impl Context {
             .try_into_checked()
             .map_err(|source| Error::int_conversion("tensor dimension", source))?;
         let raw = unsafe { ffi::ggml_reshape_2d(self.raw.as_ptr(), a.raw.as_ptr(), ne0, ne1) };
-        self.wrap_tensor(raw)
+        self.wrap_typed_tensor(raw)
             .map_err(|error| error.with_context("ggml_reshape_2d"))
     }
 
-    pub fn reshape_3d<'ctx>(
+    pub fn reshape_3d<'ctx, T: GgmlElement>(
         &'ctx self,
-        a: &Tensor<'ctx>,
+        a: &Tensor<'ctx, T>,
         ne0: usize,
         ne1: usize,
         ne2: usize,
-    ) -> Result<Tensor<'ctx>> {
+    ) -> Result<Tensor<'ctx, T>> {
+        validate_reshape_source(a, &[ne0, ne1, ne2])?;
         let ne0 = (ne0)
             .try_into_checked()
             .map_err(|source| Error::int_conversion("tensor dimension", source))?;
@@ -681,60 +811,175 @@ impl Context {
             .try_into_checked()
             .map_err(|source| Error::int_conversion("tensor dimension", source))?;
         let raw = unsafe { ffi::ggml_reshape_3d(self.raw.as_ptr(), a.raw.as_ptr(), ne0, ne1, ne2) };
-        self.wrap_tensor(raw)
+        self.wrap_typed_tensor(raw)
             .map_err(|error| error.with_context("ggml_reshape_3d"))
     }
 
-    pub fn view_1d<'ctx>(
+    pub fn reshape_4d<'ctx, T: GgmlElement>(
         &'ctx self,
-        a: &Tensor<'ctx>,
-        ne0: usize,
-        offset: usize,
-    ) -> Result<Tensor<'ctx>> {
-        let ne0 = (ne0)
-            .try_into_checked()
-            .map_err(|source| Error::int_conversion("tensor dimension", source))?;
-        let raw = unsafe { ffi::ggml_view_1d(self.raw.as_ptr(), a.raw.as_ptr(), ne0, offset) };
-        self.wrap_tensor(raw)
-            .map_err(|error| error.with_context("ggml_view_1d"))
-    }
-
-    pub fn view_2d<'ctx>(
-        &'ctx self,
-        a: &Tensor<'ctx>,
+        a: &Tensor<'ctx, T>,
         ne0: usize,
         ne1: usize,
-        row_stride: usize,
-        offset: usize,
-    ) -> Result<Tensor<'ctx>> {
+        ne2: usize,
+        ne3: usize,
+    ) -> Result<Tensor<'ctx, T>> {
+        validate_reshape_source(a, &[ne0, ne1, ne2, ne3])?;
         let ne0 = (ne0)
             .try_into_checked()
             .map_err(|source| Error::int_conversion("tensor dimension", source))?;
         let ne1 = (ne1)
             .try_into_checked()
             .map_err(|source| Error::int_conversion("tensor dimension", source))?;
+        let ne2 = (ne2)
+            .try_into_checked()
+            .map_err(|source| Error::int_conversion("tensor dimension", source))?;
+        let ne3 = (ne3)
+            .try_into_checked()
+            .map_err(|source| Error::int_conversion("tensor dimension", source))?;
+        let raw =
+            unsafe { ffi::ggml_reshape_4d(self.raw.as_ptr(), a.raw.as_ptr(), ne0, ne1, ne2, ne3) };
+        self.wrap_typed_tensor(raw)
+            .map_err(|error| error.with_context("ggml_reshape_4d"))
+    }
+
+    pub fn view_1d<'ctx, T: GgmlElement>(
+        &'ctx self,
+        a: &Tensor<'ctx, T>,
+        ne0: usize,
+        offset: usize,
+    ) -> Result<Tensor<'ctx, T>> {
+        let elem_size = std::mem::size_of::<T>();
+        let inner_bytes = ne0.checked_mul(elem_size).ok_or(Error::Overflow)?;
+        validate_view_extent(a, offset, &[], inner_bytes)?;
+        let ne0 = (ne0)
+            .try_into_checked()
+            .map_err(|source| Error::int_conversion("tensor dimension", source))?;
+        let raw = unsafe { ffi::ggml_view_1d(self.raw.as_ptr(), a.raw.as_ptr(), ne0, offset) };
+        self.wrap_typed_tensor(raw)
+            .map_err(|error| error.with_context("ggml_view_1d"))
+    }
+
+    pub fn view_2d<'ctx, T: GgmlElement>(
+        &'ctx self,
+        a: &Tensor<'ctx, T>,
+        ne0: usize,
+        ne1: usize,
+        nb1: usize,
+        offset: usize,
+    ) -> Result<Tensor<'ctx, T>> {
+        let elem_size = std::mem::size_of::<T>();
+        let inner_bytes = ne0.checked_mul(elem_size).ok_or(Error::Overflow)?;
+        validate_view_extent(a, offset, &[(ne1, nb1)], inner_bytes)?;
+        let ne0 = (ne0)
+            .try_into_checked()
+            .map_err(|source| Error::int_conversion("tensor dimension", source))?;
+        let ne1 = (ne1)
+            .try_into_checked()
+            .map_err(|source| Error::int_conversion("tensor dimension", source))?;
+        let raw =
+            unsafe { ffi::ggml_view_2d(self.raw.as_ptr(), a.raw.as_ptr(), ne0, ne1, nb1, offset) };
+        self.wrap_typed_tensor(raw)
+            .map_err(|error| error.with_context("ggml_view_2d"))
+    }
+
+    #[allow(clippy::too_many_arguments)] // mirrors ggml_view_3d C API
+    pub fn view_3d<'ctx, T: GgmlElement>(
+        &'ctx self,
+        a: &Tensor<'ctx, T>,
+        ne0: usize,
+        ne1: usize,
+        ne2: usize,
+        nb1: usize,
+        nb2: usize,
+        offset: usize,
+    ) -> Result<Tensor<'ctx, T>> {
+        let elem_size = std::mem::size_of::<T>();
+        let inner_bytes = ne0.checked_mul(elem_size).ok_or(Error::Overflow)?;
+        validate_view_extent(a, offset, &[(ne2, nb2), (ne1, nb1)], inner_bytes)?;
+        let ne0 = (ne0)
+            .try_into_checked()
+            .map_err(|source| Error::int_conversion("tensor dimension", source))?;
+        let ne1 = (ne1)
+            .try_into_checked()
+            .map_err(|source| Error::int_conversion("tensor dimension", source))?;
+        let ne2 = (ne2)
+            .try_into_checked()
+            .map_err(|source| Error::int_conversion("tensor dimension", source))?;
         let raw = unsafe {
-            ffi::ggml_view_2d(
+            ffi::ggml_view_3d(
                 self.raw.as_ptr(),
                 a.raw.as_ptr(),
                 ne0,
                 ne1,
-                row_stride,
+                ne2,
+                nb1,
+                nb2,
                 offset,
             )
         };
-        self.wrap_tensor(raw)
-            .map_err(|error| error.with_context("ggml_view_2d"))
+        self.wrap_typed_tensor(raw)
+            .map_err(|error| error.with_context("ggml_view_3d"))
     }
 
-    pub fn permute<'ctx>(
+    #[allow(clippy::too_many_arguments)] // mirrors ggml_view_4d C API
+    pub fn view_4d<'ctx, T: GgmlElement>(
         &'ctx self,
-        a: &Tensor<'ctx>,
+        a: &Tensor<'ctx, T>,
+        ne0: usize,
+        ne1: usize,
+        ne2: usize,
+        ne3: usize,
+        nb1: usize,
+        nb2: usize,
+        nb3: usize,
+        offset: usize,
+    ) -> Result<Tensor<'ctx, T>> {
+        let elem_size = std::mem::size_of::<T>();
+        let inner_bytes = ne0.checked_mul(elem_size).ok_or(Error::Overflow)?;
+        validate_view_extent(
+            a,
+            offset,
+            &[(ne3, nb3), (ne2, nb2), (ne1, nb1)],
+            inner_bytes,
+        )?;
+        let ne0 = (ne0)
+            .try_into_checked()
+            .map_err(|source| Error::int_conversion("tensor dimension", source))?;
+        let ne1 = (ne1)
+            .try_into_checked()
+            .map_err(|source| Error::int_conversion("tensor dimension", source))?;
+        let ne2 = (ne2)
+            .try_into_checked()
+            .map_err(|source| Error::int_conversion("tensor dimension", source))?;
+        let ne3 = (ne3)
+            .try_into_checked()
+            .map_err(|source| Error::int_conversion("tensor dimension", source))?;
+        let raw = unsafe {
+            ffi::ggml_view_4d(
+                self.raw.as_ptr(),
+                a.raw.as_ptr(),
+                ne0,
+                ne1,
+                ne2,
+                ne3,
+                nb1,
+                nb2,
+                nb3,
+                offset,
+            )
+        };
+        self.wrap_typed_tensor(raw)
+            .map_err(|error| error.with_context("ggml_view_4d"))
+    }
+
+    pub fn permute<'ctx, T: GgmlElement>(
+        &'ctx self,
+        a: &Tensor<'ctx, T>,
         axis0: i32,
         axis1: i32,
         axis2: i32,
         axis3: i32,
-    ) -> Result<Tensor<'ctx>> {
+    ) -> Result<Tensor<'ctx, T>> {
         let raw = unsafe {
             ffi::ggml_permute(
                 self.raw.as_ptr(),
@@ -745,44 +990,51 @@ impl Context {
                 axis3,
             )
         };
-        self.wrap_tensor(raw)
+        self.wrap_typed_tensor(raw)
             .map_err(|error| error.with_context("ggml_permute"))
     }
 
-    pub fn diag_mask_inf<'ctx>(&'ctx self, a: &Tensor<'ctx>, n_past: i32) -> Result<Tensor<'ctx>> {
+    pub fn diag_mask_inf<'ctx, T: GgmlElement>(
+        &'ctx self,
+        a: &Tensor<'ctx, T>,
+        n_past: i32,
+    ) -> Result<Tensor<'ctx, T>> {
         let raw = unsafe { ffi::ggml_diag_mask_inf(self.raw.as_ptr(), a.raw.as_ptr(), n_past) };
-        self.wrap_tensor(raw)
+        self.wrap_typed_tensor(raw)
             .map_err(|error| error.with_context("ggml_diag_mask_inf"))
     }
 
-    pub fn soft_max<'ctx>(&'ctx self, a: &Tensor<'ctx>) -> Result<Tensor<'ctx>> {
+    pub fn soft_max<'ctx, T: GgmlElement>(
+        &'ctx self,
+        a: &Tensor<'ctx, T>,
+    ) -> Result<Tensor<'ctx, T>> {
         let raw = unsafe { ffi::ggml_soft_max(self.raw.as_ptr(), a.raw.as_ptr()) };
-        self.wrap_tensor(raw)
+        self.wrap_typed_tensor(raw)
             .map_err(|error| error.with_context("ggml_soft_max"))
     }
 
-    pub fn soft_max_ext<'ctx>(
+    pub fn soft_max_ext<'ctx, T: GgmlElement>(
         &'ctx self,
-        a: &Tensor<'ctx>,
-        mask: Option<&Tensor<'ctx>>,
+        a: &Tensor<'ctx, T>,
+        mask: Option<&Tensor<'ctx, T>>,
         scale: f32,
         max_bias: f32,
-    ) -> Result<Tensor<'ctx>> {
+    ) -> Result<Tensor<'ctx, T>> {
         let mask_raw = mask.map_or(ptr::null_mut(), |t| t.raw.as_ptr());
         let raw = unsafe {
             ffi::ggml_soft_max_ext(self.raw.as_ptr(), a.raw.as_ptr(), mask_raw, scale, max_bias)
         };
-        self.wrap_tensor(raw)
+        self.wrap_typed_tensor(raw)
             .map_err(|error| error.with_context("ggml_soft_max_ext"))
     }
 
-    pub fn rope_ext<'ctx>(
+    pub fn rope_ext<'ctx, T: GgmlElement>(
         &'ctx self,
-        a: &Tensor<'ctx>,
-        positions: &Tensor<'ctx>,
-        freq_factors: Option<&Tensor<'ctx>>,
+        a: &Tensor<'ctx, T>,
+        positions: &Tensor<'ctx, T>,
+        freq_factors: Option<&Tensor<'ctx, T>>,
         params: RopeExtParams,
-    ) -> Result<Tensor<'ctx>> {
+    ) -> Result<Tensor<'ctx, T>> {
         let freq_factors_raw = freq_factors.map_or(ptr::null_mut(), |t| t.raw.as_ptr());
         let raw = unsafe {
             ffi::ggml_rope_ext(
@@ -801,7 +1053,40 @@ impl Context {
                 params.beta_slow,
             )
         };
-        self.wrap_tensor(raw)
+        self.wrap_typed_tensor(raw)
+            .map_err(|error| error.with_context("ggml_rope_ext"))
+    }
+
+    /// Applies RoPE with mixed element types: f32 data tensor and i32 positions.
+    ///
+    /// This is the common case for LLM inference where position indices are `i32`
+    /// while the data tensor is `f32`.
+    pub fn rope_ext_with_i32_positions<'ctx, T: GgmlElement>(
+        &'ctx self,
+        a: &Tensor<'ctx, T>,
+        positions: &Tensor<'ctx, i32>,
+        freq_factors: Option<&Tensor<'ctx, T>>,
+        params: RopeExtParams,
+    ) -> Result<Tensor<'ctx, T>> {
+        let freq_factors_raw = freq_factors.map_or(ptr::null_mut(), |t| t.raw.as_ptr());
+        let raw = unsafe {
+            ffi::ggml_rope_ext(
+                self.raw.as_ptr(),
+                a.raw.as_ptr(),
+                positions.raw.as_ptr(),
+                freq_factors_raw,
+                params.n_dims,
+                params.mode,
+                params.n_ctx_orig,
+                params.freq_base,
+                params.freq_scale,
+                params.ext_factor,
+                params.attn_factor,
+                params.beta_fast,
+                params.beta_slow,
+            )
+        };
+        self.wrap_typed_tensor(raw)
             .map_err(|error| error.with_context("ggml_rope_ext"))
     }
 
@@ -819,7 +1104,7 @@ impl Context {
     }
 
     /// Wraps a tensor into expression form for operator-based composition.
-    pub fn expr<'ctx>(&'ctx self, tensor: Tensor<'ctx>) -> TensorExpr<'ctx> {
+    pub fn expr<'ctx, T: GgmlElement>(&'ctx self, tensor: Tensor<'ctx, T>) -> TensorExpr<'ctx, T> {
         TensorExpr { ctx: self, tensor }
     }
 
@@ -865,26 +1150,27 @@ impl Drop for Context {
     }
 }
 
-/// Thin safe handle to a ggml tensor allocated from `Context`.
+/// Dynamically-typed tensor handle (element type not known at compile time).
+///
+/// Use this when the element type is only known at runtime, such as when
+/// loading tensors from GGUF files or inspecting graph nodes.
 #[derive(Clone, Copy)]
-pub struct Tensor<'ctx> {
-    raw: NonNull<ffi::ggml_tensor>,
+pub struct DynTensor<'ctx> {
+    pub(crate) raw: NonNull<ffi::ggml_tensor>,
     _ctx: PhantomData<&'ctx Context>,
 }
 
-impl<'ctx> Tensor<'ctx> {
+impl<'ctx> DynTensor<'ctx> {
     pub(crate) fn raw_ptr(&self) -> *mut ffi::ggml_tensor {
         self.raw.as_ptr()
     }
 
-    /// Returns total element count (`ggml_nelements`).
     pub fn element_count(&self) -> Result<usize> {
         (unsafe { ffi::ggml_nelements(self.raw.as_ptr()) })
             .try_into_checked()
             .map_err(|source| Error::int_conversion("tensor dimension", source))
     }
 
-    /// Returns row count (`ggml_nrows`).
     pub fn row_count(&self) -> Result<usize> {
         (unsafe { ffi::ggml_nrows(self.raw.as_ptr()) })
             .try_into_checked()
@@ -902,14 +1188,12 @@ impl<'ctx> Tensor<'ctx> {
         Ok(elements / rows)
     }
 
-    /// Returns tensor rank reported by ggml.
     pub fn rank(&self) -> Result<usize> {
         (unsafe { ffi::ggml_n_dims(self.raw.as_ptr()) })
             .try_into_checked()
             .map_err(|source| Error::int_conversion("ggml_n_dims", source))
     }
 
-    /// Returns dynamic tensor dimensions in ggml order (`ne0..ne{rank-1}`).
     pub fn shape_nd(&self) -> Result<Vec<usize>> {
         let rank = self.rank()?;
         let ne = unsafe { self.raw.as_ref().ne };
@@ -922,7 +1206,6 @@ impl<'ctx> Tensor<'ctx> {
             .collect()
     }
 
-    /// Returns fixed-rank dimensions when tensor rank matches `N`.
     pub fn dims<const N: usize>(&self) -> Result<Dims<N>> {
         let rank = self.rank()?;
         if rank != N {
@@ -938,13 +1221,11 @@ impl<'ctx> Tensor<'ctx> {
         Ok(Dims::new(dims))
     }
 
-    /// Returns `(cols, rows)` for tensors representable as 2D.
     pub fn shape_2d(&self) -> Result<(usize, usize)> {
         let shape = self.shape()?;
         Ok((shape.cols.get(), shape.rows.get()))
     }
 
-    /// Returns semantic shape newtypes for 2D-compatible tensors.
     pub fn shape(&self) -> Result<Shape2D> {
         Ok(Shape2D {
             cols: Cols::new(self.col_count()?),
@@ -952,12 +1233,142 @@ impl<'ctx> Tensor<'ctx> {
         })
     }
 
-    /// Returns semantic 3D shape when rank is exactly 3.
     pub fn shape_3d(&self) -> Result<Shape3D> {
         Ok(Shape3D::from(self.dims::<3>()?))
     }
 
-    /// Returns semantic 4D shape when rank is exactly 4.
+    pub fn shape_4d(&self) -> Result<Shape4D> {
+        Ok(Shape4D::from(self.dims::<4>()?))
+    }
+
+    pub fn nbytes(&self) -> usize {
+        unsafe { ffi::ggml_nbytes(self.raw.as_ptr()) }
+    }
+
+    pub fn set_name(&self, name: &str) -> Result<()> {
+        let name = CString::new(name)?;
+        let raw = unsafe { ffi::ggml_set_name(self.raw.as_ptr(), name.as_ptr()) };
+        let _ = NonNull::new(raw).ok_or_else(|| Error::null_pointer("ggml_set_name"))?;
+        Ok(())
+    }
+
+    pub fn name(&self) -> Result<String> {
+        let ptr = unsafe { ffi::ggml_get_name(self.raw.as_ptr()) };
+        if ptr.is_null() {
+            return Err(Error::null_pointer("ggml_get_name"));
+        }
+        let cstr = unsafe { CStr::from_ptr(ptr) };
+        Ok(cstr.to_str()?.to_owned())
+    }
+
+    /// Converts to a typed tensor, checking that the runtime element type matches `T`.
+    pub fn as_typed<T: GgmlElement>(&self) -> Result<Tensor<'ctx, T>> {
+        let actual_type = unsafe { (*self.raw.as_ptr()).type_ };
+        if actual_type != T::GGML_TYPE.as_raw() as ffi::ggml_type {
+            return Err(Error::TypeMismatch {
+                expected: T::GGML_TYPE.as_raw(),
+                actual: actual_type as c_int,
+            });
+        }
+        Ok(Tensor {
+            raw: self.raw,
+            _ctx: PhantomData,
+            _type: PhantomData,
+        })
+    }
+}
+
+/// Compile-time typed tensor handle carrying element type information.
+///
+/// The type parameter `T` propagates through operations, eliminating the need
+/// for explicit type annotations on I/O methods like `write_data` and `read_data`.
+pub struct Tensor<'ctx, T: GgmlElement> {
+    pub(crate) raw: NonNull<ffi::ggml_tensor>,
+    _ctx: PhantomData<&'ctx Context>,
+    _type: PhantomData<T>,
+}
+
+impl<'ctx, T: GgmlElement> Clone for Tensor<'ctx, T> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<'ctx, T: GgmlElement> Copy for Tensor<'ctx, T> {}
+
+impl<'ctx, T: GgmlElement> Tensor<'ctx, T> {
+    pub fn element_count(&self) -> Result<usize> {
+        (unsafe { ffi::ggml_nelements(self.raw.as_ptr()) })
+            .try_into_checked()
+            .map_err(|source| Error::int_conversion("tensor dimension", source))
+    }
+
+    pub fn row_count(&self) -> Result<usize> {
+        (unsafe { ffi::ggml_nrows(self.raw.as_ptr()) })
+            .try_into_checked()
+            .map_err(|source| Error::int_conversion("tensor dimension", source))
+    }
+
+    pub fn col_count(&self) -> Result<usize> {
+        let rows = self.row_count()?;
+        let elements = self.element_count()?;
+
+        if rows == 0 || elements % rows != 0 {
+            return Err(Error::UnexpectedShape);
+        }
+
+        Ok(elements / rows)
+    }
+
+    pub fn rank(&self) -> Result<usize> {
+        (unsafe { ffi::ggml_n_dims(self.raw.as_ptr()) })
+            .try_into_checked()
+            .map_err(|source| Error::int_conversion("ggml_n_dims", source))
+    }
+
+    pub fn shape_nd(&self) -> Result<Vec<usize>> {
+        let rank = self.rank()?;
+        let ne = unsafe { self.raw.as_ref().ne };
+        (0..rank)
+            .map(|index| {
+                ne[index]
+                    .try_into_checked()
+                    .map_err(|source| Error::int_conversion("tensor dimension", source))
+            })
+            .collect()
+    }
+
+    pub fn dims<const N: usize>(&self) -> Result<Dims<N>> {
+        let rank = self.rank()?;
+        if rank != N {
+            return Err(Error::UnsupportedRank(rank));
+        }
+        let ne = unsafe { self.raw.as_ref().ne };
+        let mut dims = [0usize; N];
+        for (index, dst) in dims.iter_mut().enumerate() {
+            *dst = ne[index]
+                .try_into_checked()
+                .map_err(|source| Error::int_conversion("tensor dimension", source))?;
+        }
+        Ok(Dims::new(dims))
+    }
+
+    pub fn shape_2d(&self) -> Result<(usize, usize)> {
+        let shape = self.shape()?;
+        Ok((shape.cols.get(), shape.rows.get()))
+    }
+
+    pub fn shape(&self) -> Result<Shape2D> {
+        Ok(Shape2D {
+            cols: Cols::new(self.col_count()?),
+            rows: Rows::new(self.row_count()?),
+        })
+    }
+
+    pub fn shape_3d(&self) -> Result<Shape3D> {
+        Ok(Shape3D::from(self.dims::<3>()?))
+    }
+
     pub fn shape_4d(&self) -> Result<Shape4D> {
         Ok(Shape4D::from(self.dims::<4>()?))
     }
@@ -970,23 +1381,21 @@ impl<'ctx> Tensor<'ctx> {
         unsafe { ffi::ggml_is_contiguous(self.raw.as_ptr()) as i32 != 0 }
     }
 
-    fn contiguous_data_ptr<T>(&self) -> Option<NonNull<T>> {
+    fn contiguous_data_ptr<U>(&self) -> Option<NonNull<U>> {
         if !self.is_contiguous() {
             return None;
         }
-        let raw = unsafe { ffi::ggml_get_data(self.raw.as_ptr()) }.cast::<T>();
+        let raw = unsafe { ffi::ggml_get_data(self.raw.as_ptr()) }.cast::<U>();
         NonNull::new(raw)
     }
 
-    fn expected_nbytes_for<T: BackendElement>(&self) -> Result<usize> {
+    fn expected_nbytes_for<U: BackendElement>(&self) -> Result<usize> {
         let elements = self.element_count()?;
-        elements.checked_mul_checked(std::mem::size_of::<T>())
+        elements.checked_mul_checked(std::mem::size_of::<U>())
     }
 
-    fn ensure_backend_slice_compatible<T: BackendElement>(&self) -> Result<usize> {
-        // ggml backend APIs are byte-oriented; enforce exact element-size match
-        // up front to avoid silent reinterpretation.
-        let expected_nbytes = self.expected_nbytes_for::<T>()?;
+    fn ensure_backend_slice_compatible<U: BackendElement>(&self) -> Result<usize> {
+        let expected_nbytes = self.expected_nbytes_for::<U>()?;
         let actual_nbytes = self.nbytes();
         if expected_nbytes != actual_nbytes {
             return Err(Error::UnexpectedTensorByteSize {
@@ -997,7 +1406,6 @@ impl<'ctx> Tensor<'ctx> {
         Ok(expected_nbytes)
     }
 
-    /// Assigns a debug name to the tensor.
     pub fn set_name(&self, name: &str) -> Result<()> {
         let name = CString::new(name)?;
         let raw = unsafe { ffi::ggml_set_name(self.raw.as_ptr(), name.as_ptr()) };
@@ -1005,7 +1413,6 @@ impl<'ctx> Tensor<'ctx> {
         Ok(())
     }
 
-    /// Reads a tensor debug name.
     pub fn name(&self) -> Result<String> {
         let ptr = unsafe { ffi::ggml_get_name(self.raw.as_ptr()) };
         if ptr.is_null() {
@@ -1015,65 +1422,77 @@ impl<'ctx> Tensor<'ctx> {
         Ok(cstr.to_str()?.to_owned())
     }
 
-    /// Writes host values using typed tensor I/O dispatch.
-    pub fn write_data<T: GgmlElement>(&self, values: &[T]) -> Result<()> {
+    /// Converts to a dynamically-typed tensor, discarding compile-time type information.
+    pub fn into_dyn(self) -> DynTensor<'ctx> {
+        DynTensor {
+            raw: self.raw,
+            _ctx: self._ctx,
+        }
+    }
+
+    /// Writes host values into the tensor.
+    pub fn write_data(&self, values: &[T]) -> Result<()> {
         T::write_data(self, values)
     }
 
     /// Writes host values at the provided element offset.
-    pub fn write_data_at<T: GgmlElement>(&self, element_offset: usize, values: &[T]) -> Result<()> {
+    pub fn write_data_at(&self, element_offset: usize, values: &[T]) -> Result<()> {
         T::write_data_at(self, element_offset, values)
     }
 
     /// Writes backend values with an element type inferred from the slice.
-    pub fn write_data_backend<T: BackendElement>(&self, values: &[T]) -> Result<()> {
+    pub fn write_data_backend(&self, values: &[T]) -> Result<()>
+    where
+        T: BackendElement,
+    {
         self.write_backend_slice(values)
     }
 
     /// Writes backend values at the provided element offset.
-    pub fn write_data_backend_at<T: BackendElement>(
-        &self,
-        element_offset: usize,
-        values: &[T],
-    ) -> Result<()> {
+    pub fn write_data_backend_at(&self, element_offset: usize, values: &[T]) -> Result<()>
+    where
+        T: BackendElement,
+    {
         self.write_backend_slice_at(element_offset, values)
     }
 
-    /// Reads all host values using typed tensor I/O dispatch.
-    pub fn read_data<T: GgmlElement>(&self) -> Result<Vec<T>> {
+    /// Reads all host values.
+    pub fn read_data(&self) -> Result<Vec<T>> {
         T::read_data(self)
     }
 
-    /// Reads a host tensor slice using typed tensor I/O dispatch.
-    pub fn read_data_at<T: GgmlElement>(
-        &self,
-        element_offset: usize,
-        element_count: usize,
-    ) -> Result<Vec<T>> {
+    /// Reads a host tensor slice.
+    pub fn read_data_at(&self, element_offset: usize, element_count: usize) -> Result<Vec<T>> {
         T::read_data_at(self, element_offset, element_count)
     }
 
-    /// Reads all backend values for the requested element type.
-    pub fn read_data_backend<T: BackendElement>(&self) -> Result<Vec<T>> {
+    /// Reads all backend values.
+    pub fn read_data_backend(&self) -> Result<Vec<T>>
+    where
+        T: BackendElement,
+    {
         self.read_backend_vec()
     }
 
-    /// Reads a backend tensor slice for the requested element type.
-    pub fn read_data_backend_at<T: BackendElement>(
+    /// Reads a backend tensor slice.
+    pub fn read_data_backend_at(
         &self,
         element_offset: usize,
         element_count: usize,
-    ) -> Result<Vec<T>> {
+    ) -> Result<Vec<T>>
+    where
+        T: BackendElement,
+    {
         self.read_backend_vec_at(element_offset, element_count)
     }
 
-    /// Reads one element using typed tensor I/O dispatch.
-    pub fn get_data<T: GgmlElement>(&self, index: TensorIndex) -> Result<T> {
+    /// Reads one element with bounds checking.
+    pub fn get_data(&self, index: TensorIndex) -> Result<T> {
         T::get_data(self, index)
     }
 
     /// Writes host values through context tensor APIs.
-    pub(crate) fn write_host_data<T: HostElement>(&self, values: &[T]) -> Result<()> {
+    pub(crate) fn write_host_data(&self, values: &[T]) -> Result<()> {
         let expected = self.element_count()?;
         if values.len() != expected {
             return Err(Error::LengthMismatch {
@@ -1109,11 +1528,7 @@ impl<'ctx> Tensor<'ctx> {
     }
 
     /// Writes a host slice with bounds checking.
-    pub(crate) fn write_host_data_at<T: HostElement>(
-        &self,
-        element_offset: usize,
-        values: &[T],
-    ) -> Result<()> {
+    pub(crate) fn write_host_data_at(&self, element_offset: usize, values: &[T]) -> Result<()> {
         if values.is_empty() {
             return Ok(());
         }
@@ -1160,8 +1575,11 @@ impl<'ctx> Tensor<'ctx> {
         Ok(())
     }
 
-    /// Writes host values through backend tensor APIs.
-    fn write_backend_slice<T: BackendElement>(&self, values: &[T]) -> Result<()> {
+    /// Writes backend values through backend tensor APIs.
+    fn write_backend_slice(&self, values: &[T]) -> Result<()>
+    where
+        T: BackendElement,
+    {
         let expected = self.element_count()?;
         if values.len() != expected {
             return Err(Error::LengthMismatch {
@@ -1185,11 +1603,10 @@ impl<'ctx> Tensor<'ctx> {
     }
 
     /// Writes a backend slice into a contiguous tensor region.
-    fn write_backend_slice_at<T: BackendElement>(
-        &self,
-        element_offset: usize,
-        values: &[T],
-    ) -> Result<()> {
+    fn write_backend_slice_at(&self, element_offset: usize, values: &[T]) -> Result<()>
+    where
+        T: BackendElement,
+    {
         if values.is_empty() {
             return Ok(());
         }
@@ -1222,7 +1639,7 @@ impl<'ctx> Tensor<'ctx> {
     }
 
     /// Reads one host element with bounds checking.
-    pub(crate) fn read_host_at<T: HostElement>(&self, index: TensorIndex) -> Result<T> {
+    pub(crate) fn read_host_at(&self, index: TensorIndex) -> Result<T> {
         let index = index.get();
         let len = self.element_count()?;
         if index >= len {
@@ -1236,7 +1653,7 @@ impl<'ctx> Tensor<'ctx> {
     }
 
     /// Reads all host values through context tensor APIs.
-    pub(crate) fn read_host_data<T: HostElement>(&self) -> Result<Vec<T>> {
+    pub(crate) fn read_host_data(&self) -> Result<Vec<T>> {
         let len = self.element_count()?;
         if len >= CONTIGUOUS_BULK_COPY_MIN_ELEMS {
             let expected_nbytes = len.checked_mul_checked(std::mem::size_of::<T>())?;
@@ -1269,7 +1686,7 @@ impl<'ctx> Tensor<'ctx> {
     }
 
     /// Reads a host slice with bounds checking.
-    pub(crate) fn read_host_data_at<T: HostElement>(
+    pub(crate) fn read_host_data_at(
         &self,
         element_offset: usize,
         element_count: usize,
@@ -1321,7 +1738,10 @@ impl<'ctx> Tensor<'ctx> {
     }
 
     /// Reads all values through backend tensor APIs.
-    fn read_backend_vec<T: BackendElement>(&self) -> Result<Vec<T>> {
+    fn read_backend_vec(&self) -> Result<Vec<T>>
+    where
+        T: BackendElement,
+    {
         let len = self.element_count()?;
         let expected_nbytes = self.expected_nbytes_for::<T>()?;
         let actual_nbytes = self.nbytes();
@@ -1350,11 +1770,10 @@ impl<'ctx> Tensor<'ctx> {
     }
 
     /// Reads a contiguous value range through backend tensor APIs.
-    fn read_backend_vec_at<T: BackendElement>(
-        &self,
-        element_offset: usize,
-        element_count: usize,
-    ) -> Result<Vec<T>> {
+    fn read_backend_vec_at(&self, element_offset: usize, element_count: usize) -> Result<Vec<T>>
+    where
+        T: BackendElement,
+    {
         if element_count == 0 {
             return Ok(Vec::new());
         }
@@ -1400,7 +1819,14 @@ pub struct Graph<'ctx> {
 
 impl<'ctx> Graph<'ctx> {
     /// Expands the graph forward pass using the provided terminal tensor.
-    pub fn build_forward_expand(&mut self, tensor: &Tensor<'ctx>) {
+    pub fn build_forward_expand<T: GgmlElement>(&mut self, tensor: &Tensor<'ctx, T>) {
+        unsafe {
+            ffi::ggml_build_forward_expand(self.raw.as_ptr(), tensor.raw.as_ptr());
+        }
+    }
+
+    /// Expands the graph forward pass using a dynamically-typed tensor.
+    pub fn build_forward_expand_dyn(&mut self, tensor: &DynTensor<'ctx>) {
         unsafe {
             ffi::ggml_build_forward_expand(self.raw.as_ptr(), tensor.raw.as_ptr());
         }
@@ -1411,8 +1837,8 @@ impl<'ctx> Graph<'ctx> {
         unsafe { ffi::ggml_graph_n_nodes(self.raw.as_ptr()) }
     }
 
-    /// Returns a node by index (supports negative indexing from the end).
-    pub fn node(&self, index: i32) -> Result<Tensor<'ctx>> {
+    /// Returns a dynamically-typed node by index (supports negative indexing from the end).
+    pub fn node(&self, index: i32) -> Result<DynTensor<'ctx>> {
         let node_count = self.node_count();
         if node_count <= 0 {
             return Err(Error::InvalidGraphIndex { index, node_count });
@@ -1426,14 +1852,19 @@ impl<'ctx> Graph<'ctx> {
         let raw = unsafe { ffi::ggml_graph_node(self.raw.as_ptr(), normalized) };
         let raw = NonNull::new(raw).ok_or_else(|| Error::null_pointer("ggml_graph_node"))?;
 
-        Ok(Tensor {
+        Ok(DynTensor {
             raw,
             _ctx: PhantomData,
         })
     }
 
-    /// Returns the last graph node.
-    pub fn last_node(&self) -> Result<Tensor<'ctx>> {
+    /// Returns a typed node by index with runtime type checking.
+    pub fn node_typed<T: GgmlElement>(&self, index: i32) -> Result<Tensor<'ctx, T>> {
+        self.node(index)?.as_typed::<T>()
+    }
+
+    /// Returns the last graph node as a dynamically-typed tensor.
+    pub fn last_node(&self) -> Result<DynTensor<'ctx>> {
         let node_count = self.node_count();
         if node_count <= 0 {
             return Err(Error::InvalidGraphIndex {
@@ -1443,6 +1874,11 @@ impl<'ctx> Graph<'ctx> {
         }
 
         self.node(node_count - 1)
+    }
+
+    /// Returns the last graph node as a typed tensor with runtime type checking.
+    pub fn last_node_typed<T: GgmlElement>(&self) -> Result<Tensor<'ctx, T>> {
+        self.last_node()?.as_typed::<T>()
     }
 }
 

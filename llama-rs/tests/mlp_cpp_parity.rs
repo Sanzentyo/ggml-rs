@@ -143,7 +143,6 @@ fn ggml_lib_dir(ggml_root: &Path) -> PathBuf {
     match std::env::var_os("GGML_RS_LIB_DIRS") {
         Some(paths) => std::env::split_paths(&paths)
             .next()
-            .map(PathBuf::from)
             .unwrap_or_else(|| ggml_root.join("build/src")),
         None => ggml_root.join("build/src"),
     }

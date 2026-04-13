@@ -73,8 +73,29 @@ pub enum Error {
     #[error("ggml graph compute failed with status {0}")]
     ComputeFailed(i32),
 
-    #[error("gguf_write_to_file reported failure")]
+    #[error("gguf write reported failure")]
     GgufWriteFailed,
+
+    #[error("gguf type mismatch: expected {expected}, got {actual}")]
+    GgufTypeMismatch {
+        expected: &'static str,
+        actual: &'static str,
+    },
+
+    #[error("tensor type mismatch: expected type {expected} but got type {actual}")]
+    TypeMismatch { expected: c_int, actual: c_int },
+
+    #[error("tensor is not contiguous (required for reshape)")]
+    NotContiguous,
+
+    #[error(
+        "view extent ({extent} bytes at offset {offset}) exceeds source tensor ({source_size} bytes)"
+    )]
+    ViewOutOfBounds {
+        offset: usize,
+        extent: usize,
+        source_size: usize,
+    },
 }
 
 impl Error {

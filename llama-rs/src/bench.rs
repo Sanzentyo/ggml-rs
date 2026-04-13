@@ -165,9 +165,9 @@ pub fn backend_matmul_bench(
     let avg_ms = elapsed.as_secs_f64() * 1000.0 / config.bench_iters as f64;
 
     let values = graph
-        .last_node()
+        .last_node_typed::<f32>()
         .map_err(|source| BenchError::ggml("Graph::last_node", source))?
-        .read_data_backend::<f32>()
+        .read_data_backend()
         .map_err(|source| BenchError::ggml("Tensor::read_data_backend", source))?;
     let checksum = values.iter().take(16).map(|value| f64::from(*value)).sum();
 

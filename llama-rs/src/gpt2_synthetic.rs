@@ -186,9 +186,9 @@ pub fn run_ctx(config: SyntheticConfig) -> Result<SyntheticReport, SyntheticErro
             .map_err(|source| SyntheticError::ggml("Context::compute", source))?;
 
         let values = graph
-            .last_node()
+            .last_node_typed::<f32>()
             .map_err(|source| SyntheticError::ggml("Graph::last_node", source))?
-            .read_data::<f32>()
+            .read_data()
             .map_err(|source| SyntheticError::ggml("Tensor::read_data", source))?;
         checksum += checksum_from_logits(&values, config.n_vocab, active_batch);
     }
@@ -382,9 +382,9 @@ fn run_backend_for_steps(
             .map_err(|source| SyntheticError::ggml("Backend::compute", source))?;
 
         let values = graph
-            .last_node()
+            .last_node_typed::<f32>()
             .map_err(|source| SyntheticError::ggml("Graph::last_node", source))?
-            .read_data_backend_at::<f32>(0, sample_len)
+            .read_data_backend_at(0, sample_len)
             .map_err(|source| SyntheticError::ggml("Tensor::read_data_backend_at", source))?;
         checksum += checksum_from_logits(&values, config.n_vocab, active_batch);
     }

@@ -28,9 +28,9 @@ Baseline readiness check:
 | parallel | Not started | No | No |  |
 | passkey | Not started | No | No |  |
 | retrieval | Not started | No | No |  |
-| save-load-state | Not started | No | No |  |
-| simple | In progress | Yes | Yes | `simple` + `min_infer_linear` + `min_infer_mlp` + `min_infer_mlp_layer` + `min_infer_attention_layer` まで拡張。name resolver + metadata resolver 連携で layer index 実行を自動化（`FullMetadata` / `TensorHeuristic` を可視化）。attention は ADT 化（layout/mask/rope）し multi-head + causal(CPU) 経路を追加。full model/token inference parity は未対応 |
-| simple-chat | Not started | No | No |  |
+| save-load-state | In progress | Yes | No | `GenerationSession` + `GenerationCheckpoint` で step-by-step 生成とバイナリ checkpoint を実装。postcard format, model fingerprint 検証, KV cache trimming, invariant validation 対応。resume() は backend + policy のみ caller から取得（他は checkpoint から復元）。save_load_state example 追加。18 unit tests passing |
+| simple | In progress | Yes | Yes | `simple` + `min_infer_linear` + `min_infer_mlp` + `min_infer_mlp_layer` + `min_infer_attention_layer` まで拡張。name resolver + metadata resolver 連携で layer index 実行を自動化（`FullMetadata` / `TensorHeuristic` を可視化）。attention は ADT 化（layout/mask/rope）し multi-head + causal(CPU) 経路を追加。**Qwen3.5 E2E parity 達成**: single-token `[5328]`, multi-token 5生成 `[1088,35790,90,16,14728]`, 3-prompt+5-gen `[31,2,5,1,271]`, 5-prompt+5-gen `[6,24218,10,4838,1665]` 全 match。精度限界: prompt `[5]` の token 5 のみ diverge (23 vs 24, adjacent logits)。NeoX RoPE, causal depthwise conv, delta-net recurrence, Q/gate split 全て実装・検証済み。**autoregressive decode 実装済み**: two-phase loop (prefill → decode) で KV cache (full attention) + conv buffer/SSM states (linear attention) を保持。`GenerationMode` enum (`Auto | FullReprocess | TwoPhase`) で実行戦略を選択。`two_phase_matches_full_reprocess_multi_layer` テストで 3層合成モデルの parity 検証済み |
+| simple-chat | In progress | No | No | `chat.rs` module: `ChatMessage`/`Role`/`ChatFormat` types, ChatML formatting, content sanitization (sentinel rejection), `format_chat_prompt()`. `tokenizer.rs`: `decode()`/`decode_token()` detokenization, `encode_with_special_tokens()` for ChatML, `StreamingDecoder` for UTF-8 safe streaming, `special_token_id()` lookup. `simple_chat` example: interactive multi-turn loop with streaming output, `<\|im_end\|>` stop detection. 20+ unit tests |
 | speculative | Not started | No | No |  |
 | speculative-simple | Not started | No | No |  |
 | gen-docs | Not started | No | No |  |

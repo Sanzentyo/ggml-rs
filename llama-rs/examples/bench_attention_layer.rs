@@ -259,7 +259,7 @@ fn main() -> Result<(), ExampleError> {
             continue;
         }
 
-        for (block_layer, block_mlp_weights) in block_mlp_layers.iter().copied() {
+        for (block_layer, block_mlp_weights) in block_mlp_layers.iter() {
             for backend in parsed.backends.iter().copied() {
                 let layer_repeat =
                     model_layer_repeat.unwrap_or_else(|| parsed.layer_repeat_for_backend(backend));
@@ -1020,6 +1020,8 @@ fn resolve_block_mlp_weights_for_layer(
     let names = LlamaLayerTensorNames {
         layer,
         attn_norm: String::new(),
+        attn_q_norm: None,
+        attn_k_norm: None,
         attn_q: String::new(),
         attn_k: String::new(),
         attn_v: String::new(),

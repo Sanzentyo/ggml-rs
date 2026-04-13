@@ -2,7 +2,8 @@
 
 use crate::ffi;
 use crate::num_ext::TryIntoChecked;
-use crate::{Error, Result, Tensor};
+use crate::types::Type;
+use crate::{DynTensor, Error, Result, Tensor};
 use std::ffi::{CStr, CString};
 use std::marker::PhantomData;
 use std::os::raw::{c_char, c_int};
@@ -150,8 +151,7 @@ pub struct GgufTensorInfo {
     pub name: String,
     pub offset: usize,
     pub size: usize,
-    pub ggml_type_raw: i32,
-    pub ggml_type_name: String,
+    pub ggml_type: Type,
 }
 
 /// RAII owner for a GGUF context.
@@ -206,8 +206,8 @@ impl GgufFile {
         Ok(cstr.to_str()?.to_owned())
     }
 
-    pub fn find_key(&self, key: &str) -> Result<Option<usize>> {
-        let key = CString::new(key)?;
+    pub fn find_key(&self, key: impl AsRef<str>) -> Result<Option<usize>> {
+        let key = CString::new(key.as_ref())?;
         let idx = unsafe { ffi::gguf_find_key(self.raw.as_ptr(), key.as_ptr()) };
         if idx < 0 {
             Ok(None)
@@ -234,11 +234,18 @@ impl GgufFile {
         self.kv_value_from_type(key_id, value_type)
     }
 
-    pub fn kv_value_by_key(&self, key: &str) -> Result<Option<GgufValue>> {
-        let Some(index) = self.find_key(key)? else {
+    pub fn kv_value_by_key(&self, key: impl AsRef<str>) -> Result<Option<GgufValue>> {
+        let Some(index) = self.find_key(key.as_ref())? else {
             return Ok(None);
         };
         self.kv_value(index).map(Some)
+    }
+
+    pub fn kv_value_as<T: TryFromGgufValue>(&self, key: impl AsRef<str>) -> Result<Option<T>> {
+        let Some(value) = self.kv_value_by_key(key)? else {
+            return Ok(None);
+        };
+        T::try_from_gguf_value(&value).map(Some)
     }
 
     pub fn kv_type_name(&self, index: usize) -> Result<String> {
@@ -280,11 +287,7 @@ impl GgufFile {
         let name = unsafe { CStr::from_ptr(name_ptr) }.to_str()?.to_owned();
 
         let ggml_type_raw = unsafe { ffi::gguf_get_tensor_type(self.raw.as_ptr(), index_i64) };
-        let type_ptr = unsafe { ffi::ggml_type_name(ggml_type_raw as _) };
-        if type_ptr.is_null() {
-            return Err(Error::null_pointer("ggml_type_name"));
-        }
-        let ggml_type_name = unsafe { CStr::from_ptr(type_ptr) }.to_str()?.to_owned();
+        let ggml_type = Type::from_raw(ggml_type_raw as c_int);
 
         let offset = unsafe { ffi::gguf_get_tensor_offset(self.raw.as_ptr(), index_i64) };
         let size = unsafe { ffi::gguf_get_tensor_size(self.raw.as_ptr(), index_i64) };
@@ -293,8 +296,7 @@ impl GgufFile {
             name,
             offset,
             size,
-            ggml_type_raw: ggml_type_raw as c_int,
-            ggml_type_name,
+            ggml_type,
         })
     }
 
@@ -439,8 +441,8 @@ impl GgufWriter {
         })
     }
 
-    pub fn set_value(&mut self, key: &str, value: &GgufValue) -> Result<()> {
-        let key = CString::new(key)?;
+    pub fn set_value(&mut self, key: impl AsRef<str>, value: &GgufValue) -> Result<()> {
+        let key = CString::new(key.as_ref())?;
         let key_ptr = key.as_ptr();
 
         match value {
@@ -499,8 +501,8 @@ impl GgufWriter {
         Ok(())
     }
 
-    pub fn remove_key(&mut self, key: &str) -> Result<Option<usize>> {
-        let key = CString::new(key)?;
+    pub fn remove_key(&mut self, key: impl AsRef<str>) -> Result<Option<usize>> {
+        let key = CString::new(key.as_ref())?;
         let removed = unsafe { ffi::gguf_remove_key(self.raw.as_ptr(), key.as_ptr()) };
         if removed < 0 {
             Ok(None)
@@ -517,10 +519,15 @@ impl GgufWriter {
         }
     }
 
-    pub fn add_tensor(&mut self, tensor: &Tensor<'_>) {
+    pub fn add_tensor(&mut self, tensor: &DynTensor<'_>) {
         unsafe {
             ffi::gguf_add_tensor(self.raw.as_ptr(), tensor.raw_ptr().cast_const());
         }
+    }
+
+    /// Adds a typed tensor to the GGUF context, converting to dynamic form.
+    pub fn add_typed_tensor<T: crate::GgmlElement>(&mut self, tensor: &Tensor<'_, T>) {
+        self.add_tensor(&tensor.into_dyn())
     }
 
     pub fn write_to_file<P: AsRef<Path>>(&self, path: P, only_meta: bool) -> Result<()> {
@@ -639,4 +646,157 @@ fn c_string_from_ptr(ptr: *const c_char, context: &'static str) -> Result<String
     }
     let cstr = unsafe { CStr::from_ptr(ptr) };
     Ok(cstr.to_str()?.to_owned())
+}
+
+/// Trait for extracting typed values from `GgufValue`.
+///
+/// Provides a fallible conversion from the `GgufValue` enum to Rust primitive
+/// types, returning an error when the variant does not match the requested type.
+/// This enables the `kv_value_as::<T>()` convenience method on `GgufFile`.
+pub trait TryFromGgufValue: Sized {
+    fn try_from_gguf_value(value: &GgufValue) -> Result<Self>;
+}
+
+impl TryFromGgufValue for u8 {
+    fn try_from_gguf_value(value: &GgufValue) -> Result<Self> {
+        match value {
+            GgufValue::U8(v) => Ok(*v),
+            other => Err(Error::GgufTypeMismatch {
+                expected: "u8",
+                actual: other.type_name(),
+            }),
+        }
+    }
+}
+
+impl TryFromGgufValue for i8 {
+    fn try_from_gguf_value(value: &GgufValue) -> Result<Self> {
+        match value {
+            GgufValue::I8(v) => Ok(*v),
+            other => Err(Error::GgufTypeMismatch {
+                expected: "i8",
+                actual: other.type_name(),
+            }),
+        }
+    }
+}
+
+impl TryFromGgufValue for u16 {
+    fn try_from_gguf_value(value: &GgufValue) -> Result<Self> {
+        match value {
+            GgufValue::U16(v) => Ok(*v),
+            other => Err(Error::GgufTypeMismatch {
+                expected: "u16",
+                actual: other.type_name(),
+            }),
+        }
+    }
+}
+
+impl TryFromGgufValue for i16 {
+    fn try_from_gguf_value(value: &GgufValue) -> Result<Self> {
+        match value {
+            GgufValue::I16(v) => Ok(*v),
+            other => Err(Error::GgufTypeMismatch {
+                expected: "i16",
+                actual: other.type_name(),
+            }),
+        }
+    }
+}
+
+impl TryFromGgufValue for u32 {
+    fn try_from_gguf_value(value: &GgufValue) -> Result<Self> {
+        match value {
+            GgufValue::U32(v) => Ok(*v),
+            other => Err(Error::GgufTypeMismatch {
+                expected: "u32",
+                actual: other.type_name(),
+            }),
+        }
+    }
+}
+
+impl TryFromGgufValue for i32 {
+    fn try_from_gguf_value(value: &GgufValue) -> Result<Self> {
+        match value {
+            GgufValue::I32(v) => Ok(*v),
+            other => Err(Error::GgufTypeMismatch {
+                expected: "i32",
+                actual: other.type_name(),
+            }),
+        }
+    }
+}
+
+impl TryFromGgufValue for f32 {
+    fn try_from_gguf_value(value: &GgufValue) -> Result<Self> {
+        match value {
+            GgufValue::F32(v) => Ok(*v),
+            other => Err(Error::GgufTypeMismatch {
+                expected: "f32",
+                actual: other.type_name(),
+            }),
+        }
+    }
+}
+
+impl TryFromGgufValue for bool {
+    fn try_from_gguf_value(value: &GgufValue) -> Result<Self> {
+        match value {
+            GgufValue::Bool(v) => Ok(*v),
+            other => Err(Error::GgufTypeMismatch {
+                expected: "bool",
+                actual: other.type_name(),
+            }),
+        }
+    }
+}
+
+impl TryFromGgufValue for String {
+    fn try_from_gguf_value(value: &GgufValue) -> Result<Self> {
+        match value {
+            GgufValue::String(v) => Ok(v.clone()),
+            other => Err(Error::GgufTypeMismatch {
+                expected: "String",
+                actual: other.type_name(),
+            }),
+        }
+    }
+}
+
+impl TryFromGgufValue for u64 {
+    fn try_from_gguf_value(value: &GgufValue) -> Result<Self> {
+        match value {
+            GgufValue::U64(v) => Ok(*v),
+            other => Err(Error::GgufTypeMismatch {
+                expected: "u64",
+                actual: other.type_name(),
+            }),
+        }
+    }
+}
+
+impl TryFromGgufValue for i64 {
+    fn try_from_gguf_value(value: &GgufValue) -> Result<Self> {
+        match value {
+            GgufValue::I64(v) => Ok(*v),
+            other => Err(Error::GgufTypeMismatch {
+                expected: "i64",
+                actual: other.type_name(),
+            }),
+        }
+    }
+}
+
+impl TryFromGgufValue for f64 {
+    fn try_from_gguf_value(value: &GgufValue) -> Result<Self> {
+        match value {
+            GgufValue::F64(v) => Ok(*v),
+            other => Err(Error::GgufTypeMismatch {
+                expected: "f64",
+                actual: other.type_name(),
+            }),
+        }
+    }
 }

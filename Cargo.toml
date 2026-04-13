@@ -22,6 +22,11 @@ path = "examples/backend_matmul.rs"
 required-features = ["link-system"]
 
 [[example]]
+name = "backend_ops"
+path = "examples/backend_ops.rs"
+required-features = ["link-system"]
+
+[[example]]
 name = "perf_metal"
 path = "examples/perf_metal.rs"
 required-features = ["link-system"]

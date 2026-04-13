@@ -217,10 +217,10 @@ impl AttentionDecodeStepwiseConfig {
 
 #[derive(Default)]
 struct KvCacheWriteNodes<'ctx> {
-    shared_k: Option<ggml_rs::Tensor<'ctx>>,
-    shared_v: Option<ggml_rs::Tensor<'ctx>>,
-    step_k: Option<Vec<ggml_rs::Tensor<'ctx>>>,
-    step_v: Option<Vec<ggml_rs::Tensor<'ctx>>>,
+    shared_k: Option<ggml_rs::Tensor<'ctx, f32>>,
+    shared_v: Option<ggml_rs::Tensor<'ctx, f32>>,
+    step_k: Option<Vec<ggml_rs::Tensor<'ctx, f32>>>,
+    step_v: Option<Vec<ggml_rs::Tensor<'ctx, f32>>>,
 }
 
 trait KvCacheWriteStrategy {
@@ -303,10 +303,10 @@ impl KvCacheWriteStrategy for StepSpecificKvCacheWriteStrategy {
 
 struct StepwiseGraphBuildInput<'ctx> {
     steps: usize,
-    y: &'ctx ggml_rs::Tensor<'ctx>,
-    projected_k_step: Option<&'ctx ggml_rs::Tensor<'ctx>>,
-    projected_v_step: Option<&'ctx ggml_rs::Tensor<'ctx>>,
-    head_prereq_nodes: &'ctx [ggml_rs::Tensor<'ctx>],
+    y: &'ctx ggml_rs::Tensor<'ctx, f32>,
+    projected_k_step: Option<&'ctx ggml_rs::Tensor<'ctx, f32>>,
+    projected_v_step: Option<&'ctx ggml_rs::Tensor<'ctx, f32>>,
+    head_prereq_nodes: &'ctx [ggml_rs::Tensor<'ctx, f32>],
     kv_cache_write_nodes: &'ctx KvCacheWriteNodes<'ctx>,
 }
 
@@ -417,10 +417,10 @@ impl HeadOutputProjectionMode {
 
 struct HeadOutputAssembler<'ctx> {
     mode: HeadOutputProjectionMode,
-    output_projection: Option<ggml_rs::Tensor<'ctx>>,
-    head_outputs: Vec<ggml_rs::Tensor<'ctx>>,
-    head_output_staging: Option<ggml_rs::Tensor<'ctx>>,
-    head_output_staging_writes: Vec<ggml_rs::Tensor<'ctx>>,
+    output_projection: Option<ggml_rs::Tensor<'ctx, f32>>,
+    head_outputs: Vec<ggml_rs::Tensor<'ctx, f32>>,
+    head_output_staging: Option<ggml_rs::Tensor<'ctx, f32>>,
+    head_output_staging_writes: Vec<ggml_rs::Tensor<'ctx, f32>>,
     concat_metadata: HeadConcatMetadata,
     hidden_features: usize,
     query_head_count: usize,
@@ -489,15 +489,15 @@ impl<'ctx> HeadOutputAssembler<'ctx> {
         })
     }
 
-    fn graph_prereq_nodes(&self) -> &[ggml_rs::Tensor<'ctx>] {
+    fn graph_prereq_nodes(&self) -> &[ggml_rs::Tensor<'ctx, f32>] {
         &self.head_output_staging_writes
     }
 
     fn accumulate(
         &mut self,
         ctx: &'ctx Context,
-        w_o: &ggml_rs::Tensor<'ctx>,
-        head_output: ggml_rs::Tensor<'ctx>,
+        w_o: &ggml_rs::Tensor<'ctx, f32>,
+        head_output: ggml_rs::Tensor<'ctx, f32>,
         args: HeadOutputAccumulateArgs,
     ) -> Result<(), InferenceError> {
         match self.mode {
@@ -556,8 +556,8 @@ impl<'ctx> HeadOutputAssembler<'ctx> {
     fn finalize(
         &mut self,
         ctx: &'ctx Context,
-        w_o: &ggml_rs::Tensor<'ctx>,
-    ) -> Result<ggml_rs::Tensor<'ctx>, InferenceError> {
+        w_o: &ggml_rs::Tensor<'ctx, f32>,
+    ) -> Result<ggml_rs::Tensor<'ctx, f32>, InferenceError> {
         match self.mode {
             HeadOutputProjectionMode::PerHead => self
                 .output_projection
@@ -597,19 +597,19 @@ impl<'ctx> HeadOutputAssembler<'ctx> {
 trait SequenceStateUpdater {
     fn initialize_mask<'ctx>(
         &mut self,
-        mask: Option<&ggml_rs::Tensor<'ctx>>,
+        mask: Option<&ggml_rs::Tensor<'ctx, f32>>,
         past_start: usize,
     ) -> Result<(), InferenceError>;
 
     fn update_positions<'ctx>(
         &mut self,
-        positions_q: Option<&ggml_rs::Tensor<'ctx>>,
+        positions_q: Option<&ggml_rs::Tensor<'ctx, i32>>,
         step_past_tokens: usize,
     ) -> Result<(), InferenceError>;
 
     fn update_mask<'ctx>(
         &mut self,
-        mask: Option<&ggml_rs::Tensor<'ctx>>,
+        mask: Option<&ggml_rs::Tensor<'ctx, f32>>,
         step: usize,
         step_past_tokens: usize,
     ) -> Result<(), InferenceError>;
@@ -668,7 +668,7 @@ impl DeltaSequenceStateUpdater {
 impl SequenceStateUpdater for DeltaSequenceStateUpdater {
     fn initialize_mask<'ctx>(
         &mut self,
-        mask: Option<&ggml_rs::Tensor<'ctx>>,
+        mask: Option<&ggml_rs::Tensor<'ctx, f32>>,
         past_start: usize,
     ) -> Result<(), InferenceError> {
         if !self.incremental_mask_update {
@@ -703,7 +703,7 @@ impl SequenceStateUpdater for DeltaSequenceStateUpdater {
 
     fn update_positions<'ctx>(
         &mut self,
-        positions_q: Option<&ggml_rs::Tensor<'ctx>>,
+        positions_q: Option<&ggml_rs::Tensor<'ctx, i32>>,
         step_past_tokens: usize,
     ) -> Result<(), InferenceError> {
         if let Some(positions_q) = positions_q {
@@ -733,7 +733,7 @@ impl SequenceStateUpdater for DeltaSequenceStateUpdater {
 
     fn update_mask<'ctx>(
         &mut self,
-        mask: Option<&ggml_rs::Tensor<'ctx>>,
+        mask: Option<&ggml_rs::Tensor<'ctx, f32>>,
         step: usize,
         step_past_tokens: usize,
     ) -> Result<(), InferenceError> {
@@ -1699,7 +1699,7 @@ fn execute_stepwise_sweep_internal(
                         .map_err(|source| InferenceError::ggml("Backend::synchronize", source))?;
                 }
                 if readback_per_step {
-                    let _ = y.read_data_backend::<f32>().map_err(|source| {
+                    let _ = y.read_data_backend().map_err(|source| {
                         InferenceError::ggml("Tensor::read_data_backend<Y_STEP>", source)
                     })?;
                 }
@@ -1720,7 +1720,7 @@ fn execute_stepwise_sweep_internal(
         let bench_duration = bench_start.elapsed();
 
         let output = y
-            .read_data_backend::<f32>()
+            .read_data_backend()
             .map_err(|source| InferenceError::ggml("Tensor::read_data_backend<Y>", source))?;
         executions.push(AttentionDecodeStepwiseReport {
             backend_name: backend_name.clone(),

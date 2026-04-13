@@ -14,18 +14,18 @@ fn scoped_context_helpers_work() -> Result<(), Error> {
     let element_count = with_context(mem, |ctx| {
         let tensor = ctx.new_tensor_2d::<f32>(lhs)?;
         tensor.write_data(&[1.0, 2.0, 3.0, 4.0])?;
-        assert_eq!(tensor.read_data_at::<f32>(1, 2)?, vec![2.0, 3.0]);
+        assert_eq!(tensor.read_data_at(1, 2)?, vec![2.0, 3.0]);
         tensor.write_data_at(2, &[9.0, 8.0])?;
-        assert_eq!(tensor.read_data::<f32>()?, vec![1.0, 2.0, 9.0, 8.0]);
+        assert_eq!(tensor.read_data()?, vec![1.0, 2.0, 9.0, 8.0]);
         let err = tensor
-            .read_data_at::<f32>(4, 1)
+            .read_data_at(4, 1)
             .expect_err("host read range past end should error");
         assert!(matches!(err, Error::IndexOutOfBounds { .. }));
         let err = tensor
             .write_data_at(4, &[1.0])
             .expect_err("host write range past end should error");
         assert!(matches!(err, Error::IndexOutOfBounds { .. }));
-        Ok(tensor.element_count()?)
+        tensor.element_count()
     })?;
     assert_eq!(element_count, 4);
 
@@ -35,7 +35,7 @@ fn scoped_context_helpers_work() -> Result<(), Error> {
         let tensor = ctx.new_tensor_2d::<f32>(lhs)?;
         let _buffer = ctx.allocate_tensors(&backend)?;
         tensor.write_data_backend(&[1.0, 2.0, 3.0, 4.0])?;
-        let out = tensor.read_data_backend::<f32>()?;
+        let out = tensor.read_data_backend()?;
         assert_eq!(out, vec![1.0, 2.0, 3.0, 4.0]);
         Ok(())
     })?;
@@ -73,7 +73,7 @@ fn reshape_view_permute_smoke() -> Result<(), Error> {
 
         let viewed = ctx.view_1d(&base, 4, 0)?;
         assert_eq!(viewed.element_count()?, 4);
-        assert_eq!(viewed.get_data::<f32>(TensorIndex::new(3))?, 3.0);
+        assert_eq!(viewed.get_data(TensorIndex::new(3))?, 3.0);
 
         let tensor4 = ctx.new_tensor_4d::<f32>(Shape4D::new(3, 2, 2, 2))?;
         let permuted = ctx.permute(&tensor4, 1, 0, 2, 3)?;
@@ -92,17 +92,14 @@ fn backend_roundtrip_and_bounds_checks() -> Result<(), Error> {
 
         let values = [10, 20, 30, 40, 50, 60, 70, 80];
         tensor.write_data_backend(&values)?;
-        assert_eq!(tensor.read_data_backend::<i32>()?, values.to_vec());
+        assert_eq!(tensor.read_data_backend()?, values.to_vec());
 
         tensor.write_data_backend_at(2, &[111, 222])?;
         assert_eq!(
-            tensor.read_data_backend::<i32>()?,
+            tensor.read_data_backend()?,
             vec![10, 20, 111, 222, 50, 60, 70, 80]
         );
-        assert_eq!(
-            tensor.read_data_backend_at::<i32>(2, 3)?,
-            vec![111, 222, 50]
-        );
+        assert_eq!(tensor.read_data_backend_at(2, 3)?, vec![111, 222, 50]);
 
         let err = tensor
             .write_data_backend_at(8, &[1])
@@ -110,10 +107,213 @@ fn backend_roundtrip_and_bounds_checks() -> Result<(), Error> {
         assert!(matches!(err, Error::IndexOutOfBounds { .. }));
 
         let err = tensor
-            .read_data_backend_at::<i32>(7, 2)
+            .read_data_backend_at(7, 2)
             .expect_err("read range past end should error");
         assert!(matches!(err, Error::IndexOutOfBounds { .. }));
 
+        Ok(())
+    })
+}
+
+// -- reshape_1d / reshape_4d --
+
+#[test]
+fn reshape_1d_flattens_2d() -> Result<(), Error> {
+    let mem = Bytes::new(256 * 1024);
+    with_context(mem, |ctx| {
+        let base = ctx.new_tensor_2d::<f32>(Shape2D::new(3, 4))?;
+        let flat = ctx.reshape_1d(&base, 12)?;
+        assert_eq!(flat.element_count()?, 12);
+        Ok(())
+    })
+}
+
+#[test]
+fn reshape_4d_smoke() -> Result<(), Error> {
+    let mem = Bytes::new(256 * 1024);
+    with_context(mem, |ctx| {
+        // 2×3×4×5 = 120 elements
+        let base = ctx.new_tensor_2d::<f32>(Shape2D::new(12, 10))?; // 120
+        let r4 = ctx.reshape_4d(&base, 2, 3, 4, 5)?;
+        assert_eq!(*r4.dims::<4>()?.as_array(), [2, 3, 4, 5]);
+        assert_eq!(r4.element_count()?, 120);
+        Ok(())
+    })
+}
+
+#[test]
+fn reshape_element_count_mismatch_returns_error() -> Result<(), Error> {
+    let mem = Bytes::new(256 * 1024);
+    with_context(mem, |ctx| {
+        let base = ctx.new_tensor_2d::<f32>(Shape2D::new(3, 4))?; // 12 elements
+        assert!(matches!(
+            ctx.reshape_1d(&base, 10),
+            Err(Error::LengthMismatch { .. })
+        ));
+        assert!(matches!(
+            ctx.reshape_4d(&base, 2, 2, 2, 2),
+            Err(Error::LengthMismatch { .. })
+        ));
+        Ok(())
+    })
+}
+
+#[test]
+fn reshape_non_contiguous_returns_error() -> Result<(), Error> {
+    let mem = Bytes::new(256 * 1024);
+    with_context(mem, |ctx| {
+        let base = ctx.new_tensor_2d::<f32>(Shape2D::new(4, 3))?; // 12 elements
+        let transposed = ctx.transpose(&base)?; // non-contiguous
+        assert!(matches!(
+            ctx.reshape_1d(&transposed, 12),
+            Err(Error::NotContiguous)
+        ));
+        Ok(())
+    })
+}
+
+// -- view_2d with stride and offset --
+
+#[test]
+fn view_2d_strided_with_offset() -> Result<(), Error> {
+    let mem = Bytes::new(256 * 1024);
+    with_context(mem, |ctx| {
+        // Base: 12 f32 values = [0..11]
+        let base = ctx.new_tensor_1d::<f32>(Length::new(12))?;
+        let data: Vec<f32> = (0..12).map(|i| i as f32).collect();
+        base.write_data(&data)?;
+
+        let elem_size = std::mem::size_of::<f32>();
+        // View 2 elements per row, 3 rows, stride = 4 * sizeof(f32) (skip 2 elements between rows)
+        let viewed = ctx.view_2d(&base, 2, 3, 4 * elem_size, 0)?;
+        assert_eq!(*viewed.dims::<2>()?.as_array(), [2, 3]);
+        // Row 0: [0,1], Row 1: [4,5], Row 2: [8,9]
+        assert_eq!(viewed.get_data(TensorIndex::new(0))?, 0.0);
+        assert_eq!(viewed.get_data(TensorIndex::new(1))?, 1.0);
+
+        // View with offset: start at element 1
+        let viewed_off = ctx.view_2d(&base, 2, 2, 4 * elem_size, 1 * elem_size)?;
+        assert_eq!(viewed_off.get_data(TensorIndex::new(0))?, 1.0);
+        Ok(())
+    })
+}
+
+// -- view_3d --
+
+#[test]
+fn view_3d_smoke() -> Result<(), Error> {
+    let mem = Bytes::new(256 * 1024);
+    with_context(mem, |ctx| {
+        // 24 f32 elements
+        let base = ctx.new_tensor_1d::<f32>(Length::new(24))?;
+        let data: Vec<f32> = (0..24).map(|i| i as f32).collect();
+        base.write_data(&data)?;
+
+        let elem = std::mem::size_of::<f32>();
+        // 3D view: ne0=2, ne1=3, ne2=4
+        // Contiguous strides: nb1 = 2*elem, nb2 = 2*3*elem
+        let v3 = ctx.view_3d(&base, 2, 3, 4, 2 * elem, 6 * elem, 0)?;
+        assert_eq!(*v3.dims::<3>()?.as_array(), [2, 3, 4]);
+        assert_eq!(v3.element_count()?, 24);
+        // First element
+        assert_eq!(v3.get_data(TensorIndex::new(0))?, 0.0);
+        Ok(())
+    })
+}
+
+// -- view_4d --
+
+#[test]
+fn view_4d_smoke() -> Result<(), Error> {
+    let mem = Bytes::new(512 * 1024);
+    with_context(mem, |ctx| {
+        // 2*3*4*5 = 120 elements
+        let base = ctx.new_tensor_1d::<f32>(Length::new(120))?;
+        let data: Vec<f32> = (0..120).map(|i| i as f32).collect();
+        base.write_data(&data)?;
+
+        let elem = std::mem::size_of::<f32>();
+        let v4 = ctx.view_4d(&base, 2, 3, 4, 5, 2 * elem, 6 * elem, 24 * elem, 0)?;
+        assert_eq!(*v4.dims::<4>()?.as_array(), [2, 3, 4, 5]);
+        assert_eq!(v4.element_count()?, 120);
+        assert_eq!(v4.get_data(TensorIndex::new(0))?, 0.0);
+        Ok(())
+    })
+}
+
+// -- aliasing: write through view, verify base changed --
+
+#[test]
+fn view_aliases_base_tensor() -> Result<(), Error> {
+    let mem = Bytes::new(256 * 1024);
+    with_context(mem, |ctx| {
+        let base = ctx.new_tensor_1d::<f32>(Length::new(8))?;
+        base.write_data(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0])?;
+
+        let elem = std::mem::size_of::<f32>();
+        // View of last 4 elements
+        let tail = ctx.view_1d(&base, 4, 4 * elem)?;
+        assert_eq!(tail.get_data(TensorIndex::new(0))?, 5.0);
+
+        // Write through the view
+        tail.write_data(&[50.0, 60.0, 70.0, 80.0])?;
+
+        // Verify base tensor was modified
+        let all = base.read_data()?;
+        assert_eq!(all, vec![1.0, 2.0, 3.0, 4.0, 50.0, 60.0, 70.0, 80.0]);
+        Ok(())
+    })
+}
+
+#[test]
+fn reshape_aliases_base_tensor() -> Result<(), Error> {
+    let mem = Bytes::new(256 * 1024);
+    with_context(mem, |ctx| {
+        let base = ctx.new_tensor_2d::<f32>(Shape2D::new(3, 2))?;
+        base.write_data(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0])?;
+
+        let flat = ctx.reshape_1d(&base, 6)?;
+        flat.write_data(&[10.0, 20.0, 30.0, 40.0, 50.0, 60.0])?;
+
+        let base_data = base.read_data()?;
+        assert_eq!(base_data, vec![10.0, 20.0, 30.0, 40.0, 50.0, 60.0]);
+        Ok(())
+    })
+}
+
+// -- view bounds checks --
+
+#[test]
+fn view_1d_out_of_bounds_returns_error() -> Result<(), Error> {
+    let mem = Bytes::new(256 * 1024);
+    with_context(mem, |ctx| {
+        let base = ctx.new_tensor_1d::<f32>(Length::new(4))?; // 16 bytes
+        // Try to view 5 elements (20 bytes) from a 16-byte tensor
+        assert!(matches!(
+            ctx.view_1d(&base, 5, 0),
+            Err(Error::ViewOutOfBounds { .. })
+        ));
+
+        // Offset pushes view past end
+        assert!(matches!(
+            ctx.view_1d(&base, 2, 3 * std::mem::size_of::<f32>()),
+            Err(Error::ViewOutOfBounds { .. })
+        ));
+        Ok(())
+    })
+}
+
+#[test]
+fn view_3d_out_of_bounds_returns_error() -> Result<(), Error> {
+    let mem = Bytes::new(256 * 1024);
+    with_context(mem, |ctx| {
+        let base = ctx.new_tensor_1d::<f32>(Length::new(8))?; // 32 bytes
+        let elem = std::mem::size_of::<f32>();
+        // ne0=2, ne1=2, ne2=3 → contiguous would need 12 elements = 48 bytes
+        assert!(matches!(
+            ctx.view_3d(&base, 2, 2, 3, 2 * elem, 4 * elem, 0),
+            Err(Error::ViewOutOfBounds { .. })
+        ));
         Ok(())
     })
 }

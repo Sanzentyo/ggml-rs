@@ -26,6 +26,16 @@ Status legend:
 | `mnist-train` | `examples/mnist_train.rs` | Done (synthetic) | PASS | `~56.55x` | MNIST model/dataset missing |
 | `sam` | `examples/sam.rs` | Done (synthetic) | PASS | `~16.70x` | SAM model missing (example image present) |
 | `yolov3-tiny` | `examples/yolov3_tiny.rs` | Done (synthetic) | PASS | `~36.21x` | YOLO model/input/labels missing |
+| `backend-ops` | `examples/backend_ops.rs` | Done (direct) | checksum delta `0.0` (CPU/Metal) | N/A | none |
+
+## Additional examples (no upstream counterpart)
+
+| Example | Purpose |
+| --- | --- |
+| `examples/backend_ops.rs` | Multi-op backend graph (matmul + bias add) on CPU/Metal |
+| `examples/arithmetic_expr.rs` | Expression-style arithmetic API demo |
+| `examples/bench_matmul.rs` | Context-path matmul benchmarking |
+| `examples/bench_upstream_suite.rs` | Upstream benchmark suite runner |
 
 ## Artifacts
 

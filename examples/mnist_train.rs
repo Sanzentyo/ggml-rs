@@ -131,7 +131,7 @@ fn run_synthetic_train_iters(iters: usize) -> Result<TrainSummary> {
             bias_t.write_data(&bias)?;
             ctx.compute(&mut graph, 1)?;
 
-            let logits = logits_t.read_data::<f32>()?;
+            let logits = logits_t.read_data()?;
             grad_w.fill(0.0);
             grad_b.fill(0.0);
 

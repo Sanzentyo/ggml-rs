@@ -1,4 +1,4 @@
-use crate::{Context, Error, GgmlType, Result, Tensor, TensorIndex, ffi};
+use crate::{Context, DynTensor, Error, GgmlType, Result, Tensor, TensorIndex, ffi};
 use std::ops::{Add, Div, Mul, Sub};
 
 /// Element types allowed for backend tensor transfer helpers.
@@ -8,13 +8,23 @@ impl BackendElement for f32 {}
 
 impl BackendElement for i32 {}
 
-/// Internal host accessor contract used by fast generic tensor host I/O.
+/// Low-level host accessor contract for 1D element read/write.
 ///
-/// Kept crate-private on purpose so `GgmlElement` remains a high-level public
-/// trait and does not leak raw-pointer FFI requirements to external users.
-pub(crate) trait HostElement: GgmlElement {
+/// This trait is sealed: only `f32` and `i32` implement it within this crate.
+/// External crates can *see* the trait (so `GgmlElement`'s supertrait bound is
+/// satisfied publicly) but cannot implement it because the required method
+/// signature uses a private type from `sealed`.
+pub trait HostElement: Copy + Default + sealed::Sealed {
+    #[doc(hidden)]
     fn set_1d_raw(raw: *mut ffi::ggml_tensor, index: i32, value: Self);
+    #[doc(hidden)]
     fn get_1d_raw(raw: *mut ffi::ggml_tensor, index: i32) -> Self;
+}
+
+mod sealed {
+    pub trait Sealed {}
+    impl Sealed for f32 {}
+    impl Sealed for i32 {}
 }
 
 impl HostElement for f32 {
@@ -42,75 +52,91 @@ impl HostElement for i32 {
 }
 
 /// Element types that map to ggml tensor types and typed tensor I/O helpers.
-pub trait GgmlElement: BackendElement + GgmlType {
+///
+/// This trait serves as a bounds marker combining `BackendElement`, `GgmlType`,
+/// and `HostElement`. The I/O methods that were previously on this trait are now
+/// inherent methods on `Tensor<'ctx, T>`, where `T: GgmlElement`.
+pub trait GgmlElement: BackendElement + GgmlType + HostElement {
     /// Writes host values into the tensor through the most appropriate path.
-    fn write_data(tensor: &Tensor<'_>, values: &[Self]) -> Result<()>;
+    fn write_data(tensor: &Tensor<'_, Self>, values: &[Self]) -> Result<()>;
 
     /// Writes a host tensor slice.
-    fn write_data_at(tensor: &Tensor<'_>, element_offset: usize, values: &[Self]) -> Result<()>;
+    fn write_data_at(
+        tensor: &Tensor<'_, Self>,
+        element_offset: usize,
+        values: &[Self],
+    ) -> Result<()>;
 
     /// Reads tensor values into host memory through the most appropriate path.
-    fn read_data(tensor: &Tensor<'_>) -> Result<Vec<Self>>;
+    fn read_data(tensor: &Tensor<'_, Self>) -> Result<Vec<Self>>;
 
     /// Reads a host tensor slice into host memory.
     fn read_data_at(
-        tensor: &Tensor<'_>,
+        tensor: &Tensor<'_, Self>,
         element_offset: usize,
         element_count: usize,
     ) -> Result<Vec<Self>>;
 
     /// Reads one element with bounds checking.
-    fn get_data(tensor: &Tensor<'_>, index: TensorIndex) -> Result<Self>;
+    fn get_data(tensor: &Tensor<'_, Self>, index: TensorIndex) -> Result<Self>;
 }
 
 impl GgmlElement for f32 {
-    fn write_data(tensor: &Tensor<'_>, values: &[Self]) -> Result<()> {
+    fn write_data(tensor: &Tensor<'_, Self>, values: &[Self]) -> Result<()> {
         tensor.write_host_data(values)
     }
 
-    fn write_data_at(tensor: &Tensor<'_>, element_offset: usize, values: &[Self]) -> Result<()> {
+    fn write_data_at(
+        tensor: &Tensor<'_, Self>,
+        element_offset: usize,
+        values: &[Self],
+    ) -> Result<()> {
         tensor.write_host_data_at(element_offset, values)
     }
 
-    fn read_data(tensor: &Tensor<'_>) -> Result<Vec<Self>> {
+    fn read_data(tensor: &Tensor<'_, Self>) -> Result<Vec<Self>> {
         tensor.read_host_data()
     }
 
     fn read_data_at(
-        tensor: &Tensor<'_>,
+        tensor: &Tensor<'_, Self>,
         element_offset: usize,
         element_count: usize,
     ) -> Result<Vec<Self>> {
         tensor.read_host_data_at(element_offset, element_count)
     }
 
-    fn get_data(tensor: &Tensor<'_>, index: TensorIndex) -> Result<Self> {
+    fn get_data(tensor: &Tensor<'_, Self>, index: TensorIndex) -> Result<Self> {
         tensor.read_host_at(index)
     }
 }
 
 impl GgmlElement for i32 {
-    fn write_data(tensor: &Tensor<'_>, values: &[Self]) -> Result<()> {
+    fn write_data(tensor: &Tensor<'_, Self>, values: &[Self]) -> Result<()> {
         tensor.write_host_data(values)
     }
 
-    fn write_data_at(tensor: &Tensor<'_>, element_offset: usize, values: &[Self]) -> Result<()> {
+    fn write_data_at(
+        tensor: &Tensor<'_, Self>,
+        element_offset: usize,
+        values: &[Self],
+    ) -> Result<()> {
         tensor.write_host_data_at(element_offset, values)
     }
 
-    fn read_data(tensor: &Tensor<'_>) -> Result<Vec<Self>> {
+    fn read_data(tensor: &Tensor<'_, Self>) -> Result<Vec<Self>> {
         tensor.read_host_data()
     }
 
     fn read_data_at(
-        tensor: &Tensor<'_>,
+        tensor: &Tensor<'_, Self>,
         element_offset: usize,
         element_count: usize,
     ) -> Result<Vec<Self>> {
         tensor.read_host_data_at(element_offset, element_count)
     }
 
-    fn get_data(tensor: &Tensor<'_>, index: TensorIndex) -> Result<Self> {
+    fn get_data(tensor: &Tensor<'_, Self>, index: TensorIndex) -> Result<Self> {
         tensor.read_host_at(index)
     }
 }
@@ -120,17 +146,17 @@ impl GgmlElement for i32 {
 ///
 /// Arithmetic operators return `Result<TensorExpr>` so context mismatch and
 /// ggml allocation errors stay explicit.
-pub struct TensorExpr<'ctx> {
+pub struct TensorExpr<'ctx, T: GgmlElement> {
     pub(crate) ctx: &'ctx Context,
-    pub(crate) tensor: Tensor<'ctx>,
+    pub(crate) tensor: Tensor<'ctx, T>,
 }
 
-impl<'ctx> TensorExpr<'ctx> {
-    pub fn into_tensor(self) -> Tensor<'ctx> {
+impl<'ctx, T: GgmlElement> TensorExpr<'ctx, T> {
+    pub fn into_tensor(self) -> Tensor<'ctx, T> {
         self.tensor
     }
 
-    pub fn tensor(self) -> Tensor<'ctx> {
+    pub fn tensor(self) -> Tensor<'ctx, T> {
         self.tensor
     }
 
@@ -149,13 +175,19 @@ impl<'ctx> TensorExpr<'ctx> {
     }
 }
 
-impl<'ctx> From<TensorExpr<'ctx>> for Tensor<'ctx> {
-    fn from(value: TensorExpr<'ctx>) -> Self {
+impl<'ctx, T: GgmlElement> From<TensorExpr<'ctx, T>> for Tensor<'ctx, T> {
+    fn from(value: TensorExpr<'ctx, T>) -> Self {
         value.tensor
     }
 }
 
-impl<'ctx> Add for TensorExpr<'ctx> {
+impl<'ctx, T: GgmlElement> From<TensorExpr<'ctx, T>> for DynTensor<'ctx> {
+    fn from(value: TensorExpr<'ctx, T>) -> Self {
+        value.tensor.into_dyn()
+    }
+}
+
+impl<'ctx, T: GgmlElement> Add for TensorExpr<'ctx, T> {
     type Output = Result<Self>;
 
     fn add(self, rhs: Self) -> Self::Output {
@@ -169,7 +201,7 @@ impl<'ctx> Add for TensorExpr<'ctx> {
     }
 }
 
-impl<'ctx> Sub for TensorExpr<'ctx> {
+impl<'ctx, T: GgmlElement> Sub for TensorExpr<'ctx, T> {
     type Output = Result<Self>;
 
     fn sub(self, rhs: Self) -> Self::Output {
@@ -183,7 +215,7 @@ impl<'ctx> Sub for TensorExpr<'ctx> {
     }
 }
 
-impl<'ctx> Mul for TensorExpr<'ctx> {
+impl<'ctx, T: GgmlElement> Mul for TensorExpr<'ctx, T> {
     type Output = Result<Self>;
 
     fn mul(self, rhs: Self) -> Self::Output {
@@ -197,7 +229,7 @@ impl<'ctx> Mul for TensorExpr<'ctx> {
     }
 }
 
-impl<'ctx> Div for TensorExpr<'ctx> {
+impl<'ctx, T: GgmlElement> Div for TensorExpr<'ctx, T> {
     type Output = Result<Self>;
 
     fn div(self, rhs: Self) -> Self::Output {

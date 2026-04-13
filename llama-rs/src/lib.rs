@@ -1,7 +1,16 @@
+//! `llama-rs` — architecture-aware inference on GGUF models, built on `ggml-rs`.
+//!
+//! This crate provides tokenization, metadata extraction, and end-to-end token
+//! generation for transformer architectures (Qwen3.5 full/linear attention,
+//! standard attention, MLP).  The [`e2e`] module implements a two-phase
+//! generation loop (prefill + autoregressive decode) with verified token-ID
+//! parity against llama.cpp.
+
 pub mod backend;
 pub mod batched;
 pub mod bench;
 pub mod bench_report;
+pub mod chat;
 pub mod e2e;
 pub mod embedding;
 pub mod error;
@@ -28,10 +37,14 @@ pub use bench_report::{
     parse_attention_bench_output, parse_llama_cpp_jsonl, parse_mlp_bench_output,
     render_markdown_summary,
 };
+pub use chat::{
+    ChatError, ChatFormat, ChatMessage, Role, detect_chat_format, format_chat_prompt,
+    read_chat_template,
+};
 pub use e2e::{
-    E2eError, E2eGenerationConfig, E2eGenerationReport, MixedLayerPolicy,
-    generate_token_ids_from_model, generate_token_ids_from_path, resolve_eos_token_id,
-    tokenize_prompt_text,
+    E2eError, E2eGenerationConfig, E2eGenerationReport, GenerationCheckpoint, GenerationSession,
+    MixedLayerPolicy, generate_token_ids_from_model, generate_token_ids_from_path,
+    resolve_eos_token_id, tokenize_prompt_text,
 };
 pub use embedding::{EmbeddingError, EmbeddingStats, summarize_embedding_tensor};
 pub use error::{LlamaError, LlamaResult};
@@ -81,4 +94,6 @@ pub use naming::{
 };
 pub use simple::{SimpleError, SimpleReport, simple_ctx};
 pub use smoke::{SmokeError, SmokeReport, backend_smoke};
-pub use tokenizer::{GgufTokenizer, TokenizerError, TokenizerModel, tokenize_text_prompt};
+pub use tokenizer::{
+    GgufTokenizer, StreamingDecoder, TokenizerError, TokenizerModel, tokenize_text_prompt,
+};

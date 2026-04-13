@@ -132,10 +132,10 @@ pub fn backend_smoke(backend: LlamaBackend) -> Result<SmokeReport> {
         .map_err(|source| SmokeError::ggml("Backend::compute", source))?;
 
     let output = graph
-        .last_node()
+        .last_node_typed::<f32>()
         .map_err(|source| SmokeError::ggml("Graph::last_node", source))?;
     let values = output
-        .read_data_backend::<f32>()
+        .read_data_backend()
         .map_err(|source| SmokeError::ggml("Tensor::read_data_backend", source))?;
     assert_expected(&values)?;
     let shape = output

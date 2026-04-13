@@ -113,10 +113,10 @@ pub fn simple_ctx() -> Result<SimpleReport, SimpleError> {
         .map_err(|source| SimpleError::ggml("Context::compute", source))?;
 
     let output = graph
-        .last_node()
+        .last_node_typed::<f32>()
         .map_err(|source| SimpleError::ggml("Graph::last_node", source))?;
     let values = output
-        .read_data::<f32>()
+        .read_data()
         .map_err(|source| SimpleError::ggml("Tensor::read_data", source))?;
     assert_expected(&values)?;
     let shape = output

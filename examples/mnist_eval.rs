@@ -130,7 +130,7 @@ fn run_synthetic_eval_iters(iters: usize) -> Result<EvalSummary> {
     };
     for _ in 0..iters {
         ctx.compute(&mut graph, 1)?;
-        let values = logits.read_data::<f32>()?;
+        let values = logits.read_data()?;
         summary = summarize_eval_logits(&values, &labels);
     }
     Ok(summary)

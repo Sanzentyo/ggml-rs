@@ -65,14 +65,12 @@ fn run_all_upstream_ggml_tests() {
     for target in &targets {
         let started = Instant::now();
 
-        if !skip_build {
-            if let Err(error) = build_target(&build_dir, target) {
-                failures.push(format!("{target}: build error: {error}"));
-                if !keep_going {
-                    break;
-                }
-                continue;
+        if !skip_build && let Err(error) = build_target(&build_dir, target) {
+            failures.push(format!("{target}: build error: {error}"));
+            if !keep_going {
+                break;
             }
+            continue;
         }
 
         if let Err(error) = run_target(&build_dir, target) {

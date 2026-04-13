@@ -54,10 +54,13 @@ git submodule update --init --recursive
 - For benchmark timing, call `Backend::synchronize()` after compute loops to
   ensure queued backend work is fully completed before measuring/reporting.
 - Quantized tensor decode helpers are available in safe API:
-  - `decode_tensor_data_to::<T>(ggml_type_raw, payload) -> Vec<T>`
-  - `tensor_element_count(ggml_type_raw, payload_bytes)`
+  - `decode_tensor_data_to::<T>(ggml_type: Type, payload) -> Vec<T>`
+  - `tensor_element_count(ggml_type: Type, payload_bytes)`
   These use GGML type traits (`ggml_get_type_traits`) and are useful for GGUF
   model paths that need typed views over quantized payloads.
+  The `Type` enum covers all ~32 ggml tensor types (native floats, integers,
+  and quantized block formats) with `from_raw(i32)` / `as_raw()` conversion
+  and classification helpers (`is_quantized()`, `is_float()`, `is_integer()`).
 - Decode API ownership refactor was assembly-verified (`2026-03-15`):
   - focused snippets: `target/benchmarks/review3_decode_asm_snippets.md`
   - before/after line-count summary: `target/benchmarks/review3_decode_asm_compare.md`
@@ -86,6 +89,13 @@ git submodule update --init --recursive
     - `write_data_to_file(path)`
     - `write_metadata_to_file(path)`
   This allows fixture generation and round-trip checks without exposing unsafe pointers.
+- GGUF key-value access now accepts `impl AsRef<str>` for ergonomic string handling (`2026-04-12`):
+  - `GgufFile::find_key(key: impl AsRef<str>)`, `kv_value_by_key(key: impl AsRef<str>)`
+  - `GgufWriter::set_value(key: impl AsRef<str>, ...)`, `remove_key(key: impl AsRef<str>)`
+- GGUF typed value extraction via `TryFromGgufValue` trait (`2026-04-12`):
+  - `TryFromGgufValue` implemented for `u8`, `i8`, `u16`, `i16`, `u32`, `i32`, `f32`, `bool`, `String`, `u64`, `i64`, `f64`
+  - `GgufFile::kv_value_as::<T>(key)` — extracts a typed value with compile-time type safety
+  - `Error::GgufTypeMismatch` for type-mismatch errors
 - Tensor constructor wrappers were consolidated into generic APIs (`2026-03-15`):
   - use `new_tensor_typed::<T, N>(Dims<N>)` for rank-generic paths,
   - use semantic helpers `new_tensor_1d::<T>(Length)`, `new_tensor_2d::<T>(Shape2D)`,

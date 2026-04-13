@@ -166,7 +166,7 @@ fn run_yolo_synthetic_iters(cli: Cli) -> Result<YoloSummary> {
     };
     for _ in 0..cli.synthetic_iters {
         ctx.compute(&mut graph, 1)?;
-        let raw = raw_t.read_data::<f32>()?;
+        let raw = raw_t.read_data()?;
         summary = summarize_yolo_raw(&raw, cli.thresh);
     }
 

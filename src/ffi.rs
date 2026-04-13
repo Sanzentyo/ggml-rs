@@ -17,7 +17,37 @@ mod bindings {
     include!(concat!(env!("OUT_DIR"), "/ffi_bindings.rs"));
 
     pub const GGML_TYPE_F32: c_int = ggml_type_GGML_TYPE_F32 as c_int;
+    pub const GGML_TYPE_F16: c_int = ggml_type_GGML_TYPE_F16 as c_int;
+    pub const GGML_TYPE_Q4_0: c_int = ggml_type_GGML_TYPE_Q4_0 as c_int;
+    pub const GGML_TYPE_Q4_1: c_int = ggml_type_GGML_TYPE_Q4_1 as c_int;
+    pub const GGML_TYPE_Q5_0: c_int = ggml_type_GGML_TYPE_Q5_0 as c_int;
+    pub const GGML_TYPE_Q5_1: c_int = ggml_type_GGML_TYPE_Q5_1 as c_int;
+    pub const GGML_TYPE_Q8_0: c_int = ggml_type_GGML_TYPE_Q8_0 as c_int;
+    pub const GGML_TYPE_Q8_1: c_int = ggml_type_GGML_TYPE_Q8_1 as c_int;
+    pub const GGML_TYPE_Q2_K: c_int = ggml_type_GGML_TYPE_Q2_K as c_int;
+    pub const GGML_TYPE_Q3_K: c_int = ggml_type_GGML_TYPE_Q3_K as c_int;
+    pub const GGML_TYPE_Q4_K: c_int = ggml_type_GGML_TYPE_Q4_K as c_int;
+    pub const GGML_TYPE_Q5_K: c_int = ggml_type_GGML_TYPE_Q5_K as c_int;
+    pub const GGML_TYPE_Q6_K: c_int = ggml_type_GGML_TYPE_Q6_K as c_int;
+    pub const GGML_TYPE_Q8_K: c_int = ggml_type_GGML_TYPE_Q8_K as c_int;
+    pub const GGML_TYPE_IQ2_XXS: c_int = ggml_type_GGML_TYPE_IQ2_XXS as c_int;
+    pub const GGML_TYPE_IQ2_XS: c_int = ggml_type_GGML_TYPE_IQ2_XS as c_int;
+    pub const GGML_TYPE_IQ3_XXS: c_int = ggml_type_GGML_TYPE_IQ3_XXS as c_int;
+    pub const GGML_TYPE_IQ1_S: c_int = ggml_type_GGML_TYPE_IQ1_S as c_int;
+    pub const GGML_TYPE_IQ4_NL: c_int = ggml_type_GGML_TYPE_IQ4_NL as c_int;
+    pub const GGML_TYPE_IQ3_S: c_int = ggml_type_GGML_TYPE_IQ3_S as c_int;
+    pub const GGML_TYPE_IQ2_S: c_int = ggml_type_GGML_TYPE_IQ2_S as c_int;
+    pub const GGML_TYPE_IQ4_XS: c_int = ggml_type_GGML_TYPE_IQ4_XS as c_int;
+    pub const GGML_TYPE_I8: c_int = ggml_type_GGML_TYPE_I8 as c_int;
+    pub const GGML_TYPE_I16: c_int = ggml_type_GGML_TYPE_I16 as c_int;
     pub const GGML_TYPE_I32: c_int = ggml_type_GGML_TYPE_I32 as c_int;
+    pub const GGML_TYPE_I64: c_int = ggml_type_GGML_TYPE_I64 as c_int;
+    pub const GGML_TYPE_F64: c_int = ggml_type_GGML_TYPE_F64 as c_int;
+    pub const GGML_TYPE_IQ1_M: c_int = ggml_type_GGML_TYPE_IQ1_M as c_int;
+    pub const GGML_TYPE_BF16: c_int = ggml_type_GGML_TYPE_BF16 as c_int;
+    pub const GGML_TYPE_TQ1_0: c_int = ggml_type_GGML_TYPE_TQ1_0 as c_int;
+    pub const GGML_TYPE_TQ2_0: c_int = ggml_type_GGML_TYPE_TQ2_0 as c_int;
+    pub const GGML_TYPE_MXFP4: c_int = ggml_type_GGML_TYPE_MXFP4 as c_int;
     pub const GGML_TYPE_COUNT: c_int = ggml_type_GGML_TYPE_COUNT as c_int;
     pub const GGML_STATUS_SUCCESS: c_int = ggml_status_GGML_STATUS_SUCCESS as c_int;
     pub const GGML_BACKEND_DEVICE_TYPE_CPU: c_int =

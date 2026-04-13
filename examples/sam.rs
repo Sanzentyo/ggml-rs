@@ -208,7 +208,7 @@ fn run_sam_synthetic_iters(cli: Cli) -> Result<SamSummary> {
     };
     for _ in 0..cli.synthetic_iters {
         ctx.compute(&mut graph, 1)?;
-        let logits = logits_t.read_data::<f32>()?;
+        let logits = logits_t.read_data()?;
         summary = summarize_sam_logits(&logits, cli, prompt_scale);
     }
 

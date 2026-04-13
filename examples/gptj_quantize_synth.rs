@@ -92,7 +92,7 @@ fn main() -> AppResult<()> {
     let ctx = Context::new_bytes(Bytes::new(CONTEXT_BYTES))?;
     let tensor = ctx.new_tensor_1d::<f32>(Length::new(tensor_len))?;
     tensor.write_data(&tensor_values)?;
-    let source = tensor.read_data::<f32>()?;
+    let source = tensor.read_data()?;
 
     let (scale, quantized, dequantized) = quantize_q8_0(&source);
 

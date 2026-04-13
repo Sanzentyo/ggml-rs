@@ -202,7 +202,9 @@ fn main() -> AppResult<()> {
         let start = GPTJ_VOCAB
             .checked_mul(tokens.len().saturating_sub(1))
             .ok_or_else(|| AppError::InvalidArgument("logit indexing overflow".into()))?;
-        final_logits = graph.last_node()?.read_data_at::<f32>(start, GPTJ_VOCAB)?;
+        final_logits = graph
+            .last_node_typed::<f32>()?
+            .read_data_at(start, GPTJ_VOCAB)?;
         let next = argmax(&final_logits) as i32;
         tokens.push(next);
         generated.push(next);

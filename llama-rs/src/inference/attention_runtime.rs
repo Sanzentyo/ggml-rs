@@ -420,9 +420,9 @@ fn attention_inference_with_weights_with_context(
     }
 
     graph
-        .last_node()
+        .last_node_typed::<f32>()
         .map_err(|source| InferenceError::ggml("Graph::last_node", source))?
-        .read_data_backend::<f32>()
+        .read_data_backend()
         .map_err(|source| InferenceError::ggml("Tensor::read_data_backend", source))
 }
 
@@ -759,9 +759,9 @@ pub(crate) fn attention_decode_proxy_with_cache_repeats_inner(
     }
 
     let output = graph
-        .last_node()
+        .last_node_typed::<f32>()
         .map_err(|source| InferenceError::ggml("Graph::last_node", source))?
-        .read_data_backend::<f32>()
+        .read_data_backend()
         .map_err(|source| InferenceError::ggml("Tensor::read_data_backend", source))?;
 
     Ok(AttentionDecodeProxyReport {
@@ -786,11 +786,11 @@ pub(crate) fn build_causal_mask_values(
 
 fn apply_optional_head_rms_norm<'ctx>(
     ctx: &'ctx Context,
-    tensor: &ggml_rs::Tensor<'ctx>,
-    weight: Option<&ggml_rs::Tensor<'ctx>>,
+    tensor: &ggml_rs::Tensor<'ctx, f32>,
+    weight: Option<&ggml_rs::Tensor<'ctx, f32>>,
     eps: f32,
     label: &'static str,
-) -> Result<ggml_rs::Tensor<'ctx>, InferenceError> {
+) -> Result<ggml_rs::Tensor<'ctx, f32>, InferenceError> {
     let Some(weight) = weight else {
         return Ok(*tensor);
     };
