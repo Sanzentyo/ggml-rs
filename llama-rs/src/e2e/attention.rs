@@ -22,14 +22,16 @@ use ggml_rs::{Backend, BackendBuffer, Bytes, Context, GraphAllocator, Shape2D, S
 /// source of truth (for checkpoint serialization and host-scoring fallback).
 /// This struct is runtime-only decode infrastructure — not serializable.
 pub(super) struct PersistentKvCache<'ctx> {
-    /// K values: `[D, Hkv, MaxT, 1]` on backend.
+    /// K values: `[D, MaxT, Hkv, 1]` on backend (flash-friendly time-major layout).
     k_tensor: Tensor<'ctx, f32>,
-    /// V values: `[D, Hkv, MaxT, 1]` on backend.
+    /// V values: `[D, MaxT, Hkv, 1]` on backend (flash-friendly time-major layout).
     v_tensor: Tensor<'ctx, f32>,
     /// Backend buffer keeping tensors alive on device.
     _buffer: BackendBuffer<'ctx>,
-    /// `kv_head_count × head_dimension`.
-    kv_features: usize,
+    /// Head dimension (D).
+    head_dim: usize,
+    /// Number of KV heads (Hkv).
+    kv_head_count: usize,
     /// Max tokens this cache can hold.
     max_tokens: usize,
 }
@@ -39,6 +41,9 @@ impl<'ctx> PersistentKvCache<'ctx> {
     ///
     /// `cached_len` is the position index (0-based) of the new token. The
     /// caller must ensure `cached_len < max_tokens`.
+    ///
+    /// Layout is `[D, MaxT, Hkv, 1]` (flash-friendly time-major). Each KV
+    /// head's D-element slice is written to the appropriate stride offset.
     pub(super) fn append_token(
         &self,
         k_values: &[f32],
@@ -51,31 +56,54 @@ impl<'ctx> PersistentKvCache<'ctx> {
                 context_length: self.max_tokens,
             });
         }
-        let offset = cached_len * self.kv_features;
-        self.k_tensor
-            .write_data_backend_at(offset, k_values)
-            .map_err(|source| E2eError::ggml("append_token(K)", source))?;
-        self.v_tensor
-            .write_data_backend_at(offset, v_values)
-            .map_err(|source| E2eError::ggml("append_token(V)", source))?;
+        let d = self.head_dim;
+        let max_t = self.max_tokens;
+        // In [D, MaxT, Hkv, 1] layout:
+        // - stride between time positions = D elements
+        // - stride between heads = D * MaxT elements
+        // - offset for head h, position t = h * D * MaxT + t * D
+        for h in 0..self.kv_head_count {
+            let src_offset = h * d;
+            let dst_offset = h * d * max_t + cached_len * d;
+            self.k_tensor
+                .write_data_backend_at(dst_offset, &k_values[src_offset..src_offset + d])
+                .map_err(|source| E2eError::ggml("append_token(K)", source))?;
+            self.v_tensor
+                .write_data_backend_at(dst_offset, &v_values[src_offset..src_offset + d])
+                .map_err(|source| E2eError::ggml("append_token(V)", source))?;
+        }
         Ok(())
     }
 
     /// Bulk-upload existing KV prefix from host cache (used at initialization
     /// after prefill populates the host cache).
+    ///
+    /// Host cache layout is `[D * Hkv, T]` (contiguous per-token), which must
+    /// be transposed to `[D, MaxT, Hkv, 1]` (per-head, time-major).
     pub(super) fn seed_from_host(
         &self,
         k_cache: &[f32],
         v_cache: &[f32],
         cached_len: usize,
     ) -> Result<(), E2eError> {
-        let prefix_len = checked_mul(cached_len, self.kv_features)?;
-        self.k_tensor
-            .write_data_backend(&k_cache[..prefix_len])
-            .map_err(|source| E2eError::ggml("seed(K)", source))?;
-        self.v_tensor
-            .write_data_backend(&v_cache[..prefix_len])
-            .map_err(|source| E2eError::ggml("seed(V)", source))?;
+        let d = self.head_dim;
+        let hkv = self.kv_head_count;
+        let max_t = self.max_tokens;
+        let kv_features = d * hkv;
+
+        for t in 0..cached_len {
+            let src_base = t * kv_features;
+            for h in 0..hkv {
+                let src_offset = src_base + h * d;
+                let dst_offset = h * d * max_t + t * d;
+                self.k_tensor
+                    .write_data_backend_at(dst_offset, &k_cache[src_offset..src_offset + d])
+                    .map_err(|source| E2eError::ggml("seed(K)", source))?;
+                self.v_tensor
+                    .write_data_backend_at(dst_offset, &v_cache[src_offset..src_offset + d])
+                    .map_err(|source| E2eError::ggml("seed(V)", source))?;
+            }
+        }
         Ok(())
     }
 }
@@ -92,18 +120,17 @@ pub(super) fn build_persistent_kv_cache(
 ) -> Result<(Context, PersistentKvCache<'static>), E2eError> {
     let d = attention.head_dimension;
     let hkv = attention.kv_head_count;
-    let kv_features = checked_mul(hkv, d)?;
 
-    // Two 4D tensors: K + V, each [D, Hkv, MaxT, 1].
+    // Two 4D tensors: K + V, each [D, MaxT, Hkv, 1] (flash-friendly time-major).
     // Metadata context: ~256 KB is plenty for 2 tensors.
     let ctx = Context::new_no_alloc(256 * 1024)
         .map_err(|source| E2eError::ggml("Context(persistent_kv)", source))?;
 
     let k_tensor = ctx
-        .new_tensor_4d::<f32>(Shape4D::new(d, hkv, max_tokens, 1))
+        .new_tensor_4d::<f32>(Shape4D::new(d, max_tokens, hkv, 1))
         .map_err(|source| E2eError::ggml("k_tensor(persistent_kv)", source))?;
     let v_tensor = ctx
-        .new_tensor_4d::<f32>(Shape4D::new(d, hkv, max_tokens, 1))
+        .new_tensor_4d::<f32>(Shape4D::new(d, max_tokens, hkv, 1))
         .map_err(|source| E2eError::ggml("v_tensor(persistent_kv)", source))?;
 
     let buffer = ctx
@@ -121,7 +148,8 @@ pub(super) fn build_persistent_kv_cache(
                 k_tensor,
                 v_tensor,
                 _buffer: buffer,
-                kv_features,
+                head_dim: d,
+                kv_head_count: hkv,
                 max_tokens,
             },
         )
@@ -202,27 +230,19 @@ fn build_scoring_graph<'ctx>(
         .new_tensor_4d::<f32>(Shape4D::new(d, h, 1, 1))
         .map_err(|source| E2eError::ggml("gate_tensor", source))?;
 
-    let nb1 = d * elem;
-    let nb2 = d * hkv * elem;
-    let k_view = ctx
-        .view_4d_of(&kv_cache.k_tensor, d, hkv, t, 1, nb1, nb2, nb2 * t, 0)
-        .map_err(|source| E2eError::ggml("view_4d_of(K)", source))?;
-    let v_view = ctx
-        .view_4d_of(&kv_cache.v_tensor, d, hkv, t, 1, nb1, nb2, nb2 * t, 0)
-        .map_err(|source| E2eError::ggml("view_4d_of(V)", source))?;
-
-    let k_perm = ctx
-        .permute(&k_view, 0, 2, 1, 3)
-        .map_err(|source| E2eError::ggml("permute(K)", source))?;
+    // Direct view into flash-friendly [D, MaxT, Hkv, 1] layout.
+    // View [D, T, Hkv, 1] — already in the format flash_attn_ext expects,
+    // no permute or contiguous copy needed.
+    let max_t = kv_cache.max_tokens;
+    let nb1 = d * elem; // byte stride between time positions
+    let nb2 = d * max_t * elem; // byte stride between KV heads
+    let nb3 = nb2 * hkv; // byte stride for dim3 (trivial)
     let k = ctx
-        .cont(&k_perm)
-        .map_err(|source| E2eError::ggml("cont(K)", source))?;
-    let v_perm = ctx
-        .permute(&v_view, 0, 2, 1, 3)
-        .map_err(|source| E2eError::ggml("permute(V)", source))?;
+        .view_4d_of(&kv_cache.k_tensor, d, t, hkv, 1, nb1, nb2, nb3, 0)
+        .map_err(|source| E2eError::ggml("view_4d_of(K)", source))?;
     let v = ctx
-        .cont(&v_perm)
-        .map_err(|source| E2eError::ggml("cont(V)", source))?;
+        .view_4d_of(&kv_cache.v_tensor, d, t, hkv, 1, nb1, nb2, nb3, 0)
+        .map_err(|source| E2eError::ggml("view_4d_of(V)", source))?;
 
     let attn = ctx
         .flash_attn_ext(&q, &k, &v, None, attention.attention_scale, 0.0, 0.0)
