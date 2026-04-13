@@ -605,6 +605,224 @@ fn try_build_persistent_mlps(
     (contexts, mlps)
 }
 
+// ---------------------------------------------------------------------------
+// PersistentDecodeResources: unified persistent resource bundle
+// ---------------------------------------------------------------------------
+
+/// All GPU-resident persistent resources needed for optimized decode.
+///
+/// Field ordering is **safety-critical**: resources that reference contexts must
+/// be declared (and thus dropped) *before* the contexts that own the underlying
+/// ggml memory.  Rust drops struct fields in declaration order (top to bottom).
+///
+/// The struct is built once after prefill and reused for every decode step.
+/// Individual resource groups are independently optional — a failure in one
+/// (e.g., KV cache) does not prevent others (e.g., MLPs) from being used.
+pub(super) struct PersistentDecodeResources {
+    // --- Resources referencing contexts (dropped first) ---
+    pub scoring_ctx: Option<PersistentScoringContext>,
+    pub linear_scratch: Option<LinearDecodeScratch>,
+    pub persistent_mlps: Vec<Option<PersistentMlp<'static>>>,
+    pub decode_projs: Option<Vec<Option<PersistentDecodeProjection<'static>>>>,
+    pub kv_caches: Vec<Option<PersistentKvCache<'static>>>,
+
+    // LM head: graph tensors that reference _lm_ctx
+    lm_x_in: ggml_rs::Tensor<'static, f32>,
+    lm_logits_t: ggml_rs::Tensor<'static, f32>,
+    lm_graph: ggml_rs::Graph<'static>,
+
+    // --- Contexts (dropped last — keeps tensor memory alive) ---
+    _lm_buffer: ggml_rs::BackendBuffer<'static>,
+    _lm_ctx: Context,
+    _mlp_ctxs: Vec<Option<Context>>,
+    _proj_ctxs: Vec<Option<Context>>,
+    _kv_ctxs: Vec<Option<Context>>,
+}
+
+impl PersistentDecodeResources {
+    /// Build persistent decode resources from layer plans and model weights.
+    ///
+    /// The LM head graph is always built. Projections, KV caches, scoring
+    /// context, linear scratch, and MLPs are each independently optional —
+    /// a failure in one category does not affect others.
+    ///
+    /// Returns `None` only if the LM head graph fails to build (critical path).
+    pub(super) fn try_build(
+        layer_plans: &[LayerPlan],
+        hidden_features: usize,
+        vocab_size: usize,
+        rms_norm_eps: f32,
+        total_sequence_length: usize,
+        output_weight_values: &[f32],
+        output_norm_values: &[f32],
+        backend: &Backend,
+    ) -> Option<Self> {
+        // 1. LM head (always required)
+        let lm_ctx_size = recommended_lm_head_memory(hidden_features, vocab_size).ok()?;
+        let lm_ctx = Context::new_no_alloc_bytes(lm_ctx_size).ok()?;
+        let (w_out, norm_w, x_in, logits_t, graph) =
+            build_lm_head_graph(&lm_ctx, hidden_features, vocab_size, rms_norm_eps).ok()?;
+        let lm_buffer = lm_ctx.allocate_tensors(backend).ok()?;
+        w_out.write_data_backend(output_weight_values).ok()?;
+        norm_w.write_data_backend(output_norm_values).ok()?;
+
+        // SAFETY: lm_ctx, lm_buffer kept alive as struct fields; drop order
+        // ensures resources drop before contexts (declaration order, top→bottom).
+        let lm_x_in = unsafe {
+            std::mem::transmute::<ggml_rs::Tensor<'_, f32>, ggml_rs::Tensor<'static, f32>>(x_in)
+        };
+        let lm_logits_t = unsafe {
+            std::mem::transmute::<ggml_rs::Tensor<'_, f32>, ggml_rs::Tensor<'static, f32>>(logits_t)
+        };
+        let lm_graph =
+            unsafe { std::mem::transmute::<ggml_rs::Graph<'_>, ggml_rs::Graph<'static>>(graph) };
+        let _lm_buffer = unsafe {
+            std::mem::transmute::<ggml_rs::BackendBuffer<'_>, ggml_rs::BackendBuffer<'static>>(
+                lm_buffer,
+            )
+        };
+
+        // 2. Persistent MLPs (per-layer opportunistic)
+        let (_mlp_ctxs, persistent_mlps) =
+            try_build_persistent_mlps(layer_plans, rms_norm_eps, backend);
+
+        // 3. Persistent projections (all-or-nothing per attention type)
+        let persistent = try_build_persistent_projections(layer_plans, backend);
+        let (_proj_ctxs, decode_projs) = match persistent {
+            Some((ctxs, projs)) => (ctxs, Some(projs)),
+            None => (Vec::new(), None),
+        };
+
+        // 4. Persistent KV caches (requires projections to be useful)
+        let kv_persistent =
+            try_build_persistent_kv_caches(layer_plans, total_sequence_length, backend);
+        let (_kv_ctxs, kv_caches) = match kv_persistent {
+            Some((ctxs, caches)) => (ctxs, caches),
+            None => {
+                let empty: Vec<Option<PersistentKvCache<'static>>> =
+                    (0..layer_plans.len()).map(|_| None).collect();
+                (Vec::new(), empty)
+            }
+        };
+
+        // 5. Persistent scoring context (requires KV caches)
+        let scoring_ctx = kv_caches
+            .iter()
+            .zip(layer_plans.iter())
+            .find_map(|(kv, lp)| {
+                if let (Some(kv), Some(AttentionLayerPlan::Qwen35Full(attn))) =
+                    (kv, lp.attention.as_ref())
+                {
+                    Some((attn, kv))
+                } else {
+                    None
+                }
+            })
+            .and_then(|(attn, kv)| {
+                PersistentScoringContext::new(attn, total_sequence_length, kv, backend).ok()
+            });
+
+        // 6. Linear attention scratch buffers
+        let linear_scratch = layer_plans.iter().find_map(|lp| {
+            if let Some(AttentionLayerPlan::Qwen35Linear(attn)) = lp.attention.as_ref() {
+                Some(LinearDecodeScratch::new(attn.state_size, attn.inner_size))
+            } else {
+                None
+            }
+        });
+
+        Some(Self {
+            scoring_ctx,
+            linear_scratch,
+            persistent_mlps,
+            decode_projs,
+            kv_caches,
+            lm_x_in,
+            lm_logits_t,
+            lm_graph,
+            _lm_buffer,
+            _lm_ctx: lm_ctx,
+            _mlp_ctxs,
+            _proj_ctxs,
+            _kv_ctxs,
+        })
+    }
+
+    /// Seed persistent KV caches from host-side prefill state.
+    pub(super) fn seed_kv_caches(&self, state: &GenerationState) {
+        for (layer_idx, cache) in self.kv_caches.iter().enumerate() {
+            if let (Some(cache), Some(LayerAttentionState::Qwen35Full(s))) =
+                (cache, state.layers.get(layer_idx))
+            {
+                let _ = cache.seed_from_host(&s.k_cache, &s.v_cache, s.token_count());
+            }
+        }
+    }
+
+    /// Run one LM head sampling step on a single-token hidden state.
+    pub(super) fn sample_token(
+        &mut self,
+        hidden: &[f32],
+        token_index: usize,
+        hidden_features: usize,
+        backend: &Backend,
+    ) -> Result<i32, E2eError> {
+        let offset = checked_mul(token_index, hidden_features)?;
+        let last_hidden = &hidden[offset..offset + hidden_features];
+        lm_head_sample_step(
+            last_hidden,
+            &self.lm_x_in,
+            &self.lm_logits_t,
+            &mut self.lm_graph,
+            backend,
+        )
+    }
+
+    /// Run one decode step through all layers using persistent resources.
+    ///
+    /// If persistent projections are available, uses the fast path
+    /// (`persistent_decode_all_layers`). Otherwise falls back to
+    /// `DecodeStrategy` with `process_all_layers`.
+    pub(super) fn decode_step(
+        &mut self,
+        hidden: &mut [f32],
+        layer_plans: &[LayerPlan],
+        state: &mut GenerationState,
+        hidden_features: usize,
+        rms_norm_eps: f32,
+        backend: &Backend,
+    ) -> Result<(), E2eError> {
+        if let Some(ref mut projs) = self.decode_projs {
+            persistent_decode_all_layers(
+                hidden,
+                layer_plans,
+                projs,
+                &self.kv_caches,
+                &mut self.persistent_mlps,
+                self.scoring_ctx.as_mut(),
+                &mut self.linear_scratch,
+                state,
+                hidden_features,
+                rms_norm_eps,
+                backend,
+            )
+        } else {
+            // Fallback: per-token weight upload for attention, but persistent MLPs
+            let mut strategy = DecodeStrategy { state };
+            process_all_layers(
+                hidden,
+                layer_plans,
+                &mut strategy,
+                hidden_features,
+                1,
+                rms_norm_eps,
+                backend,
+                &mut self.persistent_mlps,
+            )
+        }
+    }
+}
+
 /// Process all layers in decode mode using persistent projections.
 ///
 /// For each layer: host norm → persistent input proj → core logic → persistent
@@ -712,6 +930,30 @@ fn graph_sample_at(
     let offset = checked_mul(token_index, inputs.hidden_features)?;
     let last_hidden = &hidden[offset..offset + inputs.hidden_features];
     lm_head_sample_step(last_hidden, x_in, logits_t, lm_graph, inputs.backend)
+}
+
+/// CPU-only greedy sampling fallback when persistent LM head is unavailable.
+fn graph_sample_fallback(
+    hidden: &[f32],
+    token_index: usize,
+    inputs: &GenerationInputs<'_>,
+) -> Result<i32, E2eError> {
+    let offset = checked_mul(token_index, inputs.hidden_features)?;
+    let last_hidden = &hidden[offset..offset + inputs.hidden_features];
+    let normalized = rms_norm_with_weight(
+        last_hidden,
+        inputs.hidden_features,
+        1,
+        inputs.output_norm_values,
+        inputs.rms_norm_eps,
+    )?;
+    greedy_next_token_id(
+        &normalized,
+        0,
+        inputs.hidden_features,
+        inputs.output_weight_values,
+        inputs.vocab_size,
+    )
 }
 
 pub fn resolve_eos_token_id(model: &GgufModel) -> Option<i32> {
@@ -1009,25 +1251,19 @@ fn two_phase_loop(
 
     let mut state = GenerationState::new(inputs.layer_plans, inputs.total_sequence_length)?;
 
-    // Persistent LM head: build graph and upload weights once.
-    let lm_ctx_size = recommended_lm_head_memory(inputs.hidden_features, inputs.vocab_size)?;
-    let lm_ctx = Context::new_no_alloc_bytes(lm_ctx_size)
-        .map_err(|source| E2eError::ggml("Context::new_no_alloc_bytes(lm_head)", source))?;
-    let (w_out, norm_w, x_in, logits_t, mut lm_graph) = build_lm_head_graph(
-        &lm_ctx,
+    // Build all persistent resources upfront (LM head, projections, KV caches,
+    // scoring ctx, linear scratch, MLPs). LM head is reused for both prefill
+    // sampling and decode loop — no duplicate graph build.
+    let mut resources = PersistentDecodeResources::try_build(
+        inputs.layer_plans,
         inputs.hidden_features,
         inputs.vocab_size,
         inputs.rms_norm_eps,
-    )?;
-    let _lm_buffer = lm_ctx
-        .allocate_tensors(inputs.backend)
-        .map_err(|source| E2eError::ggml("allocate_tensors(lm_head)", source))?;
-    w_out
-        .write_data_backend(inputs.output_weight_values)
-        .map_err(|source| E2eError::ggml("write<W_OUT>", source))?;
-    norm_w
-        .write_data_backend(inputs.output_norm_values)
-        .map_err(|source| E2eError::ggml("write<NORM_W>", source))?;
+        inputs.total_sequence_length,
+        inputs.output_weight_values,
+        inputs.output_norm_values,
+        inputs.backend,
+    );
 
     // Phase 1: Prefill — process all prompt tokens at once, capturing state.
     let prompt_ids = &all_token_ids[..prompt_token_count];
@@ -1055,8 +1291,13 @@ fn two_phase_loop(
     let last_index = prompt_token_count
         .checked_sub(1)
         .ok_or(E2eError::EmptyPrompt)?;
-    let first_token_id =
-        graph_sample_at(&hidden, last_index, inputs, &x_in, &logits_t, &mut lm_graph)?;
+
+    // Sample first token using persistent LM head if available.
+    let first_token_id = if let Some(ref mut res) = resources {
+        res.sample_token(&hidden, last_index, inputs.hidden_features, inputs.backend)?
+    } else {
+        graph_sample_fallback(&hidden, last_index, inputs)?
+    };
 
     generated_token_ids.push(first_token_id);
     all_token_ids[prompt_token_count] = first_token_id;
@@ -1066,141 +1307,37 @@ fn two_phase_loop(
         return Ok(());
     }
 
-    // Phase 2: Decode — one token at a time using cached state.
-    let remaining_decode_steps = inputs.max_new_tokens.saturating_sub(1);
-    if remaining_decode_steps == 0 {
+    if inputs.max_new_tokens <= 1 {
         return Ok(());
     }
 
-    // Build persistent MLPs independently of attention projections.
-    // Per-layer opportunistic: failed layers fall back to ephemeral path.
-    // LIFO drop order: `persistent_mlps` drops BEFORE `_mlp_ctxs`.
-    let (_mlp_ctxs, mut persistent_mlps) =
-        try_build_persistent_mlps(inputs.layer_plans, inputs.rms_norm_eps, inputs.backend);
+    // Seed persistent KV caches from host prefill state.
+    if let Some(ref res) = resources {
+        res.seed_kv_caches(&state);
+    }
 
-    // Attempt persistent projections (upload weights once for all layers).
-    // Falls back to DecodeStrategy if build fails.
-    let persistent = try_build_persistent_projections(inputs.layer_plans, inputs.backend);
-    if let Some((_proj_ctxs, mut decode_projs)) = persistent {
-        // Attempt persistent KV caches (O(1) per-step KV upload).
-        // Use 4096 as default max token budget — covers typical generation
-        // while keeping memory usage reasonable (~64 MB for 8 layers).
-        let kv_max_tokens = inputs.total_sequence_length;
-        let kv_persistent =
-            try_build_persistent_kv_caches(inputs.layer_plans, kv_max_tokens, inputs.backend);
+    // Phase 2: Decode — one token at a time using cached state.
+    for _step in 1..inputs.max_new_tokens {
+        let new_token_id = all_token_ids[*current_token_count - 1];
+        let mut hidden = gather_embeddings(
+            inputs.token_embedding_values,
+            inputs.hidden_features,
+            inputs.vocab_size,
+            &[new_token_id],
+        )?;
 
-        // Separate ownership: contexts keep tensors alive, caches are the handles.
-        // `_kv_ctxs` must live longer than `kv_caches` (drop order: LIFO).
-        let (_kv_ctxs, kv_caches) = match &kv_persistent {
-            Some((_ctxs_ref, caches_ref)) => {
-                // Seed from the host KV cache built during prefill.
-                for (layer_idx, cache) in caches_ref.iter().enumerate() {
-                    if let (Some(cache), Some(LayerAttentionState::Qwen35Full(s))) =
-                        (cache, state.layers.get(layer_idx))
-                    {
-                        let _ = cache.seed_from_host(&s.k_cache, &s.v_cache, s.token_count());
-                    }
-                }
-                // Create a view slice (caches are in the Option tuple above).
-                (None::<()>, caches_ref.as_slice())
-            }
-            None => (None, [].as_slice()),
-        };
-
-        // Build a padded vec if kv_caches slice is empty (no persistent KV).
-        let empty_kv: Vec<Option<PersistentKvCache<'static>>>;
-        let kv_caches_for_decode: &[Option<PersistentKvCache<'static>>] = if kv_caches.is_empty() {
-            empty_kv = (0..inputs.layer_plans.len()).map(|_| None).collect();
-            &empty_kv
-        } else {
-            kv_caches
-        };
-
-        // Build persistent scoring context (pre-reserved graph allocator for FA scoring).
-        // Uses the first full-attention layer's plan + KV cache as the reservation template.
-        // All FA layers share the same dimensions, so one allocator suffices.
-        let mut scoring_ctx = kv_caches_for_decode
-            .iter()
-            .zip(inputs.layer_plans.iter())
-            .find_map(|(kv, lp)| {
-                if let (Some(kv), Some(AttentionLayerPlan::Qwen35Full(attn))) =
-                    (kv, lp.attention.as_ref())
-                {
-                    Some((attn, kv))
-                } else {
-                    None
-                }
-            })
-            .and_then(|(attn, kv)| {
-                PersistentScoringContext::new(
-                    attn,
-                    inputs.total_sequence_length,
-                    kv,
-                    inputs.backend,
-                )
-                .ok()
-            });
-
-        // Build reusable scratch buffers for linear attention decode.
-        // Uses the first linear attention layer as template (all share dimensions).
-        let mut linear_scratch = inputs.layer_plans.iter().find_map(|lp| {
-            if let Some(AttentionLayerPlan::Qwen35Linear(attn)) = lp.attention.as_ref() {
-                Some(LinearDecodeScratch::new(attn.state_size, attn.inner_size))
-            } else {
-                None
-            }
-        });
-
-        // Persistent path: no per-token weight upload.
-        for _step in 1..inputs.max_new_tokens {
-            let new_token_id = all_token_ids[*current_token_count - 1];
-            let mut hidden = gather_embeddings(
-                inputs.token_embedding_values,
-                inputs.hidden_features,
-                inputs.vocab_size,
-                &[new_token_id],
-            )?;
-
-            persistent_decode_all_layers(
+        let next_token_id = if let Some(ref mut res) = resources {
+            res.decode_step(
                 &mut hidden,
                 inputs.layer_plans,
-                &mut decode_projs,
-                kv_caches_for_decode,
-                &mut persistent_mlps,
-                scoring_ctx.as_mut(),
-                &mut linear_scratch,
                 &mut state,
                 inputs.hidden_features,
                 inputs.rms_norm_eps,
                 inputs.backend,
             )?;
-
-            let next_token_id =
-                graph_sample_at(&hidden, 0, inputs, &x_in, &logits_t, &mut lm_graph)?;
-
-            generated_token_ids.push(next_token_id);
-            if *current_token_count < inputs.total_sequence_length {
-                all_token_ids[*current_token_count] = next_token_id;
-                *current_token_count += 1;
-            }
-
-            if inputs.eos_token_id.is_some_and(|eos| eos == next_token_id) {
-                break;
-            }
-        }
-    } else {
-        // Fallback: per-token weight upload via DecodeStrategy (attention only).
-        // Persistent MLPs still used when available.
-        let mut strategy = DecodeStrategy { state: &mut state };
-        for _step in 1..inputs.max_new_tokens {
-            let new_token_id = all_token_ids[*current_token_count - 1];
-            let mut hidden = gather_embeddings(
-                inputs.token_embedding_values,
-                inputs.hidden_features,
-                inputs.vocab_size,
-                &[new_token_id],
-            )?;
-
+            res.sample_token(&hidden, 0, inputs.hidden_features, inputs.backend)?
+        } else {
+            let mut strategy = DecodeStrategy { state: &mut state };
             process_all_layers(
                 &mut hidden,
                 inputs.layer_plans,
@@ -1209,21 +1346,19 @@ fn two_phase_loop(
                 1,
                 inputs.rms_norm_eps,
                 inputs.backend,
-                &mut persistent_mlps,
+                &mut [],
             )?;
+            graph_sample_fallback(&hidden, 0, inputs)?
+        };
 
-            let next_token_id =
-                graph_sample_at(&hidden, 0, inputs, &x_in, &logits_t, &mut lm_graph)?;
+        generated_token_ids.push(next_token_id);
+        if *current_token_count < inputs.total_sequence_length {
+            all_token_ids[*current_token_count] = next_token_id;
+            *current_token_count += 1;
+        }
 
-            generated_token_ids.push(next_token_id);
-            if *current_token_count < inputs.total_sequence_length {
-                all_token_ids[*current_token_count] = next_token_id;
-                *current_token_count += 1;
-            }
-
-            if inputs.eos_token_id.is_some_and(|eos| eos == next_token_id) {
-                break;
-            }
+        if inputs.eos_token_id.is_some_and(|eos| eos == next_token_id) {
+            break;
         }
     }
     Ok(())

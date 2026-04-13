@@ -22,8 +22,8 @@ use super::config::{E2eGenerationConfig, MixedLayerPolicy};
 use super::decode::decode_norm_tensor;
 use super::error::E2eError;
 use super::generation::{
-    DecodeStrategy, GenerationMode, InferenceStrategy, PrefillStrategy, greedy_next_token_id,
-    process_all_layers,
+    DecodeStrategy, GenerationMode, InferenceStrategy, PersistentDecodeResources, PrefillStrategy,
+    greedy_next_token_id, process_all_layers,
 };
 use super::numeric::{checked_mul, validate_token_id};
 use super::plan::{AttentionLayerPlan, LayerPlan};
@@ -73,6 +73,10 @@ pub struct GenerationSession {
 
     // Model fingerprint (for checkpoint validation)
     fingerprint: ModelFingerprint,
+
+    // Persistent decode resources (built lazily after prefill for TwoPhase mode).
+    // Drop order: resources drop BEFORE backend (declared before `backend`).
+    persistent_resources: Option<PersistentDecodeResources>,
 
     // Backend
     backend: Backend,
@@ -201,6 +205,7 @@ impl GenerationSession {
             prefill_done: false,
             finished: config.max_new_tokens == 0,
             fingerprint,
+            persistent_resources: None,
             backend,
         })
     }
@@ -335,6 +340,7 @@ impl GenerationSession {
             prefill_done: cp.prefill_done,
             finished: cp.finished,
             fingerprint: current_fingerprint,
+            persistent_resources: None,
             backend,
         })
     }
@@ -433,12 +439,23 @@ impl GenerationSession {
 
             self.prefill_done = true;
 
+            // Build persistent resources after prefill (lazy init).
+            self.ensure_persistent_resources();
+
             let last_index = prompt_token_count
                 .checked_sub(1)
                 .ok_or(E2eError::EmptyPrompt)?;
-            let next = self.sample_next(&hidden, last_index)?;
+
+            let next = if let Some(ref mut res) = self.persistent_resources {
+                res.sample_token(&hidden, last_index, self.hidden_features, &self.backend)?
+            } else {
+                self.sample_next(&hidden, last_index)?
+            };
             return self.emit_token(next);
         }
+
+        // Lazy-init for resumed sessions that already had prefill_done.
+        self.ensure_persistent_resources();
 
         // Phase 2: Decode one token using cached state
         let new_token_id = self.all_token_ids[self.current_token_count - 1];
@@ -449,22 +466,61 @@ impl GenerationSession {
             &[new_token_id],
         )?;
 
-        let mut strategy = DecodeStrategy {
-            state: &mut self.state,
-        };
-        process_all_layers(
-            &mut hidden,
-            &self.layer_plans,
-            &mut strategy,
-            self.hidden_features,
-            1,
-            self.rms_norm_eps,
-            &self.backend,
-            &mut [],
-        )?;
+        if let Some(ref mut res) = self.persistent_resources {
+            res.decode_step(
+                &mut hidden,
+                &self.layer_plans,
+                &mut self.state,
+                self.hidden_features,
+                self.rms_norm_eps,
+                &self.backend,
+            )?;
+            let next = res.sample_token(&hidden, 0, self.hidden_features, &self.backend)?;
+            self.emit_token(next)
+        } else {
+            let mut strategy = DecodeStrategy {
+                state: &mut self.state,
+            };
+            process_all_layers(
+                &mut hidden,
+                &self.layer_plans,
+                &mut strategy,
+                self.hidden_features,
+                1,
+                self.rms_norm_eps,
+                &self.backend,
+                &mut [],
+            )?;
+            let next = self.sample_next(&hidden, 0)?;
+            self.emit_token(next)
+        }
+    }
 
-        let next = self.sample_next(&hidden, 0)?;
-        self.emit_token(next)
+    /// Build persistent decode resources if not already built.
+    ///
+    /// Called lazily after prefill or on first decode step after resume.
+    /// Failure is non-fatal: session falls back to the slow path.
+    fn ensure_persistent_resources(&mut self) {
+        if self.persistent_resources.is_some() {
+            return;
+        }
+
+        let resources = PersistentDecodeResources::try_build(
+            &self.layer_plans,
+            self.hidden_features,
+            self.vocab_size,
+            self.rms_norm_eps,
+            self.total_sequence_length,
+            &self.output_weight_values,
+            &self.output_norm_values,
+            &self.backend,
+        );
+
+        if let Some(ref res) = resources {
+            res.seed_kv_caches(&self.state);
+        }
+
+        self.persistent_resources = resources;
     }
 
     fn step_full_reprocess(&mut self) -> Result<Option<i32>, E2eError> {
@@ -615,6 +671,7 @@ mod tests {
             prefill_done: false,
             finished: max_new_tokens == 0,
             fingerprint,
+            persistent_resources: None,
             backend,
         }
     }
