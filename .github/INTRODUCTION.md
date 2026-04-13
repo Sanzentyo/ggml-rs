@@ -394,6 +394,15 @@ And you should write rusty code(ADT, enum, type state pattern)
   replaces inline calculation. Reduces function preamble from ~30 lines to 2.
   See comparison doc item 43.
 
+- **`LinearAttentionDims` struct** (item 44):
+  Consolidated dimension derivation + memory estimation for linear attention.
+  `new()` reuses existing helper functions; `estimate_fused_memory(seq_len)` replaces
+  ~40 lines of inline memory calculation. Three callers now use the struct instead
+  of duplicated inline derivation. `project_and_conv_fused_graph` drops from 8→7
+  params, removing `#[allow(clippy::too_many_arguments)]`. Spurious `#[allow]` on
+  `project_linear_inputs_graph` (6 params) also removed.
+  See comparison doc item 44.
+
 ## Validation checkpoints completed on this branch
 
 - `cargo fmt --all`

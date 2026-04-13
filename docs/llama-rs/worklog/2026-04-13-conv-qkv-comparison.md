@@ -2987,4 +2987,54 @@ The function body continues to use the destructured locals — no `dims.` prefix
 | File | Changes |
 |------|---------|
 | `llama-rs/src/e2e/attention.rs` | Added `FullAttentionDims` struct + `new()` + `estimate_memory()`, updated `fully_fused_attention_graph` |
+
+---
+
+## Item 44 — `LinearAttentionDims` Struct (dimension consolidation for linear attention)
+
+**Commit:** `57d949b refactor(llama-rs): extract LinearAttentionDims struct from project_and_conv_fused_graph (item 44)`
+
+### 44.1 Motivation
+
+`project_and_conv_fused_graph` (251 lines, 8 params) had `#[allow(clippy::too_many_arguments)]`.
+The same dimension derivation (`hidden_features` from output weight matrix, `conv_channels` from
+`inner_size + 2 * group_count * state_size`) was duplicated in three places:
+- `qwen35_linear_attention_core` (inline derivation)
+- `project_linear_inputs` (inline derivation)
+- `project_and_conv_fused_graph` (received as params)
+
+### 44.2 New Struct
+
+```rust
+#[derive(Debug, Clone, Copy)]
+struct LinearAttentionDims {
+    hidden: usize,         // Hidden features (H) — from output weight matrix
+    inner_size: usize,     // Inner size (IS) — from plan
+    conv_channels: usize,  // IS + 2*G*S — total conv channel width
+    time_step_rank: usize, // Timestep rank (R) — from plan
+    kernel_size: usize,    // Conv kernel size (K) — from plan
+}
+```
+
+### 44.3 Key Methods
+
+- `LinearAttentionDims::new(attention)` — reuses existing `linear_attention_hidden_features` +
+  `linear_attention_conv_channels` helpers for validation
+- `estimate_fused_memory(seq_len)` — replaces ~40 lines of inline memory estimation in
+  `project_and_conv_fused_graph` (projection matmul memory + conv intermediates + slack)
+
+### 44.4 Changes
+
+| What | Before | After |
+|------|--------|-------|
+| `project_and_conv_fused_graph` params | 8 (with `#[allow]`) | 7 (no `#[allow]`) |
+| `qwen35_linear_attention_core` dim derivation | 16 lines inline | `LinearAttentionDims::new(attention)?` |
+| `project_linear_inputs` dim derivation | 13 lines inline | `LinearAttentionDims::new(attention)?` |
+| `project_linear_inputs_graph` | spurious `#[allow]` (only 6 params) | `#[allow]` removed |
+
+### 44.5 Files Modified
+
+| File | Changes |
+|------|---------|
+| `llama-rs/src/e2e/linear_attention.rs` | Added `LinearAttentionDims` struct + methods; refactored 3 callers; removed 2 `#[allow]` annotations |
 | `llama-rs/Cargo.toml` | Added `postcard` + `serde` dependencies |
