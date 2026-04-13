@@ -291,6 +291,13 @@ And you should write rusty code(ADT, enum, type state pattern)
   all FA layers (serial execution, same dimensions). Eliminates ~800µs/step
   (8 layers × ~100µs). See comparison doc item 30.
 
+- **Flash-friendly KV layout** (item 31):
+  Changed `PersistentKvCache` from `[D, Hkv, MaxT, 1]` (head-major) to
+  `[D, MaxT, Hkv, 1]` (time-major, flash-friendly). Eliminates per-step
+  `permute(0,2,1,3) + cont` O(T) device copy (~136µs at T=1000). Direct
+  `view_4d_of` with strided nb2 feeds flash_attn_ext; Hkv small writes
+  per append (D=64, Hkv=4: negligible). See comparison doc item 31.
+
 ## Validation checkpoints completed on this branch
 
 - `cargo fmt --all`

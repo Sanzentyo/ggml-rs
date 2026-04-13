@@ -2093,4 +2093,66 @@ Threading:
 |------|---------|
 | `llama-rs/src/e2e/attention.rs` | Added `PersistentScoringContext`, `ScoringGraph`, `build_scoring_graph()`; refactored `decode_scoring_gpu_persistent()`; updated `full_attention_decode_core()` signature |
 | `llama-rs/src/e2e/generation.rs` | Updated `persistent_decode_all_layers()` and `two_phase_loop()` to build and thread `PersistentScoringContext` |
+
+## 31. Flash-Friendly KV Layout (Eliminate Permute+Cont)
+
+### 31.1 Problem
+
+`PersistentKvCache` stored tensors in `[D, Hkv, MaxT, 1]` (head-major)
+layout, but `flash_attn_ext` expects `[D, T, Hkv, 1]` (time-major). Every
+decode step performed `permute(0,2,1,3) + cont` — an O(T) on-device data
+copy — to transpose the KV tensors. At T=1000, this cost ~136µs/step.
+
+### 31.2 Design
+
+Changed storage layout to `[D, MaxT, Hkv, 1]` (time-major, flash-friendly):
+
+**Before:**
+```
+Storage: [D, Hkv, MaxT, 1]  →  view [D, Hkv, T, 1]
+                             →  permute(0,2,1,3)  [D, T, Hkv, 1]
+                             →  cont               [D, T, Hkv, 1] (copy)
+```
+
+**After:**
+```
+Storage: [D, MaxT, Hkv, 1]  →  view_4d_of [D, T, Hkv, 1]  (zero-copy)
+```
+
+The view uses strided access: `nb2 = D × MaxT × sizeof(f32)` to skip
+between heads without copying. `flash_attn_ext` handles non-contiguous
+K/V via stride metadata (verified in both `ggml.c` and Metal backend — no
+contiguity assertions on K or V inputs).
+
+#### `append_token()` changes
+
+Old: one contiguous `write_data_backend_at` per tensor (offset = `t × kv_features`).
+
+New: Hkv small writes per tensor, each writing D floats to the head's stride:
+```
+offset_for_head_h = h × D × MaxT + t × D
+```
+
+For Qwen3.5 0.6B (Hkv=4, D=64): 4 writes of 256 bytes instead of 1 write
+of 1024 bytes — negligible overhead increase.
+
+#### `seed_from_host()` changes
+
+Host layout is `[D×Hkv, T]` (contiguous per-token). Now transposes to
+`[D, MaxT, Hkv, 1]` during bulk upload (T × Hkv individual writes).
+
+### 31.3 Performance Impact
+
+| Metric | Before | After |
+|--------|--------|-------|
+| Per-step permute+cont | O(T) device copy (~136µs at T=1000) | Eliminated |
+| Per-step append overhead | 1 contiguous write | Hkv small writes (negligible) |
+| Seed overhead | 2 bulk writes | T×Hkv writes (one-time) |
+| Graph ops | view→permute→cont→flash_attn | view→flash_attn (2 fewer ops) |
+
+### 31.4 Files Modified
+
+| File | Changes |
+|------|---------|
+| `llama-rs/src/e2e/attention.rs` | Changed `PersistentKvCache` layout from `[D, Hkv, MaxT, 1]` to `[D, MaxT, Hkv, 1]`; updated `append_token()`, `seed_from_host()`, `build_persistent_kv_cache()`, `build_scoring_graph()` |
 - `DecodeStrategy` preserved as reference implementation for `full_reprocess_loop`
