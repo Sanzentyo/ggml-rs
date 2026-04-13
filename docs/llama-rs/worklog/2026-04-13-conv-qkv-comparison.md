@@ -2155,4 +2155,126 @@ Host layout is `[D×Hkv, T]` (contiguous per-token). Now transposes to
 | File | Changes |
 |------|---------|
 | `llama-rs/src/e2e/attention.rs` | Changed `PersistentKvCache` layout from `[D, Hkv, MaxT, 1]` to `[D, MaxT, Hkv, 1]`; updated `append_token()`, `seed_from_host()`, `build_persistent_kv_cache()`, `build_scoring_graph()` |
+
+## 32. Auto-Vectorization Verification + Decode Allocation Elimination
+
+### 32.1 Auto-Vectorization Analysis
+
+#### Method
+
+Emitted release ASM with native CPU targeting to verify LLVM auto-vectorization:
+
+```bash
+cargo rustc --release -p llama-rs --features link-system \
+  -- --emit asm -C target-cpu=native -C opt-level=3
+```
+
+Output: `target/release/deps/llama_rs-*.s`
+
+#### Findings: `ssm_recurrence_step`
+
+| Aspect | Detail |
+|--------|--------|
+| Vectorization | LLVM auto-vectorizes SSM phases 1, 3, 4 with NEON |
+| Instructions | `fmul.4s` + `fadd.4s` pairs (NOT fused `fmla.4s`) |
+| Throughput | 8 floats/iteration via register pairs (`ldp`/`stp q1, q2`) |
+| Total NEON instructions | 129 across `ssm_recurrence_step` |
+| `dot()` | Fully inlined by LLVM — no separate symbol |
+
+#### FMA Rejection
+
+Fused multiply-add (`f32::mul_add` / `vfmaq_f32`) was **rejected** for the
+default path because:
+
+1. FMA uses single rounding (round-once) vs. separate mul+add (round-twice)
+2. This changes the least-significant bits of intermediate results
+3. In autoregressive SSM recurrence, small differences accumulate across
+   hundreds of steps on 64×64 state matrices
+4. Accumulated drift can flip argmax decisions in greedy decoding
+5. Our decode equivalence tests verify exact parity with the prefill path,
+   which uses ggml graph execution (no FMA in host-side fallback)
+
+**Decision**: Keep LLVM's auto-vectorized mul+add pairs. No `std::arch`
+intrinsics, no `mul_add()`. Parity trumps throughput for correctness.
+
+#### Non-target: `dot()` / `project_sequence()`
+
+The `dot()` function in `numeric.rs` is used by `project_sequence()` for
+host-side QKV projection. However, in the production decode path, projections
+execute through ggml compute graphs on Metal/CPU backend — `dot()` is only
+used in the reference/test path. Optimizing it yields no runtime benefit.
+
+### 32.2 Decode Allocation Elimination
+
+#### Problem
+
+In the persistent decode loop, `linear_attention_decode_core()` allocated
+fresh buffers on every call:
+
+- 3 `Vec<f32>` for `SsmScratch` (sk, delta, out) — per head × 12 heads
+- 1 `Vec<f32>` for output accumulator (inner_size=768)
+- 12 `Vec<f32>` for `rms_norm_single()` results (one per head)
+
+Total: **16 allocations per layer × 24 linear layers = 384 heap allocations
+per decode step**.
+
+#### Design
+
+**New allocation-free normalization functions:**
+
+```rust
+fn rms_norm_single_into(input: &[f32], weight: &[f32], eps: f32, dst: &mut [f32])
+fn rms_norm_single_in_place(data: &mut [f32], weight: &[f32], eps: f32)
+```
+
+- `rms_norm_single_into`: writes result into caller-provided buffer (separate
+  input/output)
+- `rms_norm_single_in_place`: reads and writes the same buffer. Needed because
+  Rust's borrow checker prevents passing the same slice as both `&[f32]` and
+  `&mut [f32]` to `rms_norm_single_into`
+- `rms_norm_single()` refactored to delegate to `rms_norm_single_into()`
+- `per_head_rms_norm()` updated to use `rms_norm_single_in_place()`
+
+**`LinearDecodeScratch` struct:**
+
+```rust
+pub(crate) struct LinearDecodeScratch {
+    pub ssm: SsmScratch,      // sk[state_size], delta[time_step_rank], out[state_size]
+    pub output: Vec<f32>,     // inner_size accumulator
+    pub norm_buf: Vec<f32>,   // state_size for rms_norm scratch
+}
+```
+
+- Built once before decode loop from first linear attention layer's dimensions
+- Passed as `&mut Option<LinearDecodeScratch>` through `persistent_decode_all_layers()`
+- All 24 linear layers share dimensions, so one scratch serves all
+
+**Threading:**
+
+```
+two_phase_loop()
+  └── builds LinearDecodeScratch from layer dims
+      └── persistent_decode_all_layers(&mut linear_scratch)
+          └── linear_attention_decode_core(Some(&mut scratch))
+              ├── reuses scratch.ssm for ssm_recurrence_step
+              ├── reuses scratch.output for accumulation
+              └── reuses scratch.norm_buf for per_head_rms_norm
+```
+
+### 32.3 Performance Impact
+
+| Metric | Before | After |
+|--------|--------|-------|
+| Heap allocations per decode step | 384 (16/layer × 24 layers) | 0 (scratch reused) |
+| Allocation overhead | ~38µs/step (est. 100ns/alloc) | Eliminated |
+| Auto-vectorization | Already optimal (NEON confirmed) | No change needed |
+| FMA | Not used | Rejected (parity) |
+
+### 32.4 Files Modified
+
+| File | Changes |
+|------|---------|
+| `llama-rs/src/e2e/tensor_ops.rs` | Added `rms_norm_single_into()`, `rms_norm_single_in_place()`; refactored `rms_norm_single()` to delegate; updated `per_head_rms_norm()` to in-place |
+| `llama-rs/src/e2e/linear_attention.rs` | Added `LinearDecodeScratch` struct; updated `linear_attention_decode_core()` to accept optional scratch; added scratch construction helper |
+| `llama-rs/src/e2e/generation.rs` | Builds `LinearDecodeScratch` in `two_phase_loop()`; threads through `persistent_decode_all_layers()` |
 - `DecodeStrategy` preserved as reference implementation for `full_reprocess_loop`

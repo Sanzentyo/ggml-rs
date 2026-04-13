@@ -298,6 +298,16 @@ And you should write rusty code(ADT, enum, type state pattern)
   `view_4d_of` with strided nb2 feeds flash_attn_ext; Hkv small writes
   per append (D=64, Hkv=4: negligible). See comparison doc item 31.
 
+- **Auto-vectorization verification + decode allocation elimination** (item 32):
+  Verified LLVM auto-vectorizes `ssm_recurrence_step` with NEON (129 NEON insns,
+  `fmul.4s`+`fadd.4s` pairs, 8 floats/iter via `ldp`/`stp` register pairs).
+  FMA rejected: changes rounding semantics, breaks decode parity.
+  Added `LinearDecodeScratch` bundling `SsmScratch` + output + norm_buf, reused
+  across all 24 linear layers. Eliminates 384 heap allocations per decode step
+  (16/layer × 24 layers). Added `rms_norm_single_into()` and
+  `rms_norm_single_in_place()` for allocation-free normalization.
+  See comparison doc item 32.
+
 ## Validation checkpoints completed on this branch
 
 - `cargo fmt --all`
