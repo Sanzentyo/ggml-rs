@@ -90,6 +90,14 @@ And you should write rusty code(ADT, enum, type state pattern)
   `ModelFingerprint`) keeps serde types distinct from runtime state. Session
   reuses `AttentionStrategy` trait + `process_all_layers` shared infrastructure.
   11 unit tests (7 checkpoint + 4 session) all passing.
+- **Detokenization + chat infrastructure** (`simple-chat`):
+  `tokenizer.rs` gains `decode()` / `decode_token()` (reverse GPT-2 byte-BPE),
+  `encode_with_special_tokens()` (direct vocab lookup for ChatML markers),
+  `special_token_id()`, and `StreamingDecoder` (buffered UTF-8 safe streaming).
+  New `chat.rs` module provides `ChatMessage` / `Role` / `ChatFormat` types,
+  `format_chat_prompt()` with ChatML support and content sanitization (sentinel
+  rejection). `simple_chat` example: interactive multi-turn loop with streaming
+  token output, `<|im_end|>` stop detection. 20+ unit tests.
 
 ## Validation checkpoints completed on this branch
 

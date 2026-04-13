@@ -65,7 +65,7 @@ API improvements.
 
 ## Test Coverage
 
-- **149 tests** pass with `--features link-system` (1 ignored: upstream suite)
+- **180 tests** pass with `--features link-system` (1 ignored: upstream suite)
 - **0 clippy warnings**
 - **0 fmt issues**
 - Key test categories:
