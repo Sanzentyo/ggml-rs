@@ -281,3 +281,57 @@ llama-rs uses explicit `copy_from_slice`.
     - Benchmark module: `llama-rs/src/e2e/bench_graphs.rs` (run with
       `--ignored --nocapture`).
 
+## 13. LM Head (Output Projection) Graph Optimization
+
+The LM head is the final projection: rms_norm(last_hidden, eps) × norm_weight →
+matmul(output_weight) → logits [vocab_size]. For Qwen3.5 (0.6B), this is a GEMV:
+1536 × 151936 ≈ 233M multiply-adds, with ~935MB weight matrix.
+
+### 13.1 Previous: Host-side Naive Loop
+
+`greedy_next_token_id` (generation.rs) performed a scalar host-side matmul:
+151,936 dot products of length 1536 in a tight loop. Additionally,
+`sample_next_token` wastefully rms-normalized ALL tokens (seq_len × hidden)
+when only the last token's hidden state is needed for sampling.
+
+### 13.2 Current: Graph-level Persistent LM Head
+
+The generation loops (`two_phase_loop`, `full_reprocess_loop`) now use a
+persistent ggml graph for the LM head:
+
+1. **One-time setup**: Build a ggml context + graph (rms_norm → mul → reshape →
+   mul_mat), allocate backend buffer, upload weights (~935MB) once.
+2. **Per step**: Upload only the last token's hidden state (~6KB), recompute
+   the graph, read back logits (~608KB). Total per-step transfer ≈ 614KB
+   vs 935MB for a cold upload.
+
+Key design decisions:
+- **No self-referential struct**: Instead of a `PersistentLmHead<'static>` with
+  unsafe transmute, the ggml context + tensors live as function-scoped variables
+  in the generation loop. This avoids all unsafe code.
+- **`build_lm_head_graph`**: Reusable builder (tensor_ops.rs) returns
+  `(w_out, norm_w, x_in, logits, graph)` — caller owns the context.
+- **`lm_head_sample_step`**: One-liner per decode step (write input → compute →
+  read logits → argmax).
+- **`graph_sample_at`**: Convenience wrapper that extracts the last token's
+  hidden state from a multi-token buffer before calling `lm_head_sample_step`.
+- **`sample_next_token` removed**: Was unused after both loops switched to graph.
+  `greedy_next_token_id` kept as fallback for tests and `session.rs`.
+
+### 13.3 Files Changed
+
+| File | Changes |
+|------|---------|
+| `tensor_ops.rs` | Added `recommended_lm_head_memory`, `lm_head_graph` (one-shot), `build_lm_head_graph` (persistent builder), `lm_head_sample_step`, `argmax_token_id` |
+| `generation.rs` | Both loops use persistent LM head; added `graph_sample_at`; removed `sample_next_token` |
+| `bench_graphs.rs` | Added `bench_lm_head_qwen35`: host vs cold graph vs warm graph |
+
+### 13.4 Parity Tests
+
+- `lm_head_graph_matches_host_sampling`: Verifies one-shot graph argmax matches
+  host-side rms_norm + greedy_next_token_id.
+- `lm_head_sample_step_matches_one_shot`: Verifies persistent graph step matches
+  one-shot graph result.
+- `argmax_picks_largest` / `argmax_empty_returns_error`: Unit tests for argmax.
+
+

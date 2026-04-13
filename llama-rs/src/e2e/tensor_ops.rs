@@ -1,6 +1,6 @@
 use super::error::E2eError;
 use super::numeric::checked_mul;
-use ggml_rs::{Backend, Bytes, Context, Shape2D};
+use ggml_rs::{Backend, Bytes, Context, Graph, Length, Shape2D, Tensor};
 
 /// Slack constant added to memory estimates for ggml graph/tensor overhead.
 pub(super) const PROJECTION_SLACK_BYTES: usize = 4 * 1024 * 1024;
@@ -280,6 +280,213 @@ pub(super) fn project_sequence_graph(
         .map_err(|source| E2eError::ggml("read_data_backend<Y>", source))
 }
 
+// ---------------------------------------------------------------------------
+// LM head (output projection): rms_norm → weight → matmul → logits
+// ---------------------------------------------------------------------------
+
+/// Estimate backend memory for the LM head graph.
+pub(super) fn recommended_lm_head_memory(
+    hidden_features: usize,
+    vocab_size: usize,
+) -> Result<Bytes, E2eError> {
+    let matmul_mem = Context::recommended_backend_matmul_memory::<f32>(
+        Shape2D::new(hidden_features, vocab_size),
+        Shape2D::new(hidden_features, 1),
+    )
+    .map_err(|source| E2eError::ggml("recommended_backend_matmul_memory(lm_head)", source))?;
+
+    // Extra for norm input tensor, norm weight, and intermediate tensors.
+    let slack = hidden_features
+        .checked_mul(std::mem::size_of::<f32>())
+        .and_then(|v| v.checked_mul(4))
+        .and_then(|v| v.checked_add(PROJECTION_SLACK_BYTES))
+        .ok_or(E2eError::MemorySizeOverflow)?;
+
+    let total = matmul_mem
+        .get()
+        .checked_add(slack)
+        .ok_or(E2eError::MemorySizeOverflow)?;
+    Ok(Bytes::new(total))
+}
+
+/// One-shot LM head: rms_norm(hidden, eps) * norm_weight → matmul(output_weight).
+///
+/// Takes a single token's hidden state `[hidden_features]` and returns logits
+/// `[vocab_size]`. For multi-step decode, prefer the inline persistent pattern
+/// used in `two_phase_loop` / `full_reprocess_loop` that uploads weights once.
+pub(super) fn lm_head_graph(
+    hidden_state: &[f32],
+    norm_weight: &[f32],
+    output_weight: &[f32],
+    hidden_features: usize,
+    vocab_size: usize,
+    rms_norm_eps: f32,
+    backend: &Backend,
+) -> Result<Vec<f32>, E2eError> {
+    if hidden_state.len() != hidden_features {
+        return Err(E2eError::BufferLengthMismatch {
+            expected: hidden_features,
+            actual: hidden_state.len(),
+        });
+    }
+    if norm_weight.len() != hidden_features {
+        return Err(E2eError::BufferLengthMismatch {
+            expected: hidden_features,
+            actual: norm_weight.len(),
+        });
+    }
+    let expected_output_len = checked_mul(hidden_features, vocab_size)?;
+    if output_weight.len() != expected_output_len {
+        return Err(E2eError::BufferLengthMismatch {
+            expected: expected_output_len,
+            actual: output_weight.len(),
+        });
+    }
+
+    let ctx_size = recommended_lm_head_memory(hidden_features, vocab_size)?;
+    let ctx = Context::new_no_alloc_bytes(ctx_size)
+        .map_err(|source| E2eError::ggml("Context::new_no_alloc_bytes(lm_head)", source))?;
+
+    let w_out = ctx
+        .new_tensor_2d::<f32>(Shape2D::new(hidden_features, vocab_size))
+        .map_err(|source| E2eError::ggml("new_tensor_2d<W_OUT>", source))?;
+    let norm_w = ctx
+        .new_tensor_1d::<f32>(Length::new(hidden_features))
+        .map_err(|source| E2eError::ggml("new_tensor_1d<NORM_W>", source))?;
+    let x_in = ctx
+        .new_tensor_1d::<f32>(Length::new(hidden_features))
+        .map_err(|source| E2eError::ggml("new_tensor_1d<X_IN>", source))?;
+
+    let x_normed = ctx
+        .rms_norm(&x_in, rms_norm_eps)
+        .map_err(|source| E2eError::ggml("rms_norm(lm_head)", source))?;
+    let x_scaled = ctx
+        .mul(&x_normed, &norm_w)
+        .map_err(|source| E2eError::ggml("mul(lm_head_norm)", source))?;
+    let x_2d = ctx
+        .reshape_2d(&x_scaled, hidden_features, 1)
+        .map_err(|source| E2eError::ggml("reshape_2d(lm_head)", source))?;
+    let logits = ctx
+        .mul_mat(&w_out, &x_2d)
+        .map_err(|source| E2eError::ggml("mul_mat(lm_head)", source))?;
+
+    let mut graph = ctx
+        .new_graph()
+        .map_err(|source| E2eError::ggml("new_graph(lm_head)", source))?;
+    graph.build_forward_expand(&logits);
+
+    let _buffer = ctx
+        .allocate_tensors(backend)
+        .map_err(|source| E2eError::ggml("allocate_tensors(lm_head)", source))?;
+
+    w_out
+        .write_data_backend(output_weight)
+        .map_err(|source| E2eError::ggml("write<W_OUT>", source))?;
+    norm_w
+        .write_data_backend(norm_weight)
+        .map_err(|source| E2eError::ggml("write<NORM_W>", source))?;
+    x_in.write_data_backend(hidden_state)
+        .map_err(|source| E2eError::ggml("write<X_IN>", source))?;
+
+    backend
+        .compute(&mut graph)
+        .map_err(|source| E2eError::ggml("compute(lm_head)", source))?;
+
+    logits
+        .read_data_backend()
+        .map_err(|source| E2eError::ggml("read<logits>", source))
+}
+
+/// Build an LM head ggml graph (rms_norm → weight → matmul) in the given context.
+///
+/// Returns `(x_input_tensor, logits_tensor, graph)`. The caller must:
+/// 1. Call `ctx.allocate_tensors(backend)` and keep the buffer alive.
+/// 2. Upload weights once via `w_out.write_data_backend` and `norm_w.write_data_backend`.
+/// 3. Per step: upload hidden state to the returned x_input, compute, read logits.
+///
+/// This is the building block for persistent LM head contexts in generation loops.
+#[allow(clippy::type_complexity)]
+pub(super) fn build_lm_head_graph<'ctx>(
+    ctx: &'ctx Context,
+    hidden_features: usize,
+    vocab_size: usize,
+    rms_norm_eps: f32,
+) -> Result<
+    (
+        Tensor<'ctx, f32>,
+        Tensor<'ctx, f32>,
+        Tensor<'ctx, f32>,
+        Tensor<'ctx, f32>,
+        Graph<'ctx>,
+    ),
+    E2eError,
+> {
+    let w_out = ctx
+        .new_tensor_2d::<f32>(Shape2D::new(hidden_features, vocab_size))
+        .map_err(|source| E2eError::ggml("new_tensor_2d<W_OUT>(plm)", source))?;
+    let norm_w = ctx
+        .new_tensor_1d::<f32>(Length::new(hidden_features))
+        .map_err(|source| E2eError::ggml("new_tensor_1d<NORM_W>(plm)", source))?;
+    let x_in = ctx
+        .new_tensor_1d::<f32>(Length::new(hidden_features))
+        .map_err(|source| E2eError::ggml("new_tensor_1d<X_IN>(plm)", source))?;
+
+    let x_normed = ctx
+        .rms_norm(&x_in, rms_norm_eps)
+        .map_err(|source| E2eError::ggml("rms_norm(plm)", source))?;
+    let x_scaled = ctx
+        .mul(&x_normed, &norm_w)
+        .map_err(|source| E2eError::ggml("mul(plm_norm)", source))?;
+    let x_2d = ctx
+        .reshape_2d(&x_scaled, hidden_features, 1)
+        .map_err(|source| E2eError::ggml("reshape_2d(plm)", source))?;
+    let logits = ctx
+        .mul_mat(&w_out, &x_2d)
+        .map_err(|source| E2eError::ggml("mul_mat(plm)", source))?;
+
+    let mut graph = ctx
+        .new_graph()
+        .map_err(|source| E2eError::ggml("new_graph(plm)", source))?;
+    graph.build_forward_expand(&logits);
+
+    Ok((w_out, norm_w, x_in, logits, graph))
+}
+
+/// Argmax over a logits vector — returns the token index with the highest value.
+pub(super) fn argmax_token_id(logits: &[f32]) -> Result<i32, E2eError> {
+    logits
+        .iter()
+        .enumerate()
+        .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+        .map(|(idx, _)| i32::try_from(idx).map_err(|_| E2eError::MemorySizeOverflow))
+        .ok_or(E2eError::BufferLengthMismatch {
+            expected: 1,
+            actual: 0,
+        })?
+}
+
+/// Run one sampling step through a pre-built LM head graph.
+///
+/// Writes `hidden_state` (a single token's hidden vector) to the input tensor,
+/// recomputes the graph, reads back the logits, and returns the argmax token ID.
+pub(super) fn lm_head_sample_step(
+    hidden_state: &[f32],
+    x_in: &Tensor<'_, f32>,
+    logits_t: &Tensor<'_, f32>,
+    lm_graph: &mut Graph<'_>,
+    backend: &Backend,
+) -> Result<i32, E2eError> {
+    x_in.write_data_backend(hidden_state)
+        .map_err(|source| E2eError::ggml("write<X_IN>(step)", source))?;
+    backend
+        .compute(lm_graph)
+        .map_err(|source| E2eError::ggml("compute(lm_head_step)", source))?;
+    let logits_data: Vec<f32> = logits_t
+        .read_data_backend()
+        .map_err(|source| E2eError::ggml("read<logits>(step)", source))?;
+    argmax_token_id(&logits_data)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -348,5 +555,128 @@ mod tests {
                 (h - g).abs()
             );
         }
+    }
+
+    #[test]
+    fn argmax_picks_largest() {
+        assert_eq!(argmax_token_id(&[1.0, 3.0, 2.0]).unwrap(), 1);
+        assert_eq!(argmax_token_id(&[5.0, 1.0, 2.0]).unwrap(), 0);
+        assert_eq!(argmax_token_id(&[-1.0, -2.0, -0.5]).unwrap(), 2);
+    }
+
+    #[test]
+    fn argmax_empty_returns_error() {
+        assert!(argmax_token_id(&[]).is_err());
+    }
+
+    #[test]
+    fn lm_head_graph_matches_host_sampling() {
+        use super::super::generation::greedy_next_token_id;
+        use crate::backend::ensure_backends_loaded;
+        use ggml_rs::BackendKind;
+
+        let hidden_features = 8_usize;
+        let vocab_size = 6_usize;
+        let rms_norm_eps = 1e-5_f32;
+
+        let norm_weight: Vec<f32> = (0..hidden_features)
+            .map(|i| 0.8 + (i as f32) * 0.05)
+            .collect();
+        let output_weight: Vec<f32> = (0..hidden_features * vocab_size)
+            .map(|i| ((i % 11) as f32 - 5.0) * 0.1)
+            .collect();
+        let hidden_state: Vec<f32> = (0..hidden_features)
+            .map(|i| (i as f32 + 1.0) * 0.2)
+            .collect();
+
+        // Host path: rms_norm_with_weight → greedy_next_token_id
+        let normed = rms_norm_with_weight(
+            &hidden_state,
+            hidden_features,
+            1,
+            &norm_weight,
+            rms_norm_eps,
+        )
+        .expect("host rms_norm");
+        let host_token =
+            greedy_next_token_id(&normed, 0, hidden_features, &output_weight, vocab_size)
+                .expect("host sampling");
+
+        // Graph path
+        ensure_backends_loaded();
+        let backend = Backend::new(BackendKind::Cpu).expect("CPU backend");
+        let graph_logits = lm_head_graph(
+            &hidden_state,
+            &norm_weight,
+            &output_weight,
+            hidden_features,
+            vocab_size,
+            rms_norm_eps,
+            &backend,
+        )
+        .expect("lm_head_graph");
+        let graph_token = argmax_token_id(&graph_logits).expect("argmax");
+
+        assert_eq!(
+            host_token, graph_token,
+            "host token {host_token} != graph token {graph_token}"
+        );
+    }
+
+    #[test]
+    fn lm_head_sample_step_matches_one_shot() {
+        use crate::backend::ensure_backends_loaded;
+        use ggml_rs::BackendKind;
+
+        let hidden_features = 8_usize;
+        let vocab_size = 6_usize;
+        let rms_norm_eps = 1e-5_f32;
+
+        let norm_weight: Vec<f32> = (0..hidden_features)
+            .map(|i| 0.8 + (i as f32) * 0.05)
+            .collect();
+        let output_weight: Vec<f32> = (0..hidden_features * vocab_size)
+            .map(|i| ((i % 11) as f32 - 5.0) * 0.1)
+            .collect();
+        let hidden_state: Vec<f32> = (0..hidden_features)
+            .map(|i| (i as f32 + 1.0) * 0.2)
+            .collect();
+
+        ensure_backends_loaded();
+        let backend = Backend::new(BackendKind::Cpu).expect("CPU backend");
+
+        // One-shot graph
+        let one_shot_logits = lm_head_graph(
+            &hidden_state,
+            &norm_weight,
+            &output_weight,
+            hidden_features,
+            vocab_size,
+            rms_norm_eps,
+            &backend,
+        )
+        .expect("one-shot");
+        let one_shot_token = argmax_token_id(&one_shot_logits).expect("argmax");
+
+        // Persistent graph via build_lm_head_graph
+        let ctx_size = recommended_lm_head_memory(hidden_features, vocab_size).expect("mem");
+        let ctx = Context::new_no_alloc_bytes(ctx_size).expect("ctx");
+        let (w_out, norm_w, x_in, logits_t, mut graph) =
+            build_lm_head_graph(&ctx, hidden_features, vocab_size, rms_norm_eps).expect("build");
+        let _buf = ctx.allocate_tensors(&backend).expect("alloc");
+        w_out
+            .write_data_backend(&output_weight)
+            .expect("write w_out");
+        norm_w
+            .write_data_backend(&norm_weight)
+            .expect("write norm_w");
+
+        let step_token = lm_head_sample_step(&hidden_state, &x_in, &logits_t, &mut graph, &backend)
+            .expect("sample_step");
+
+        assert_eq!(
+            one_shot_token, step_token,
+            "one-shot token {one_shot_token} != step token {step_token}"
+        );
     }
 }

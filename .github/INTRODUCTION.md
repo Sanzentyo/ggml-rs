@@ -189,6 +189,18 @@ And you should write rusty code(ADT, enum, type state pattern)
   limited by host-side SSM recurrence. See `docs/llama-rs/worklog/2026-04-13-conv-qkv-comparison.md`
   item 12 for full table.
 
+- **Graph-level LM head (output projection)**:
+  Replaced host-side naive matmul (151936 dot products × 1536) and wasteful
+  full-sequence normalization with a persistent ggml graph: `rms_norm → mul →
+  reshape → mul_mat`. Weights (~935MB for Qwen3.5) uploaded once; per-step cost
+  drops to ~614KB I/O (6KB hidden input + 608KB logits readback). Both
+  `two_phase_loop` and `full_reprocess_loop` use the persistent graph.
+  `build_lm_head_graph` + `lm_head_sample_step` in `tensor_ops.rs`;
+  `graph_sample_at` convenience wrapper in `generation.rs`. No unsafe code
+  (function-scoped ggml context avoids self-referential struct). Parity tests
+  verify graph argmax matches host-side sampling. LM head benchmark added to
+  `bench_graphs.rs`. See comparison doc item 13.
+
 ## Validation checkpoints completed on this branch
 
 - `cargo fmt --all`

@@ -27,13 +27,16 @@ use super::plan::{AttentionLayerPlan, LayerPlan};
 use super::planner::build_layer_plans;
 use super::resolve::resolve_global_tensor_names;
 use super::state::{GenerationState, LayerAttentionState};
-use super::tensor_ops::{add_in_place, gather_embeddings, rms_norm_with_weight};
+use super::tensor_ops::{
+    add_in_place, build_lm_head_graph, gather_embeddings, lm_head_sample_step,
+    recommended_lm_head_memory, rms_norm_with_weight,
+};
 use crate::backend::ensure_backends_loaded;
 use crate::inference::attention_inference_with_weights_on_backend_repeats_with_length;
 use crate::metadata::resolve_transformer_metadata;
 use crate::model::GgufModel;
 use crate::tokenizer::tokenize_text_prompt;
-use ggml_rs::Backend;
+use ggml_rs::{Backend, Context};
 use std::path::Path;
 use std::time::Instant;
 
@@ -282,27 +285,19 @@ pub(super) fn process_all_layers(
     Ok(())
 }
 
-/// Normalize the final hidden state and greedily sample the next token.
-fn sample_next_token(
+/// Extract the last token's hidden state from a `[seq_len × hidden_features]` buffer
+/// and run a graph-level LM head sampling step.
+fn graph_sample_at(
     hidden: &[f32],
     token_index: usize,
     inputs: &GenerationInputs<'_>,
+    x_in: &ggml_rs::Tensor<'_, f32>,
+    logits_t: &ggml_rs::Tensor<'_, f32>,
+    lm_graph: &mut ggml_rs::Graph<'_>,
 ) -> Result<i32, E2eError> {
-    let seq_len = token_index + 1;
-    let normalized_output = rms_norm_with_weight(
-        hidden,
-        inputs.hidden_features,
-        seq_len,
-        inputs.output_norm_values,
-        inputs.rms_norm_eps,
-    )?;
-    greedy_next_token_id(
-        &normalized_output,
-        token_index,
-        inputs.hidden_features,
-        inputs.output_weight_values,
-        inputs.vocab_size,
-    )
+    let offset = checked_mul(token_index, inputs.hidden_features)?;
+    let last_hidden = &hidden[offset..offset + inputs.hidden_features];
+    lm_head_sample_step(last_hidden, x_in, logits_t, lm_graph, inputs.backend)
 }
 
 pub fn resolve_eos_token_id(model: &GgufModel) -> Option<i32> {
@@ -527,6 +522,26 @@ fn full_reprocess_loop(
 ) -> Result<(), E2eError> {
     let mut strategy = InferenceStrategy;
 
+    // Persistent LM head: build graph and upload weights once.
+    let lm_ctx_size = recommended_lm_head_memory(inputs.hidden_features, inputs.vocab_size)?;
+    let lm_ctx = Context::new_no_alloc_bytes(lm_ctx_size)
+        .map_err(|source| E2eError::ggml("Context::new_no_alloc_bytes(lm_head)", source))?;
+    let (w_out, norm_w, x_in, logits_t, mut lm_graph) = build_lm_head_graph(
+        &lm_ctx,
+        inputs.hidden_features,
+        inputs.vocab_size,
+        inputs.rms_norm_eps,
+    )?;
+    let _lm_buffer = lm_ctx
+        .allocate_tensors(inputs.backend)
+        .map_err(|source| E2eError::ggml("allocate_tensors(lm_head)", source))?;
+    w_out
+        .write_data_backend(inputs.output_weight_values)
+        .map_err(|source| E2eError::ggml("write<W_OUT>", source))?;
+    norm_w
+        .write_data_backend(inputs.output_norm_values)
+        .map_err(|source| E2eError::ggml("write<NORM_W>", source))?;
+
     for _step in 0..inputs.max_new_tokens {
         let active_token_ids = &all_token_ids[..*current_token_count];
         let mut hidden = gather_embeddings(
@@ -549,7 +564,8 @@ fn full_reprocess_loop(
         let last_index = current_token_count
             .checked_sub(1)
             .ok_or(E2eError::EmptyPrompt)?;
-        let next_token_id = sample_next_token(&hidden, last_index, inputs)?;
+        let next_token_id =
+            graph_sample_at(&hidden, last_index, inputs, &x_in, &logits_t, &mut lm_graph)?;
 
         generated_token_ids.push(next_token_id);
         if *current_token_count < inputs.total_sequence_length {
@@ -578,6 +594,26 @@ fn two_phase_loop(
 
     let mut state = GenerationState::new(inputs.layer_plans, inputs.total_sequence_length)?;
 
+    // Persistent LM head: build graph and upload weights once.
+    let lm_ctx_size = recommended_lm_head_memory(inputs.hidden_features, inputs.vocab_size)?;
+    let lm_ctx = Context::new_no_alloc_bytes(lm_ctx_size)
+        .map_err(|source| E2eError::ggml("Context::new_no_alloc_bytes(lm_head)", source))?;
+    let (w_out, norm_w, x_in, logits_t, mut lm_graph) = build_lm_head_graph(
+        &lm_ctx,
+        inputs.hidden_features,
+        inputs.vocab_size,
+        inputs.rms_norm_eps,
+    )?;
+    let _lm_buffer = lm_ctx
+        .allocate_tensors(inputs.backend)
+        .map_err(|source| E2eError::ggml("allocate_tensors(lm_head)", source))?;
+    w_out
+        .write_data_backend(inputs.output_weight_values)
+        .map_err(|source| E2eError::ggml("write<W_OUT>", source))?;
+    norm_w
+        .write_data_backend(inputs.output_norm_values)
+        .map_err(|source| E2eError::ggml("write<NORM_W>", source))?;
+
     // Phase 1: Prefill — process all prompt tokens at once, capturing state.
     let prompt_ids = &all_token_ids[..prompt_token_count];
     let mut hidden = gather_embeddings(
@@ -603,7 +639,8 @@ fn two_phase_loop(
     let last_index = prompt_token_count
         .checked_sub(1)
         .ok_or(E2eError::EmptyPrompt)?;
-    let first_token_id = sample_next_token(&hidden, last_index, inputs)?;
+    let first_token_id =
+        graph_sample_at(&hidden, last_index, inputs, &x_in, &logits_t, &mut lm_graph)?;
 
     generated_token_ids.push(first_token_id);
     all_token_ids[prompt_token_count] = first_token_id;
@@ -634,7 +671,8 @@ fn two_phase_loop(
             inputs.backend,
         )?;
 
-        let next_token_id = sample_next_token(&hidden, 0, inputs)?;
+        // Decode phase: hidden is [1 × hidden_features], so token_index=0.
+        let next_token_id = graph_sample_at(&hidden, 0, inputs, &x_in, &logits_t, &mut lm_graph)?;
 
         generated_token_ids.push(next_token_id);
         if *current_token_count < inputs.total_sequence_length {
