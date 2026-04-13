@@ -79,6 +79,86 @@ struct FusedLinearOutputs {
     conv_channels: usize,
 }
 
+/// Validated dimension bundle for linear attention operations.
+///
+/// Consolidates dimension derivation (`hidden` from output weight matrix,
+/// `conv_channels` from group/state dims) and provides memory estimation
+/// for the fused projection + conv graph.
+#[derive(Debug, Clone, Copy)]
+struct LinearAttentionDims {
+    /// Hidden features (H) — derived from output weight matrix.
+    hidden: usize,
+    /// Inner size (IS) — from plan.
+    inner_size: usize,
+    /// Total conv channel width: IS + 2 * G * S.
+    conv_channels: usize,
+    /// Timestep rank (R) — from plan.
+    time_step_rank: usize,
+    /// Conv kernel size (K) — from plan.
+    kernel_size: usize,
+}
+
+impl LinearAttentionDims {
+    /// Derive and validate all linear attention dimensions from a layer plan.
+    fn new(attention: &Qwen35LinearAttentionLayerPlan) -> Result<Self, E2eError> {
+        let hidden = linear_attention_hidden_features(attention)?;
+        let conv_channels = linear_attention_conv_channels(attention)?;
+        Ok(Self {
+            hidden,
+            inner_size: attention.inner_size,
+            conv_channels,
+            time_step_rank: attention.time_step_rank,
+            kernel_size: attention.conv_kernel,
+        })
+    }
+
+    /// Conservative memory estimate for the fused projection + conv graph.
+    fn estimate_fused_memory(&self, seq_len: usize) -> Result<usize, E2eError> {
+        let input_shape = Shape2D::new(self.hidden, seq_len);
+
+        let proj_mem = [
+            Context::recommended_backend_matmul_memory::<f32>(
+                Shape2D::new(self.hidden, self.conv_channels),
+                input_shape,
+            )
+            .map_err(|source| E2eError::ggml("matmul_mem(QKV)", source))?,
+            Context::recommended_backend_matmul_memory::<f32>(
+                Shape2D::new(self.hidden, self.inner_size),
+                input_shape,
+            )
+            .map_err(|source| E2eError::ggml("matmul_mem(Z)", source))?,
+            Context::recommended_backend_matmul_memory::<f32>(
+                Shape2D::new(self.hidden, self.time_step_rank),
+                input_shape,
+            )
+            .map_err(|source| E2eError::ggml("matmul_mem(alpha)", source))?,
+            Context::recommended_backend_matmul_memory::<f32>(
+                Shape2D::new(self.hidden, self.time_step_rank),
+                input_shape,
+            )
+            .map_err(|source| E2eError::ggml("matmul_mem(beta)", source))?,
+        ];
+        let proj_total: usize = proj_mem.iter().map(|b| b.get()).sum();
+
+        let pad = self.kernel_size.saturating_sub(1);
+        let padded_len = pad + seq_len;
+        let conv_tensor_bytes = std::mem::size_of::<f32>()
+            * (seq_len * self.conv_channels
+                + pad * self.conv_channels
+                + padded_len * self.conv_channels
+                + self.kernel_size * self.conv_channels
+                + seq_len * self.conv_channels
+                + seq_len * self.conv_channels
+                + self.hidden
+                + self.hidden * seq_len);
+
+        proj_total
+            .checked_add(conv_tensor_bytes)
+            .and_then(|v| v.checked_add(PROJECTION_SLACK_BYTES * 2))
+            .ok_or(E2eError::MemorySizeOverflow)
+    }
+}
+
 /// Estimate the backend memory needed for 4 linear-attention input projections.
 ///
 /// Sums estimates for QKV, gate(Z), alpha, and beta matmuls sharing the same
@@ -124,7 +204,6 @@ fn recommended_linear_projection_memory(
 /// Compute QKV, gate, alpha, and beta projections in a single ggml graph.
 ///
 /// Batches four `mul_mat` operations sharing the same input tensor.
-#[allow(clippy::too_many_arguments)]
 fn project_linear_inputs_graph(
     attention: &Qwen35LinearAttentionLayerPlan,
     input: &[f32],
@@ -385,20 +464,9 @@ fn project_linear_inputs(
     sequence_length: usize,
     backend: Option<&Backend>,
 ) -> Result<LinearProjections, E2eError> {
-    let hidden_features = attention
-        .inner_size
-        .checked_div(1) // just for consistent error path
-        .filter(|&is| is > 0)
-        .and_then(|_| {
-            let total = attention.ssm_out_weight_values.len();
-            let is = attention.inner_size;
-            let h = total / is;
-            (h > 0 && h * is == total).then_some(h)
-        })
-        .ok_or(E2eError::BufferLengthMismatch {
-            expected: 1,
-            actual: 0,
-        })?;
+    let dims = LinearAttentionDims::new(attention)?;
+    let hidden_features = dims.hidden;
+    let conv_channels = dims.conv_channels;
 
     let expected_input_len = checked_mul(hidden_features, sequence_length)?;
     if input.len() != expected_input_len {
@@ -407,9 +475,6 @@ fn project_linear_inputs(
             actual: input.len(),
         });
     }
-
-    let conv_channels = attention.inner_size
-        + checked_mul(checked_mul(attention.group_count, attention.state_size)?, 2)?;
 
     if let Some(backend) = backend {
         return project_linear_inputs_graph(
@@ -513,23 +578,8 @@ fn qwen35_linear_attention_core(
     mut state: Option<&mut LinearAttentionState>,
     backend: &Backend,
 ) -> Result<Vec<f32>, E2eError> {
-    // Derive hidden_features from weight matrix dimensions.
-    let hidden_features = attention
-        .inner_size
-        .checked_div(1)
-        .filter(|&is| is > 0)
-        .and_then(|_| {
-            let total = attention.ssm_out_weight_values.len();
-            let is = attention.inner_size;
-            let h = total / is;
-            (h > 0 && h * is == total).then_some(h)
-        })
-        .ok_or(E2eError::BufferLengthMismatch {
-            expected: 1,
-            actual: 0,
-        })?;
-    let conv_channels = attention.inner_size
-        + checked_mul(checked_mul(attention.group_count, attention.state_size)?, 2)?;
+    let dims = LinearAttentionDims::new(attention)?;
+    let hidden_features = dims.hidden;
 
     let expected_input_len = checked_mul(hidden_features, sequence_length)?;
     if input.len() != expected_input_len {
@@ -549,10 +599,9 @@ fn qwen35_linear_attention_core(
         conv_channels,
     } = project_and_conv_fused_graph(
         attention,
+        &dims,
         input,
         sequence_length,
-        hidden_features,
-        conv_channels,
         attn_norm_weight,
         rms_norm_eps,
         backend,
@@ -951,18 +1000,23 @@ fn causal_depthwise_conv_graph(
 ///
 /// Also returns `qkv_pre_conv` (the raw projection output before conv) so that
 /// `capture_conv_buffer` can store the last `kernel_size - 1` rows for decode.
-#[allow(clippy::too_many_arguments)]
 fn project_and_conv_fused_graph(
     attention: &Qwen35LinearAttentionLayerPlan,
+    dims: &LinearAttentionDims,
     input: &[f32],
     sequence_length: usize,
-    hidden_features: usize,
-    conv_channels: usize,
     attn_norm_weight: &[f32],
     rms_norm_eps: f32,
     backend: &Backend,
 ) -> Result<FusedLinearOutputs, E2eError> {
-    let kernel_size = attention.conv_kernel;
+    let LinearAttentionDims {
+        hidden,
+        inner_size,
+        conv_channels,
+        time_step_rank,
+        kernel_size,
+    } = *dims;
+
     if kernel_size == 0 {
         return Err(E2eError::BufferLengthMismatch {
             expected: 1,
@@ -976,79 +1030,33 @@ fn project_and_conv_fused_graph(
         });
     }
 
-    let inner_size = attention.inner_size;
-    let time_step_rank = attention.time_step_rank;
     let pad = kernel_size - 1;
     let padded_len = pad + sequence_length;
 
-    // --- Memory estimation ---
-    // Sum of projection matmul memory + conv intermediates (transpose, cont,
-    // concat, reshape, ssm_conv, silu) + slack.
-    let input_shape = Shape2D::new(hidden_features, sequence_length);
-    let proj_mem = [
-        Context::recommended_backend_matmul_memory::<f32>(
-            Shape2D::new(hidden_features, conv_channels),
-            input_shape,
-        )
-        .map_err(|source| E2eError::ggml("matmul_mem(QKV)", source))?,
-        Context::recommended_backend_matmul_memory::<f32>(
-            Shape2D::new(hidden_features, inner_size),
-            input_shape,
-        )
-        .map_err(|source| E2eError::ggml("matmul_mem(Z)", source))?,
-        Context::recommended_backend_matmul_memory::<f32>(
-            Shape2D::new(hidden_features, time_step_rank),
-            input_shape,
-        )
-        .map_err(|source| E2eError::ggml("matmul_mem(alpha)", source))?,
-        Context::recommended_backend_matmul_memory::<f32>(
-            Shape2D::new(hidden_features, time_step_rank),
-            input_shape,
-        )
-        .map_err(|source| E2eError::ggml("matmul_mem(beta)", source))?,
-    ];
-    let proj_total: usize = proj_mem.iter().map(|b| b.get()).sum();
-
-    // Conv intermediates: cont(transpose) + zeros + concat + reshape_3d + kernel +
-    // ssm_conv output + silu output. Conservative: count each as full tensor.
-    // +hidden_features for norm weight, +hidden_features*seq_len for normed intermediate
-    let conv_tensor_bytes = std::mem::size_of::<f32>()
-        * (sequence_length * conv_channels   // cont(transpose)
-         + pad * conv_channels               // zero padding
-         + padded_len * conv_channels         // concat result
-         + kernel_size * conv_channels        // conv kernel
-         + sequence_length * conv_channels    // ssm_conv output
-         + sequence_length * conv_channels    // silu output
-         + hidden_features                    // norm weight
-         + hidden_features * sequence_length); // normed intermediate
-    let total_bytes = proj_total
-        .checked_add(conv_tensor_bytes)
-        .and_then(|v| v.checked_add(PROJECTION_SLACK_BYTES * 2))
-        .ok_or(E2eError::MemorySizeOverflow)?;
-
+    let total_bytes = dims.estimate_fused_memory(sequence_length)?;
     let ctx = Context::new_no_alloc_bytes(Bytes::new(total_bytes))
         .map_err(|source| E2eError::ggml("Context::new_no_alloc_bytes(fused)", source))?;
 
     // --- Projection tensors ---
     let w_qkv = ctx
-        .new_tensor_2d::<f32>(Shape2D::new(hidden_features, conv_channels))
+        .new_tensor_2d::<f32>(Shape2D::new(hidden, conv_channels))
         .map_err(|source| E2eError::ggml("new_tensor_2d<W_QKV>", source))?;
     let w_z = ctx
-        .new_tensor_2d::<f32>(Shape2D::new(hidden_features, inner_size))
+        .new_tensor_2d::<f32>(Shape2D::new(hidden, inner_size))
         .map_err(|source| E2eError::ggml("new_tensor_2d<W_Z>", source))?;
     let w_alpha = ctx
-        .new_tensor_2d::<f32>(Shape2D::new(hidden_features, time_step_rank))
+        .new_tensor_2d::<f32>(Shape2D::new(hidden, time_step_rank))
         .map_err(|source| E2eError::ggml("new_tensor_2d<W_alpha>", source))?;
     let w_beta = ctx
-        .new_tensor_2d::<f32>(Shape2D::new(hidden_features, time_step_rank))
+        .new_tensor_2d::<f32>(Shape2D::new(hidden, time_step_rank))
         .map_err(|source| E2eError::ggml("new_tensor_2d<W_beta>", source))?;
     let x_raw = ctx
-        .new_tensor_2d::<f32>(Shape2D::new(hidden_features, sequence_length))
+        .new_tensor_2d::<f32>(Shape2D::new(hidden, sequence_length))
         .map_err(|source| E2eError::ggml("new_tensor_2d<X>", source))?;
 
-    // Layer pre-norm weight: [hidden_features]
+    // Layer pre-norm weight: [hidden]
     let norm_w = ctx
-        .new_tensor_1d::<f32>(Length::new(hidden_features))
+        .new_tensor_1d::<f32>(Length::new(hidden))
         .map_err(|source| E2eError::ggml("new<norm_w>", source))?;
 
     // In-graph layer pre-norm: rms_norm(X, eps) * norm_weight
