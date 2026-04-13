@@ -10,7 +10,7 @@ use super::state::Qwen35FullAttentionState;
 use super::tensor_ops::{
     PROJECTION_SLACK_BYTES, per_head_rms_norm, project_sequence, project_sequence_graph,
 };
-use ggml_rs::{Backend, Bytes, Context, Shape2D};
+use ggml_rs::{Backend, Bytes, Context, Shape2D, Shape4D};
 
 pub(super) fn qwen35_full_attention_inference(
     attention: &Qwen35FullAttentionLayerPlan,
@@ -789,14 +789,132 @@ fn fully_fused_attention_graph(
         .read_data_backend()
         .map_err(|source| E2eError::ggml("read<output>", source))
 }
+/// GPU-accelerated attention scoring via `flash_attn_ext`.
+///
+/// Builds a temporary ggml graph each decode step that:
+/// 1. Uploads Q, live KV cache prefix, and gate to the backend
+/// 2. Permutes K/V from host cache layout `[D, Hkv, T]` → flash `[D, T, Hkv]`
+/// 3. Runs `flash_attn_ext` (Q·K scoring + softmax + V aggregation)
+/// 4. Applies sigmoid gating
+///
+/// Returns the gated head outputs matching host scoring loop semantics.
+/// On any failure the caller should fall back to the host scoring loop.
+fn decode_scoring_gpu(
+    q_values: &[f32],
+    q_gate: &[f32],
+    state: &Qwen35FullAttentionState,
+    total_tokens: usize,
+    attention: &Qwen35FullAttentionLayerPlan,
+    query_features: usize,
+    backend: &Backend,
+) -> Result<Vec<f32>, E2eError> {
+    let d = attention.head_dimension;
+    let h = attention.head_count;
+    let hkv = attention.kv_head_count;
+    let t = total_tokens;
+
+    // Metadata-only context (backend manages data); 2 MB is generous for ~10 tensors + 1 graph.
+    let ctx = Context::new_no_alloc(2 * 1024 * 1024)
+        .map_err(|source| E2eError::ggml("ctx(scoring_gpu)", source))?;
+
+    // Input tensors — shapes follow flash_attn_ext convention.
+    // Q: [D, T_q=1, H, 1]
+    let q = ctx
+        .new_tensor_4d::<f32>(Shape4D::new(d, 1, h, 1))
+        .map_err(|source| E2eError::ggml("q_tensor", source))?;
+    // K/V in host cache layout [D, Hkv, T, 1]; will be permuted to [D, T, Hkv, 1].
+    let k_raw = ctx
+        .new_tensor_4d::<f32>(Shape4D::new(d, hkv, t, 1))
+        .map_err(|source| E2eError::ggml("k_tensor", source))?;
+    let v_raw = ctx
+        .new_tensor_4d::<f32>(Shape4D::new(d, hkv, t, 1))
+        .map_err(|source| E2eError::ggml("v_tensor", source))?;
+    // Gate: [D, H, 1, 1] — matches flash_attn_ext output shape.
+    let gate = ctx
+        .new_tensor_4d::<f32>(Shape4D::new(d, h, 1, 1))
+        .map_err(|source| E2eError::ggml("gate_tensor", source))?;
+
+    // Permute K/V from [D, Hkv, T, 1] → [D, T, Hkv, 1] + make contiguous.
+    let k_perm = ctx
+        .permute(&k_raw, 0, 2, 1, 3)
+        .map_err(|source| E2eError::ggml("permute(K)", source))?;
+    let k = ctx
+        .cont(&k_perm)
+        .map_err(|source| E2eError::ggml("cont(K)", source))?;
+    let v_perm = ctx
+        .permute(&v_raw, 0, 2, 1, 3)
+        .map_err(|source| E2eError::ggml("permute(V)", source))?;
+    let v = ctx
+        .cont(&v_perm)
+        .map_err(|source| E2eError::ggml("cont(V)", source))?;
+
+    // flash_attn_ext: Q·K scoring + softmax + V aggregation.
+    // No causal mask for single-query decode (token attends to itself + all past).
+    let attn = ctx
+        .flash_attn_ext(&q, &k, &v, None, attention.attention_scale, 0.0, 0.0)
+        .map_err(|source| E2eError::ggml("flash_attn_ext(decode)", source))?;
+    // Output: [D, H, 1, 1]
+
+    // Gating: sigmoid(gate) ⊙ attn
+    let gate_sig = ctx
+        .sigmoid(&gate)
+        .map_err(|source| E2eError::ggml("sigmoid(gate)", source))?;
+    let gated = ctx
+        .mul(&attn, &gate_sig)
+        .map_err(|source| E2eError::ggml("mul(attn,gate)", source))?;
+
+    // Build graph → allocate → upload → compute → readback.
+    let mut graph = ctx
+        .new_graph()
+        .map_err(|source| E2eError::ggml("new_graph(scoring)", source))?;
+    graph.build_forward_expand(&gated);
+
+    let _buffer = ctx
+        .allocate_tensors(backend)
+        .map_err(|source| E2eError::ggml("allocate(scoring)", source))?;
+
+    let kv_prefix_len = t * state.kv_features;
+    q.write_data_backend(q_values)
+        .map_err(|source| E2eError::ggml("write(Q)", source))?;
+    k_raw
+        .write_data_backend(&state.k_cache[..kv_prefix_len])
+        .map_err(|source| E2eError::ggml("write(K)", source))?;
+    v_raw
+        .write_data_backend(&state.v_cache[..kv_prefix_len])
+        .map_err(|source| E2eError::ggml("write(V)", source))?;
+    gate.write_data_backend(q_gate)
+        .map_err(|source| E2eError::ggml("write(gate)", source))?;
+
+    backend
+        .compute(&mut graph)
+        .map_err(|source| E2eError::ggml("compute(scoring)", source))?;
+
+    let outputs = gated
+        .read_data_backend()
+        .map_err(|source| E2eError::ggml("read(gated)", source))?;
+
+    if outputs.len() != query_features {
+        return Err(E2eError::BufferLengthMismatch {
+            expected: query_features,
+            actual: outputs.len(),
+        });
+    }
+
+    Ok(outputs)
+}
+
 /// Core full attention decode logic: RoPE → KV cache append → scoring → gating.
 ///
 /// Takes prepared QKV projections and returns gated head outputs (before output
 /// projection). The caller is responsible for projecting the output.
+///
+/// When `backend` is `Some`, attempts GPU-accelerated scoring via `flash_attn_ext`.
+/// Falls back to the host scoring loop on any GPU failure.
 pub(super) fn full_attention_decode_core(
     prepared: PreparedAttention,
     attention: &Qwen35FullAttentionLayerPlan,
     state: &mut Qwen35FullAttentionState,
+    backend: Option<&Backend>,
 ) -> Result<Vec<f32>, E2eError> {
     let PreparedAttention {
         mut q_values,
@@ -842,6 +960,22 @@ pub(super) fn full_attention_decode_core(
     state.append_batch(&k_values, &v_proj, 1)?;
     let total_tokens = state.token_count();
 
+    // Try GPU-accelerated scoring when a backend is available.
+    if let Some(backend) = backend {
+        if let Ok(outputs) = decode_scoring_gpu(
+            &q_values,
+            &q_gate,
+            state,
+            total_tokens,
+            attention,
+            query_features,
+            backend,
+        ) {
+            return Ok(outputs);
+        }
+        // GPU failed — fall through to host scoring loop.
+    }
+
     let groups = attention.head_count / attention.kv_head_count;
     let mut head_outputs = vec![0.0_f32; query_features];
     for head in 0..attention.head_count {
@@ -886,7 +1020,7 @@ pub(super) fn qwen35_full_attention_decode_step(
     let prepared = project_and_prepare_qkv(attention, input, 1, rms_norm_eps, Some(backend))?;
     let hidden_features = prepared.hidden_features;
     let query_features = prepared.query_features;
-    let head_outputs = full_attention_decode_core(prepared, attention, state)?;
+    let head_outputs = full_attention_decode_core(prepared, attention, state, Some(backend))?;
 
     project_sequence_graph(
         &head_outputs,
@@ -1087,6 +1221,112 @@ mod tests {
                 (a - b).abs() < 1e-5,
                 "feature {i}: decode={a} vs full={b}, diff={}",
                 (a - b).abs()
+            );
+        }
+    }
+
+    /// Verifies that `decode_scoring_gpu` (flash_attn_ext path) produces the
+    /// same gated head outputs as the host scoring loop inside
+    /// `full_attention_decode_core`.
+    ///
+    /// Uses GQA (H > Hkv) with multiple cached tokens (Tkv > 1) to exercise
+    /// the KV cache permutation and grouped-query layout.
+    #[test]
+    fn gpu_scoring_matches_host_scoring() {
+        let head_count = 4;
+        let kv_head_count = 2; // GQA: 2 groups
+        let hd = 4;
+        let query_features = head_count * hd; // 16
+        let kv_features = kv_head_count * hd; // 8
+        let hidden = 6;
+
+        // Deterministic weights.
+        let q_weight: Vec<f32> = (0..hidden * query_features * 2)
+            .map(|i| ((i % 7) as f32 - 3.0) * 0.05)
+            .collect();
+        let k_weight: Vec<f32> = (0..hidden * kv_features)
+            .map(|i| ((i % 5) as f32 - 2.0) * 0.08)
+            .collect();
+        let v_weight: Vec<f32> = (0..hidden * kv_features)
+            .map(|i| ((i % 11) as f32 - 5.0) * 0.03)
+            .collect();
+        let output_weight: Vec<f32> = (0..query_features * hidden)
+            .map(|i| ((i % 13) as f32 - 6.0) * 0.02)
+            .collect();
+        let q_norm = vec![1.0_f32; hd];
+        let k_norm = vec![1.0_f32; hd];
+
+        let plan = super::super::plan::Qwen35FullAttentionLayerPlan {
+            norm_values: vec![1.0; hidden],
+            q_norm_values: q_norm,
+            k_norm_values: k_norm,
+            q_weight_values: q_weight,
+            k_weight_values: k_weight,
+            v_weight_values: v_weight,
+            output_weight_values: output_weight,
+            head_count,
+            kv_head_count,
+            head_dimension: hd,
+            attention_scale: 1.0 / (hd as f32).sqrt(),
+            rope_n_dims: hd,
+            rope_freq_base: 10000.0,
+            rope_freq_scale: 1.0,
+        };
+
+        // 5-token prompt + 1 decode token — ensures Tkv > 1 for cache.
+        let prompt: Vec<f32> = (0..5 * hidden).map(|i| (i as f32 + 1.0) * 0.1).collect();
+        let decode_token: Vec<f32> = (0..hidden).map(|i| (i as f32 + 50.0) * 0.05).collect();
+
+        crate::backend::ensure_backends_loaded();
+        let backend =
+            Backend::new(ggml_rs::BackendKind::Cpu).expect("CPU backend should be available");
+
+        // Prefill to populate KV cache with 5 tokens.
+        let norm_weight = &plan.norm_values;
+        let mut state_host = Qwen35FullAttentionState::new(6, kv_head_count, hd).unwrap();
+        let _prefill = qwen35_full_attention_prefill(
+            &plan,
+            &prompt,
+            5,
+            1e-5,
+            norm_weight,
+            &mut state_host,
+            &backend,
+        )
+        .unwrap();
+
+        // Clone state so both paths start from the same KV cache snapshot.
+        let mut state_gpu = state_host.clone();
+
+        // Project decode token (shared for both paths).
+        let normalized = super::super::tensor_ops::rms_norm_with_weight(
+            &decode_token,
+            hidden,
+            1,
+            norm_weight,
+            1e-5,
+        )
+        .unwrap();
+
+        // Host scoring: backend = None.
+        let prepared_host =
+            project_and_prepare_qkv(&plan, &normalized, 1, 1e-5, Some(&backend)).unwrap();
+        let host_out =
+            full_attention_decode_core(prepared_host, &plan, &mut state_host, None).unwrap();
+
+        // GPU scoring: backend = Some.
+        let prepared_gpu =
+            project_and_prepare_qkv(&plan, &normalized, 1, 1e-5, Some(&backend)).unwrap();
+        let gpu_out =
+            full_attention_decode_core(prepared_gpu, &plan, &mut state_gpu, Some(&backend))
+                .unwrap();
+
+        assert_eq!(host_out.len(), gpu_out.len());
+        for (i, (h, g)) in host_out.iter().zip(gpu_out.iter()).enumerate() {
+            assert!(
+                (h - g).abs() < 1e-4,
+                "head_output[{i}]: host={h} vs gpu={g}, diff={}",
+                (h - g).abs()
             );
         }
     }

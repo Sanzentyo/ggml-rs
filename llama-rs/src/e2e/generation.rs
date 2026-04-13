@@ -539,7 +539,8 @@ fn persistent_decode_all_layers(
                     let hf = full_attention_hidden_features(attn)?;
                     let prepared =
                         prepare_qkv_from_raw(attn, q_full, k_proj, v_proj, 1, hf, rms_norm_eps)?;
-                    let head_outputs = full_attention_decode_core(prepared, attn, s)?;
+                    let head_outputs =
+                        full_attention_decode_core(prepared, attn, s, Some(backend))?;
                     proj.project_output(&head_outputs, backend)?
                 }
                 (AttentionLayerPlan::Qwen35Linear(attn), LayerAttentionState::Qwen35Linear(s)) => {

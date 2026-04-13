@@ -490,4 +490,91 @@ Soundness maintained because:
 
 - All existing tests pass (behavior-preserving refactoring + additive feature)
 - Fallback path exercised when persistent build is not available
+
+---
+
+## 16. Decode Attention Scoring Offload to GPU (`flash_attn_ext`)
+
+### 16.1 Problem
+
+After persistent decode projections (item 15), the **attention scoring loop**
+became the dominant decode bottleneck. For each token at position T, the host
+performs O(T × H × D) FLOPs for Q·K dot products, softmax, V aggregation, and
+sigmoid gating — ~8.2M FLOPs at T=1000 (34% of decode CPU time).
+
+The host path is a triple-nested scalar loop:
+```
+for head in 0..H:
+  for source in 0..T:       score = dot(Q[head], K_cache[source, kv_head])
+  softmax(scores)
+  for source in 0..T:       V_agg += V_cache[source, kv_head] * weight[source]
+  gate: V_agg *= sigmoid(Q_gate[head])
+```
+
+### 16.2 Solution
+
+Offload the entire scoring + gating operation to the backend using
+`flash_attn_ext`, which fuses Q·K scoring, softmax, and V aggregation in a
+single GPU-optimized kernel. Sigmoid gating is included in the same graph
+to avoid an extra host ↔ device readback.
+
+### 16.3 Implementation
+
+**New function** `decode_scoring_gpu` in `attention.rs`:
+1. Creates a temporary ggml context per decode step (KV length changes each step)
+2. Uploads Q `[D, 1, H, 1]`, gate `[D, H, 1, 1]`, and **live KV cache prefix**
+3. Permutes K/V from host cache layout `[D, Hkv, T]` → flash layout `[D, T, Hkv]`
+4. Runs `flash_attn_ext` (no mask needed for single-query decode)
+5. Applies `sigmoid(gate) ⊙ attn` in the same graph
+6. Reads back gated head outputs `[D × H]`
+
+**Modified function** `full_attention_decode_core`:
+- New parameter `backend: Option<&Backend>`
+- When `Some`: tries GPU scoring first; on any failure, falls back to host loop
+- When `None`: host scoring loop (unchanged behavior)
+
+### 16.4 Key Design Decisions
+
+| Decision | Rationale |
+|----------|-----------|
+| Per-step temporary context | KV cache length changes each step; can't reuse a persistent graph |
+| Upload only live prefix | `k_cache[..total_tokens * kv_features]`, not full buffer (rubber-duck catch) |
+| Q shape `[D, 1, H, 1]` | Matches `flash_attn_ext` convention `[D, T_q, H, 1]` (rubber-duck caught initial `[D, H, 1, 1]` bug) |
+| No causal mask for T_q=1 | Single-query decode: token attends to self + all past, no future tokens exist |
+| Fallback on GPU failure | `full_attention_decode_core` silently falls back to host loop if graph build/compute fails |
+| GQA native | `flash_attn_ext` handles H ≠ Hkv natively; no head expansion needed |
+
+### 16.5 KV Cache Layout Transformation
+
+```
+Host cache:  k_cache[token * kv_features + kv_head * hd + dim]
+             → ggml shape [D, Hkv, T, 1]
+
+flash_attn:  K [D, Tkv, Hkv, 1]
+
+Transform:   permute(0, 2, 1, 3) + cont()
+             [D, Hkv, T, 1] → [D, T, Hkv, 1]
+```
+
+### 16.6 Performance Impact (Estimated)
+
+| Metric | Before (host) | After (GPU) | Notes |
+|--------|---------------|-------------|-------|
+| Scoring FLOPs at T=1000 | ~8.2M (scalar) | ~8.2M (SIMD/GPU) | Same work, massively parallel |
+| KV upload per step | 0 | ~64KB at T=1000 | Cheap on unified memory |
+| Context allocation | 0 | ~2MB metadata | One per step, freed immediately |
+| Gating | Separate loop | Fused in graph | One fewer host ↔ device transfer |
+
+### 16.7 Files Changed
+
+| File | Changes |
+|------|---------|
+| `attention.rs` | Add `decode_scoring_gpu` function; modify `full_attention_decode_core` to accept `backend: Option<&Backend>` with GPU-first + host fallback; update `qwen35_full_attention_decode_step` caller |
+| `generation.rs` | Pass `Some(backend)` to `full_attention_decode_core` in `persistent_decode_all_layers` |
+
+### 16.8 Test Results
+
+- New test: `gpu_scoring_matches_host_scoring` — GQA (H=4, Hkv=2), 5+1 tokens,
+  verifies GPU path output matches host scoring loop within 1e-4
+- All existing tests pass (including `full_attention_prefill_then_decode_matches_full_reprocess`)
 - `DecodeStrategy` preserved as reference implementation for `full_reprocess_loop`

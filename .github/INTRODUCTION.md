@@ -218,6 +218,14 @@ And you should write rusty code(ADT, enum, type state pattern)
   `linear_attention_decode_core` (pure refactoring, all tests pass). `two_phase_loop`
   tries persistent path first, falls back to `DecodeStrategy` on failure (runtime
   robustness). See comparison doc item 15.
+- **Decode attention scoring offload** (`flash_attn_ext`):
+  Offloads the Q·K scoring + softmax + V aggregation + sigmoid gating loop to GPU
+  via `flash_attn_ext` graph. `decode_scoring_gpu` in `attention.rs` builds a
+  per-step temporary graph, uploads the live KV cache prefix with permutation
+  `[D, Hkv, T] → [D, T, Hkv]`, runs fused attention, and reads back gated outputs.
+  `full_attention_decode_core` now accepts `backend: Option<&Backend>` — GPU-first
+  with silent fallback to host loop. GQA-aware parity test passes within 1e-4.
+  See comparison doc item 16.
 
 ## Validation checkpoints completed on this branch
 
