@@ -170,9 +170,14 @@ llama-rs uses explicit `copy_from_slice`.
 4. **Full attention decode** is also implemented (`qwen35_full_attention_decode_step`
    + `Qwen35FullAttentionState` KV cache). RoPE `position_offset` parameter
    enables correct position encoding for decode tokens.
-5. **Performance**: llama-rs uses scalar loops with explicit copies; llama.cpp
-   uses graph-level zero-copy views and multi-threaded kernels. This is
-   expected for a reference implementation vs production runtime.
+5. **Performance**: llama-rs prefill path now uses `ggml_ssm_conv` via
+   `causal_depthwise_conv_graph` — the same graph-level operator used by
+   llama.cpp for Mamba/SSM models. Host-side transpose + left-padding maps
+   our channel-fast `[seq_len, channels]` layout to ggml's time-fast
+   `[padded_len, channels]` convention; the output `[channels, seq_len]` is
+   read back channel-fast. Decode path (single token) stays on host scalar
+   for latency. QKV splits still use explicit `copy_from_slice` (zero-copy
+   views planned). 4 parity tests verify graph vs host-only numerical match.
 6. **Future optimization**: The `copy_from_slice` QKV splits now use
    `chunks_exact` iterators, eliminating manual index arithmetic.
    Projection and normalization logic is shared via extracted helpers

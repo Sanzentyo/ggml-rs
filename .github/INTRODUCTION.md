@@ -125,6 +125,14 @@ And you should write rusty code(ADT, enum, type state pattern)
   Added missing `save_load_state` and `simple_chat` Cargo.toml entries. All 192 tests
   pass. File history preserved via `git mv`.
 
+- **Graph-level causal depthwise conv** (`ggml_ssm_conv`):
+  Added `ssm_conv` safe wrapper to `ggml-rs` (f32-only). `causal_depthwise_conv_graph`
+  in `linear_attention.rs` performs host-side transpose + left-padding then runs
+  `ggml_ssm_conv` + `ggml_silu` on the backend (CPU/Metal/CUDA). Prefill path now
+  uses graph-level conv; decode stays host-side (single token). 4 parity tests verify
+  graph vs host-only numerical match. Original host function kept as `#[cfg(test)]`
+  reference. 196 tests pass.
+
 ## Validation checkpoints completed on this branch
 
 - `cargo fmt --all`
