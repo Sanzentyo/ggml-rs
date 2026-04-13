@@ -179,6 +179,11 @@ llama-rs uses explicit `copy_from_slice`.
    (`project_and_prepare_qkv`, `project_linear_inputs`, `split_and_norm_qk`),
    reducing code duplication between prefill and decode paths. Further
    optimization (strided views) possible when ggml-rs safe API supports it.
+   **Update**: `view_3d`, `view_4d`, `reshape_1d`, `reshape_4d` safe wrappers
+   are now implemented in ggml-rs with Rust-side validation (contiguity,
+   element count, bounds). Existing `view_1d`/`view_2d`/`reshape_2d`/`reshape_3d`
+   also gained validation. Graph-level zero-copy QKV splits are now feasible
+   as a follow-up optimization.
 7. **Multi-layer orchestration verified**: `generation.rs` extracted a
    `GenerationMode` enum (`Auto | FullReprocess | TwoPhase`) and a
    `generate_from_plans` helper.  Integration test

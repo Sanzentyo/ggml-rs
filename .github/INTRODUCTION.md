@@ -99,6 +99,16 @@ And you should write rusty code(ADT, enum, type state pattern)
   rejection). `simple_chat` example: interactive multi-turn loop with streaming
   token output, `<|im_end|>` stop detection. 20+ unit tests.
 
+- **Safe view/reshape wrappers** (`view_3d`, `view_4d`, `reshape_1d`, `reshape_4d`):
+  Added missing safe API wrappers to `ggml-rs` that mirror the ggml C API for
+  zero-copy tensor views. Backfilled Rust-side validation on all existing wrappers
+  (`view_1d`, `view_2d`, `reshape_2d`, `reshape_3d`). Two new error variants:
+  `NotContiguous` (blocks reshape of non-contiguous tensors), `ViewOutOfBounds`
+  (blocks views that exceed source tensor bounds). Overflow-checked arithmetic
+  prevents C-level aborts. 13 new integration tests covering aliasing, error
+  paths, and OOB rejection. Enables future graph-level zero-copy QKV splits
+  in llama-rs.
+
 ## Validation checkpoints completed on this branch
 
 - `cargo fmt --all`

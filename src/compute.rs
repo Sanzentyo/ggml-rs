@@ -18,6 +18,59 @@ use std::ptr::{self, NonNull};
 const SIMPLE_CONTEXT_SLACK_BYTES: usize = 1024;
 const CONTIGUOUS_BULK_COPY_MIN_ELEMS: usize = 256;
 
+/// Validates that a tensor is contiguous and its element count matches the
+/// product of the target dimensions. This prevents the C library from
+/// aborting on invalid reshape inputs.
+fn validate_reshape_source<T: GgmlElement>(a: &Tensor<'_, T>, target_dims: &[usize]) -> Result<()> {
+    let is_contiguous = unsafe { ffi::ggml_is_contiguous(a.raw.as_ptr()) as i32 != 0 };
+    if !is_contiguous {
+        return Err(Error::NotContiguous);
+    }
+    let target_count = target_dims
+        .iter()
+        .try_fold(1usize, |acc, &d| acc.checked_mul(d))
+        .ok_or(Error::Overflow)?;
+    let source_count = a.element_count()?;
+    if target_count != source_count {
+        return Err(Error::LengthMismatch {
+            expected: source_count,
+            actual: target_count,
+        });
+    }
+    Ok(())
+}
+
+/// Validates that a view's maximum addressed byte stays within the source
+/// tensor's byte size.
+///
+/// `outer_dims` contains `(ne_i, nb_i)` pairs for dimensions 1..N (outer to
+/// inner). `inner_row_bytes` is `ne0 * element_size`.
+fn validate_view_extent<T: GgmlElement>(
+    source: &Tensor<'_, T>,
+    offset: usize,
+    outer_dims: &[(usize, usize)],
+    inner_row_bytes: usize,
+) -> Result<()> {
+    let mut extent = inner_row_bytes;
+    for &(ne, nb) in outer_dims {
+        let stride_span = ne
+            .saturating_sub(1)
+            .checked_mul(nb)
+            .ok_or(Error::Overflow)?;
+        extent = extent.checked_add(stride_span).ok_or(Error::Overflow)?;
+    }
+    let max_byte = offset.checked_add(extent).ok_or(Error::Overflow)?;
+    let source_size = source.nbytes();
+    if max_byte > source_size {
+        return Err(Error::ViewOutOfBounds {
+            offset,
+            extent,
+            source_size,
+        });
+    }
+    Ok(())
+}
+
 /// Initializes ggml global timing infrastructure.
 pub fn init_timing() {
     unsafe {
@@ -705,12 +758,27 @@ impl Context {
             .map_err(|error| error.with_context("ggml_transpose"))
     }
 
+    pub fn reshape_1d<'ctx, T: GgmlElement>(
+        &'ctx self,
+        a: &Tensor<'ctx, T>,
+        ne0: usize,
+    ) -> Result<Tensor<'ctx, T>> {
+        validate_reshape_source(a, &[ne0])?;
+        let ne0 = (ne0)
+            .try_into_checked()
+            .map_err(|source| Error::int_conversion("tensor dimension", source))?;
+        let raw = unsafe { ffi::ggml_reshape_1d(self.raw.as_ptr(), a.raw.as_ptr(), ne0) };
+        self.wrap_typed_tensor(raw)
+            .map_err(|error| error.with_context("ggml_reshape_1d"))
+    }
+
     pub fn reshape_2d<'ctx, T: GgmlElement>(
         &'ctx self,
         a: &Tensor<'ctx, T>,
         ne0: usize,
         ne1: usize,
     ) -> Result<Tensor<'ctx, T>> {
+        validate_reshape_source(a, &[ne0, ne1])?;
         let ne0 = (ne0)
             .try_into_checked()
             .map_err(|source| Error::int_conversion("tensor dimension", source))?;
@@ -729,6 +797,7 @@ impl Context {
         ne1: usize,
         ne2: usize,
     ) -> Result<Tensor<'ctx, T>> {
+        validate_reshape_source(a, &[ne0, ne1, ne2])?;
         let ne0 = (ne0)
             .try_into_checked()
             .map_err(|source| Error::int_conversion("tensor dimension", source))?;
@@ -743,12 +812,42 @@ impl Context {
             .map_err(|error| error.with_context("ggml_reshape_3d"))
     }
 
+    pub fn reshape_4d<'ctx, T: GgmlElement>(
+        &'ctx self,
+        a: &Tensor<'ctx, T>,
+        ne0: usize,
+        ne1: usize,
+        ne2: usize,
+        ne3: usize,
+    ) -> Result<Tensor<'ctx, T>> {
+        validate_reshape_source(a, &[ne0, ne1, ne2, ne3])?;
+        let ne0 = (ne0)
+            .try_into_checked()
+            .map_err(|source| Error::int_conversion("tensor dimension", source))?;
+        let ne1 = (ne1)
+            .try_into_checked()
+            .map_err(|source| Error::int_conversion("tensor dimension", source))?;
+        let ne2 = (ne2)
+            .try_into_checked()
+            .map_err(|source| Error::int_conversion("tensor dimension", source))?;
+        let ne3 = (ne3)
+            .try_into_checked()
+            .map_err(|source| Error::int_conversion("tensor dimension", source))?;
+        let raw =
+            unsafe { ffi::ggml_reshape_4d(self.raw.as_ptr(), a.raw.as_ptr(), ne0, ne1, ne2, ne3) };
+        self.wrap_typed_tensor(raw)
+            .map_err(|error| error.with_context("ggml_reshape_4d"))
+    }
+
     pub fn view_1d<'ctx, T: GgmlElement>(
         &'ctx self,
         a: &Tensor<'ctx, T>,
         ne0: usize,
         offset: usize,
     ) -> Result<Tensor<'ctx, T>> {
+        let elem_size = std::mem::size_of::<T>();
+        let inner_bytes = ne0.checked_mul(elem_size).ok_or(Error::Overflow)?;
+        validate_view_extent(a, offset, &[], inner_bytes)?;
         let ne0 = (ne0)
             .try_into_checked()
             .map_err(|source| Error::int_conversion("tensor dimension", source))?;
@@ -762,27 +861,112 @@ impl Context {
         a: &Tensor<'ctx, T>,
         ne0: usize,
         ne1: usize,
-        row_stride: usize,
+        nb1: usize,
         offset: usize,
     ) -> Result<Tensor<'ctx, T>> {
+        let elem_size = std::mem::size_of::<T>();
+        let inner_bytes = ne0.checked_mul(elem_size).ok_or(Error::Overflow)?;
+        validate_view_extent(a, offset, &[(ne1, nb1)], inner_bytes)?;
         let ne0 = (ne0)
             .try_into_checked()
             .map_err(|source| Error::int_conversion("tensor dimension", source))?;
         let ne1 = (ne1)
             .try_into_checked()
             .map_err(|source| Error::int_conversion("tensor dimension", source))?;
+        let raw =
+            unsafe { ffi::ggml_view_2d(self.raw.as_ptr(), a.raw.as_ptr(), ne0, ne1, nb1, offset) };
+        self.wrap_typed_tensor(raw)
+            .map_err(|error| error.with_context("ggml_view_2d"))
+    }
+
+    #[allow(clippy::too_many_arguments)] // mirrors ggml_view_3d C API
+    pub fn view_3d<'ctx, T: GgmlElement>(
+        &'ctx self,
+        a: &Tensor<'ctx, T>,
+        ne0: usize,
+        ne1: usize,
+        ne2: usize,
+        nb1: usize,
+        nb2: usize,
+        offset: usize,
+    ) -> Result<Tensor<'ctx, T>> {
+        let elem_size = std::mem::size_of::<T>();
+        let inner_bytes = ne0.checked_mul(elem_size).ok_or(Error::Overflow)?;
+        validate_view_extent(a, offset, &[(ne2, nb2), (ne1, nb1)], inner_bytes)?;
+        let ne0 = (ne0)
+            .try_into_checked()
+            .map_err(|source| Error::int_conversion("tensor dimension", source))?;
+        let ne1 = (ne1)
+            .try_into_checked()
+            .map_err(|source| Error::int_conversion("tensor dimension", source))?;
+        let ne2 = (ne2)
+            .try_into_checked()
+            .map_err(|source| Error::int_conversion("tensor dimension", source))?;
         let raw = unsafe {
-            ffi::ggml_view_2d(
+            ffi::ggml_view_3d(
                 self.raw.as_ptr(),
                 a.raw.as_ptr(),
                 ne0,
                 ne1,
-                row_stride,
+                ne2,
+                nb1,
+                nb2,
                 offset,
             )
         };
         self.wrap_typed_tensor(raw)
-            .map_err(|error| error.with_context("ggml_view_2d"))
+            .map_err(|error| error.with_context("ggml_view_3d"))
+    }
+
+    #[allow(clippy::too_many_arguments)] // mirrors ggml_view_4d C API
+    pub fn view_4d<'ctx, T: GgmlElement>(
+        &'ctx self,
+        a: &Tensor<'ctx, T>,
+        ne0: usize,
+        ne1: usize,
+        ne2: usize,
+        ne3: usize,
+        nb1: usize,
+        nb2: usize,
+        nb3: usize,
+        offset: usize,
+    ) -> Result<Tensor<'ctx, T>> {
+        let elem_size = std::mem::size_of::<T>();
+        let inner_bytes = ne0.checked_mul(elem_size).ok_or(Error::Overflow)?;
+        validate_view_extent(
+            a,
+            offset,
+            &[(ne3, nb3), (ne2, nb2), (ne1, nb1)],
+            inner_bytes,
+        )?;
+        let ne0 = (ne0)
+            .try_into_checked()
+            .map_err(|source| Error::int_conversion("tensor dimension", source))?;
+        let ne1 = (ne1)
+            .try_into_checked()
+            .map_err(|source| Error::int_conversion("tensor dimension", source))?;
+        let ne2 = (ne2)
+            .try_into_checked()
+            .map_err(|source| Error::int_conversion("tensor dimension", source))?;
+        let ne3 = (ne3)
+            .try_into_checked()
+            .map_err(|source| Error::int_conversion("tensor dimension", source))?;
+        let raw = unsafe {
+            ffi::ggml_view_4d(
+                self.raw.as_ptr(),
+                a.raw.as_ptr(),
+                ne0,
+                ne1,
+                ne2,
+                ne3,
+                nb1,
+                nb2,
+                nb3,
+                offset,
+            )
+        };
+        self.wrap_typed_tensor(raw)
+            .map_err(|error| error.with_context("ggml_view_4d"))
     }
 
     pub fn permute<'ctx, T: GgmlElement>(
