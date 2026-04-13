@@ -12,7 +12,7 @@ use super::tensor_ops::{
     PROJECTION_SLACK_BYTES, head_slice, head_slice_mut, per_head_l2_norm, project_sequence,
     project_sequence_graph, rms_norm_single,
 };
-use ggml_rs::{Backend, Bytes, Context, Shape2D, Shape3D};
+use ggml_rs::{Backend, Bytes, Context, Shape2D};
 
 pub(super) fn qwen35_linear_attention_inference(
     attention: &Qwen35LinearAttentionLayerPlan,
@@ -58,6 +58,21 @@ struct LinearProjections {
     beta: Vec<f32>,
     conv_channels: usize,
     hidden_features: usize,
+}
+
+/// Output of the fused projection + conv graph, which computes all four linear
+/// projections AND the causal depthwise convolution + SiLU in a single ggml
+/// compute graph, eliminating the host↔device round-trip between them.
+struct FusedLinearOutputs {
+    /// Post-conv, post-SiLU activation `[seq_len × conv_channels]`.
+    conv: Vec<f32>,
+    /// Pre-conv QKV projection `[seq_len × conv_channels]` — needed by
+    /// `capture_conv_buffer` for decode state continuity.
+    qkv_pre_conv: Vec<f32>,
+    z: Vec<f32>,
+    alpha: Vec<f32>,
+    beta: Vec<f32>,
+    conv_channels: usize,
 }
 
 /// Estimate the backend memory needed for 4 linear-attention input projections.
@@ -347,27 +362,52 @@ fn qwen35_linear_attention_core(
     mut state: Option<&mut LinearAttentionState>,
     backend: &Backend,
 ) -> Result<Vec<f32>, E2eError> {
-    let LinearProjections {
-        qkv,
+    // Derive hidden_features from weight matrix dimensions.
+    let hidden_features = attention
+        .inner_size
+        .checked_div(1)
+        .filter(|&is| is > 0)
+        .and_then(|_| {
+            let total = attention.ssm_out_weight_values.len();
+            let is = attention.inner_size;
+            let h = total / is;
+            (h > 0 && h * is == total).then_some(h)
+        })
+        .ok_or(E2eError::BufferLengthMismatch {
+            expected: 1,
+            actual: 0,
+        })?;
+    let conv_channels = attention.inner_size
+        + checked_mul(checked_mul(attention.group_count, attention.state_size)?, 2)?;
+
+    let expected_input_len = checked_mul(hidden_features, sequence_length)?;
+    if input.len() != expected_input_len {
+        return Err(E2eError::BufferLengthMismatch {
+            expected: expected_input_len,
+            actual: input.len(),
+        });
+    }
+
+    // Fused projection + conv: single graph, no host round-trip.
+    let FusedLinearOutputs {
+        conv,
+        qkv_pre_conv,
         z,
         alpha,
         beta,
         conv_channels,
-        hidden_features,
-    } = project_linear_inputs(attention, input, sequence_length, Some(backend))?;
-
-    let conv = causal_depthwise_conv_graph(
-        &qkv,
+    } = project_and_conv_fused_graph(
+        attention,
+        input,
         sequence_length,
+        hidden_features,
         conv_channels,
-        attention.conv_kernel,
-        &attention.conv_weight_values,
         backend,
     )?;
 
     // Capture pre-conv QKV into conv buffer for future decode steps.
     if let Some(ref mut state) = state {
-        state.capture_conv_buffer(&qkv, sequence_length)?;
+        state.capture_conv_buffer(&qkv_pre_conv, sequence_length)?;
     }
 
     let qk_features = checked_mul(attention.group_count, attention.state_size)?;
@@ -622,18 +662,9 @@ fn causal_depthwise_conv(
 
 /// Graph-accelerated causal depthwise convolution via `ggml_ssm_conv` + SiLU.
 ///
-/// Equivalent to `causal_depthwise_conv` (host-only reference) but runs on the backend (CPU/Metal/
-/// CUDA). The input is transposed and left-padded on the host before upload so
-/// that `ggml_ssm_conv` produces a causal result.
-///
-/// # Tensor layout
-///
-/// - `sx` (pre-padded input): `[kernel_size - 1 + seq_len, channels, 1]`
-///   (time-fast, channels-slow — the transpose of our row-major convention).
-/// - `c` (kernel weights): `[kernel_size, channels]` — matches our weight
-///   layout directly.
-/// - Output: `[channels, seq_len, 1]` — channels-fast, tokens-slow — matches
-///   our row-major `[token * channels + channel]` convention.
+/// Standalone version used by tests for parity checking. Production code uses
+/// the fused `project_and_conv_fused_graph` which combines projection + conv.
+#[cfg(test)]
 fn causal_depthwise_conv_graph(
     input: &[f32],
     sequence_length: usize,
@@ -688,7 +719,7 @@ fn causal_depthwise_conv_graph(
 
     // sx: [padded_len, channels, 1] — ggml ne[0]=padded_len, ne[1]=channels, ne[2]=1
     let sx = ctx
-        .new_tensor_3d::<f32>(Shape3D::new(padded_len, channels, 1))
+        .new_tensor_3d::<f32>(ggml_rs::Shape3D::new(padded_len, channels, 1))
         .map_err(|source| E2eError::ggml("new_tensor_3d<sx>", source))?;
 
     // c: [kernel_size, channels] — ggml ne[0]=kernel_size, ne[1]=channels
@@ -727,6 +758,245 @@ fn causal_depthwise_conv_graph(
     result
         .read_data_backend()
         .map_err(|source| E2eError::ggml("read_data_backend(conv)", source))
+}
+
+/// Fused projection + convolution graph for linear attention prefill.
+///
+/// Combines four input projections (`mul_mat`), in-graph transpose + left-pad,
+/// `ggml_ssm_conv`, and SiLU activation into a single compute graph. This
+/// eliminates the host↔device round-trip between projection and convolution.
+///
+/// Also returns `qkv_pre_conv` (the raw projection output before conv) so that
+/// `capture_conv_buffer` can store the last `kernel_size - 1` rows for decode.
+#[allow(clippy::too_many_arguments)]
+fn project_and_conv_fused_graph(
+    attention: &Qwen35LinearAttentionLayerPlan,
+    input: &[f32],
+    sequence_length: usize,
+    hidden_features: usize,
+    conv_channels: usize,
+    backend: &Backend,
+) -> Result<FusedLinearOutputs, E2eError> {
+    let kernel_size = attention.conv_kernel;
+    if kernel_size == 0 {
+        return Err(E2eError::BufferLengthMismatch {
+            expected: 1,
+            actual: 0,
+        });
+    }
+    if sequence_length == 0 {
+        return Err(E2eError::BufferLengthMismatch {
+            expected: 1,
+            actual: 0,
+        });
+    }
+
+    let inner_size = attention.inner_size;
+    let time_step_rank = attention.time_step_rank;
+    let pad = kernel_size - 1;
+    let padded_len = pad + sequence_length;
+
+    // --- Memory estimation ---
+    // Sum of projection matmul memory + conv intermediates (transpose, cont,
+    // concat, reshape, ssm_conv, silu) + slack.
+    let input_shape = Shape2D::new(hidden_features, sequence_length);
+    let proj_mem = [
+        Context::recommended_backend_matmul_memory::<f32>(
+            Shape2D::new(hidden_features, conv_channels),
+            input_shape,
+        )
+        .map_err(|source| E2eError::ggml("matmul_mem(QKV)", source))?,
+        Context::recommended_backend_matmul_memory::<f32>(
+            Shape2D::new(hidden_features, inner_size),
+            input_shape,
+        )
+        .map_err(|source| E2eError::ggml("matmul_mem(Z)", source))?,
+        Context::recommended_backend_matmul_memory::<f32>(
+            Shape2D::new(hidden_features, time_step_rank),
+            input_shape,
+        )
+        .map_err(|source| E2eError::ggml("matmul_mem(alpha)", source))?,
+        Context::recommended_backend_matmul_memory::<f32>(
+            Shape2D::new(hidden_features, time_step_rank),
+            input_shape,
+        )
+        .map_err(|source| E2eError::ggml("matmul_mem(beta)", source))?,
+    ];
+    let proj_total: usize = proj_mem.iter().map(|b| b.get()).sum();
+
+    // Conv intermediates: cont(transpose) + zeros + concat + reshape_3d + kernel +
+    // ssm_conv output + silu output. Conservative: count each as full tensor.
+    let conv_tensor_bytes = std::mem::size_of::<f32>()
+        * (sequence_length * conv_channels   // cont(transpose)
+         + pad * conv_channels               // zero padding
+         + padded_len * conv_channels         // concat result
+         + kernel_size * conv_channels        // conv kernel
+         + sequence_length * conv_channels    // ssm_conv output
+         + sequence_length * conv_channels); // silu output
+    let total_bytes = proj_total
+        .checked_add(conv_tensor_bytes)
+        .and_then(|v| v.checked_add(PROJECTION_SLACK_BYTES * 2))
+        .ok_or(E2eError::MemorySizeOverflow)?;
+
+    let ctx = Context::new_no_alloc_bytes(Bytes::new(total_bytes))
+        .map_err(|source| E2eError::ggml("Context::new_no_alloc_bytes(fused)", source))?;
+
+    // --- Projection tensors ---
+    let w_qkv = ctx
+        .new_tensor_2d::<f32>(Shape2D::new(hidden_features, conv_channels))
+        .map_err(|source| E2eError::ggml("new_tensor_2d<W_QKV>", source))?;
+    let w_z = ctx
+        .new_tensor_2d::<f32>(Shape2D::new(hidden_features, inner_size))
+        .map_err(|source| E2eError::ggml("new_tensor_2d<W_Z>", source))?;
+    let w_alpha = ctx
+        .new_tensor_2d::<f32>(Shape2D::new(hidden_features, time_step_rank))
+        .map_err(|source| E2eError::ggml("new_tensor_2d<W_alpha>", source))?;
+    let w_beta = ctx
+        .new_tensor_2d::<f32>(Shape2D::new(hidden_features, time_step_rank))
+        .map_err(|source| E2eError::ggml("new_tensor_2d<W_beta>", source))?;
+    let x = ctx
+        .new_tensor_2d::<f32>(Shape2D::new(hidden_features, sequence_length))
+        .map_err(|source| E2eError::ggml("new_tensor_2d<X>", source))?;
+
+    // --- Projection: 4 matmuls sharing input X ---
+    let qkv_out = ctx
+        .mul_mat(&w_qkv, &x)
+        .map_err(|source| E2eError::ggml("mul_mat(QKV)", source))?;
+    let z_out = ctx
+        .mul_mat(&w_z, &x)
+        .map_err(|source| E2eError::ggml("mul_mat(Z)", source))?;
+    let alpha_out = ctx
+        .mul_mat(&w_alpha, &x)
+        .map_err(|source| E2eError::ggml("mul_mat(alpha)", source))?;
+    let beta_out = ctx
+        .mul_mat(&w_beta, &x)
+        .map_err(|source| E2eError::ggml("mul_mat(beta)", source))?;
+
+    // --- In-graph conv: transpose → cont → pad → ssm_conv → silu ---
+    // qkv_out shape: ne[0]=conv_channels, ne[1]=seq_len (channels-fast)
+    // ssm_conv wants: ne[0]=padded_len, ne[1]=conv_channels (time-fast)
+
+    // Step 1: Transpose to [seq_len, conv_channels] (time-fast)
+    let qkv_t = ctx
+        .transpose(&qkv_out)
+        .map_err(|source| E2eError::ggml("transpose(QKV)", source))?;
+    // Step 2: Make contiguous (transpose is just a stride swap)
+    let qkv_cont = ctx
+        .cont(&qkv_t)
+        .map_err(|source| E2eError::ggml("cont(QKV_t)", source))?;
+
+    // Step 3: Left-pad with zeros for causal boundary.
+    // Build conv sub-graph; the `zeros` tensor (if any) and conv kernel `c`
+    // must be kept alive for data upload after allocation.
+    let (silu_out, zeros_tensor, c_tensor) = if pad > 0 {
+        let zeros = ctx
+            .new_tensor_2d::<f32>(Shape2D::new(pad, conv_channels))
+            .map_err(|source| E2eError::ggml("new_tensor_2d<zeros>", source))?;
+        let padded = ctx
+            .concat(&zeros, &qkv_cont, 0)
+            .map_err(|source| E2eError::ggml("concat(pad)", source))?;
+        let padded_3d = ctx
+            .reshape_3d(&padded, padded_len, conv_channels, 1)
+            .map_err(|source| E2eError::ggml("reshape_3d(padded)", source))?;
+        let c = ctx
+            .new_tensor_2d::<f32>(Shape2D::new(kernel_size, conv_channels))
+            .map_err(|source| E2eError::ggml("new_tensor_2d<c>", source))?;
+        let conv_out = ctx
+            .ssm_conv(&padded_3d, &c)
+            .map_err(|source| E2eError::ggml("ssm_conv", source))?;
+        let silu_out = ctx
+            .silu(&conv_out)
+            .map_err(|source| E2eError::ggml("silu(conv)", source))?;
+        (silu_out, Some(zeros), c)
+    } else {
+        // kernel_size == 1: no padding, but still transpose → cont for layout.
+        let qkv_3d = ctx
+            .reshape_3d(&qkv_cont, sequence_length, conv_channels, 1)
+            .map_err(|source| E2eError::ggml("reshape_3d(no_pad)", source))?;
+        let c = ctx
+            .new_tensor_2d::<f32>(Shape2D::new(kernel_size, conv_channels))
+            .map_err(|source| E2eError::ggml("new_tensor_2d<c>(no_pad)", source))?;
+        let conv_out = ctx
+            .ssm_conv(&qkv_3d, &c)
+            .map_err(|source| E2eError::ggml("ssm_conv(no_pad)", source))?;
+        let silu_out = ctx
+            .silu(&conv_out)
+            .map_err(|source| E2eError::ggml("silu(no_pad)", source))?;
+        (silu_out, None, c)
+    };
+
+    // --- Build graph, allocate, upload, compute, read — all in one scope so
+    //     the backend buffer stays alive through the read-back. ---
+    let mut graph = ctx
+        .new_graph()
+        .map_err(|source| E2eError::ggml("new_graph(fused)", source))?;
+    graph.build_forward_expand(&silu_out);
+    graph.build_forward_expand(&qkv_out); // pre-conv for state capture
+    graph.build_forward_expand(&z_out);
+    graph.build_forward_expand(&alpha_out);
+    graph.build_forward_expand(&beta_out);
+
+    let _buffer = ctx
+        .allocate_tensors(backend)
+        .map_err(|source| E2eError::ggml("allocate_tensors(fused)", source))?;
+
+    // Upload projection weights and input.
+    w_qkv
+        .write_data_backend(&attention.qkv_weight_values)
+        .map_err(|source| E2eError::ggml("write<W_QKV>", source))?;
+    w_z.write_data_backend(&attention.gate_weight_values)
+        .map_err(|source| E2eError::ggml("write<W_Z>", source))?;
+    w_alpha
+        .write_data_backend(&attention.alpha_weight_values)
+        .map_err(|source| E2eError::ggml("write<W_alpha>", source))?;
+    w_beta
+        .write_data_backend(&attention.beta_weight_values)
+        .map_err(|source| E2eError::ggml("write<W_beta>", source))?;
+    x.write_data_backend(input)
+        .map_err(|source| E2eError::ggml("write<X>", source))?;
+
+    // Upload zero padding (only when kernel_size > 1).
+    if let Some(ref zeros) = zeros_tensor {
+        let zero_data = vec![0.0_f32; pad * conv_channels];
+        zeros
+            .write_data_backend(&zero_data)
+            .map_err(|source| E2eError::ggml("write<zeros>", source))?;
+    }
+
+    // Upload conv kernel weights.
+    c_tensor
+        .write_data_backend(&attention.conv_weight_values)
+        .map_err(|source| E2eError::ggml("write<c>", source))?;
+
+    backend
+        .compute(&mut graph)
+        .map_err(|source| E2eError::ggml("compute(fused)", source))?;
+
+    // --- Read back results (buffer is still alive) ---
+    let conv = silu_out
+        .read_data_backend()
+        .map_err(|source| E2eError::ggml("read<conv_silu>", source))?;
+    let qkv_pre_conv = qkv_out
+        .read_data_backend()
+        .map_err(|source| E2eError::ggml("read<qkv_pre_conv>", source))?;
+    let z = z_out
+        .read_data_backend()
+        .map_err(|source| E2eError::ggml("read<Z>", source))?;
+    let alpha = alpha_out
+        .read_data_backend()
+        .map_err(|source| E2eError::ggml("read<alpha>", source))?;
+    let beta = beta_out
+        .read_data_backend()
+        .map_err(|source| E2eError::ggml("read<beta>", source))?;
+
+    Ok(FusedLinearOutputs {
+        conv,
+        qkv_pre_conv,
+        z,
+        alpha,
+        beta,
+        conv_channels,
+    })
 }
 
 /// Convolve a single new QKV row using the conv buffer from previous tokens.
