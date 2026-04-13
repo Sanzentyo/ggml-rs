@@ -1002,6 +1002,151 @@ impl Context {
             .map_err(|error| error.with_context("ggml_view_4d"))
     }
 
+    // ------------------------------------------------------------------
+    // Cross-context view variants
+    //
+    // These mirror view_1d..view_4d but accept a source tensor from a
+    // longer-lived context.  The `'src: 'ctx` bound ensures the source
+    // data outlives the view: the borrow checker ties `'src` to the
+    // source context (via `Tensor<'src, T>` PhantomData) and `'ctx` to
+    // the creating context.  Dropping the source context while the view
+    // is live is a compile error.
+    // ------------------------------------------------------------------
+
+    /// 1-D view into a tensor from a (possibly different) longer-lived context.
+    pub fn view_1d_of<'ctx, 'src: 'ctx, T: GgmlElement>(
+        &'ctx self,
+        a: &Tensor<'src, T>,
+        ne0: usize,
+        offset: usize,
+    ) -> Result<Tensor<'ctx, T>> {
+        let elem_size = std::mem::size_of::<T>();
+        let inner_bytes = ne0.checked_mul(elem_size).ok_or(Error::Overflow)?;
+        validate_view_extent(a, offset, &[], inner_bytes)?;
+        let ne0 = (ne0)
+            .try_into_checked()
+            .map_err(|source| Error::int_conversion("tensor dimension", source))?;
+        let raw = unsafe { ffi::ggml_view_1d(self.raw.as_ptr(), a.raw.as_ptr(), ne0, offset) };
+        self.wrap_typed_tensor(raw)
+            .map_err(|error| error.with_context("ggml_view_1d_of"))
+    }
+
+    /// 2-D view into a tensor from a (possibly different) longer-lived context.
+    pub fn view_2d_of<'ctx, 'src: 'ctx, T: GgmlElement>(
+        &'ctx self,
+        a: &Tensor<'src, T>,
+        ne0: usize,
+        ne1: usize,
+        nb1: usize,
+        offset: usize,
+    ) -> Result<Tensor<'ctx, T>> {
+        let elem_size = std::mem::size_of::<T>();
+        let inner_bytes = ne0.checked_mul(elem_size).ok_or(Error::Overflow)?;
+        validate_view_extent(a, offset, &[(ne1, nb1)], inner_bytes)?;
+        let ne0 = (ne0)
+            .try_into_checked()
+            .map_err(|source| Error::int_conversion("tensor dimension", source))?;
+        let ne1 = (ne1)
+            .try_into_checked()
+            .map_err(|source| Error::int_conversion("tensor dimension", source))?;
+        let raw =
+            unsafe { ffi::ggml_view_2d(self.raw.as_ptr(), a.raw.as_ptr(), ne0, ne1, nb1, offset) };
+        self.wrap_typed_tensor(raw)
+            .map_err(|error| error.with_context("ggml_view_2d_of"))
+    }
+
+    /// 3-D view into a tensor from a (possibly different) longer-lived context.
+    #[allow(clippy::too_many_arguments)]
+    pub fn view_3d_of<'ctx, 'src: 'ctx, T: GgmlElement>(
+        &'ctx self,
+        a: &Tensor<'src, T>,
+        ne0: usize,
+        ne1: usize,
+        ne2: usize,
+        nb1: usize,
+        nb2: usize,
+        offset: usize,
+    ) -> Result<Tensor<'ctx, T>> {
+        let elem_size = std::mem::size_of::<T>();
+        let inner_bytes = ne0.checked_mul(elem_size).ok_or(Error::Overflow)?;
+        validate_view_extent(a, offset, &[(ne2, nb2), (ne1, nb1)], inner_bytes)?;
+        let ne0 = (ne0)
+            .try_into_checked()
+            .map_err(|source| Error::int_conversion("tensor dimension", source))?;
+        let ne1 = (ne1)
+            .try_into_checked()
+            .map_err(|source| Error::int_conversion("tensor dimension", source))?;
+        let ne2 = (ne2)
+            .try_into_checked()
+            .map_err(|source| Error::int_conversion("tensor dimension", source))?;
+        let raw = unsafe {
+            ffi::ggml_view_3d(
+                self.raw.as_ptr(),
+                a.raw.as_ptr(),
+                ne0,
+                ne1,
+                ne2,
+                nb1,
+                nb2,
+                offset,
+            )
+        };
+        self.wrap_typed_tensor(raw)
+            .map_err(|error| error.with_context("ggml_view_3d_of"))
+    }
+
+    /// 4-D view into a tensor from a (possibly different) longer-lived context.
+    #[allow(clippy::too_many_arguments)]
+    pub fn view_4d_of<'ctx, 'src: 'ctx, T: GgmlElement>(
+        &'ctx self,
+        a: &Tensor<'src, T>,
+        ne0: usize,
+        ne1: usize,
+        ne2: usize,
+        ne3: usize,
+        nb1: usize,
+        nb2: usize,
+        nb3: usize,
+        offset: usize,
+    ) -> Result<Tensor<'ctx, T>> {
+        let elem_size = std::mem::size_of::<T>();
+        let inner_bytes = ne0.checked_mul(elem_size).ok_or(Error::Overflow)?;
+        validate_view_extent(
+            a,
+            offset,
+            &[(ne3, nb3), (ne2, nb2), (ne1, nb1)],
+            inner_bytes,
+        )?;
+        let ne0 = (ne0)
+            .try_into_checked()
+            .map_err(|source| Error::int_conversion("tensor dimension", source))?;
+        let ne1 = (ne1)
+            .try_into_checked()
+            .map_err(|source| Error::int_conversion("tensor dimension", source))?;
+        let ne2 = (ne2)
+            .try_into_checked()
+            .map_err(|source| Error::int_conversion("tensor dimension", source))?;
+        let ne3 = (ne3)
+            .try_into_checked()
+            .map_err(|source| Error::int_conversion("tensor dimension", source))?;
+        let raw = unsafe {
+            ffi::ggml_view_4d(
+                self.raw.as_ptr(),
+                a.raw.as_ptr(),
+                ne0,
+                ne1,
+                ne2,
+                ne3,
+                nb1,
+                nb2,
+                nb3,
+                offset,
+            )
+        };
+        self.wrap_typed_tensor(raw)
+            .map_err(|error| error.with_context("ggml_view_4d_of"))
+    }
+
     pub fn permute<'ctx, T: GgmlElement>(
         &'ctx self,
         a: &Tensor<'ctx, T>,
