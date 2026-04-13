@@ -4,6 +4,11 @@
 //! [`generate_token_ids_from_model`].  Internally the loop dispatches via
 //! [`GenerationMode`]: `TwoPhase` (prefill + incremental decode) when all
 //! layers support cached state, or `FullReprocess` as a fallback.
+//!
+//! The per-layer processing logic (norm → attention → residual → norm → MLP →
+//! residual) is shared via the [`AttentionStrategy`] trait, with three
+//! implementations: [`InferenceStrategy`] (stateless full-reprocess),
+//! [`PrefillStrategy`] (captures state), and [`DecodeStrategy`] (uses state).
 
 use super::attention::{
     qwen35_full_attention_decode_step, qwen35_full_attention_inference,
@@ -63,9 +68,202 @@ pub(super) struct GenerationInputs<'a> {
 }
 
 /// Result of the core generation loop (before wrapping in the public report).
+#[derive(Debug)]
 pub(super) struct GenerationOutput {
     pub generated_token_ids: Vec<i32>,
     pub all_token_ids: Vec<i32>,
+}
+
+// ---------------------------------------------------------------------------
+// AttentionStrategy trait and implementations
+// ---------------------------------------------------------------------------
+
+/// Dispatches attention computation for a single layer.
+///
+/// Three implementations cover the generation modes:
+/// - [`InferenceStrategy`]: stateless, full-reprocess (supports all layer types)
+/// - [`PrefillStrategy`]: captures per-layer state during prompt processing
+/// - [`DecodeStrategy`]: uses cached state for single-token decode
+trait AttentionStrategy {
+    fn process_attention(
+        &mut self,
+        layer_idx: usize,
+        attention: &AttentionLayerPlan,
+        normalized_input: &[f32],
+        seq_len: usize,
+        rms_norm_eps: f32,
+        backend: &Backend,
+    ) -> Result<Vec<f32>, E2eError>;
+}
+
+/// Stateless strategy: dispatches to `*_inference` functions.
+struct InferenceStrategy;
+
+impl AttentionStrategy for InferenceStrategy {
+    fn process_attention(
+        &mut self,
+        _layer_idx: usize,
+        attention: &AttentionLayerPlan,
+        normalized_input: &[f32],
+        seq_len: usize,
+        rms_norm_eps: f32,
+        backend: &Backend,
+    ) -> Result<Vec<f32>, E2eError> {
+        match attention {
+            AttentionLayerPlan::Standard(attn) => {
+                attention_inference_with_weights_on_backend_repeats_with_length(
+                    &attn.weights,
+                    normalized_input,
+                    seq_len,
+                    backend,
+                    1,
+                )
+                .map_err(|source| {
+                    E2eError::inference(
+                        "attention_inference_with_weights_on_backend_repeats_with_length",
+                        source,
+                    )
+                })
+            }
+            AttentionLayerPlan::Qwen35Full(attn) => {
+                qwen35_full_attention_inference(attn, normalized_input, seq_len, rms_norm_eps)
+            }
+            AttentionLayerPlan::Qwen35Linear(attn) => {
+                qwen35_linear_attention_inference(attn, normalized_input, seq_len, rms_norm_eps)
+            }
+        }
+    }
+}
+
+/// Prefill strategy: dispatches to `*_prefill` functions, capturing state.
+struct PrefillStrategy<'a> {
+    state: &'a mut GenerationState,
+}
+
+impl AttentionStrategy for PrefillStrategy<'_> {
+    fn process_attention(
+        &mut self,
+        layer_idx: usize,
+        attention: &AttentionLayerPlan,
+        normalized_input: &[f32],
+        seq_len: usize,
+        rms_norm_eps: f32,
+        _backend: &Backend,
+    ) -> Result<Vec<f32>, E2eError> {
+        match (attention, &mut self.state.layers[layer_idx]) {
+            (AttentionLayerPlan::Qwen35Full(attn), LayerAttentionState::Qwen35Full(s)) => {
+                qwen35_full_attention_prefill(attn, normalized_input, seq_len, rms_norm_eps, s)
+            }
+            (AttentionLayerPlan::Qwen35Linear(attn), LayerAttentionState::Qwen35Linear(s)) => {
+                qwen35_linear_attention_prefill(attn, normalized_input, seq_len, rms_norm_eps, s)
+            }
+            _ => Err(E2eError::UnsupportedTwoPhase),
+        }
+    }
+}
+
+/// Decode strategy: dispatches to `*_decode_step` functions using cached state.
+struct DecodeStrategy<'a> {
+    state: &'a mut GenerationState,
+}
+
+impl AttentionStrategy for DecodeStrategy<'_> {
+    fn process_attention(
+        &mut self,
+        layer_idx: usize,
+        attention: &AttentionLayerPlan,
+        normalized_input: &[f32],
+        seq_len: usize,
+        rms_norm_eps: f32,
+        _backend: &Backend,
+    ) -> Result<Vec<f32>, E2eError> {
+        debug_assert_eq!(seq_len, 1, "DecodeStrategy expects single-token input");
+        let _ = seq_len;
+        match (attention, &mut self.state.layers[layer_idx]) {
+            (AttentionLayerPlan::Qwen35Full(attn), LayerAttentionState::Qwen35Full(s)) => {
+                qwen35_full_attention_decode_step(attn, normalized_input, rms_norm_eps, s)
+            }
+            (AttentionLayerPlan::Qwen35Linear(attn), LayerAttentionState::Qwen35Linear(s)) => {
+                qwen35_linear_attention_decode_step(attn, normalized_input, rms_norm_eps, s)
+            }
+            _ => Err(E2eError::UnsupportedTwoPhase),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Shared layer processing and sampling
+// ---------------------------------------------------------------------------
+
+/// Process all layers using the given attention strategy.
+fn process_all_layers(
+    hidden: &mut [f32],
+    layer_plans: &[LayerPlan],
+    strategy: &mut impl AttentionStrategy,
+    hidden_features: usize,
+    seq_len: usize,
+    rms_norm_eps: f32,
+    backend: &Backend,
+) -> Result<(), E2eError> {
+    for (layer_idx, layer_plan) in layer_plans.iter().enumerate() {
+        if let Some(attention) = &layer_plan.attention {
+            let normalized_attn = rms_norm_with_weight(
+                hidden,
+                hidden_features,
+                seq_len,
+                attention.norm_values(),
+                rms_norm_eps,
+            )?;
+            let attention_output = strategy.process_attention(
+                layer_idx,
+                attention,
+                &normalized_attn,
+                seq_len,
+                rms_norm_eps,
+                backend,
+            )?;
+            add_in_place(hidden, &attention_output)?;
+        }
+
+        let normalized_ffn = rms_norm_with_weight(
+            hidden,
+            hidden_features,
+            seq_len,
+            &layer_plan.mlp.norm_values,
+            rms_norm_eps,
+        )?;
+        let mlp_output = mlp_sequence_inference_with_weights(
+            &layer_plan.mlp.weights,
+            &normalized_ffn,
+            seq_len,
+            backend,
+        )?;
+        add_in_place(hidden, &mlp_output)?;
+    }
+    Ok(())
+}
+
+/// Normalize the final hidden state and greedily sample the next token.
+fn sample_next_token(
+    hidden: &[f32],
+    token_index: usize,
+    inputs: &GenerationInputs<'_>,
+) -> Result<i32, E2eError> {
+    let seq_len = token_index + 1;
+    let normalized_output = rms_norm_with_weight(
+        hidden,
+        inputs.hidden_features,
+        seq_len,
+        inputs.output_norm_values,
+        inputs.rms_norm_eps,
+    )?;
+    greedy_next_token_id(
+        &normalized_output,
+        token_index,
+        inputs.hidden_features,
+        inputs.output_weight_values,
+        inputs.vocab_size,
+    )
 }
 
 pub fn resolve_eos_token_id(model: &GgufModel) -> Option<i32> {
@@ -247,6 +445,16 @@ pub(super) fn generate_from_plans(
         other => other,
     };
 
+    if matches!(effective_mode, GenerationMode::TwoPhase) {
+        let has_unsupported = inputs
+            .layer_plans
+            .iter()
+            .any(|p| matches!(p.attention, Some(AttentionLayerPlan::Standard(_))));
+        if has_unsupported {
+            return Err(E2eError::UnsupportedTwoPhase);
+        }
+    }
+
     match effective_mode {
         GenerationMode::FullReprocess | GenerationMode::Auto => {
             full_reprocess_loop(
@@ -278,6 +486,8 @@ fn full_reprocess_loop(
     generated_token_ids: &mut Vec<i32>,
     current_token_count: &mut usize,
 ) -> Result<(), E2eError> {
+    let mut strategy = InferenceStrategy;
+
     for _step in 0..inputs.max_new_tokens {
         let active_token_ids = &all_token_ids[..*current_token_count];
         let mut hidden = gather_embeddings(
@@ -287,98 +497,20 @@ fn full_reprocess_loop(
             active_token_ids,
         )?;
 
-        for layer_plan in inputs.layer_plans {
-            if let Some(attention) = &layer_plan.attention {
-                let attention_output = match attention {
-                    AttentionLayerPlan::Standard(attention) => {
-                        let normalized_attn = rms_norm_with_weight(
-                            &hidden,
-                            inputs.hidden_features,
-                            *current_token_count,
-                            &attention.norm_values,
-                            inputs.rms_norm_eps,
-                        )?;
-                        attention_inference_with_weights_on_backend_repeats_with_length(
-                            &attention.weights,
-                            &normalized_attn,
-                            *current_token_count,
-                            inputs.backend,
-                            1,
-                        )
-                        .map_err(|source| {
-                            E2eError::inference(
-                                "attention_inference_with_weights_on_backend_repeats_with_length",
-                                source,
-                            )
-                        })?
-                    }
-                    AttentionLayerPlan::Qwen35Full(attention) => {
-                        let normalized_attn = rms_norm_with_weight(
-                            &hidden,
-                            inputs.hidden_features,
-                            *current_token_count,
-                            &attention.norm_values,
-                            inputs.rms_norm_eps,
-                        )?;
-                        qwen35_full_attention_inference(
-                            attention,
-                            &normalized_attn,
-                            *current_token_count,
-                            inputs.rms_norm_eps,
-                        )?
-                    }
-                    AttentionLayerPlan::Qwen35Linear(attention) => {
-                        let normalized_attn = rms_norm_with_weight(
-                            &hidden,
-                            inputs.hidden_features,
-                            *current_token_count,
-                            &attention.norm_values,
-                            inputs.rms_norm_eps,
-                        )?;
-                        qwen35_linear_attention_inference(
-                            attention,
-                            &normalized_attn,
-                            *current_token_count,
-                            inputs.rms_norm_eps,
-                        )?
-                    }
-                };
-                add_in_place(&mut hidden, &attention_output)?;
-            }
-
-            let normalized_ffn = rms_norm_with_weight(
-                &hidden,
-                inputs.hidden_features,
-                *current_token_count,
-                &layer_plan.mlp.norm_values,
-                inputs.rms_norm_eps,
-            )?;
-            let mlp_output = mlp_sequence_inference_with_weights(
-                &layer_plan.mlp.weights,
-                &normalized_ffn,
-                *current_token_count,
-                inputs.backend,
-            )?;
-            add_in_place(&mut hidden, &mlp_output)?;
-        }
-
-        let normalized_output = rms_norm_with_weight(
-            &hidden,
+        process_all_layers(
+            &mut hidden,
+            inputs.layer_plans,
+            &mut strategy,
             inputs.hidden_features,
             *current_token_count,
-            inputs.output_norm_values,
             inputs.rms_norm_eps,
+            inputs.backend,
         )?;
+
         let last_index = current_token_count
             .checked_sub(1)
             .ok_or(E2eError::EmptyPrompt)?;
-        let next_token_id = greedy_next_token_id(
-            &normalized_output,
-            last_index,
-            inputs.hidden_features,
-            inputs.output_weight_values,
-            inputs.vocab_size,
-        )?;
+        let next_token_id = sample_next_token(&hidden, last_index, inputs)?;
 
         generated_token_ids.push(next_token_id);
         if *current_token_count < inputs.total_sequence_length {
@@ -400,6 +532,11 @@ fn two_phase_loop(
     current_token_count: &mut usize,
 ) -> Result<(), E2eError> {
     let prompt_token_count = inputs.prompt_token_ids.len();
+
+    if inputs.max_new_tokens == 0 {
+        return Ok(());
+    }
+
     let mut state = GenerationState::new(inputs.layer_plans, inputs.total_sequence_length)?;
 
     // Phase 1: Prefill — process all prompt tokens at once, capturing state.
@@ -411,186 +548,63 @@ fn two_phase_loop(
         prompt_ids,
     )?;
 
-    for (layer_idx, layer_plan) in inputs.layer_plans.iter().enumerate() {
-        if let Some(attention) = &layer_plan.attention {
-            let attention_output = match (attention, &mut state.layers[layer_idx]) {
-                (AttentionLayerPlan::Qwen35Full(attn), LayerAttentionState::Qwen35Full(s)) => {
-                    let normalized_attn = rms_norm_with_weight(
-                        &hidden,
-                        inputs.hidden_features,
-                        prompt_token_count,
-                        &attn.norm_values,
-                        inputs.rms_norm_eps,
-                    )?;
-                    qwen35_full_attention_prefill(
-                        attn,
-                        &normalized_attn,
-                        prompt_token_count,
-                        inputs.rms_norm_eps,
-                        s,
-                    )?
-                }
-                (AttentionLayerPlan::Qwen35Linear(attn), LayerAttentionState::Qwen35Linear(s)) => {
-                    let normalized_attn = rms_norm_with_weight(
-                        &hidden,
-                        inputs.hidden_features,
-                        prompt_token_count,
-                        &attn.norm_values,
-                        inputs.rms_norm_eps,
-                    )?;
-                    qwen35_linear_attention_prefill(
-                        attn,
-                        &normalized_attn,
-                        prompt_token_count,
-                        inputs.rms_norm_eps,
-                        s,
-                    )?
-                }
-                _ => {
-                    unreachable!("two-phase loop should not encounter Standard or mismatched state")
-                }
-            };
-            add_in_place(&mut hidden, &attention_output)?;
-        }
-
-        let normalized_ffn = rms_norm_with_weight(
-            &hidden,
+    {
+        let mut strategy = PrefillStrategy { state: &mut state };
+        process_all_layers(
+            &mut hidden,
+            inputs.layer_plans,
+            &mut strategy,
             inputs.hidden_features,
             prompt_token_count,
-            &layer_plan.mlp.norm_values,
             inputs.rms_norm_eps,
-        )?;
-        let mlp_output = mlp_sequence_inference_with_weights(
-            &layer_plan.mlp.weights,
-            &normalized_ffn,
-            prompt_token_count,
             inputs.backend,
         )?;
-        add_in_place(&mut hidden, &mlp_output)?;
     }
 
-    // Sample first token from the last prompt position.
-    let normalized_output = rms_norm_with_weight(
-        &hidden,
-        inputs.hidden_features,
-        prompt_token_count,
-        inputs.output_norm_values,
-        inputs.rms_norm_eps,
-    )?;
     let last_index = prompt_token_count
         .checked_sub(1)
         .ok_or(E2eError::EmptyPrompt)?;
-    let first_token_id = greedy_next_token_id(
-        &normalized_output,
-        last_index,
-        inputs.hidden_features,
-        inputs.output_weight_values,
-        inputs.vocab_size,
-    )?;
+    let first_token_id = sample_next_token(&hidden, last_index, inputs)?;
 
     generated_token_ids.push(first_token_id);
     all_token_ids[prompt_token_count] = first_token_id;
     *current_token_count = prompt_token_count + 1;
 
-    let eos_hit = inputs.eos_token_id.is_some_and(|eos| eos == first_token_id);
+    if inputs.eos_token_id.is_some_and(|eos| eos == first_token_id) {
+        return Ok(());
+    }
 
     // Phase 2: Decode — one token at a time using cached state.
-    if !eos_hit {
-        for _step in 1..inputs.max_new_tokens {
-            let new_token_id = all_token_ids[*current_token_count - 1];
-            let mut hidden = gather_embeddings(
-                inputs.token_embedding_values,
-                inputs.hidden_features,
-                inputs.vocab_size,
-                &[new_token_id],
-            )?;
+    let mut strategy = DecodeStrategy { state: &mut state };
+    for _step in 1..inputs.max_new_tokens {
+        let new_token_id = all_token_ids[*current_token_count - 1];
+        let mut hidden = gather_embeddings(
+            inputs.token_embedding_values,
+            inputs.hidden_features,
+            inputs.vocab_size,
+            &[new_token_id],
+        )?;
 
-            for (layer_idx, layer_plan) in inputs.layer_plans.iter().enumerate() {
-                if let Some(attention) = &layer_plan.attention {
-                    let attention_output = match (attention, &mut state.layers[layer_idx]) {
-                        (
-                            AttentionLayerPlan::Qwen35Full(attn),
-                            LayerAttentionState::Qwen35Full(s),
-                        ) => {
-                            let normalized_attn = rms_norm_with_weight(
-                                &hidden,
-                                inputs.hidden_features,
-                                1,
-                                &attn.norm_values,
-                                inputs.rms_norm_eps,
-                            )?;
-                            qwen35_full_attention_decode_step(
-                                attn,
-                                &normalized_attn,
-                                inputs.rms_norm_eps,
-                                s,
-                            )?
-                        }
-                        (
-                            AttentionLayerPlan::Qwen35Linear(attn),
-                            LayerAttentionState::Qwen35Linear(s),
-                        ) => {
-                            let normalized_attn = rms_norm_with_weight(
-                                &hidden,
-                                inputs.hidden_features,
-                                1,
-                                &attn.norm_values,
-                                inputs.rms_norm_eps,
-                            )?;
-                            qwen35_linear_attention_decode_step(
-                                attn,
-                                &normalized_attn,
-                                inputs.rms_norm_eps,
-                                s,
-                            )?
-                        }
-                        _ => unreachable!(
-                            "two-phase loop should not encounter Standard or mismatched state"
-                        ),
-                    };
-                    add_in_place(&mut hidden, &attention_output)?;
-                }
+        process_all_layers(
+            &mut hidden,
+            inputs.layer_plans,
+            &mut strategy,
+            inputs.hidden_features,
+            1,
+            inputs.rms_norm_eps,
+            inputs.backend,
+        )?;
 
-                let normalized_ffn = rms_norm_with_weight(
-                    &hidden,
-                    inputs.hidden_features,
-                    1,
-                    &layer_plan.mlp.norm_values,
-                    inputs.rms_norm_eps,
-                )?;
-                let mlp_output = mlp_sequence_inference_with_weights(
-                    &layer_plan.mlp.weights,
-                    &normalized_ffn,
-                    1,
-                    inputs.backend,
-                )?;
-                add_in_place(&mut hidden, &mlp_output)?;
-            }
+        let next_token_id = sample_next_token(&hidden, 0, inputs)?;
 
-            let normalized_output = rms_norm_with_weight(
-                &hidden,
-                inputs.hidden_features,
-                1,
-                inputs.output_norm_values,
-                inputs.rms_norm_eps,
-            )?;
-            let next_token_id = greedy_next_token_id(
-                &normalized_output,
-                0,
-                inputs.hidden_features,
-                inputs.output_weight_values,
-                inputs.vocab_size,
-            )?;
+        generated_token_ids.push(next_token_id);
+        if *current_token_count < inputs.total_sequence_length {
+            all_token_ids[*current_token_count] = next_token_id;
+            *current_token_count += 1;
+        }
 
-            generated_token_ids.push(next_token_id);
-            if *current_token_count < inputs.total_sequence_length {
-                all_token_ids[*current_token_count] = next_token_id;
-                *current_token_count += 1;
-            }
-
-            if inputs.eos_token_id.is_some_and(|eos| eos == next_token_id) {
-                break;
-            }
+        if inputs.eos_token_id.is_some_and(|eos| eos == next_token_id) {
+            break;
         }
     }
     Ok(())
@@ -901,6 +915,145 @@ mod tests {
         assert!(
             output.generated_token_ids.is_empty(),
             "Should generate zero tokens"
+        );
+    }
+
+    /// Verify TwoPhase mode with max_new_tokens=0 returns empty output.
+    #[cfg(feature = "link-system")]
+    #[test]
+    fn two_phase_zero_tokens_returns_empty() {
+        use super::super::plan::MlpLayerPlan;
+        use super::super::plan::Qwen35LinearAttentionLayerPlan;
+        use crate::backend::ensure_backends_loaded;
+        use crate::inference::{MlpInferenceConfig, MlpWeights};
+
+        let hidden = 4_usize;
+        let ffn = 8_usize;
+        let vocab = 3_usize;
+        let inner_size = 4_usize;
+        let conv_channels = inner_size + 2 * 1 * 1;
+
+        let config = MlpInferenceConfig::new(hidden, ffn).unwrap();
+        let layer_plans = vec![LayerPlan {
+            attention: Some(AttentionLayerPlan::Qwen35Linear(
+                Qwen35LinearAttentionLayerPlan {
+                    norm_values: vec![1.0; hidden],
+                    qkv_weight_values: vec![0.1; hidden * conv_channels],
+                    gate_weight_values: vec![0.1; hidden * inner_size],
+                    alpha_weight_values: vec![0.01; hidden * 2],
+                    beta_weight_values: vec![0.01; hidden * 2],
+                    conv_weight_values: vec![1.0; conv_channels * 2],
+                    dt_bias_values: vec![0.0; 2],
+                    ssm_a_values: vec![-1.0; 2],
+                    ssm_norm_values: vec![1.0; 1],
+                    ssm_out_weight_values: vec![0.1; inner_size * hidden],
+                    state_size: 1,
+                    group_count: 1,
+                    time_step_rank: 2,
+                    inner_size,
+                    conv_kernel: 2,
+                },
+            )),
+            mlp: MlpLayerPlan {
+                weights: MlpWeights::deterministic(config),
+                norm_values: vec![1.0; hidden],
+            },
+        }];
+
+        let token_embeddings: Vec<f32> = (0..vocab * hidden).map(|i| i as f32 * 0.1).collect();
+        let output_weight: Vec<f32> = (0..hidden * vocab).map(|i| i as f32 * 0.05).collect();
+        let output_norm = vec![1.0_f32; hidden];
+
+        ensure_backends_loaded();
+        let backend =
+            Backend::new(ggml_rs::BackendKind::Cpu).expect("CPU backend should be available");
+
+        let output = generate_from_plans(
+            &GenerationInputs {
+                layer_plans: &layer_plans,
+                token_embedding_values: &token_embeddings,
+                output_weight_values: &output_weight,
+                output_norm_values: &output_norm,
+                hidden_features: hidden,
+                vocab_size: vocab,
+                rms_norm_eps: 1e-5,
+                prompt_token_ids: &[0, 1],
+                max_new_tokens: 0,
+                pad_token_id: 0,
+                eos_token_id: None,
+                backend: &backend,
+                total_sequence_length: 2,
+            },
+            GenerationMode::TwoPhase,
+        )
+        .expect("TwoPhase with max_new_tokens=0 should succeed");
+        assert!(
+            output.generated_token_ids.is_empty(),
+            "Should generate zero tokens"
+        );
+    }
+
+    /// Verify TwoPhase mode with Standard attention returns error, not panic.
+    #[cfg(feature = "link-system")]
+    #[test]
+    fn two_phase_with_standard_attention_returns_error() {
+        use super::super::plan::{MlpLayerPlan, StandardAttentionLayerPlan};
+        use crate::backend::ensure_backends_loaded;
+        use crate::inference::{
+            AttentionInferenceConfig, AttentionWeights, MlpInferenceConfig, MlpWeights,
+        };
+
+        let hidden = 4_usize;
+        let ffn = 8_usize;
+        let vocab = 3_usize;
+
+        let attn_config = AttentionInferenceConfig::new(hidden, 1).unwrap();
+        let mlp_config = MlpInferenceConfig::new(hidden, ffn).unwrap();
+        let layer_plans = vec![LayerPlan {
+            attention: Some(AttentionLayerPlan::Standard(StandardAttentionLayerPlan {
+                weights: AttentionWeights::deterministic(attn_config),
+                norm_values: vec![1.0; hidden],
+            })),
+            mlp: MlpLayerPlan {
+                weights: MlpWeights::deterministic(mlp_config),
+                norm_values: vec![1.0; hidden],
+            },
+        }];
+
+        let token_embeddings: Vec<f32> = (0..vocab * hidden).map(|i| i as f32 * 0.1).collect();
+        let output_weight: Vec<f32> = (0..hidden * vocab).map(|i| i as f32 * 0.05).collect();
+        let output_norm = vec![1.0_f32; hidden];
+
+        ensure_backends_loaded();
+        let backend =
+            Backend::new(ggml_rs::BackendKind::Cpu).expect("CPU backend should be available");
+
+        let result = generate_from_plans(
+            &GenerationInputs {
+                layer_plans: &layer_plans,
+                token_embedding_values: &token_embeddings,
+                output_weight_values: &output_weight,
+                output_norm_values: &output_norm,
+                hidden_features: hidden,
+                vocab_size: vocab,
+                rms_norm_eps: 1e-5,
+                prompt_token_ids: &[0, 1],
+                max_new_tokens: 3,
+                pad_token_id: 0,
+                eos_token_id: None,
+                backend: &backend,
+                total_sequence_length: 5,
+            },
+            GenerationMode::TwoPhase,
+        );
+        assert!(
+            result.is_err(),
+            "TwoPhase with Standard attention should return Err"
+        );
+        let err = result.unwrap_err();
+        assert!(
+            matches!(err, E2eError::UnsupportedTwoPhase),
+            "Expected UnsupportedTwoPhase, got: {err}"
         );
     }
 }

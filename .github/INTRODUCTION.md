@@ -60,6 +60,14 @@ And you should write rusty code(ADT, enum, type state pattern)
   `generate_from_plans` core loop. Integration test
   `two_phase_matches_full_reprocess_multi_layer` verifies both execution
   paths produce identical token sequences on a 3-layer synthetic model.
+- **`AttentionStrategy` trait extraction**: Unified per-layer processing logic
+  (norm → attention → residual → norm → MLP → residual) behind an
+  `AttentionStrategy` trait with three implementations: `InferenceStrategy`
+  (stateless), `PrefillStrategy` (captures state), `DecodeStrategy` (uses
+  cached state). Added `process_all_layers` + `sample_next_token` shared
+  helpers. Fixed crash paths: `TwoPhase + Standard` now returns
+  `UnsupportedTwoPhase` error; `TwoPhase + max_new_tokens=0` returns empty.
+  Two new regression tests added. 138 tests pass.
 - **Iterator/chunks_exact refactoring**: Replaced procedural index loops with
   idiomatic Rust iterators across e2e modules. Extracted `SsmScratch` reusable
   buffer + `ssm_recurrence_step` helper (eliminates 60-line duplication in

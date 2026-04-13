@@ -61,6 +61,16 @@ pub(super) struct Qwen35LinearAttentionLayerPlan {
     pub conv_kernel: usize,
 }
 
+impl AttentionLayerPlan {
+    pub(super) fn norm_values(&self) -> &[f32] {
+        match self {
+            Self::Standard(a) => &a.norm_values,
+            Self::Qwen35Full(a) => &a.norm_values,
+            Self::Qwen35Linear(a) => &a.norm_values,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(super) struct MlpLayerPlan {
     pub weights: MlpWeights<f32>,

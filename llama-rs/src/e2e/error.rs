@@ -101,6 +101,8 @@ pub enum E2eError {
         rope_n_dims: usize,
         head_dimension: usize,
     },
+    #[error("TwoPhase mode requires all attention layers to be Qwen3.5 (Full or Linear)")]
+    UnsupportedTwoPhase,
 }
 
 impl E2eError {
