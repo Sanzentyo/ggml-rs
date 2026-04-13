@@ -84,12 +84,16 @@ pub(super) struct GenerationOutput {
 /// - [`InferenceStrategy`]: stateless, full-reprocess (supports all layer types)
 /// - [`PrefillStrategy`]: captures per-layer state during prompt processing
 /// - [`DecodeStrategy`]: uses cached state for single-token decode
+///
+/// For Qwen3.5 layers, `input` is un-normed; the norm is done in-graph.
+/// For `Standard` attention and decode paths, the strategy applies host-side
+/// norm internally before dispatching.
 pub(super) trait AttentionStrategy {
     fn process_attention(
         &mut self,
         layer_idx: usize,
         attention: &AttentionLayerPlan,
-        normalized_input: &[f32],
+        input: &[f32],
         seq_len: usize,
         rms_norm_eps: f32,
         backend: &Backend,
@@ -104,16 +108,25 @@ impl AttentionStrategy for InferenceStrategy {
         &mut self,
         _layer_idx: usize,
         attention: &AttentionLayerPlan,
-        normalized_input: &[f32],
+        input: &[f32],
         seq_len: usize,
         rms_norm_eps: f32,
         backend: &Backend,
     ) -> Result<Vec<f32>, E2eError> {
         match attention {
             AttentionLayerPlan::Standard(attn) => {
+                // Standard attention expects pre-normed input (host-side).
+                let hidden_features = attn.norm_values.len();
+                let normalized = rms_norm_with_weight(
+                    input,
+                    hidden_features,
+                    seq_len,
+                    &attn.norm_values,
+                    rms_norm_eps,
+                )?;
                 attention_inference_with_weights_on_backend_repeats_with_length(
                     &attn.weights,
-                    normalized_input,
+                    &normalized,
                     seq_len,
                     backend,
                     1,
@@ -127,16 +140,18 @@ impl AttentionStrategy for InferenceStrategy {
             }
             AttentionLayerPlan::Qwen35Full(attn) => qwen35_full_attention_inference(
                 attn,
-                normalized_input,
+                input,
                 seq_len,
                 rms_norm_eps,
+                attention.norm_values(),
                 backend,
             ),
             AttentionLayerPlan::Qwen35Linear(attn) => qwen35_linear_attention_inference(
                 attn,
-                normalized_input,
+                input,
                 seq_len,
                 rms_norm_eps,
+                attention.norm_values(),
                 backend,
             ),
         }
@@ -153,7 +168,7 @@ impl AttentionStrategy for PrefillStrategy<'_> {
         &mut self,
         layer_idx: usize,
         attention: &AttentionLayerPlan,
-        normalized_input: &[f32],
+        input: &[f32],
         seq_len: usize,
         rms_norm_eps: f32,
         backend: &Backend,
@@ -162,9 +177,10 @@ impl AttentionStrategy for PrefillStrategy<'_> {
             (AttentionLayerPlan::Qwen35Full(attn), LayerAttentionState::Qwen35Full(s)) => {
                 qwen35_full_attention_prefill(
                     attn,
-                    normalized_input,
+                    input,
                     seq_len,
                     rms_norm_eps,
+                    attention.norm_values(),
                     s,
                     backend,
                 )
@@ -172,9 +188,10 @@ impl AttentionStrategy for PrefillStrategy<'_> {
             (AttentionLayerPlan::Qwen35Linear(attn), LayerAttentionState::Qwen35Linear(s)) => {
                 qwen35_linear_attention_prefill(
                     attn,
-                    normalized_input,
+                    input,
                     seq_len,
                     rms_norm_eps,
+                    attention.norm_values(),
                     s,
                     backend,
                 )
@@ -194,19 +211,27 @@ impl AttentionStrategy for DecodeStrategy<'_> {
         &mut self,
         layer_idx: usize,
         attention: &AttentionLayerPlan,
-        normalized_input: &[f32],
+        input: &[f32],
         seq_len: usize,
         rms_norm_eps: f32,
         _backend: &Backend,
     ) -> Result<Vec<f32>, E2eError> {
         debug_assert_eq!(seq_len, 1, "DecodeStrategy expects single-token input");
         let _ = seq_len;
+
+        // Decode path: host-side norm before dispatch.
+        // The hidden_features dimension is inferred from the norm weight vector.
+        let norm_weight = attention.norm_values();
+        let hidden_features = norm_weight.len();
+        let normalized =
+            rms_norm_with_weight(input, hidden_features, 1, norm_weight, rms_norm_eps)?;
+
         match (attention, &mut self.state.layers[layer_idx]) {
             (AttentionLayerPlan::Qwen35Full(attn), LayerAttentionState::Qwen35Full(s)) => {
-                qwen35_full_attention_decode_step(attn, normalized_input, rms_norm_eps, s)
+                qwen35_full_attention_decode_step(attn, &normalized, rms_norm_eps, s)
             }
             (AttentionLayerPlan::Qwen35Linear(attn), LayerAttentionState::Qwen35Linear(s)) => {
-                qwen35_linear_attention_decode_step(attn, normalized_input, rms_norm_eps, s)
+                qwen35_linear_attention_decode_step(attn, &normalized, rms_norm_eps, s)
             }
             _ => Err(E2eError::UnsupportedTwoPhase),
         }
@@ -218,28 +243,25 @@ impl AttentionStrategy for DecodeStrategy<'_> {
 // ---------------------------------------------------------------------------
 
 /// Process all layers using the given attention strategy.
+///
+/// Attention norm is now done in-graph by each strategy (or host-side for
+/// decode/Standard). MLP norm is done in-graph by the MLP function. The
+/// generation loop passes un-normed `hidden` throughout.
 pub(super) fn process_all_layers(
     hidden: &mut [f32],
     layer_plans: &[LayerPlan],
     strategy: &mut impl AttentionStrategy,
-    hidden_features: usize,
+    _hidden_features: usize,
     seq_len: usize,
     rms_norm_eps: f32,
     backend: &Backend,
 ) -> Result<(), E2eError> {
     for (layer_idx, layer_plan) in layer_plans.iter().enumerate() {
         if let Some(attention) = &layer_plan.attention {
-            let normalized_attn = rms_norm_with_weight(
-                hidden,
-                hidden_features,
-                seq_len,
-                attention.norm_values(),
-                rms_norm_eps,
-            )?;
             let attention_output = strategy.process_attention(
                 layer_idx,
                 attention,
-                &normalized_attn,
+                hidden,
                 seq_len,
                 rms_norm_eps,
                 backend,
@@ -247,17 +269,12 @@ pub(super) fn process_all_layers(
             add_in_place(hidden, &attention_output)?;
         }
 
-        let normalized_ffn = rms_norm_with_weight(
+        let mlp_output = mlp_sequence_inference_with_weights(
+            &layer_plan.mlp.weights,
             hidden,
-            hidden_features,
             seq_len,
             &layer_plan.mlp.norm_values,
             rms_norm_eps,
-        )?;
-        let mlp_output = mlp_sequence_inference_with_weights(
-            &layer_plan.mlp.weights,
-            &normalized_ffn,
-            seq_len,
             backend,
         )?;
         add_in_place(hidden, &mlp_output)?;

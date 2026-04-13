@@ -15,6 +15,7 @@ pub(super) fn qwen35_full_attention_inference(
     input: &[f32],
     sequence_length: usize,
     rms_norm_eps: f32,
+    attn_norm_weight: &[f32],
     backend: &Backend,
 ) -> Result<Vec<f32>, E2eError> {
     qwen35_full_attention_core(
@@ -22,6 +23,7 @@ pub(super) fn qwen35_full_attention_inference(
         input,
         sequence_length,
         rms_norm_eps,
+        attn_norm_weight,
         None,
         backend,
     )
@@ -33,6 +35,7 @@ pub(super) fn qwen35_full_attention_prefill(
     input: &[f32],
     sequence_length: usize,
     rms_norm_eps: f32,
+    attn_norm_weight: &[f32],
     state: &mut Qwen35FullAttentionState,
     backend: &Backend,
 ) -> Result<Vec<f32>, E2eError> {
@@ -41,6 +44,7 @@ pub(super) fn qwen35_full_attention_prefill(
         input,
         sequence_length,
         rms_norm_eps,
+        attn_norm_weight,
         Some(state),
         backend,
     )
@@ -288,6 +292,7 @@ fn qwen35_full_attention_core(
     input: &[f32],
     sequence_length: usize,
     rms_norm_eps: f32,
+    attn_norm_weight: &[f32],
     state: Option<&mut Qwen35FullAttentionState>,
     backend: &Backend,
 ) -> Result<Vec<f32>, E2eError> {
@@ -296,6 +301,7 @@ fn qwen35_full_attention_core(
         input,
         sequence_length,
         rms_norm_eps,
+        attn_norm_weight,
         state,
         backend,
     )
@@ -409,12 +415,13 @@ pub(super) fn apply_neox_rope_in_place(
     Ok(())
 }
 
-/// Fully fused attention graph: projection + deinterleave + norm + RoPE + scoring.
+/// Fully fused attention graph: layer norm + projection + deinterleave + norm + RoPE + scoring.
 ///
-/// Replaces the previous two-graph pipeline (projection → host round-trip →
-/// scoring) with a single ggml compute graph:
+/// Accepts **un-normed** hidden state and applies layer pre-norm as the first
+/// graph operation, eliminating the host↔device round-trip for normalization.
 ///
-///   mul_mat(W_q/W_k/W_v, X) → strided deinterleave Q/gate
+///   rms_norm(X, eps) * attn_norm_weight
+///   → mul_mat(W_q/W_k/W_v, X_normed) → strided deinterleave Q/gate
 ///   → rms_norm + weight → rope_ext (NeoX mode=2)
 ///   → permute → cont → flash_attn_ext → sigmoid(gate) → mul
 ///   → reshape_2d → mul_mat(W_out)
@@ -426,6 +433,7 @@ fn fully_fused_attention_graph(
     input: &[f32],
     t: usize,
     rms_norm_eps: f32,
+    attn_norm_weight: &[f32],
     state: Option<&mut Qwen35FullAttentionState>,
     backend: &Backend,
 ) -> Result<Vec<f32>, E2eError> {
@@ -465,8 +473,9 @@ fn fully_fused_attention_graph(
 
     // Memory estimate: all weights + input + intermediates + mask + overhead.
     // Conservative: sum all tensor sizes × 4 for ggml overhead.
-    let weight_bytes = (hidden * qf2 + hidden * kvf * 2 + qf * hidden + d * 2) * 4;
-    let data_bytes = (hidden * t
+    // +hidden for norm weight, +hidden*t for normed intermediate
+    let weight_bytes = (hidden * qf2 + hidden * kvf * 2 + qf * hidden + d * 2 + hidden) * 4;
+    let data_bytes = (hidden * t * 2
         + qf2 * t
         + kvf * t * 2
         + qf * t * 4
@@ -481,9 +490,22 @@ fn fully_fused_attention_graph(
         .map_err(|source| E2eError::ggml("Context::new(fully_fused_attn)", source))?;
 
     // --- Input tensors ---
-    let x = ctx
+    let x_raw = ctx
         .new_tensor_2d::<f32>(Shape2D::new(hidden, t))
         .map_err(|source| E2eError::ggml("new<X>", source))?;
+
+    // Layer pre-norm weight: [hidden_features]
+    let attn_norm_w = ctx
+        .new_tensor_1d::<f32>(Length::new(hidden))
+        .map_err(|source| E2eError::ggml("new<attn_norm_w>", source))?;
+
+    // In-graph layer pre-norm: rms_norm(X, eps) * attn_norm_weight
+    let x_normed = ctx
+        .rms_norm(&x_raw, rms_norm_eps)
+        .map_err(|source| E2eError::ggml("rms_norm(X_layer)", source))?;
+    let x = ctx
+        .mul(&x_normed, &attn_norm_w)
+        .map_err(|source| E2eError::ggml("mul(X_layer_norm)", source))?;
 
     // Weight tensors
     let w_q = ctx
@@ -675,9 +697,15 @@ fn fully_fused_attention_graph(
         .allocate_tensors(backend)
         .map_err(|source| E2eError::ggml("allocate_tensors(fully_fused)", source))?;
 
-    // Write input data.
-    x.write_data_backend(input)
+    // Write input data (un-normed).
+    x_raw
+        .write_data_backend(input)
         .map_err(|source| E2eError::ggml("write<X>", source))?;
+
+    // Layer pre-norm weight.
+    attn_norm_w
+        .write_data_backend(attn_norm_weight)
+        .map_err(|source| E2eError::ggml("write<attn_norm_w>", source))?;
 
     // Write weight data.
     w_q.write_data_backend(&attention.q_weight_values)
@@ -965,16 +993,37 @@ mod tests {
 
         // Full reprocess: 4 tokens at once.
         let full_input: Vec<f32> = prompt.iter().chain(new_token.iter()).copied().collect();
+        let norm_weight = &plan.norm_values;
         let full_output =
-            qwen35_full_attention_inference(&plan, &full_input, 4, 1e-5, &backend).unwrap();
+            qwen35_full_attention_inference(&plan, &full_input, 4, 1e-5, norm_weight, &backend)
+                .unwrap();
         let expected = &full_output[3 * hidden..4 * hidden];
 
         // Prefill 3 tokens, then decode 1.
         let mut state = Qwen35FullAttentionState::new(4, kv_head_count, hd).unwrap();
-        let _prefill_out =
-            qwen35_full_attention_prefill(&plan, &prompt, 3, 1e-5, &mut state, &backend).unwrap();
+        let _prefill_out = qwen35_full_attention_prefill(
+            &plan,
+            &prompt,
+            3,
+            1e-5,
+            norm_weight,
+            &mut state,
+            &backend,
+        )
+        .unwrap();
+
+        // Decode path: apply host-side rms_norm + weight to match the in-graph
+        // norm that inference/prefill now perform.
+        let normalized_token = super::super::tensor_ops::rms_norm_with_weight(
+            &new_token,
+            hidden,
+            1,
+            norm_weight,
+            1e-5,
+        )
+        .unwrap();
         let decode_out =
-            qwen35_full_attention_decode_step(&plan, &new_token, 1e-5, &mut state).unwrap();
+            qwen35_full_attention_decode_step(&plan, &normalized_token, 1e-5, &mut state).unwrap();
 
         for (i, (a, b)) in decode_out.iter().zip(expected).enumerate() {
             assert!(

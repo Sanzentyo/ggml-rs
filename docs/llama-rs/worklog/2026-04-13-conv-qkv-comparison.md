@@ -232,3 +232,11 @@ llama-rs uses explicit `copy_from_slice`.
    and raw V conditionally read back for KV cache capture. Decode path
    unchanged. 202 tests pass.
    See `docs/llama-rs/worklog/2026-04-20-fully-fused-attention.md`.
+
+10. **Layer pre-norm fusion** (attention + MLP): Moved `rms_norm(X, eps) * weight`
+    from host-side `process_all_layers` into each ggml compute graph as the first
+    operation. Full attention, linear attention, and MLP graphs all accept un-normed
+    hidden state + norm weight, eliminating 2× host↔device round-trips per layer.
+    Decode path keeps host-side norm (single-token overhead not worthwhile).
+    Standard attention also keeps host-side norm. ggml f32 rms_norm vs host f64
+    accumulation verified within 1e-5 tolerance. 201 tests pass.

@@ -168,6 +168,18 @@ And you should write rusty code(ADT, enum, type state pattern)
   conditionally for KV cache capture via `build_forward_expand`. Decode path (seq_len=1)
   unchanged. 202 tests pass.
 
+- **Layer pre-norm fusion** (attention + MLP):
+  Moved `rms_norm + weight` from host-side (`process_all_layers`) into each ggml
+  compute graph. Full attention (`fully_fused_attention_graph`), linear attention
+  (`project_and_conv_fused_graph`), and MLP (`mlp_sequence_inference_with_weights`)
+  all accept un-normed input + norm weight, applying in-graph `rms_norm(X, eps) * w`
+  as the first operation. Eliminates 2× host↔device round-trips per layer (attention
+  norm + MLP norm). Decode path keeps host-side norm (`DecodeStrategy` calls
+  `rms_norm_with_weight` before dispatch) — single-token graph overhead not worthwhile.
+  Standard attention path also keeps host-side norm. Parity tests updated: decode
+  applies host-side norm to match in-graph norm, tolerance still within 1e-5
+  (ggml f32 vs host f64 accumulation). 201 tests pass.
+
 ## Validation checkpoints completed on this branch
 
 - `cargo fmt --all`

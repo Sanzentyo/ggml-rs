@@ -12,13 +12,14 @@ use super::tensor_ops::{
     PROJECTION_SLACK_BYTES, head_slice, head_slice_mut, per_head_l2_norm, project_sequence,
     project_sequence_graph, rms_norm_single,
 };
-use ggml_rs::{Backend, Bytes, Context, Shape2D};
+use ggml_rs::{Backend, Bytes, Context, Length, Shape2D};
 
 pub(super) fn qwen35_linear_attention_inference(
     attention: &Qwen35LinearAttentionLayerPlan,
     input: &[f32],
     sequence_length: usize,
     rms_norm_eps: f32,
+    attn_norm_weight: &[f32],
     backend: &Backend,
 ) -> Result<Vec<f32>, E2eError> {
     qwen35_linear_attention_core(
@@ -26,6 +27,7 @@ pub(super) fn qwen35_linear_attention_inference(
         input,
         sequence_length,
         rms_norm_eps,
+        attn_norm_weight,
         None,
         backend,
     )
@@ -37,6 +39,7 @@ pub(super) fn qwen35_linear_attention_prefill(
     input: &[f32],
     sequence_length: usize,
     rms_norm_eps: f32,
+    attn_norm_weight: &[f32],
     state: &mut LinearAttentionState,
     backend: &Backend,
 ) -> Result<Vec<f32>, E2eError> {
@@ -45,6 +48,7 @@ pub(super) fn qwen35_linear_attention_prefill(
         input,
         sequence_length,
         rms_norm_eps,
+        attn_norm_weight,
         Some(state),
         backend,
     )
@@ -359,6 +363,7 @@ fn qwen35_linear_attention_core(
     input: &[f32],
     sequence_length: usize,
     rms_norm_eps: f32,
+    attn_norm_weight: &[f32],
     mut state: Option<&mut LinearAttentionState>,
     backend: &Backend,
 ) -> Result<Vec<f32>, E2eError> {
@@ -402,6 +407,8 @@ fn qwen35_linear_attention_core(
         sequence_length,
         hidden_features,
         conv_channels,
+        attn_norm_weight,
+        rms_norm_eps,
         backend,
     )?;
 
@@ -775,6 +782,8 @@ fn project_and_conv_fused_graph(
     sequence_length: usize,
     hidden_features: usize,
     conv_channels: usize,
+    attn_norm_weight: &[f32],
+    rms_norm_eps: f32,
     backend: &Backend,
 ) -> Result<FusedLinearOutputs, E2eError> {
     let kernel_size = attention.conv_kernel;
@@ -826,13 +835,16 @@ fn project_and_conv_fused_graph(
 
     // Conv intermediates: cont(transpose) + zeros + concat + reshape_3d + kernel +
     // ssm_conv output + silu output. Conservative: count each as full tensor.
+    // +hidden_features for norm weight, +hidden_features*seq_len for normed intermediate
     let conv_tensor_bytes = std::mem::size_of::<f32>()
         * (sequence_length * conv_channels   // cont(transpose)
          + pad * conv_channels               // zero padding
          + padded_len * conv_channels         // concat result
          + kernel_size * conv_channels        // conv kernel
          + sequence_length * conv_channels    // ssm_conv output
-         + sequence_length * conv_channels); // silu output
+         + sequence_length * conv_channels    // silu output
+         + hidden_features                    // norm weight
+         + hidden_features * sequence_length); // normed intermediate
     let total_bytes = proj_total
         .checked_add(conv_tensor_bytes)
         .and_then(|v| v.checked_add(PROJECTION_SLACK_BYTES * 2))
@@ -854,11 +866,24 @@ fn project_and_conv_fused_graph(
     let w_beta = ctx
         .new_tensor_2d::<f32>(Shape2D::new(hidden_features, time_step_rank))
         .map_err(|source| E2eError::ggml("new_tensor_2d<W_beta>", source))?;
-    let x = ctx
+    let x_raw = ctx
         .new_tensor_2d::<f32>(Shape2D::new(hidden_features, sequence_length))
         .map_err(|source| E2eError::ggml("new_tensor_2d<X>", source))?;
 
-    // --- Projection: 4 matmuls sharing input X ---
+    // Layer pre-norm weight: [hidden_features]
+    let norm_w = ctx
+        .new_tensor_1d::<f32>(Length::new(hidden_features))
+        .map_err(|source| E2eError::ggml("new<norm_w>", source))?;
+
+    // In-graph layer pre-norm: rms_norm(X, eps) * norm_weight
+    let x_normed = ctx
+        .rms_norm(&x_raw, rms_norm_eps)
+        .map_err(|source| E2eError::ggml("rms_norm(X_layer)", source))?;
+    let x = ctx
+        .mul(&x_normed, &norm_w)
+        .map_err(|source| E2eError::ggml("mul(X_layer_norm)", source))?;
+
+    // --- Projection: 4 matmuls sharing normed input X ---
     let qkv_out = ctx
         .mul_mat(&w_qkv, &x)
         .map_err(|source| E2eError::ggml("mul_mat(QKV)", source))?;
@@ -952,8 +977,12 @@ fn project_and_conv_fused_graph(
     w_beta
         .write_data_backend(&attention.beta_weight_values)
         .map_err(|source| E2eError::ggml("write<W_beta>", source))?;
-    x.write_data_backend(input)
+    x_raw
+        .write_data_backend(input)
         .map_err(|source| E2eError::ggml("write<X>", source))?;
+    norm_w
+        .write_data_backend(attn_norm_weight)
+        .map_err(|source| E2eError::ggml("write<norm_w>", source))?;
 
     // Upload zero padding (only when kernel_size > 1).
     if let Some(ref zeros) = zeros_tensor {
@@ -1210,8 +1239,14 @@ mod tests {
         let backend =
             Backend::new(ggml_rs::BackendKind::Cpu).expect("CPU backend should be available");
 
-        let result =
-            qwen35_linear_attention_inference(&plan, &input, sequence_length, 1e-5, &backend);
+        let result = qwen35_linear_attention_inference(
+            &plan,
+            &input,
+            sequence_length,
+            1e-5,
+            &plan.norm_values,
+            &backend,
+        );
         assert!(
             result.is_ok(),
             "inference should succeed: {:?}",
@@ -1229,8 +1264,14 @@ mod tests {
             group_count: 3,
             ..plan.clone()
         };
-        let bad_result =
-            qwen35_linear_attention_inference(&plan_bad, &input, sequence_length, 1e-5, &backend);
+        let bad_result = qwen35_linear_attention_inference(
+            &plan_bad,
+            &input,
+            sequence_length,
+            1e-5,
+            &plan_bad.norm_values,
+            &backend,
+        );
         assert!(
             bad_result.is_err(),
             "should fail with indivisible group_count"
@@ -1327,8 +1368,10 @@ mod tests {
 
         // Full reprocess: all 4 tokens at once.
         let full_input: Vec<f32> = prompt.iter().chain(new_token.iter()).copied().collect();
+        let norm_weight = &plan.norm_values;
         let full_output =
-            qwen35_linear_attention_inference(&plan, &full_input, 4, 1e-5, &backend).unwrap();
+            qwen35_linear_attention_inference(&plan, &full_input, 4, 1e-5, norm_weight, &backend)
+                .unwrap();
         let expected = &full_output[3 * hidden..4 * hidden];
 
         // Prefill 3 tokens, then decode 1 token.
@@ -1339,10 +1382,30 @@ mod tests {
             state_size,
         )
         .unwrap();
-        let _prefill_output =
-            qwen35_linear_attention_prefill(&plan, &prompt, 3, 1e-5, &mut state, &backend).unwrap();
+        let _prefill_output = qwen35_linear_attention_prefill(
+            &plan,
+            &prompt,
+            3,
+            1e-5,
+            norm_weight,
+            &mut state,
+            &backend,
+        )
+        .unwrap();
+
+        // Decode path: apply host-side rms_norm + weight to match the in-graph
+        // norm that inference/prefill now perform.
+        let normalized_token = super::super::tensor_ops::rms_norm_with_weight(
+            &new_token,
+            hidden,
+            1,
+            norm_weight,
+            1e-5,
+        )
+        .unwrap();
         let decode_output =
-            qwen35_linear_attention_decode_step(&plan, &new_token, 1e-5, &mut state).unwrap();
+            qwen35_linear_attention_decode_step(&plan, &normalized_token, 1e-5, &mut state)
+                .unwrap();
 
         for (i, (a, b)) in decode_output.iter().zip(expected).enumerate() {
             assert!(

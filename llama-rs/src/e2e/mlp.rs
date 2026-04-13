@@ -1,14 +1,21 @@
 use super::error::E2eError;
 use super::numeric::checked_mul;
 use crate::inference::MlpWeights;
-use ggml_rs::{Backend, Bytes, Context, Shape2D};
+use ggml_rs::{Backend, Bytes, Context, Length, Shape2D};
 
 const MLP_BACKEND_SLACK_BYTES: usize = 4 * 1024 * 1024;
 
+/// MLP forward pass with in-graph layer pre-norm.
+///
+/// Accepts un-normed input and applies `rms_norm + weight` as the first graph
+/// operation before gate/up/down projections. This eliminates the host↔device
+/// round-trip for the layer norm.
 pub(super) fn mlp_sequence_inference_with_weights(
     weights: &MlpWeights<f32>,
     input: &[f32],
     sequence_length: usize,
+    norm_weight: &[f32],
+    rms_norm_eps: f32,
     backend: &Backend,
 ) -> Result<Vec<f32>, E2eError> {
     let hidden_features = weights.hidden_features;
@@ -18,6 +25,12 @@ pub(super) fn mlp_sequence_inference_with_weights(
         return Err(E2eError::BufferLengthMismatch {
             expected: expected_input_len,
             actual: input.len(),
+        });
+    }
+    if norm_weight.len() != hidden_features {
+        return Err(E2eError::BufferLengthMismatch {
+            expected: hidden_features,
+            actual: norm_weight.len(),
         });
     }
 
@@ -35,9 +48,20 @@ pub(super) fn mlp_sequence_inference_with_weights(
     let w_down = ctx
         .new_tensor_2d::<f32>(Shape2D::new(ffn_features, hidden_features))
         .map_err(|source| E2eError::ggml("Context::new_tensor_2d<W_DOWN>", source))?;
-    let x = ctx
+    let x_raw = ctx
         .new_tensor_2d::<f32>(Shape2D::new(hidden_features, sequence_length))
         .map_err(|source| E2eError::ggml("Context::new_tensor_2d<X>", source))?;
+    let norm_w = ctx
+        .new_tensor_1d::<f32>(Length::new(hidden_features))
+        .map_err(|source| E2eError::ggml("new_tensor_1d<norm_w>", source))?;
+
+    // In-graph layer pre-norm: rms_norm over ne[0]=hidden_features, then scale by weight.
+    let x_normed = ctx
+        .rms_norm(&x_raw, rms_norm_eps)
+        .map_err(|source| E2eError::ggml("rms_norm(X)", source))?;
+    let x = ctx
+        .mul(&x_normed, &norm_w)
+        .map_err(|source| E2eError::ggml("mul(norm)", source))?;
 
     let gate = ctx
         .mul_mat(&w_gate, &x)
@@ -71,8 +95,12 @@ pub(super) fn mlp_sequence_inference_with_weights(
     w_down
         .write_data_backend(weights.down_values())
         .map_err(|source| E2eError::ggml("Tensor::write_data_backend<W_DOWN>", source))?;
-    x.write_data_backend(input)
+    x_raw
+        .write_data_backend(input)
         .map_err(|source| E2eError::ggml("Tensor::write_data_backend<X>", source))?;
+    norm_w
+        .write_data_backend(norm_weight)
+        .map_err(|source| E2eError::ggml("write<norm_w>", source))?;
 
     backend
         .compute(&mut graph)
