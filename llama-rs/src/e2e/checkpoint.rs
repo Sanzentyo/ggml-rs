@@ -214,6 +214,7 @@ impl LayerStateDto {
                         v_cache,
                         cached_len,
                         kv_features,
+                        gpu_scoring_failed: false,
                     },
                 ))
             }

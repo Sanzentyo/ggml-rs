@@ -960,8 +960,11 @@ pub(super) fn full_attention_decode_core(
     state.append_batch(&k_values, &v_proj, 1)?;
     let total_tokens = state.token_count();
 
-    // Try GPU-accelerated scoring when a backend is available.
-    if let Some(backend) = backend {
+    // Try GPU-accelerated scoring when a backend is available and a previous
+    // attempt hasn't already failed (probe-once: avoid repeated overhead).
+    if let Some(backend) = backend
+        && !state.gpu_scoring_failed
+    {
         if let Ok(outputs) = decode_scoring_gpu(
             &q_values,
             &q_gate,
@@ -973,7 +976,8 @@ pub(super) fn full_attention_decode_core(
         ) {
             return Ok(outputs);
         }
-        // GPU failed — fall through to host scoring loop.
+        // First GPU failure — disable for future decode steps.
+        state.gpu_scoring_failed = true;
     }
 
     let groups = attention.head_count / attention.kv_head_count;

@@ -36,6 +36,9 @@ pub(super) struct Qwen35FullAttentionState {
     pub(super) cached_len: usize,
     /// Features per KV token (`kv_head_count × head_dimension`).
     pub(super) kv_features: usize,
+    /// Set to `true` after the first GPU scoring attempt fails, preventing
+    /// repeated attempts on subsequent decode steps.
+    pub(super) gpu_scoring_failed: bool,
 }
 
 /// Conv buffer + SSM recurrence states for Qwen3.5 linear attention.
@@ -80,6 +83,7 @@ impl Qwen35FullAttentionState {
             v_cache: vec![0.0; cache_size],
             cached_len: 0,
             kv_features,
+            gpu_scoring_failed: false,
         })
     }
 

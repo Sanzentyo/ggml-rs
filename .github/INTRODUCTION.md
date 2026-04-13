@@ -235,6 +235,13 @@ And you should write rusty code(ADT, enum, type state pattern)
   `sk = k^T·(decayed state)` creates state-dependent updates that linear selective
   scan cannot express. SIMD vectorization of inner loops identified as most
   promising near-term optimization. See comparison doc items 17–19.
+- **RoPE decode + probe-once GPU failure** (items 20–21):
+  RoPE decode (~6K FLOPs/layer at D=1536) stays on host — smallest per-layer
+  operation, sub-microsecond scalar cost vs ~0.8 ms Metal dispatch overhead.
+  Implemented probe-once GPU scoring optimization: `gpu_scoring_failed` flag in
+  `Qwen35FullAttentionState` prevents repeated GPU scoring attempts after the
+  first failure per sequence. Eliminates wasted dispatch overhead on CPU-only
+  backends (~0.8 ms/layer/token savings). See comparison doc items 20–21.
 
 ## Validation checkpoints completed on this branch
 

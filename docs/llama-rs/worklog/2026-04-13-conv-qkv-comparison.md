@@ -895,4 +895,88 @@ is **SIMD vectorization** of the inner loops (decay + sk accumulation, delta
 computation, rank-1 update, readout), which avoids graph dispatch overhead while
 exploiting data-level parallelism within each head's `state_size × state_size`
 matrix operations.
+
+## 20. RoPE Decode: Host Analysis
+
+### 20.1 Current Implementation
+
+`apply_neox_rope_in_place` (`attention.rs`) applies NeoX-style rotary position
+embedding to Q and K vectors. For decode (seq_len=1):
+
+```
+// Per-head, half_rot rotations:
+for k in 0..half_rot:
+    angle = (position * freq_scale) * freq_base^(-2k/n_rot)
+    values[k]            = values[k] * cos(angle) - values[k + half_rot] * sin(angle)
+    values[k + half_rot] = values[k] * sin(angle) + values[k + half_rot] * cos(angle)
+```
+
+### 20.2 Complexity (Qwen3.5 0.6B, seq_len=1)
+
+| Component | Heads | half_rot | FLOPs per rotation | Total FLOPs |
+|-----------|-------|----------|-------------------|-------------|
+| Q RoPE | 12 | 64 | 6 (4 mul + 1 sub + 1 add) | 4,608 |
+| K RoPE | 4 | 64 | 6 | 1,536 |
+| cos/sin cache | 1 | 64 | ~2 (per k) | 128 |
+| **Total** | | | | **~6,272** |
+
+### 20.3 GPU Offload Feasibility
+
+**Available op**: `rope_ext_with_i32_positions` (already used in prefill graph):
+- For decode: graph with single-position tensor, cos/sin computed on GPU
+- But total work (~6K FLOPs) is even smaller than conv decode (~5.6K FLOPs)
+- Metal dispatch overhead (~0.8 ms) exceeds computation cost by ~4 orders of magnitude
+
+**Integration with persistent projection graph**:
+- Could add RoPE as graph nodes after Q/K projection in the persistent graph
+- Position would need per-step `write_data_backend` update (1 i32 value)
+- Problem: post-RoPE Q/K values need readback for KV cache append, which already
+  happens on host. Fusing RoPE into the graph saves the host computation but adds
+  graph complexity for negligible savings.
+
+### 20.4 Verdict
+
+RoPE decode stays on host. At ~6K FLOPs, it is the **smallest** per-layer
+operation — approximately 0.001% of generation time at T=1000. Further
+optimization would be a misallocation of engineering effort.
+
+## 21. Probe-Once GPU Failure Optimization
+
+### 21.1 Problem
+
+`full_attention_decode_core` tries GPU scoring via `decode_scoring_gpu` every
+decode step, falling back to the host loop on failure. When the GPU path
+consistently fails (e.g., CPU-only backend, unsupported op), this incurs:
+- Context allocation attempt + error handling per step
+- ~µs overhead per step × hundreds/thousands of steps
+
+### 21.2 Solution
+
+Track GPU scoring availability in `Qwen35FullAttentionState`. After the first
+failure, disable GPU attempts for the remainder of the generation. On success,
+keep using GPU.
+
+```
+state.gpu_scoring_available: Option<bool>
+  None  → not probed yet, try GPU
+  Some(true)  → GPU works, keep using it
+  Some(false) → GPU failed, skip directly to host
+```
+
+### 21.3 Implementation
+
+**Modified**: `Qwen35FullAttentionState` gains `gpu_scoring_probed: bool` field
+(default `false`). After first GPU attempt:
+- Success → leave probed as false (keep trying)
+- Failure → set probed to true (skip future attempts)
+
+**Modified**: `full_attention_decode_core` checks `state.gpu_scoring_probed`
+before attempting GPU path.
+
+### 21.4 Files Changed
+
+| File | Changes |
+|------|---------|
+| `state.rs` | Add `gpu_scoring_probed: bool` to `Qwen35FullAttentionState` |
+| `attention.rs` | Check flag before GPU attempt, set on failure |
 - `DecodeStrategy` preserved as reference implementation for `full_reprocess_loop`
