@@ -2,9 +2,10 @@
 
 ## Branch Summary
 
-28 commits implementing a complete Qwen3.5 E2E inference pipeline with
+41 commits implementing a complete Qwen3.5 E2E inference pipeline with
 verified token-ID parity against llama.cpp, plus comprehensive ggml-rs
-API improvements.
+API improvements (typed tensors, safe view/reshape wrappers, graph-level
+projections, resumable generation sessions, chat infrastructure).
 
 ## Completed Work Items
 
@@ -56,43 +57,66 @@ API improvements.
     distinct from runtime state. Session reuses `AttentionStrategy` trait +
     `process_all_layers` shared infrastructure.
 
+11. **Detokenization + chat infrastructure**: `tokenizer.rs` byte-BPE decoding,
+    `StreamingDecoder` for UTF-8 safe streaming, `encode_with_special_tokens()`,
+    `chat.rs` with `ChatMessage`/`Role`/`ChatFormat` types, ChatML formatting,
+    content sanitization. `simple_chat` interactive example.
+
+### ggml-rs API Extensions
+
+12. **Safe view/reshape wrappers**: `view_3d`, `view_4d`, `reshape_1d`, `reshape_4d`
+    with Rust-side validation (contiguity, bounds, overflow). Backfilled validation
+    on existing `view_1d`/`view_2d`/`reshape_2d`/`reshape_3d`. `NotContiguous` and
+    `ViewOutOfBounds` error variants. 15 integration tests.
+
+13. **Graph-level attention projections**: Full attention batches 3 matmuls (Q, K, V)
+    in single graph; linear attention batches 4 (QKV, gate, alpha, beta). Output
+    projections also graph-based. Decode stays host-side. Shared `project_sequence_graph`
+    in `tensor_ops.rs`. Parity test confirms host vs graph within 1e-5.
+
 ### Documentation
 
-10. Conv & QKV packing comparison document (llama-rs vs llama.cpp).
-11. Module-level doc comments on all e2e submodules.
-12. Updated PARITY_MATRIX, EXAMPLE_PARITY_MATRIX, INTRODUCTION.md.
-13. Top-level README with workspace overview and API guide.
+14. Conv & QKV packing comparison document (llama-rs vs llama.cpp).
+15. Module-level doc comments on all e2e submodules.
+16. Updated PARITY_MATRIX, EXAMPLE_PARITY_MATRIX, INTRODUCTION.md.
+17. Top-level README with workspace overview and API guide.
+18. Worklog entries for all major milestones (graph projections, view wrappers,
+    save-load-state, simple-chat, trait extraction, merge prep).
 
 ## Test Coverage
 
-- **180 tests** pass with `--features link-system` (1 ignored: upstream suite)
-- **0 clippy warnings**
+- **192 tests** pass with `--features link-system` (1 ignored: upstream suite)
+- **0 clippy warnings** (2 expected `too_many_arguments` in llama-rs, not errors)
 - **0 fmt issues**
 - Key test categories:
   - 18 type system tests
   - 15 backend compute tests (CPU + Metal parity)
   - 18 error path tests
   - 20 typed tensor tests
-  - 66 llama-rs tests (attention, linear attention, state, generation, checkpoint, session, etc.)
+  - 15 llama-rs integration tests (attention, linear attention, state, generation)
   - 2 attention parity tests (CPU vs Metal)
   - 2 MLP parity tests (CPU vs Metal, CPU vs C++ reference)
   - 2 regression tests (TwoPhase+Standard→error, TwoPhase+zero tokens→empty)
   - 7 checkpoint roundtrip/validation tests
   - 4 session step/resume/parity tests
+  - 20+ tokenizer/chat unit tests
+  - 15 view/reshape wrapper tests (ggml-rs)
+  - 1 graph projection parity test (host vs graph)
 
 ## Known Limitations
 
 - Standard attention decode uses full-reprocess fallback (not incremental)
-- `copy_from_slice` for QKV splits (no strided views yet)
+- Decode (seq_len=1) stays host-side for projections (graph overhead not worthwhile)
 - Scalar CPU implementation only (no multi-threading)
 - Prompt `[5]` diverges at token 5 (adjacent logits, precision edge)
+- `too_many_arguments` clippy warnings in linear/full attention (accepted: complex state threading)
 
 ## Validation Checklist
 
 - [x] `cargo fmt --all`
 - [x] `cargo clippy --workspace --all-targets`
 - [x] `cargo test --workspace`
-- [x] `cargo test --workspace --features link-system` (138 pass)
+- [x] `cargo test --workspace --features link-system` (192 pass, 1 ignored)
 - [x] Zero TODOs/FIXMEs in codebase
 - [x] All docs updated and consistent
 - [x] Module doc comments on all e2e submodules

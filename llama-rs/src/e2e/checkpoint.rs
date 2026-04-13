@@ -433,6 +433,80 @@ impl CheckpointV1 {
                 "eos_token_id {eos} out of vocab range [0, {vocab})"
             )));
         }
+
+        // Per-layer DTO validation: check internal consistency of each state
+        for (i, dto) in self.layer_states.iter().enumerate() {
+            match dto {
+                LayerStateDto::Qwen35Full {
+                    k_cache,
+                    v_cache,
+                    cached_len,
+                    kv_features,
+                } => {
+                    if *kv_features == 0 {
+                        return Err(err(format!(
+                            "layer {i}: Qwen35Full kv_features must be > 0"
+                        )));
+                    }
+                    if *cached_len > self.total_sequence_length {
+                        return Err(err(format!(
+                            "layer {i}: cached_len ({cached_len}) > total_sequence_length ({})",
+                            self.total_sequence_length
+                        )));
+                    }
+                    let expected_data = cached_len
+                        .checked_mul(*kv_features)
+                        .ok_or(E2eError::MemorySizeOverflow)?;
+                    if k_cache.len() != expected_data || v_cache.len() != expected_data {
+                        return Err(err(format!(
+                            "layer {i}: KV data length mismatch: expected {expected_data}, got k={} v={}",
+                            k_cache.len(),
+                            v_cache.len()
+                        )));
+                    }
+                }
+                LayerStateDto::Qwen35Linear {
+                    conv_buffer,
+                    conv_valid,
+                    conv_channels,
+                    conv_kernel,
+                    ssm_states,
+                } => {
+                    if *conv_channels == 0 {
+                        return Err(err(format!(
+                            "layer {i}: Qwen35Linear conv_channels must be > 0"
+                        )));
+                    }
+                    if *conv_kernel < 2 {
+                        return Err(err(format!(
+                            "layer {i}: Qwen35Linear conv_kernel must be >= 2"
+                        )));
+                    }
+                    let max_rows = conv_kernel - 1;
+                    if *conv_valid > max_rows {
+                        return Err(err(format!(
+                            "layer {i}: conv_valid ({conv_valid}) > max rows ({max_rows})"
+                        )));
+                    }
+                    let expected_buf = max_rows
+                        .checked_mul(*conv_channels)
+                        .ok_or(E2eError::MemorySizeOverflow)?;
+                    if conv_buffer.len() != expected_buf {
+                        return Err(err(format!(
+                            "layer {i}: conv_buffer length mismatch: expected {expected_buf}, got {}",
+                            conv_buffer.len()
+                        )));
+                    }
+                    if ssm_states.is_empty() {
+                        return Err(err(format!(
+                            "layer {i}: Qwen35Linear ssm_states must not be empty"
+                        )));
+                    }
+                }
+                LayerStateDto::Standard | LayerStateDto::None => {}
+            }
+        }
+
         Ok(())
     }
 

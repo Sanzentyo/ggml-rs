@@ -177,11 +177,14 @@ where
         let mut out = Vec::with_capacity(element_count);
         unsafe {
             // SAFETY:
-            // - `out` has capacity for `element_count` elements.
-            // - `payload.len()` matches exactly `element_count * size_of::<T>()`.
-            // - Source payload bytes are read-only and copied into owned `out` storage.
-            let dst = out.spare_capacity_mut().as_mut_ptr().cast::<T>();
-            ptr::copy_nonoverlapping(payload.as_ptr().cast::<T>(), dst, element_count);
+            // - `out` has capacity for `element_count` elements (= `expected_nbytes` bytes).
+            // - `payload.len()` matches exactly `expected_nbytes`.
+            // - We copy raw bytes (not typed elements) to avoid alignment requirements
+            //   on the source pointer — `payload` is a `&[u8]` that may not be aligned
+            //   for `T`. The destination (`spare_capacity_mut`) is a Vec allocation,
+            //   which is always properly aligned for `T`.
+            let dst = out.spare_capacity_mut().as_mut_ptr().cast::<u8>();
+            ptr::copy_nonoverlapping(payload.as_ptr(), dst, expected_nbytes);
             out.set_len(element_count);
         }
         return Ok(out);

@@ -114,8 +114,6 @@ pub enum E2eError {
     CheckpointIo(#[from] std::io::Error),
     #[error("checkpoint deserialization failed: {0}")]
     CheckpointDeserialize(String),
-    #[error("generation session is already finished")]
-    SessionFinished,
 }
 
 impl E2eError {

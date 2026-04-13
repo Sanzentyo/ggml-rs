@@ -387,12 +387,21 @@ fn byte_encode(text: &str) -> String {
 
 /// Reverse of `byte_encode`: maps GPT-2 Unicode chars back to raw bytes.
 fn byte_decode(encoded: &str) -> Option<String> {
-    let table = unicode_to_byte_table();
-    let bytes: Vec<u8> = encoded
-        .chars()
-        .map(|ch| table.get(&ch).copied())
-        .collect::<Option<Vec<u8>>>()?;
+    let bytes = byte_decode_to_bytes(encoded);
     String::from_utf8(bytes).ok()
+}
+
+/// Decode a GPT-2 BPE unicode piece to raw bytes.
+///
+/// Unlike `byte_decode`, this returns the raw byte sequence without requiring
+/// valid UTF-8, which is needed for the streaming decoder to handle cross-token
+/// multi-byte sequences.
+fn byte_decode_to_bytes(encoded: &str) -> Vec<u8> {
+    let table = unicode_to_byte_table();
+    encoded
+        .chars()
+        .filter_map(|ch| table.get(&ch).copied())
+        .collect()
 }
 
 fn unicode_to_byte_table() -> &'static HashMap<char, u8> {
@@ -493,16 +502,18 @@ fn split_on_special_tokens(text: &str, special_tokens: &[&str]) -> Vec<String> {
 #[derive(Debug)]
 pub struct StreamingDecoder<'t> {
     tokenizer: &'t GgufTokenizer,
-    buffer: Vec<i32>,
-    emitted: usize,
+    /// Undecoded byte suffix from previous tokens (incomplete UTF-8 tail).
+    pending_bytes: Vec<u8>,
+    /// Total number of tokens fed so far.
+    count: usize,
 }
 
 impl<'t> StreamingDecoder<'t> {
     fn new(tokenizer: &'t GgufTokenizer) -> Self {
         Self {
             tokenizer,
-            buffer: Vec::new(),
-            emitted: 0,
+            pending_bytes: Vec::new(),
+            count: 0,
         }
     }
 
@@ -512,52 +523,71 @@ impl<'t> StreamingDecoder<'t> {
     /// the token is buffered but not yet decodable, or an error if the token
     /// ID is unknown.
     pub fn next_token(&mut self, token_id: i32) -> Result<Option<String>, TokenizerError> {
-        // Validate token exists in vocab
-        if !self.tokenizer.reverse_vocab.contains_key(&token_id) {
-            return Err(TokenizerError::UnknownTokenId { token_id });
-        }
-        self.buffer.push(token_id);
+        let piece = self
+            .tokenizer
+            .reverse_vocab
+            .get(&token_id)
+            .ok_or(TokenizerError::UnknownTokenId { token_id })?;
+        self.count += 1;
 
-        // Try to decode all buffered tokens
-        match self.tokenizer.decode(&self.buffer) {
-            Ok(full_text) => {
-                let new_text = &full_text[self.emitted..];
-                if new_text.is_empty() {
+        // Decode the token's BPE piece to raw bytes
+        let new_bytes = byte_decode_to_bytes(piece);
+        self.pending_bytes.extend_from_slice(&new_bytes);
+
+        // Find the longest valid UTF-8 prefix
+        match std::str::from_utf8(&self.pending_bytes) {
+            Ok(s) => {
+                let text = s.to_string();
+                self.pending_bytes.clear();
+                if text.is_empty() {
                     Ok(None)
                 } else {
-                    self.emitted = full_text.len();
-                    Ok(Some(new_text.to_string()))
+                    Ok(Some(text))
                 }
             }
-            // If decode fails (incomplete UTF-8), keep buffering
-            Err(TokenizerError::InvalidUtf8) => Ok(None),
-            Err(e) => Err(e),
+            Err(e) => {
+                let valid_up_to = e.valid_up_to();
+                if valid_up_to == 0 {
+                    // No valid UTF-8 yet — keep buffering
+                    Ok(None)
+                } else {
+                    let text = std::str::from_utf8(&self.pending_bytes[..valid_up_to])
+                        .expect("valid_up_to guarantees valid UTF-8")
+                        .to_string();
+                    let remaining = self.pending_bytes[valid_up_to..].to_vec();
+                    self.pending_bytes = remaining;
+                    Ok(Some(text))
+                }
+            }
         }
     }
 
-    /// Flush any remaining buffered tokens, returning the final text.
+    /// Flush any remaining buffered bytes, returning the final text.
     pub fn flush(&mut self) -> Result<Option<String>, TokenizerError> {
-        if self.buffer.len() * 4 <= self.emitted {
+        if self.pending_bytes.is_empty() {
             return Ok(None);
         }
-        match self.tokenizer.decode(&self.buffer) {
-            Ok(full_text) => {
-                let new_text = &full_text[self.emitted..];
-                self.emitted = full_text.len();
-                if new_text.is_empty() {
+        match std::str::from_utf8(&self.pending_bytes) {
+            Ok(s) => {
+                let text = s.to_string();
+                self.pending_bytes.clear();
+                if text.is_empty() {
                     Ok(None)
                 } else {
-                    Ok(Some(new_text.to_string()))
+                    Ok(Some(text))
                 }
             }
-            Err(TokenizerError::InvalidUtf8) => Ok(None),
-            Err(e) => Err(e),
+            // Remaining bytes don't form valid UTF-8 — discard
+            Err(_) => {
+                self.pending_bytes.clear();
+                Ok(None)
+            }
         }
     }
 
     /// Total number of tokens fed so far.
     pub fn token_count(&self) -> usize {
-        self.buffer.len()
+        self.count
     }
 }
 
