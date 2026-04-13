@@ -308,6 +308,17 @@ And you should write rusty code(ADT, enum, type state pattern)
   `rms_norm_single_in_place()` for allocation-free normalization.
   See comparison doc item 32.
 
+- **Resumable GenerationSession + binary checkpoint** (item 33):
+  `GenerationSession` wraps inference as an iterator-like API (`next_token()`)
+  with mid-generation checkpointing. `GenerationCheckpoint` uses postcard
+  binary format with magic bytes + version envelope. `ModelFingerprint`
+  validates layer count, hidden dims, vocab, eps, and per-layer type tags
+  on resume. `CheckpointV1` DTO decoupled from runtime types for format
+  stability. Supports TwoPhase (Qwen3.5, performance-preserving) and
+  FullReprocess (standard attention) modes. 18 tests covering roundtrip,
+  validation, invariant checking, and fingerprint mismatch.
+  See comparison doc item 33.
+
 ## Validation checkpoints completed on this branch
 
 - `cargo fmt --all`

@@ -2278,3 +2278,131 @@ two_phase_loop()
 | `llama-rs/src/e2e/linear_attention.rs` | Added `LinearDecodeScratch` struct; updated `linear_attention_decode_core()` to accept optional scratch; added scratch construction helper |
 | `llama-rs/src/e2e/generation.rs` | Builds `LinearDecodeScratch` in `two_phase_loop()`; threads through `persistent_decode_all_layers()` |
 - `DecodeStrategy` preserved as reference implementation for `full_reprocess_loop`
+
+## 33. Resumable GenerationSession + Binary Checkpoint Serialization
+
+### 33.1 Problem
+
+The existing `generate_token_ids_from_model()` API is one-shot: it runs the
+full generation loop and returns all tokens. There is no way to:
+
+- Pause generation mid-stream and resume later
+- Save inference state (KV caches, conv buffers, SSM states) to disk
+- Resume from a checkpoint with a new model instance
+- Step through generation one token at a time for streaming UIs
+
+This blocks the `save-load-state` parity matrix entry and prevents
+interactive/streaming use cases.
+
+### 33.2 Design
+
+**`GenerationSession`** (`session.rs`, 679 lines):
+
+```rust
+pub struct GenerationSession {
+    // Owned model data (embeddings, weights, norms, plans)
+    layer_plans: Vec<LayerPlan>,
+    token_embedding_values: Vec<f32>,
+    output_weight_values: Vec<f32>,
+    output_norm_values: Vec<f32>,
+    // Token tracking
+    prompt_token_ids: Vec<i32>,
+    all_token_ids: Vec<i32>,       // pad-filled, prompt + generated
+    generated_token_ids: Vec<i32>,
+    // State
+    state: GenerationState,        // per-layer KV/conv/SSM
+    effective_mode: GenerationMode, // TwoPhase or FullReprocess
+    fingerprint: ModelFingerprint,
+    backend: Backend,
+    // ...
+}
+```
+
+Key API:
+- `new(model, config)` — resolve model, validate tokens, init state
+- `next_token()` → `Option<i32>` — prefill on first call, decode thereafter
+- `checkpoint()` → `GenerationCheckpoint` — snapshot entire session state
+- `resume(model, backend, policy, checkpoint)` — restore from saved checkpoint
+- `generated_tokens()`, `all_tokens()`, `is_finished()`, `generated_count()`
+
+Execution modes:
+- **TwoPhase** (Qwen3.5 linear layers): Prefill captures KV/conv/SSM state,
+  then decode uses cached state. Checkpoints preserve performance.
+- **FullReprocess** (Standard attention or zero max_new_tokens): All tokens
+  reprocessed each step. Checkpoints save IDs and position but state is
+  recomputed on resume.
+
+**`GenerationCheckpoint`** (`checkpoint.rs`, 737 lines):
+
+```rust
+pub struct GenerationCheckpoint {
+    inner: CheckpointV1,  // versioned DTO
+}
+```
+
+Binary format:
+- Magic bytes `LRCK` + postcard-serialized `CheckpointV1`
+- Versioned envelope (CHECKPOINT_VERSION = 1) for forward compatibility
+- `save_to(impl Write)` / `load_from(impl Read)` for I/O
+
+DTO architecture:
+- `CheckpointV1` decoupled from runtime types — internal refactoring
+  won't break serialized checkpoint compatibility
+- `ModelFingerprint` validates model compatibility on load:
+  layer_count, hidden_features, vocab_size, rms_norm_eps, per-layer type tags
+- `LayerStateDto` serializes per-layer state (KV cache, conv buffer, SSM states)
+- `validate_invariants()` prevents panics from malformed/corrupted data
+
+**Error handling:**
+
+New error variants:
+- `CheckpointDeserialize(String)` — format/parse errors
+- `CheckpointVersionMismatch { file_version, expected_version }`
+- `CheckpointModelMismatch { reason: String }` — fingerprint mismatch
+
+### 33.3 Model Compatibility Validation
+
+`ModelFingerprint` captures:
+- `layer_count`, `hidden_features`, `vocab_size`, `rms_norm_eps_bits`
+- Per-layer `LayerTypeTag` with attention-specific dimensions:
+  - `Qwen35Full { kv_head_count, head_dimension }`
+  - `Qwen35Linear { conv_kernel, conv_channels, time_step_rank, state_size }`
+  - `Standard`, `None`
+
+On `resume()`, the checkpoint fingerprint is validated against the
+current model's fingerprint. Mismatch on any field produces
+`CheckpointModelMismatch` with a detailed reason string.
+
+Cross-backend resume (CPU → Metal) is allowed but not guaranteed to
+produce identical tokens due to floating-point precision differences.
+
+### 33.4 Test Coverage (18 tests)
+
+**checkpoint.rs (14 tests):**
+- Roundtrip save/load preserves all fields
+- Bad magic bytes rejected
+- Invalid version rejected
+- Corrupted data rejected
+- Token count invariant violations caught
+- Token out-of-vocab caught
+- Layer state count mismatch caught
+- KV cache data length validation
+- Conv buffer length validation
+- Fingerprint mismatch on layer_count, hidden_features, vocab_size, eps, layer types
+
+**session.rs (4 tests):**
+- Step-by-step generation produces correct token count
+- Zero max_new_tokens → immediately finished
+- Checkpoint roundtrip preserves generated tokens
+- Two independent sessions with same config produce identical tokens
+
+### 33.5 Files Modified
+
+| File | Changes |
+|------|---------|
+| `llama-rs/src/e2e/session.rs` | New file: `GenerationSession` with `new()`, `resume()`, `next_token()`, `checkpoint()` |
+| `llama-rs/src/e2e/checkpoint.rs` | New file: `GenerationCheckpoint`, `CheckpointV1`, `ModelFingerprint`, `LayerStateDto`, save/load, validation |
+| `llama-rs/src/e2e.rs` | Added `mod session`, `mod checkpoint`, public re-exports |
+| `llama-rs/src/lib.rs` | Added `GenerationSession`, `GenerationCheckpoint` to re-exports |
+| `llama-rs/src/e2e/error.rs` | Added `CheckpointDeserialize`, `CheckpointVersionMismatch`, `CheckpointModelMismatch` variants |
+| `llama-rs/Cargo.toml` | Added `postcard` + `serde` dependencies |
