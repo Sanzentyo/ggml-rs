@@ -670,6 +670,16 @@ impl Context {
             .map_err(|error| error.with_context("ggml_silu"))
     }
 
+    /// Element-wise sigmoid: σ(x) = 1 / (1 + exp(-x)).
+    pub fn sigmoid<'ctx, T: GgmlElement>(
+        &'ctx self,
+        a: &Tensor<'ctx, T>,
+    ) -> Result<Tensor<'ctx, T>> {
+        let raw = unsafe { ffi::ggml_sigmoid(self.raw.as_ptr(), a.raw.as_ptr()) };
+        self.wrap_typed_tensor(raw)
+            .map_err(|error| error.with_context("ggml_sigmoid"))
+    }
+
     /// SSM-style depthwise 1D convolution (causal, stride-1).
     ///
     /// - `sx`: pre-padded input `[d_conv - 1 + n_tokens, d_inner]` (3D with
@@ -1110,6 +1120,54 @@ impl Context {
             .map_err(|error| error.with_context("ggml_rope_ext"))
     }
 
+    /// Flash attention with optional causal mask, ALiBi bias, and logit softcap.
+    ///
+    /// # Tensor shapes
+    ///
+    /// - `q`: `[D, T, H, 1]` — query (head dim, tokens, heads, batch=1)
+    /// - `k`: `[D, Tkv, Hkv, 1]` — key (GQA: `Hkv ≤ H`)
+    /// - `v`: `[D, Tkv, Hkv, 1]` — value
+    /// - `mask`: optional `[Tkv, T, Hmask, 1]` (broadcastable over heads)
+    ///   **Must be f16** — the ggml CPU kernel reads mask values as `ggml_fp16_t`.
+    ///
+    /// # Output
+    ///
+    /// Returns **f32** tensor `[D, H, T, 1]` (note: **permuted** relative to Q).
+    /// Use `permute(result, 0, 2, 1, 3)` then `cont` to restore `[D, T, H, 1]`.
+    ///
+    /// # Parameters
+    ///
+    /// - `scale`: attention scale (typically `1/√D`)
+    /// - `max_bias`: ALiBi positional bias maximum; `0.0` for no bias
+    /// - `logit_softcap`: soft-cap on logits before softmax; `0.0` for no cap
+    pub fn flash_attn_ext<'ctx>(
+        &'ctx self,
+        q: &Tensor<'ctx, f32>,
+        k: &Tensor<'ctx, f32>,
+        v: &Tensor<'ctx, f32>,
+        mask: Option<&DynTensor<'ctx>>,
+        scale: f32,
+        max_bias: f32,
+        logit_softcap: f32,
+    ) -> Result<Tensor<'ctx, f32>> {
+        let mask_raw = mask.map_or(ptr::null_mut(), |t| t.raw.as_ptr());
+        let raw = unsafe {
+            ffi::ggml_flash_attn_ext(
+                self.raw.as_ptr(),
+                q.raw.as_ptr(),
+                k.raw.as_ptr(),
+                v.raw.as_ptr(),
+                mask_raw,
+                scale,
+                max_bias,
+                logit_softcap,
+            )
+        };
+        self.wrap_typed_tensor(raw)
+            .map_err(|error| error.with_context("ggml_flash_attn_ext"))
+    }
+
+    /// Creates a new computation graph.
     pub fn new_graph(&self) -> Result<Graph<'_>> {
         let raw = unsafe { ffi::ggml_new_graph(self.raw.as_ptr()) };
         self.wrap_graph(raw)
@@ -1295,6 +1353,24 @@ impl<'ctx> DynTensor<'ctx> {
             _ctx: PhantomData,
             _type: PhantomData,
         })
+    }
+
+    /// Writes raw bytes to the tensor through the backend API.
+    ///
+    /// The caller must ensure that `data` matches the tensor's byte size
+    /// (i.e., `data.len() == self.nbytes()`).
+    pub fn write_bytes_backend(&self, data: &[u8]) -> Result<()> {
+        let expected = self.nbytes();
+        if data.len() != expected {
+            return Err(Error::LengthMismatch {
+                expected,
+                actual: data.len(),
+            });
+        }
+        unsafe {
+            ffi::ggml_backend_tensor_set(self.raw.as_ptr(), data.as_ptr().cast(), 0, expected);
+        }
+        Ok(())
     }
 }
 
