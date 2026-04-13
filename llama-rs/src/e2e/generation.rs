@@ -824,7 +824,7 @@ impl PersistentDecodeResources {
     /// Run one decode step through all layers using persistent resources.
     ///
     /// If persistent projections are available, uses the fast path
-    /// (`persistent_decode_all_layers`). Otherwise falls back to
+    /// (inline persistent decode). Otherwise falls back to
     /// `DecodeStrategy` with `process_all_layers`.
     pub(super) fn decode_step(
         &mut self,
@@ -835,15 +835,10 @@ impl PersistentDecodeResources {
         rms_norm_eps: f32,
         backend: &Backend,
     ) -> Result<(), E2eError> {
-        if let Some(ref mut projs) = self.decode_projs {
-            persistent_decode_all_layers(
+        if self.decode_projs.is_some() {
+            self.persistent_decode_all_layers(
                 hidden,
                 layer_plans,
-                projs,
-                &self.kv_caches,
-                &mut self.persistent_mlps,
-                self.scoring_ctx.as_mut(),
-                &mut self.linear_scratch,
                 state,
                 hidden_features,
                 rms_norm_eps,
@@ -863,100 +858,113 @@ impl PersistentDecodeResources {
             )
         }
     }
-}
 
-/// Process all layers in decode mode using persistent projections.
-///
-/// For each layer: host norm → persistent input proj → core logic → persistent
-/// output proj → residual add → persistent or ephemeral MLP.
-fn persistent_decode_all_layers(
-    hidden: &mut [f32],
-    layer_plans: &[LayerPlan],
-    projections: &mut [Option<PersistentDecodeProjection<'static>>],
-    kv_caches: &[Option<PersistentKvCache<'static>>],
-    persistent_mlps: &mut [Option<PersistentMlp<'static>>],
-    mut scoring_ctx: Option<&mut PersistentScoringContext>,
-    linear_scratch: &mut Option<LinearDecodeScratch>,
-    state: &mut GenerationState,
-    hidden_features: usize,
-    rms_norm_eps: f32,
-    backend: &Backend,
-) -> Result<(), E2eError> {
-    debug_assert_eq!(layer_plans.len(), projections.len());
-    debug_assert_eq!(layer_plans.len(), kv_caches.len());
-    debug_assert!(
-        persistent_mlps.is_empty() || persistent_mlps.len() == layer_plans.len(),
-        "persistent_mlps must be empty (disabled) or aligned to layer_plans"
-    );
+    /// Process all layers in decode mode using persistent projections.
+    ///
+    /// For each layer: host norm → persistent input proj → core logic → persistent
+    /// output proj → residual add → persistent or ephemeral MLP.
+    ///
+    /// Caller must ensure `self.decode_projs.is_some()`.
+    fn persistent_decode_all_layers(
+        &mut self,
+        hidden: &mut [f32],
+        layer_plans: &[LayerPlan],
+        state: &mut GenerationState,
+        hidden_features: usize,
+        rms_norm_eps: f32,
+        backend: &Backend,
+    ) -> Result<(), E2eError> {
+        let projections = self
+            .decode_projs
+            .as_mut()
+            .ok_or(E2eError::UnsupportedTwoPhase)?;
 
-    for (layer_idx, layer_plan) in layer_plans.iter().enumerate() {
-        if let (Some(attention), Some(proj)) =
-            (&layer_plan.attention, projections[layer_idx].as_mut())
-        {
-            let norm_weight = attention.norm_values();
-            let normalized =
-                rms_norm_with_weight(hidden, hidden_features, 1, norm_weight, rms_norm_eps)?;
+        debug_assert_eq!(layer_plans.len(), projections.len());
+        debug_assert_eq!(layer_plans.len(), self.kv_caches.len());
+        debug_assert!(
+            self.persistent_mlps.is_empty() || self.persistent_mlps.len() == layer_plans.len(),
+            "persistent_mlps must be empty (disabled) or aligned to layer_plans"
+        );
 
-            proj.project_input(&normalized, backend)?;
+        for (layer_idx, layer_plan) in layer_plans.iter().enumerate() {
+            if let (Some(attention), Some(proj)) =
+                (&layer_plan.attention, projections[layer_idx].as_mut())
+            {
+                let norm_weight = attention.norm_values();
+                let normalized =
+                    rms_norm_with_weight(hidden, hidden_features, 1, norm_weight, rms_norm_eps)?;
 
-            let attention_output = match (attention, &mut state.layers[layer_idx]) {
-                (AttentionLayerPlan::Qwen35Full(attn), LayerAttentionState::Qwen35Full(s)) => {
-                    let (q_full, k_proj, v_proj) = proj.read_full_attention_projections()?;
-                    let hf = full_attention_hidden_features(attn)?;
-                    let prepared =
-                        prepare_qkv_from_raw(attn, q_full, k_proj, v_proj, 1, hf, rms_norm_eps)?;
-                    let sc = scoring_ctx.as_deref_mut();
-                    let head_outputs = full_attention_decode_core(
-                        prepared,
-                        attn,
-                        s,
-                        Some(backend),
-                        kv_caches[layer_idx].as_ref(),
-                        sc,
-                    )?;
-                    proj.project_output(&head_outputs, backend)?
-                }
-                (AttentionLayerPlan::Qwen35Linear(attn), LayerAttentionState::Qwen35Linear(s)) => {
-                    let (qkv, z, alpha, beta) = proj.read_linear_attention_projections()?;
-                    let conv_channels = linear_attention_conv_channels(attn)?;
-                    let hf = linear_attention_hidden_features(attn)?;
-                    let projections = LinearProjections {
-                        qkv,
-                        z,
-                        alpha,
-                        beta,
-                        conv_channels,
-                        hidden_features: hf,
-                    };
-                    let output = linear_attention_decode_core(
-                        projections,
-                        attn,
-                        rms_norm_eps,
-                        s,
-                        linear_scratch.as_mut(),
-                    )?;
-                    proj.project_output(&output, backend)?
-                }
-                _ => return Err(E2eError::UnsupportedTwoPhase),
+                proj.project_input(&normalized, backend)?;
+
+                let attention_output = match (attention, &mut state.layers[layer_idx]) {
+                    (AttentionLayerPlan::Qwen35Full(attn), LayerAttentionState::Qwen35Full(s)) => {
+                        let (q_full, k_proj, v_proj) = proj.read_full_attention_projections()?;
+                        let hf = full_attention_hidden_features(attn)?;
+                        let prepared = prepare_qkv_from_raw(
+                            attn,
+                            q_full,
+                            k_proj,
+                            v_proj,
+                            1,
+                            hf,
+                            rms_norm_eps,
+                        )?;
+                        let sc = self.scoring_ctx.as_mut();
+                        let head_outputs = full_attention_decode_core(
+                            prepared,
+                            attn,
+                            s,
+                            Some(backend),
+                            self.kv_caches[layer_idx].as_ref(),
+                            sc,
+                        )?;
+                        proj.project_output(&head_outputs, backend)?
+                    }
+                    (
+                        AttentionLayerPlan::Qwen35Linear(attn),
+                        LayerAttentionState::Qwen35Linear(s),
+                    ) => {
+                        let (qkv, z, alpha, beta) = proj.read_linear_attention_projections()?;
+                        let conv_channels = linear_attention_conv_channels(attn)?;
+                        let hf = linear_attention_hidden_features(attn)?;
+                        let projections = LinearProjections {
+                            qkv,
+                            z,
+                            alpha,
+                            beta,
+                            conv_channels,
+                            hidden_features: hf,
+                        };
+                        let output = linear_attention_decode_core(
+                            projections,
+                            attn,
+                            rms_norm_eps,
+                            s,
+                            self.linear_scratch.as_mut(),
+                        )?;
+                        proj.project_output(&output, backend)?
+                    }
+                    _ => return Err(E2eError::UnsupportedTwoPhase),
+                };
+                add_in_place(hidden, &attention_output)?;
+            }
+
+            let mlp_output = if let Some(Some(mlp)) = self.persistent_mlps.get_mut(layer_idx) {
+                mlp.step(hidden, backend)?
+            } else {
+                mlp_sequence_inference_with_weights(
+                    &layer_plan.mlp.weights,
+                    hidden,
+                    1,
+                    &layer_plan.mlp.norm_values,
+                    rms_norm_eps,
+                    backend,
+                )?
             };
-            add_in_place(hidden, &attention_output)?;
+            add_in_place(hidden, &mlp_output)?;
         }
-
-        let mlp_output = if let Some(Some(mlp)) = persistent_mlps.get_mut(layer_idx) {
-            mlp.step(hidden, backend)?
-        } else {
-            mlp_sequence_inference_with_weights(
-                &layer_plan.mlp.weights,
-                hidden,
-                1,
-                &layer_plan.mlp.norm_values,
-                rms_norm_eps,
-                backend,
-            )?
-        };
-        add_in_place(hidden, &mlp_output)?;
+        Ok(())
     }
-    Ok(())
 }
 
 /// Greedy sampling fallback when the persistent LM head graph is unavailable.
