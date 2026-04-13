@@ -23,7 +23,7 @@ use super::linear_attention::{
     linear_attention_hidden_features, qwen35_linear_attention_decode_step,
     qwen35_linear_attention_inference, qwen35_linear_attention_prefill,
 };
-use super::mlp::mlp_sequence_inference_with_weights;
+use super::mlp::{PersistentMlp, build_persistent_mlp, mlp_sequence_inference_with_weights};
 use super::numeric::{checked_mul, validate_token_id, value_to_i32};
 use super::plan::{
     AttentionLayerPlan, LayerPlan, Qwen35FullAttentionLayerPlan, Qwen35LinearAttentionLayerPlan,
@@ -265,7 +265,13 @@ pub(super) fn process_all_layers(
     seq_len: usize,
     rms_norm_eps: f32,
     backend: &Backend,
+    persistent_mlps: &mut [Option<PersistentMlp<'static>>],
 ) -> Result<(), E2eError> {
+    debug_assert!(
+        persistent_mlps.is_empty() || persistent_mlps.len() == layer_plans.len(),
+        "persistent_mlps must be empty (disabled) or aligned to layer_plans"
+    );
+
     for (layer_idx, layer_plan) in layer_plans.iter().enumerate() {
         if let Some(attention) = &layer_plan.attention {
             let attention_output = strategy.process_attention(
@@ -279,14 +285,18 @@ pub(super) fn process_all_layers(
             add_in_place(hidden, &attention_output)?;
         }
 
-        let mlp_output = mlp_sequence_inference_with_weights(
-            &layer_plan.mlp.weights,
-            hidden,
-            seq_len,
-            &layer_plan.mlp.norm_values,
-            rms_norm_eps,
-            backend,
-        )?;
+        let mlp_output = if let Some(Some(mlp)) = persistent_mlps.get_mut(layer_idx) {
+            mlp.step(hidden, backend)?
+        } else {
+            mlp_sequence_inference_with_weights(
+                &layer_plan.mlp.weights,
+                hidden,
+                seq_len,
+                &layer_plan.mlp.norm_values,
+                rms_norm_eps,
+                backend,
+            )?
+        };
         add_in_place(hidden, &mlp_output)?;
     }
     Ok(())
@@ -551,15 +561,58 @@ fn try_build_persistent_kv_caches(
     Some((contexts, caches))
 }
 
+type PersistentMlpSets = (Vec<Option<Context>>, Vec<Option<PersistentMlp<'static>>>);
+
+/// Attempt to build persistent MLP graphs for all layers (per-layer opportunistic).
+///
+/// Each layer is built independently — if one fails, it gets `None` and falls
+/// back to the ephemeral `mlp_sequence_inference_with_weights` path. Returns
+/// aligned vecs (one slot per layer plan).
+fn try_build_persistent_mlps(
+    layer_plans: &[LayerPlan],
+    rms_norm_eps: f32,
+    backend: &Backend,
+) -> PersistentMlpSets {
+    // Transmute is handled inside `build_persistent_mlp` (same pattern as
+    // `build_one_persistent_full`). Callers maintain LIFO drop order.
+
+    let mut contexts: Vec<Option<Context>> = Vec::with_capacity(layer_plans.len());
+    let mut mlps: Vec<Option<PersistentMlp<'static>>> = Vec::with_capacity(layer_plans.len());
+
+    for layer_plan in layer_plans {
+        let mlp_plan = &layer_plan.mlp;
+        match build_persistent_mlp(
+            &mlp_plan.weights,
+            &mlp_plan.norm_values,
+            rms_norm_eps,
+            backend,
+        ) {
+            Ok((ctx, mlp)) => {
+                contexts.push(Some(ctx));
+                mlps.push(Some(mlp));
+            }
+            Err(_) => {
+                contexts.push(None);
+                mlps.push(None);
+            }
+        }
+    }
+
+    debug_assert_eq!(contexts.len(), layer_plans.len());
+    debug_assert_eq!(mlps.len(), layer_plans.len());
+    (contexts, mlps)
+}
+
 /// Process all layers in decode mode using persistent projections.
 ///
 /// For each layer: host norm → persistent input proj → core logic → persistent
-/// output proj → residual add → MLP (unchanged).
+/// output proj → residual add → persistent or ephemeral MLP.
 fn persistent_decode_all_layers(
     hidden: &mut [f32],
     layer_plans: &[LayerPlan],
     projections: &mut [Option<PersistentDecodeProjection<'static>>],
     kv_caches: &[Option<PersistentKvCache<'static>>],
+    persistent_mlps: &mut [Option<PersistentMlp<'static>>],
     state: &mut GenerationState,
     hidden_features: usize,
     rms_norm_eps: f32,
@@ -567,6 +620,10 @@ fn persistent_decode_all_layers(
 ) -> Result<(), E2eError> {
     debug_assert_eq!(layer_plans.len(), projections.len());
     debug_assert_eq!(layer_plans.len(), kv_caches.len());
+    debug_assert!(
+        persistent_mlps.is_empty() || persistent_mlps.len() == layer_plans.len(),
+        "persistent_mlps must be empty (disabled) or aligned to layer_plans"
+    );
 
     for (layer_idx, layer_plan) in layer_plans.iter().enumerate() {
         if let (Some(attention), Some(proj)) =
@@ -613,14 +670,18 @@ fn persistent_decode_all_layers(
             add_in_place(hidden, &attention_output)?;
         }
 
-        let mlp_output = mlp_sequence_inference_with_weights(
-            &layer_plan.mlp.weights,
-            hidden,
-            1,
-            &layer_plan.mlp.norm_values,
-            rms_norm_eps,
-            backend,
-        )?;
+        let mlp_output = if let Some(Some(mlp)) = persistent_mlps.get_mut(layer_idx) {
+            mlp.step(hidden, backend)?
+        } else {
+            mlp_sequence_inference_with_weights(
+                &layer_plan.mlp.weights,
+                hidden,
+                1,
+                &layer_plan.mlp.norm_values,
+                rms_norm_eps,
+                backend,
+            )?
+        };
         add_in_place(hidden, &mlp_output)?;
     }
     Ok(())
@@ -900,6 +961,7 @@ fn full_reprocess_loop(
             *current_token_count,
             inputs.rms_norm_eps,
             inputs.backend,
+            &mut [],
         )?;
 
         let last_index = current_token_count
@@ -974,6 +1036,7 @@ fn two_phase_loop(
             prompt_token_count,
             inputs.rms_norm_eps,
             inputs.backend,
+            &mut [],
         )?;
     }
 
@@ -992,6 +1055,17 @@ fn two_phase_loop(
     }
 
     // Phase 2: Decode — one token at a time using cached state.
+    let remaining_decode_steps = inputs.max_new_tokens.saturating_sub(1);
+    if remaining_decode_steps == 0 {
+        return Ok(());
+    }
+
+    // Build persistent MLPs independently of attention projections.
+    // Per-layer opportunistic: failed layers fall back to ephemeral path.
+    // LIFO drop order: `persistent_mlps` drops BEFORE `_mlp_ctxs`.
+    let (_mlp_ctxs, mut persistent_mlps) =
+        try_build_persistent_mlps(inputs.layer_plans, inputs.rms_norm_eps, inputs.backend);
+
     // Attempt persistent projections (upload weights once for all layers).
     // Falls back to DecodeStrategy if build fails.
     let persistent = try_build_persistent_projections(inputs.layer_plans, inputs.backend);
@@ -1045,6 +1119,7 @@ fn two_phase_loop(
                 inputs.layer_plans,
                 &mut decode_projs,
                 kv_caches_for_decode,
+                &mut persistent_mlps,
                 &mut state,
                 inputs.hidden_features,
                 inputs.rms_norm_eps,
@@ -1065,7 +1140,8 @@ fn two_phase_loop(
             }
         }
     } else {
-        // Fallback: per-token weight upload via DecodeStrategy.
+        // Fallback: per-token weight upload via DecodeStrategy (attention only).
+        // Persistent MLPs still used when available.
         let mut strategy = DecodeStrategy { state: &mut state };
         for _step in 1..inputs.max_new_tokens {
             let new_token_id = all_token_ids[*current_token_count - 1];
@@ -1084,6 +1160,7 @@ fn two_phase_loop(
                 1,
                 inputs.rms_norm_eps,
                 inputs.backend,
+                &mut persistent_mlps,
             )?;
 
             let next_token_id =

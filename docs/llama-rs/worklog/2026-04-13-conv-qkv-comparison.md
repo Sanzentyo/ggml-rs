@@ -1846,4 +1846,125 @@ convolution.
 | `llama-rs/src/e2e/generation.rs` | Dispatch: persistent projections, persistent KV cache |
 | `vendor/ggml/src/ggml.c` | `ggml_ssm_conv` definition (L5430-5454) |
 | `vendor/ggml/src/ggml-cpu/ops.cpp` | CPU `ssm_conv` kernel (L9191-9259) |
+
+---
+
+## 28. Persistent MLP Graphs (Decode-Path Weight-Reuse)
+
+### 28.1 Problem
+
+During autoregressive decode, the MLP stage was the **#1 remaining bottleneck**.
+Each decode step created a new ggml context and re-uploaded all three weight
+matrices (gate, up, down) per layer per token:
+
+| Matrix | Shape | Bytes (f32) |
+|--------|-------|-------------|
+| W_gate | `[hidden × ffn]` | `1536 × 8960 × 4 = 55.1 MB` |
+| W_up   | `[hidden × ffn]` | `55.1 MB` |
+| W_down | `[ffn × hidden]` | `55.1 MB` |
+| **Per layer** | | **~165 MB** |
+| **32 layers** | | **~5.3 GB** |
+
+This upload happened on *every* decode token, even though the weights are
+constant. The actual payload per step is just the hidden vector (~6 KB each
+way at hidden=1536).
+
+### 28.2 Solution: `PersistentMlp`
+
+Follows the established persistent graph pattern from items 13 (LM head) and
+15 (decode projections): build the graph once, upload weights once, reuse for
+every decode token.
+
+```rust
+pub(super) struct PersistentMlp<'ctx> {
+    x_in: Tensor<'ctx, f32>,     // input (hidden_features × 1)
+    y_out: Tensor<'ctx, f32>,    // output (hidden_features × 1)
+    graph: Graph<'ctx>,
+    _buffer: BackendBuffer<'ctx>,
+    hidden_features: usize,
+}
+```
+
+**Graph topology (fixed at seq_len=1):**
+```
+rms_norm(x_in, eps) → mul(norm_w) → mul_mat(W_gate) → silu
+                                   → mul_mat(W_up)
+                                     → mul(silu_gate, up)
+                                       → mul_mat(W_down)
+                                         → y_out
+```
+
+**Per-step cost:**
+- Write: ~6 KB (hidden vector to `x_in`)
+- Compute: 3 matmuls on device (no transfer)
+- Read: ~6 KB (hidden vector from `y_out`)
+- **Total: ~12 KB I/O vs ~165 MB ephemeral**
+
+### 28.3 Implementation
+
+#### `build_persistent_mlp()`
+
+Creates a dedicated ggml `Context`, builds the full MLP graph, allocates a
+backend buffer, uploads weights (gate, up, down, norm) once, and returns
+`(Context, PersistentMlp<'static>)`.
+
+Uses the same `transmute` pattern as `build_one_persistent_full`: `Tensor`,
+`Graph`, and `BackendBuffer` all carry `PhantomData<&'ctx Context>` (raw
+pointers, not real references). The transmute erases the unnameable local
+borrow. Callers maintain LIFO drop order: handles drop before contexts.
+
+#### `PersistentMlp::step()`
+
+```rust
+fn step(&mut self, hidden: &[f32], backend: &Backend) -> Result<Vec<f32>, E2eError> {
+    self.x_in.write_data_backend(hidden)?;
+    backend.compute(&mut self.graph)?;
+    self.y_out.read_data_backend()
+}
+```
+
+#### `try_build_persistent_mlps()`
+
+Per-layer opportunistic builder in `generation.rs`. Unlike
+`try_build_persistent_projections` (all-or-nothing), this returns aligned
+vecs where individual layers can be `None`. Failed layers fall back to
+ephemeral `mlp_sequence_inference_with_weights`.
+
+#### Integration into `two_phase_loop()`
+
+1. Persistent MLPs built **before** the projection decision (same weights
+   needed regardless of persistent vs ephemeral projection path)
+2. Early-return when `remaining_decode_steps == 0` (skips persistent resource
+   construction entirely — adopted from rubber-duck review)
+3. MLPs threaded through both persistent and fallback decode branches
+
+### 28.4 API Changes
+
+`process_all_layers()` gained a `persistent_mlps: &mut [Option<PersistentMlp<'static>>]`
+parameter. Empty slice (`&mut []`) means disabled. `debug_assert!` validates
+that non-empty slices align to `layer_plans.len()`. Safe indexing via `get_mut`.
+
+All callers in `session.rs` and `generation.rs::full_reprocess_loop` pass
+`&mut []` (persistent MLPs only apply to the decode phase of `two_phase_loop`).
+
+### 28.5 Performance Impact
+
+| Metric | Before (ephemeral) | After (persistent) |
+|--------|-------------------|-------------------|
+| Weight upload/step | ~5.3 GB (32 layers) | 0 (one-time) |
+| I/O per layer/step | ~165 MB | ~12 KB |
+| Context allocation | Per-step per-layer | Once at decode start |
+| Graph build | Per-step per-layer | Once at decode start |
+
+Combined with persistent projections (item 15) and persistent KV cache
+(item 26), the decode path now has minimal per-step overhead: primarily
+compute-bound (matmuls on device) rather than transfer-bound.
+
+### 28.6 Files Modified
+
+| File | Changes |
+|------|---------|
+| `llama-rs/src/e2e/mlp.rs` | Added `PersistentMlp`, `step()`, `build_persistent_mlp()`, `recommended_persistent_mlp_memory()` |
+| `llama-rs/src/e2e/generation.rs` | Added `PersistentMlpSets`, `try_build_persistent_mlps()`; updated `process_all_layers`, `persistent_decode_all_layers`, `two_phase_loop` |
+| `llama-rs/src/e2e/session.rs` | Updated 3 `process_all_layers` call sites |
 - `DecodeStrategy` preserved as reference implementation for `full_reprocess_loop`

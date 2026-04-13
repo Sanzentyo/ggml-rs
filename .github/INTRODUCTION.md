@@ -268,6 +268,14 @@ And you should write rusty code(ADT, enum, type state pattern)
   state management, and GPU offloading. Covers separate vs unified QKV,
   Q+gate interleaving, sliding window buffer, fused projection+conv graph,
   and `ggml_ssm_conv` primitive usage. See comparison doc item 27.
+- **Persistent MLP graphs** (item 28):
+  Pre-built MLP compute graphs with weights resident on device. Eliminates
+  ~165 MB weight upload per layer per token (~5.3 GB across 32 layers).
+  `PersistentMlp` struct holds fixed `seq_len=1` graph (`rms_norm → mul →
+  silu(gate) × up → down`). Per-step cost: ~12 KB I/O vs ~165 MB ephemeral.
+  Per-layer opportunistic (failed layers fall back to ephemeral). Integrated
+  into `two_phase_loop` with early-return when `remaining_decode_steps == 0`.
+  See comparison doc item 28.
 
 ## Validation checkpoints completed on this branch
 

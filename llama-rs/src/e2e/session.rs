@@ -428,6 +428,7 @@ impl GenerationSession {
                 prompt_token_count,
                 self.rms_norm_eps,
                 &self.backend,
+                &mut [],
             )?;
 
             self.prefill_done = true;
@@ -459,6 +460,7 @@ impl GenerationSession {
             1,
             self.rms_norm_eps,
             &self.backend,
+            &mut [],
         )?;
 
         let next = self.sample_next(&hidden, 0)?;
@@ -483,6 +485,7 @@ impl GenerationSession {
             self.current_token_count,
             self.rms_norm_eps,
             &self.backend,
+            &mut [],
         )?;
 
         let last_index = self
