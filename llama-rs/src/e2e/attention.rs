@@ -423,6 +423,92 @@ struct QkvProjections {
     v_proj: Vec<f32>,
 }
 
+/// Validated derived dimensions for full (gated) attention.
+///
+/// Constructed once from `Qwen35FullAttentionLayerPlan`, validates all
+/// dimension invariants upfront: GQA divisibility, hidden size consistency,
+/// and weight buffer lengths.
+#[derive(Debug, Clone, Copy)]
+struct FullAttentionDims {
+    /// Per-head feature dimension (D).
+    d: usize,
+    /// Number of query/gate heads (H).
+    h: usize,
+    /// Number of KV heads (Hkv ≤ H, for GQA).
+    hkv: usize,
+    /// Model hidden size (`H * D`, derived from output weight matrix).
+    hidden: usize,
+    /// Total query features (`H * D`).
+    qf: usize,
+    /// Total Q+gate interleaved features (`H * D * 2`).
+    qf2: usize,
+    /// Total KV features per tensor (`Hkv * D`).
+    kvf: usize,
+}
+
+impl FullAttentionDims {
+    fn new(attention: &Qwen35FullAttentionLayerPlan) -> Result<Self, E2eError> {
+        let d = attention.head_dimension;
+        let h = attention.head_count;
+        let hkv = attention.kv_head_count;
+
+        let hidden = h
+            .checked_mul(d)
+            .and_then(|qf| attention.output_weight_values.len().checked_div(qf))
+            .filter(|&hid| hid > 0 && hid * h * d == attention.output_weight_values.len())
+            .ok_or(E2eError::BufferLengthMismatch {
+                expected: 1,
+                actual: 0,
+            })?;
+
+        if !h.is_multiple_of(hkv) {
+            return Err(E2eError::BufferLengthMismatch {
+                expected: 0,
+                actual: h % hkv,
+            });
+        }
+
+        let qf = h * d;
+        let qf2 = qf * 2;
+        let kvf = hkv * d;
+
+        Ok(Self {
+            d,
+            h,
+            hkv,
+            hidden,
+            qf,
+            qf2,
+            kvf,
+        })
+    }
+
+    /// Conservative memory estimate for the fully-fused attention graph.
+    fn estimate_memory(&self, t: usize) -> Bytes {
+        let Self {
+            d,
+            h: _,
+            hkv: _,
+            hidden,
+            qf,
+            qf2,
+            kvf,
+        } = *self;
+        let weight_bytes = (hidden * qf2 + hidden * kvf * 2 + qf * hidden + d * 2 + hidden) * 4;
+        let data_bytes = (hidden * t * 2
+            + qf2 * t
+            + kvf * t * 2
+            + qf * t * 4
+            + kvf * t * 2
+            + qf * t * 3
+            + t * t
+            + hidden * t)
+            * 4;
+        let mask_bytes_estimate = t * t * 2; // f16
+        Bytes::new((weight_bytes + data_bytes + mask_bytes_estimate) * 2 + 1_048_576)
+    }
+}
+
 /// Compute Q, K, V projections using a single ggml compute graph.
 ///
 /// Batches three `mul_mat` operations sharing the same input tensor into one
@@ -811,29 +897,17 @@ fn fully_fused_attention_graph(
     use super::numeric::build_causal_mask_f16_bytes;
     use ggml_rs::{Dims, Length, RopeExtParams, Type};
 
-    let d = attention.head_dimension;
-    let h = attention.head_count;
-    let hkv = attention.kv_head_count;
-    let hidden = attention
-        .head_count
-        .checked_mul(d)
-        .and_then(|qf| attention.output_weight_values.len().checked_div(qf))
-        .filter(|&hid| hid > 0 && hid * h * d == attention.output_weight_values.len())
-        .ok_or(E2eError::BufferLengthMismatch {
-            expected: 1,
-            actual: 0,
-        })?;
+    let dims = FullAttentionDims::new(attention)?;
+    let FullAttentionDims {
+        d,
+        h,
+        hkv,
+        hidden,
+        qf,
+        qf2,
+        kvf,
+    } = dims;
 
-    if !h.is_multiple_of(hkv) {
-        return Err(E2eError::BufferLengthMismatch {
-            expected: 0,
-            actual: h % hkv,
-        });
-    }
-
-    let qf = h * d;
-    let qf2 = qf * 2; // Q + gate interleaved
-    let kvf = hkv * d;
     let expected_input = checked_mul(hidden, t)?;
     if input.len() != expected_input {
         return Err(E2eError::BufferLengthMismatch {
@@ -842,22 +916,7 @@ fn fully_fused_attention_graph(
         });
     }
 
-    // Memory estimate: all weights + input + intermediates + mask + overhead.
-    // Conservative: sum all tensor sizes × 4 for ggml overhead.
-    // +hidden for norm weight, +hidden*t for normed intermediate
-    let weight_bytes = (hidden * qf2 + hidden * kvf * 2 + qf * hidden + d * 2 + hidden) * 4;
-    let data_bytes = (hidden * t * 2
-        + qf2 * t
-        + kvf * t * 2
-        + qf * t * 4
-        + kvf * t * 2
-        + qf * t * 3
-        + t * t
-        + hidden * t)
-        * 4;
-    let mask_bytes_estimate = t * t * 2; // f16
-    let mem = Bytes::new((weight_bytes + data_bytes + mask_bytes_estimate) * 2 + 1_048_576);
-    let ctx = Context::new_no_alloc_bytes(mem)
+    let ctx = Context::new_no_alloc_bytes(dims.estimate_memory(t))
         .map_err(|source| E2eError::ggml("Context::new(fully_fused_attn)", source))?;
 
     // --- Input tensors ---
