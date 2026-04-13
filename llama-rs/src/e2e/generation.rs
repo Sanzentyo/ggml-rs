@@ -11,9 +11,10 @@
 //! [`PrefillStrategy`] (captures state), and [`DecodeStrategy`] (uses state).
 
 use super::attention::{
-    PersistentKvCache, build_persistent_kv_cache, full_attention_decode_core,
-    full_attention_hidden_features, prepare_qkv_from_raw, qwen35_full_attention_decode_step,
-    qwen35_full_attention_inference, qwen35_full_attention_prefill,
+    PersistentKvCache, PersistentScoringContext, build_persistent_kv_cache,
+    full_attention_decode_core, full_attention_hidden_features, prepare_qkv_from_raw,
+    qwen35_full_attention_decode_step, qwen35_full_attention_inference,
+    qwen35_full_attention_prefill,
 };
 use super::config::{E2eGenerationConfig, E2eGenerationReport};
 use super::decode::decode_norm_tensor;
@@ -613,6 +614,7 @@ fn persistent_decode_all_layers(
     projections: &mut [Option<PersistentDecodeProjection<'static>>],
     kv_caches: &[Option<PersistentKvCache<'static>>],
     persistent_mlps: &mut [Option<PersistentMlp<'static>>],
+    mut scoring_ctx: Option<&mut PersistentScoringContext>,
     state: &mut GenerationState,
     hidden_features: usize,
     rms_norm_eps: f32,
@@ -641,12 +643,14 @@ fn persistent_decode_all_layers(
                     let hf = full_attention_hidden_features(attn)?;
                     let prepared =
                         prepare_qkv_from_raw(attn, q_full, k_proj, v_proj, 1, hf, rms_norm_eps)?;
+                    let sc = scoring_ctx.as_deref_mut();
                     let head_outputs = full_attention_decode_core(
                         prepared,
                         attn,
                         s,
                         Some(backend),
                         kv_caches[layer_idx].as_ref(),
+                        sc,
                     )?;
                     proj.project_output(&head_outputs, backend)?
                 }
@@ -1104,6 +1108,31 @@ fn two_phase_loop(
             kv_caches
         };
 
+        // Build persistent scoring context (pre-reserved graph allocator for FA scoring).
+        // Uses the first full-attention layer's plan + KV cache as the reservation template.
+        // All FA layers share the same dimensions, so one allocator suffices.
+        let mut scoring_ctx = kv_caches_for_decode
+            .iter()
+            .zip(inputs.layer_plans.iter())
+            .find_map(|(kv, lp)| {
+                if let (Some(kv), Some(AttentionLayerPlan::Qwen35Full(attn))) =
+                    (kv, lp.attention.as_ref())
+                {
+                    Some((attn, kv))
+                } else {
+                    None
+                }
+            })
+            .and_then(|(attn, kv)| {
+                PersistentScoringContext::new(
+                    attn,
+                    inputs.total_sequence_length,
+                    kv,
+                    inputs.backend,
+                )
+                .ok()
+            });
+
         // Persistent path: no per-token weight upload.
         for _step in 1..inputs.max_new_tokens {
             let new_token_id = all_token_ids[*current_token_count - 1];
@@ -1120,6 +1149,7 @@ fn two_phase_loop(
                 &mut decode_projs,
                 kv_caches_for_decode,
                 &mut persistent_mlps,
+                scoring_ctx.as_mut(),
                 &mut state,
                 inputs.hidden_features,
                 inputs.rms_norm_eps,

@@ -10,7 +10,7 @@ use super::state::Qwen35FullAttentionState;
 use super::tensor_ops::{
     PROJECTION_SLACK_BYTES, per_head_rms_norm, project_sequence, project_sequence_graph,
 };
-use ggml_rs::{Backend, BackendBuffer, Bytes, Context, Shape2D, Shape4D, Tensor};
+use ggml_rs::{Backend, BackendBuffer, Bytes, Context, GraphAllocator, Shape2D, Shape4D, Tensor};
 
 /// Backend-resident KV cache for GPU-accelerated attention scoring.
 ///
@@ -130,42 +130,80 @@ pub(super) fn build_persistent_kv_cache(
     Ok((ctx, cache))
 }
 
-/// GPU-accelerated scoring using persistent backend-resident KV cache.
+/// Pre-reserved graph allocator for GPU-accelerated attention scoring.
 ///
-/// Instead of uploading the entire KV cache each step, creates cross-context
-/// views into the persistent tensors for the active prefix `[D, Hkv, T]`.
-fn decode_scoring_gpu_persistent(
-    q_values: &[f32],
-    q_gate: &[f32],
-    total_tokens: usize,
+/// Eliminates per-step Metal buffer allocation by pre-reserving a buffer
+/// large enough for the maximum-T scoring graph. Each step reuses this
+/// buffer via [`GraphAllocator::alloc_graph`] instead of calling
+/// [`Context::allocate_tensors`].
+///
+/// One `PersistentScoringContext` can be shared across all full-attention
+/// layers with the same dimensions (decode runs layers serially, so the
+/// buffer is safely reused).
+pub(super) struct PersistentScoringContext {
+    gallocr: GraphAllocator,
+}
+
+impl PersistentScoringContext {
+    /// Build a persistent scoring context by reserving a buffer for the
+    /// worst-case (max_tokens) scoring graph topology.
+    pub(super) fn new(
+        attention: &Qwen35FullAttentionLayerPlan,
+        max_tokens: usize,
+        kv_cache: &PersistentKvCache<'static>,
+        backend: &Backend,
+    ) -> Result<Self, E2eError> {
+        let mut gallocr = GraphAllocator::new(backend)
+            .map_err(|source| E2eError::ggml("GraphAllocator::new(scoring)", source))?;
+
+        // Build a reservation graph at max_tokens to determine buffer size.
+        let ctx = Context::new_no_alloc(2 * 1024 * 1024)
+            .map_err(|source| E2eError::ggml("ctx(scoring_reserve)", source))?;
+        let sg = build_scoring_graph(&ctx, attention, max_tokens, kv_cache)?;
+
+        gallocr
+            .reserve(&sg.graph)
+            .map_err(|source| E2eError::ggml("gallocr.reserve(scoring)", source))?;
+
+        Ok(Self { gallocr })
+    }
+}
+
+/// Intermediate result from [`build_scoring_graph`] holding all tensors
+/// needed for data upload and result readback.
+struct ScoringGraph<'ctx> {
+    q: Tensor<'ctx, f32>,
+    gate: Tensor<'ctx, f32>,
+    gated: Tensor<'ctx, f32>,
+    graph: ggml_rs::Graph<'ctx>,
+}
+
+/// Build the scoring compute graph for a given number of tokens.
+///
+/// The graph's tensors are not yet allocated — the caller must use either
+/// `allocate_tensors` or `GraphAllocator::alloc_graph` before writing data
+/// and computing.
+fn build_scoring_graph<'ctx>(
+    ctx: &'ctx Context,
     attention: &Qwen35FullAttentionLayerPlan,
-    query_features: usize,
+    total_tokens: usize,
     kv_cache: &PersistentKvCache<'static>,
-    backend: &Backend,
-) -> Result<Vec<f32>, E2eError> {
+) -> Result<ScoringGraph<'ctx>, E2eError> {
     let d = attention.head_dimension;
     let h = attention.head_count;
     let hkv = attention.kv_head_count;
     let t = total_tokens;
     let elem = std::mem::size_of::<f32>();
 
-    // Ephemeral scoring context — creates views into persistent KV tensors.
-    let ctx = Context::new_no_alloc(2 * 1024 * 1024)
-        .map_err(|source| E2eError::ggml("ctx(scoring_persistent)", source))?;
-
-    // Q: [D, T_q=1, H, 1]
     let q = ctx
         .new_tensor_4d::<f32>(Shape4D::new(d, 1, h, 1))
         .map_err(|source| E2eError::ggml("q_tensor", source))?;
-    // Gate: [D, H, 1, 1]
     let gate = ctx
         .new_tensor_4d::<f32>(Shape4D::new(d, h, 1, 1))
         .map_err(|source| E2eError::ggml("gate_tensor", source))?;
 
-    // Cross-context views into persistent KV tensors for active prefix.
-    // Persistent layout: [D, Hkv, MaxT, 1]; we view [D, Hkv, T, 1].
-    let nb1 = d * elem; // stride between KV heads
-    let nb2 = d * hkv * elem; // stride between time steps
+    let nb1 = d * elem;
+    let nb2 = d * hkv * elem;
     let k_view = ctx
         .view_4d_of(&kv_cache.k_tensor, d, hkv, t, 1, nb1, nb2, nb2 * t, 0)
         .map_err(|source| E2eError::ggml("view_4d_of(K)", source))?;
@@ -173,7 +211,6 @@ fn decode_scoring_gpu_persistent(
         .view_4d_of(&kv_cache.v_tensor, d, hkv, t, 1, nb1, nb2, nb2 * t, 0)
         .map_err(|source| E2eError::ggml("view_4d_of(V)", source))?;
 
-    // Permute [D, Hkv, T, 1] → [D, T, Hkv, 1] + make contiguous.
     let k_perm = ctx
         .permute(&k_view, 0, 2, 1, 3)
         .map_err(|source| E2eError::ggml("permute(K)", source))?;
@@ -187,12 +224,10 @@ fn decode_scoring_gpu_persistent(
         .cont(&v_perm)
         .map_err(|source| E2eError::ggml("cont(V)", source))?;
 
-    // flash_attn_ext: Q·K scoring + softmax + V aggregation.
     let attn = ctx
         .flash_attn_ext(&q, &k, &v, None, attention.attention_scale, 0.0, 0.0)
-        .map_err(|source| E2eError::ggml("flash_attn_ext(persistent)", source))?;
+        .map_err(|source| E2eError::ggml("flash_attn_ext", source))?;
 
-    // Gating: sigmoid(gate) ⊙ attn
     let gate_sig = ctx
         .sigmoid(&gate)
         .map_err(|source| E2eError::ggml("sigmoid(gate)", source))?;
@@ -200,27 +235,70 @@ fn decode_scoring_gpu_persistent(
         .mul(&attn, &gate_sig)
         .map_err(|source| E2eError::ggml("mul(attn,gate)", source))?;
 
-    // Build graph → allocate ephemeral tensors (Q, gate, intermediates).
     let mut graph = ctx
         .new_graph()
-        .map_err(|source| E2eError::ggml("new_graph(scoring_persistent)", source))?;
+        .map_err(|source| E2eError::ggml("new_graph(scoring)", source))?;
     graph.build_forward_expand(&gated);
 
-    let _buffer = ctx
-        .allocate_tensors(backend)
-        .map_err(|source| E2eError::ggml("allocate(scoring_persistent)", source))?;
+    Ok(ScoringGraph {
+        q,
+        gate,
+        gated,
+        graph,
+    })
+}
+
+/// GPU-accelerated scoring using persistent backend-resident KV cache.
+///
+/// Instead of uploading the entire KV cache each step, creates cross-context
+/// views into the persistent tensors for the active prefix `[D, Hkv, T]`.
+///
+/// When a `PersistentScoringContext` is provided, its pre-reserved buffer is
+/// reused (no per-step Metal buffer allocation). Otherwise, falls back to
+/// `allocate_tensors` per step.
+fn decode_scoring_gpu_persistent(
+    q_values: &[f32],
+    q_gate: &[f32],
+    total_tokens: usize,
+    attention: &Qwen35FullAttentionLayerPlan,
+    kv_cache: &PersistentKvCache<'static>,
+    backend: &Backend,
+    scoring_ctx: Option<&mut PersistentScoringContext>,
+) -> Result<Vec<f32>, E2eError> {
+    let query_features = attention.head_dimension * attention.head_count;
+
+    // Ephemeral scoring context — creates views into persistent KV tensors.
+    let ctx = Context::new_no_alloc(2 * 1024 * 1024)
+        .map_err(|source| E2eError::ggml("ctx(scoring_persistent)", source))?;
+
+    let mut sg = build_scoring_graph(&ctx, attention, total_tokens, kv_cache)?;
+
+    // Allocate: use pre-reserved gallocr if available, otherwise per-step alloc.
+    let _buffer = if let Some(sc) = scoring_ctx {
+        sc.gallocr
+            .alloc_graph(&mut sg.graph)
+            .map_err(|source| E2eError::ggml("gallocr.alloc_graph(scoring)", source))?;
+        None
+    } else {
+        Some(
+            ctx.allocate_tensors(backend)
+                .map_err(|source| E2eError::ggml("allocate(scoring_persistent)", source))?,
+        )
+    };
 
     // Upload only Q and gate — K/V are already on device.
-    q.write_data_backend(q_values)
+    sg.q.write_data_backend(q_values)
         .map_err(|source| E2eError::ggml("write(Q)", source))?;
-    gate.write_data_backend(q_gate)
+    sg.gate
+        .write_data_backend(q_gate)
         .map_err(|source| E2eError::ggml("write(gate)", source))?;
 
     backend
-        .compute(&mut graph)
+        .compute(&mut sg.graph)
         .map_err(|source| E2eError::ggml("compute(scoring_persistent)", source))?;
 
-    let outputs = gated
+    let outputs = sg
+        .gated
         .read_data_backend()
         .map_err(|source| E2eError::ggml("read(gated)", source))?;
 
@@ -1139,6 +1217,7 @@ pub(super) fn full_attention_decode_core(
     state: &mut Qwen35FullAttentionState,
     backend: Option<&Backend>,
     persistent_kv: Option<&PersistentKvCache<'static>>,
+    scoring_ctx: Option<&mut PersistentScoringContext>,
 ) -> Result<Vec<f32>, E2eError> {
     let PreparedAttention {
         mut q_values,
@@ -1200,9 +1279,9 @@ pub(super) fn full_attention_decode_core(
             &q_gate,
             total_tokens,
             attention,
-            query_features,
             kv,
             backend,
+            scoring_ctx,
         ) {
             return Ok(outputs);
         }
@@ -1272,7 +1351,8 @@ pub(super) fn qwen35_full_attention_decode_step(
     let prepared = project_and_prepare_qkv(attention, input, 1, rms_norm_eps, Some(backend))?;
     let hidden_features = prepared.hidden_features;
     let query_features = prepared.query_features;
-    let head_outputs = full_attention_decode_core(prepared, attention, state, Some(backend), None)?;
+    let head_outputs =
+        full_attention_decode_core(prepared, attention, state, Some(backend), None, None)?;
 
     project_sequence_graph(
         &head_outputs,
@@ -1564,14 +1644,21 @@ mod tests {
         let prepared_host =
             project_and_prepare_qkv(&plan, &normalized, 1, 1e-5, Some(&backend)).unwrap();
         let host_out =
-            full_attention_decode_core(prepared_host, &plan, &mut state_host, None, None).unwrap();
+            full_attention_decode_core(prepared_host, &plan, &mut state_host, None, None, None)
+                .unwrap();
 
         // GPU scoring: backend = Some.
         let prepared_gpu =
             project_and_prepare_qkv(&plan, &normalized, 1, 1e-5, Some(&backend)).unwrap();
-        let gpu_out =
-            full_attention_decode_core(prepared_gpu, &plan, &mut state_gpu, Some(&backend), None)
-                .unwrap();
+        let gpu_out = full_attention_decode_core(
+            prepared_gpu,
+            &plan,
+            &mut state_gpu,
+            Some(&backend),
+            None,
+            None,
+        )
+        .unwrap();
 
         assert_eq!(host_out.len(), gpu_out.len());
         for (i, (h, g)) in host_out.iter().zip(gpu_out.iter()).enumerate() {
