@@ -23,136 +23,158 @@ xxhash-rust = { version = "0.8", features = ["xxh64"] }
 [dev-dependencies]
 clap = { version = "4.5", features = ["derive"] }
 
+# --- Basics ---
+
 [[example]]
 name = "backend_smoke"
-path = "examples/backend_smoke.rs"
+path = "examples/basics/backend_smoke.rs"
 required-features = ["link-system"]
 
 [[example]]
 name = "simple"
-path = "examples/simple.rs"
+path = "examples/basics/simple.rs"
 required-features = ["link-system"]
 
-[[example]]
-name = "batched"
-path = "examples/batched.rs"
-required-features = ["link-system"]
+# --- Benchmarks ---
 
 [[example]]
 name = "bench_matmul"
-path = "examples/bench_matmul.rs"
+path = "examples/benchmarks/bench_matmul.rs"
 required-features = ["link-system"]
 
 [[example]]
 name = "bench_mlp_layer"
-path = "examples/bench_mlp_layer.rs"
+path = "examples/benchmarks/bench_mlp_layer.rs"
 required-features = ["link-system"]
 
 [[example]]
 name = "bench_attention_layer"
-path = "examples/bench_attention_layer.rs"
+path = "examples/benchmarks/bench_attention_layer.rs"
 required-features = ["link-system"]
 
 [[example]]
 name = "bench_attention_decode_cpp_compare"
-path = "examples/bench_attention_decode_cpp_compare.rs"
-required-features = ["link-system"]
-
-[[example]]
-name = "gguf_inspect"
-path = "examples/gguf_inspect.rs"
-required-features = ["link-system"]
-
-[[example]]
-name = "gguf"
-path = "examples/gguf.rs"
-required-features = ["link-system"]
-
-[[example]]
-name = "idle"
-path = "examples/idle.rs"
-required-features = ["link-system"]
-
-[[example]]
-name = "model_catalog"
-path = "examples/model_catalog.rs"
-required-features = ["link-system"]
-
-[[example]]
-name = "resolve_tensor_names"
-path = "examples/resolve_tensor_names.rs"
-required-features = ["link-system"]
-
-[[example]]
-name = "embedding_probe"
-path = "examples/embedding_probe.rs"
-required-features = ["link-system"]
-
-[[example]]
-name = "min_infer_linear"
-path = "examples/min_infer_linear.rs"
-required-features = ["link-system"]
-
-[[example]]
-name = "min_infer_mlp"
-path = "examples/min_infer_mlp.rs"
-required-features = ["link-system"]
-
-[[example]]
-name = "min_infer_mlp_layer"
-path = "examples/min_infer_mlp_layer.rs"
-required-features = ["link-system"]
-
-[[example]]
-name = "min_infer_attention_layer"
-path = "examples/min_infer_attention_layer.rs"
-required-features = ["link-system"]
-
-[[example]]
-name = "gguf_hash"
-path = "examples/gguf_hash.rs"
+path = "examples/benchmarks/bench_attention_decode_cpp_compare.rs"
 required-features = ["link-system"]
 
 [[example]]
 name = "bench_compare_report"
-path = "examples/bench_compare_report.rs"
+path = "examples/benchmarks/bench_compare_report.rs"
+
+# --- GGUF Utilities ---
 
 [[example]]
-name = "gpt2_ctx"
-path = "examples/gpt2_ctx.rs"
+name = "gguf_inspect"
+path = "examples/gguf/gguf_inspect.rs"
 required-features = ["link-system"]
 
 [[example]]
-name = "gpt2_alloc"
-path = "examples/gpt2_alloc.rs"
+name = "gguf"
+path = "examples/gguf/gguf.rs"
 required-features = ["link-system"]
 
 [[example]]
-name = "gpt2_backend"
-path = "examples/gpt2_backend.rs"
+name = "gguf_hash"
+path = "examples/gguf/gguf_hash.rs"
 required-features = ["link-system"]
 
 [[example]]
-name = "gpt2_sched"
-path = "examples/gpt2_sched.rs"
+name = "model_catalog"
+path = "examples/gguf/model_catalog.rs"
 required-features = ["link-system"]
 
 [[example]]
-name = "gpt2_batched"
-path = "examples/gpt2_batched.rs"
+name = "resolve_tensor_names"
+path = "examples/gguf/resolve_tensor_names.rs"
+required-features = ["link-system"]
+
+# --- Inference ---
+
+[[example]]
+name = "embedding_probe"
+path = "examples/inference/embedding_probe.rs"
 required-features = ["link-system"]
 
 [[example]]
-name = "gpt2_quantize"
-path = "examples/gpt2_quantize.rs"
+name = "min_infer_linear"
+path = "examples/inference/min_infer_linear.rs"
+required-features = ["link-system"]
+
+[[example]]
+name = "min_infer_mlp"
+path = "examples/inference/min_infer_mlp.rs"
+required-features = ["link-system"]
+
+[[example]]
+name = "min_infer_mlp_layer"
+path = "examples/inference/min_infer_mlp_layer.rs"
+required-features = ["link-system"]
+
+[[example]]
+name = "min_infer_attention_layer"
+path = "examples/inference/min_infer_attention_layer.rs"
 required-features = ["link-system"]
 
 [[example]]
 name = "e2e_generate_tokens"
-path = "examples/e2e_generate_tokens.rs"
+path = "examples/inference/e2e_generate_tokens.rs"
 required-features = ["link-system"]
 
 [[example]]
 name = "e2e_parity_harness"
-path = "examples/e2e_parity_harness.rs"
+path = "examples/inference/e2e_parity_harness.rs"
+required-features = ["link-system"]
+
+# --- Synthetic Models ---
+
+[[example]]
+name = "gpt2_ctx"
+path = "examples/models/gpt2_ctx.rs"
+required-features = ["link-system"]
+
+[[example]]
+name = "gpt2_alloc"
+path = "examples/models/gpt2_alloc.rs"
+required-features = ["link-system"]
+
+[[example]]
+name = "gpt2_backend"
+path = "examples/models/gpt2_backend.rs"
+required-features = ["link-system"]
+
+[[example]]
+name = "gpt2_sched"
+path = "examples/models/gpt2_sched.rs"
+required-features = ["link-system"]
+
+[[example]]
+name = "gpt2_batched"
+path = "examples/models/gpt2_batched.rs"
+required-features = ["link-system"]
+
+[[example]]
+name = "gpt2_quantize"
+path = "examples/models/gpt2_quantize.rs"
+required-features = ["link-system"]
+
+# --- Applications ---
+
+[[example]]
+name = "batched"
+path = "examples/applications/batched.rs"
+required-features = ["link-system"]
+
+[[example]]
+name = "idle"
+path = "examples/applications/idle.rs"
+required-features = ["link-system"]
+
+[[example]]
+name = "save_load_state"
+path = "examples/applications/save_load_state.rs"
+required-features = ["link-system"]
+
+[[example]]
+name = "simple_chat"
+path = "examples/applications/simple_chat.rs"
 required-features = ["link-system"]
