@@ -7,10 +7,7 @@ use super::error::E2eError;
 use super::numeric::{checked_mul, dot, sigmoid_scalar, softmax_prefix};
 use super::plan::Qwen35FullAttentionLayerPlan;
 use super::state::Qwen35FullAttentionState;
-use super::tensor_ops::{
-    PROJECTION_SLACK_BYTES, head_slice, head_slice_mut, per_head_rms_norm, project_sequence,
-    project_sequence_graph,
-};
+use super::tensor_ops::{PROJECTION_SLACK_BYTES, per_head_rms_norm, project_sequence};
 use ggml_rs::{Backend, Bytes, Context, Shape2D};
 
 pub(super) fn qwen35_full_attention_inference(
@@ -300,7 +297,7 @@ fn qwen35_full_attention_core(
         v_proj,
         q_gate,
         hidden_features,
-        query_features,
+        query_features: _,
     } = project_and_prepare_qkv(
         attention,
         input,
@@ -336,68 +333,19 @@ fn qwen35_full_attention_core(
         state.append_batch(&k_values, &v_proj, sequence_length)?;
     }
 
-    let groups = attention.head_count / attention.kv_head_count;
-    let mut head_outputs = vec![0.0_f32; checked_mul(sequence_length, query_features)?];
-    for token in 0..sequence_length {
-        for head in 0..attention.head_count {
-            let kv_head = head / groups;
-            let mut scores = vec![f32::NEG_INFINITY; sequence_length];
-            for (source, score) in scores.iter_mut().enumerate().take(token + 1) {
-                let q = head_slice(
-                    &q_values,
-                    token,
-                    head,
-                    attention.head_count,
-                    attention.head_dimension,
-                );
-                let k = head_slice(
-                    &k_values,
-                    source,
-                    kv_head,
-                    attention.kv_head_count,
-                    attention.head_dimension,
-                );
-                *score = dot(q, k) * attention.attention_scale;
-            }
-            let weights = softmax_prefix(&scores, token + 1);
-            let dst = head_slice_mut(
-                &mut head_outputs,
-                token,
-                head,
-                attention.head_count,
-                attention.head_dimension,
-            );
-            for (source, weight) in weights.iter().copied().enumerate() {
-                let v = head_slice(
-                    &v_proj,
-                    source,
-                    kv_head,
-                    attention.kv_head_count,
-                    attention.head_dimension,
-                );
-                for index in 0..attention.head_dimension {
-                    dst[index] += v[index] * weight;
-                }
-            }
-            let gate = head_slice(
-                &q_gate,
-                token,
-                head,
-                attention.head_count,
-                attention.head_dimension,
-            );
-            for index in 0..attention.head_dimension {
-                dst[index] *= sigmoid_scalar(gate[index]);
-            }
-        }
-    }
-
-    project_sequence_graph(
-        &head_outputs,
-        sequence_length,
-        query_features,
-        hidden_features,
+    // Fused attention scoring + gating + output projection via flash_attn_ext.
+    fused_attention_scoring_graph(
+        &q_values,
+        &k_values,
+        &v_proj,
+        &q_gate,
         &attention.output_weight_values,
+        attention.head_dimension,
+        sequence_length,
+        attention.head_count,
+        attention.kv_head_count,
+        hidden_features,
+        attention.attention_scale,
         backend,
     )
 }
@@ -510,7 +458,155 @@ pub(super) fn apply_neox_rope_in_place(
     Ok(())
 }
 
-/// Single-token decode step for Qwen3.5 full attention.
+/// Fused attention scoring + gating + output projection using flash_attn_ext.
+///
+/// Replaces the host-side O(T²·H·D) scoring loop with a single ggml graph:
+///   permute(Q/K/V) → flash_attn_ext → sigmoid(gate) → mul → reshape → mul_mat(output)
+///
+/// All input vectors use `[T, H, D]` host layout (= ggml `[D, H, T, 1]`).
+/// The causal mask is built as f16 per ggml CPU kernel requirements.
+#[allow(clippy::too_many_arguments)]
+fn fused_attention_scoring_graph(
+    q_values: &[f32],
+    k_values: &[f32],
+    v_proj: &[f32],
+    q_gate: &[f32],
+    output_weight: &[f32],
+    d: usize,
+    t: usize,
+    h: usize,
+    hkv: usize,
+    hidden: usize,
+    scale: f32,
+    backend: &Backend,
+) -> Result<Vec<f32>, E2eError> {
+    use super::numeric::build_causal_mask_f16_bytes;
+    use ggml_rs::{Dims, Shape4D, Type};
+
+    if !h.is_multiple_of(hkv) {
+        return Err(E2eError::BufferLengthMismatch {
+            expected: 0,
+            actual: h % hkv,
+        });
+    }
+
+    let qf = h * d;
+    let kvf = hkv * d;
+    let mask_elems = t * t;
+
+    // Memory: inputs + intermediates + mask + output weight + graph overhead.
+    let data_bytes = (qf * t + kvf * t * 2 + qf * t + mask_elems + qf * hidden + hidden * t) * 4;
+    let mem = Bytes::new(data_bytes * 4 + 524_288);
+    let ctx = Context::new_no_alloc_bytes(mem)
+        .map_err(|source| E2eError::ggml("Context::new_no_alloc_bytes(fused_attn)", source))?;
+
+    // Input tensors in host [T, H, D] layout = ggml [D, H, T, 1].
+    let q = ctx
+        .new_tensor_4d::<f32>(Shape4D::new(d, h, t, 1))
+        .map_err(|source| E2eError::ggml("new_tensor_4d<Q>", source))?;
+    let k = ctx
+        .new_tensor_4d::<f32>(Shape4D::new(d, hkv, t, 1))
+        .map_err(|source| E2eError::ggml("new_tensor_4d<K>", source))?;
+    let v = ctx
+        .new_tensor_4d::<f32>(Shape4D::new(d, hkv, t, 1))
+        .map_err(|source| E2eError::ggml("new_tensor_4d<V>", source))?;
+    let gate = ctx
+        .new_tensor_4d::<f32>(Shape4D::new(d, h, t, 1))
+        .map_err(|source| E2eError::ggml("new_tensor_4d<gate>", source))?;
+
+    // Causal mask as f16: [T, T, 1, 1].
+    let mask = ctx
+        .new_tensor(Type::F16, Dims::new([t, t, 1, 1]))
+        .map_err(|source| E2eError::ggml("new_tensor<mask>", source))?;
+
+    // Output weight: [H*D, hidden].
+    let w_out = ctx
+        .new_tensor_2d::<f32>(Shape2D::new(qf, hidden))
+        .map_err(|source| E2eError::ggml("new_tensor_2d<W_out>", source))?;
+
+    // Permute Q/K/V from [D, H, T, 1] to [D, T, H, 1] for flash_attn_ext.
+    let q_perm = ctx
+        .permute(&q, 0, 2, 1, 3)
+        .map_err(|source| E2eError::ggml("permute(Q)", source))?;
+    let k_perm = ctx
+        .permute(&k, 0, 2, 1, 3)
+        .map_err(|source| E2eError::ggml("permute(K)", source))?;
+    let v_perm = ctx
+        .permute(&v, 0, 2, 1, 3)
+        .map_err(|source| E2eError::ggml("permute(V)", source))?;
+
+    // flash_attn_ext may need contiguous inputs on some backends.
+    let q_cont = ctx
+        .cont(&q_perm)
+        .map_err(|source| E2eError::ggml("cont(Q)", source))?;
+    let k_cont = ctx
+        .cont(&k_perm)
+        .map_err(|source| E2eError::ggml("cont(K)", source))?;
+    let v_cont = ctx
+        .cont(&v_perm)
+        .map_err(|source| E2eError::ggml("cont(V)", source))?;
+
+    // Flash attention → [D, H, T, 1] (permuted output).
+    let attn = ctx
+        .flash_attn_ext(&q_cont, &k_cont, &v_cont, Some(&mask), scale, 0.0, 0.0)
+        .map_err(|source| E2eError::ggml("flash_attn_ext", source))?;
+
+    // Gate: sigmoid(gate) in [D, H, T, 1] — same layout as flash output.
+    let gate_sig = ctx
+        .sigmoid(&gate)
+        .map_err(|source| E2eError::ggml("sigmoid(gate)", source))?;
+
+    // Element-wise gating: attn * sigmoid(gate).
+    let gated = ctx
+        .mul(&attn, &gate_sig)
+        .map_err(|source| E2eError::ggml("mul(attn, sigmoid_gate)", source))?;
+
+    // Reshape for output projection: [D, H, T, 1] → [H*D, T].
+    // [D, H, T, 1] in memory is d-fastest, h-next, t-slowest — same as [H*D, T].
+    let gated_2d = ctx
+        .reshape_2d(&gated, qf, t)
+        .map_err(|source| E2eError::ggml("reshape_2d(gated)", source))?;
+
+    // Output projection: mul_mat(W_out, gated) → [hidden, T].
+    let output = ctx
+        .mul_mat(&w_out, &gated_2d)
+        .map_err(|source| E2eError::ggml("mul_mat(output)", source))?;
+
+    let mut graph = ctx
+        .new_graph()
+        .map_err(|source| E2eError::ggml("new_graph(fused_attn)", source))?;
+    graph.build_forward_expand(&output);
+
+    let _buffer = ctx
+        .allocate_tensors(backend)
+        .map_err(|source| E2eError::ggml("allocate_tensors(fused_attn)", source))?;
+
+    // Write input data.
+    q.write_data_backend(q_values)
+        .map_err(|source| E2eError::ggml("write<Q>", source))?;
+    k.write_data_backend(k_values)
+        .map_err(|source| E2eError::ggml("write<K>", source))?;
+    v.write_data_backend(v_proj)
+        .map_err(|source| E2eError::ggml("write<V>", source))?;
+    gate.write_data_backend(q_gate)
+        .map_err(|source| E2eError::ggml("write<gate>", source))?;
+
+    let mask_bytes = build_causal_mask_f16_bytes(t);
+    mask.write_bytes_backend(&mask_bytes)
+        .map_err(|source| E2eError::ggml("write<mask>", source))?;
+
+    w_out
+        .write_data_backend(output_weight)
+        .map_err(|source| E2eError::ggml("write<W_out>", source))?;
+
+    backend
+        .compute(&mut graph)
+        .map_err(|source| E2eError::ggml("compute(fused_attn)", source))?;
+
+    output
+        .read_data_backend()
+        .map_err(|source| E2eError::ggml("read<output>", source))
+}
 ///
 /// Processes one token using the KV cache accumulated during prefill (and
 /// previous decode steps). The new K/V are appended to `state` BEFORE attention
