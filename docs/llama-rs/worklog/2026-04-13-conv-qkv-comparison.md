@@ -174,7 +174,10 @@ llama-rs uses explicit `copy_from_slice`.
    uses graph-level zero-copy views and multi-threaded kernels. This is
    expected for a reference implementation vs production runtime.
 6. **Future optimization**: The `copy_from_slice` QKV splits now use
-   `chunks_exact` iterators, eliminating manual index arithmetic. Further
+   `chunks_exact` iterators, eliminating manual index arithmetic.
+   Projection and normalization logic is shared via extracted helpers
+   (`project_and_prepare_qkv`, `project_linear_inputs`, `split_and_norm_qk`),
+   reducing code duplication between prefill and decode paths. Further
    optimization (strided views) possible when ggml-rs safe API supports it.
 7. **Multi-layer orchestration verified**: `generation.rs` extracted a
    `GenerationMode` enum (`Auto | FullReprocess | TwoPhase`) and a

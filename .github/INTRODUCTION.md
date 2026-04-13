@@ -75,6 +75,11 @@ And you should write rusty code(ADT, enum, type state pattern)
   validation (was duplicated in prefill + decode paths). QKV split uses
   `chunks_exact` zip. Per-head norm functions use `chunks_exact_mut`.
   Conv inner loop uses `saturating_sub` for tap range. All 136 tests pass.
+- **Shared projection/normalization helpers**: Extracted `project_and_prepare_qkv`
+  + `PreparedAttention` in `attention.rs` and `project_linear_inputs` +
+  `LinearProjections` + `split_and_norm_qk` in `linear_attention.rs`. Shared by
+  core and decode_step paths. Validates dimension divisibility upfront. Decode
+  path borrows `v_raw` directly from conv output (avoids extra copy).
 
 ## Validation checkpoints completed on this branch
 
