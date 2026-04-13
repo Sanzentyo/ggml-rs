@@ -397,27 +397,29 @@ fn build_one_persistent_full(
     let ctx = Context::new_no_alloc_bytes(ctx_size)
         .map_err(|source| E2eError::ggml("Context(pfa)", source))?;
 
-    let (x_in, w_q, w_k, w_v, q_out, k_out, v_out, input_graph, out_x, w_out, out_y, output_graph) =
-        build_persistent_full_attention_graphs(
-            &ctx,
-            hidden_features,
-            query_features_x2,
-            kv_features,
-            query_features,
-        )?;
+    let g = build_persistent_full_attention_graphs(
+        &ctx,
+        hidden_features,
+        query_features_x2,
+        kv_features,
+        query_features,
+    )?;
 
     let buffer = ctx
         .allocate_tensors(backend)
         .map_err(|source| E2eError::ggml("allocate(pfa)", source))?;
 
     // Upload weights once.
-    w_q.write_data_backend(&attn.q_weight_values)
+    g.w_q
+        .write_data_backend(&attn.q_weight_values)
         .map_err(|source| E2eError::ggml("write<W_Q>(pfa)", source))?;
-    w_k.write_data_backend(&attn.k_weight_values)
+    g.w_k
+        .write_data_backend(&attn.k_weight_values)
         .map_err(|source| E2eError::ggml("write<W_K>(pfa)", source))?;
-    w_v.write_data_backend(&attn.v_weight_values)
+    g.w_v
+        .write_data_backend(&attn.v_weight_values)
         .map_err(|source| E2eError::ggml("write<W_V>(pfa)", source))?;
-    w_out
+    g.w_out
         .write_data_backend(&attn.output_weight_values)
         .map_err(|source| E2eError::ggml("write<W_OUT>(pfa)", source))?;
 
@@ -425,14 +427,14 @@ fn build_one_persistent_full(
     let proj = unsafe {
         std::mem::transmute::<PersistentDecodeProjection<'_>, PersistentDecodeProjection<'static>>(
             PersistentDecodeProjection::FullAttention {
-                x_in,
-                q_out,
-                k_out,
-                v_out,
-                input_graph,
-                out_x,
-                out_y,
-                output_graph,
+                x_in: g.x_in,
+                q_out: g.q_out,
+                k_out: g.k_out,
+                v_out: g.v_out,
+                input_graph: g.input_graph,
+                out_x: g.out_x,
+                out_y: g.out_y,
+                output_graph: g.output_graph,
                 _buffer: buffer,
             },
         )
@@ -458,22 +460,7 @@ fn build_one_persistent_linear(
     let ctx = Context::new_no_alloc_bytes(ctx_size)
         .map_err(|source| E2eError::ggml("Context(pla)", source))?;
 
-    let (
-        x_in,
-        w_qkv,
-        w_z,
-        w_alpha,
-        w_beta,
-        qkv_out,
-        z_out,
-        alpha_out,
-        beta_out,
-        input_graph,
-        out_x,
-        w_out,
-        out_y,
-        output_graph,
-    ) = build_persistent_linear_attention_graphs(
+    let g = build_persistent_linear_attention_graphs(
         &ctx,
         hidden_features,
         conv_channels,
@@ -485,33 +472,34 @@ fn build_one_persistent_linear(
         .allocate_tensors(backend)
         .map_err(|source| E2eError::ggml("allocate(pla)", source))?;
 
-    w_qkv
+    g.w_qkv
         .write_data_backend(&attn.qkv_weight_values)
         .map_err(|source| E2eError::ggml("write<W_QKV>(pla)", source))?;
-    w_z.write_data_backend(&attn.gate_weight_values)
+    g.w_z
+        .write_data_backend(&attn.gate_weight_values)
         .map_err(|source| E2eError::ggml("write<W_Z>(pla)", source))?;
-    w_alpha
+    g.w_alpha
         .write_data_backend(&attn.alpha_weight_values)
         .map_err(|source| E2eError::ggml("write<W_ALPHA>(pla)", source))?;
-    w_beta
+    g.w_beta
         .write_data_backend(&attn.beta_weight_values)
         .map_err(|source| E2eError::ggml("write<W_BETA>(pla)", source))?;
-    w_out
+    g.w_out
         .write_data_backend(&attn.ssm_out_weight_values)
         .map_err(|source| E2eError::ggml("write<W_OUT>(pla)", source))?;
 
     let proj = unsafe {
         std::mem::transmute::<PersistentDecodeProjection<'_>, PersistentDecodeProjection<'static>>(
             PersistentDecodeProjection::LinearAttention {
-                x_in,
-                qkv_out,
-                z_out,
-                alpha_out,
-                beta_out,
-                input_graph,
-                out_x,
-                out_y,
-                output_graph,
+                x_in: g.x_in,
+                qkv_out: g.qkv_out,
+                z_out: g.z_out,
+                alpha_out: g.alpha_out,
+                beta_out: g.beta_out,
+                input_graph: g.input_graph,
+                out_x: g.out_x,
+                out_y: g.out_y,
+                output_graph: g.output_graph,
                 _buffer: buffer,
             },
         )
@@ -638,22 +626,26 @@ impl LmHeadResources {
     ) -> Option<Self> {
         let ctx_size = recommended_lm_head_memory(hidden_features, vocab_size).ok()?;
         let ctx = Context::new_no_alloc_bytes(ctx_size).ok()?;
-        let (w_out, norm_w, x_in, logits_t, graph) =
-            build_lm_head_graph(&ctx, hidden_features, vocab_size, rms_norm_eps).ok()?;
+        let parts = build_lm_head_graph(&ctx, hidden_features, vocab_size, rms_norm_eps).ok()?;
         let buffer = ctx.allocate_tensors(backend).ok()?;
-        w_out.write_data_backend(output_weight_values).ok()?;
-        norm_w.write_data_backend(output_norm_values).ok()?;
+        parts.w_out.write_data_backend(output_weight_values).ok()?;
+        parts.norm_w.write_data_backend(output_norm_values).ok()?;
 
         // SAFETY: ctx and buffer kept alive as struct fields; drop order
         // (declaration order, top→bottom) ensures tensors/graph drop before ctx/buffer.
         let x_in = unsafe {
-            std::mem::transmute::<ggml_rs::Tensor<'_, f32>, ggml_rs::Tensor<'static, f32>>(x_in)
+            std::mem::transmute::<ggml_rs::Tensor<'_, f32>, ggml_rs::Tensor<'static, f32>>(
+                parts.x_in,
+            )
         };
         let logits_t = unsafe {
-            std::mem::transmute::<ggml_rs::Tensor<'_, f32>, ggml_rs::Tensor<'static, f32>>(logits_t)
+            std::mem::transmute::<ggml_rs::Tensor<'_, f32>, ggml_rs::Tensor<'static, f32>>(
+                parts.logits,
+            )
         };
-        let graph =
-            unsafe { std::mem::transmute::<ggml_rs::Graph<'_>, ggml_rs::Graph<'static>>(graph) };
+        let graph = unsafe {
+            std::mem::transmute::<ggml_rs::Graph<'_>, ggml_rs::Graph<'static>>(parts.graph)
+        };
         let _buffer = unsafe {
             std::mem::transmute::<ggml_rs::BackendBuffer<'_>, ggml_rs::BackendBuffer<'static>>(
                 buffer,

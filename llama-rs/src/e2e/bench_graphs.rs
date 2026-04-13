@@ -536,19 +536,25 @@ mod tests {
             // 3. Persistent graph (warm: weights pre-uploaded, measure step only)
             let ctx_size = recommended_lm_head_memory(hidden, vocab).expect("mem");
             let ctx = Context::new_no_alloc_bytes(ctx_size).expect("ctx");
-            let (w_out, norm_w, x_in, logits_t, mut graph) =
-                build_lm_head_graph(&ctx, hidden, vocab, eps).expect("build");
+            let mut parts = build_lm_head_graph(&ctx, hidden, vocab, eps).expect("build");
             let _buf = ctx.allocate_tensors(backend).expect("alloc");
-            w_out
+            parts
+                .w_out
                 .write_data_backend(&output_weight)
                 .expect("write w_out");
-            norm_w
+            parts
+                .norm_w
                 .write_data_backend(&norm_weight)
                 .expect("write norm_w");
 
             let avg = bench_fn(warmup, iters, || {
-                let tok =
-                    lm_head_sample_step(&hidden_state, &x_in, &logits_t, &mut graph, backend)?;
+                let tok = lm_head_sample_step(
+                    &hidden_state,
+                    &parts.x_in,
+                    &parts.logits,
+                    &mut parts.graph,
+                    backend,
+                )?;
                 Ok(vec![tok as f32])
             });
             results.push(BenchResult {

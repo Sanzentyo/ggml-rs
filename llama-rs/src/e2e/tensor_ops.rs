@@ -434,6 +434,23 @@ pub(super) fn lm_head_graph(
         .map_err(|source| E2eError::ggml("read<logits>", source))
 }
 
+/// Built parts of a persistent LM head graph.
+///
+/// Separates weight tensors (uploaded once) from I/O tensors (used per step).
+/// Returned by [`build_lm_head_graph`].
+pub(super) struct LmHeadGraphParts<'ctx> {
+    /// Weight tensor for output projection `[hidden_features, vocab_size]`.
+    pub w_out: Tensor<'ctx, f32>,
+    /// Weight tensor for RMS norm `[hidden_features]`.
+    pub norm_w: Tensor<'ctx, f32>,
+    /// Input tensor (hidden state) — written per step.
+    pub x_in: Tensor<'ctx, f32>,
+    /// Output tensor (logits) — read per step.
+    pub logits: Tensor<'ctx, f32>,
+    /// Compute graph: rms_norm → mul → reshape → mul_mat.
+    pub graph: Graph<'ctx>,
+}
+
 /// Build an LM head ggml graph (rms_norm → weight → matmul) in the given context.
 ///
 /// Returns `(x_input_tensor, logits_tensor, graph)`. The caller must:
@@ -448,16 +465,7 @@ pub(super) fn build_lm_head_graph<'ctx>(
     hidden_features: usize,
     vocab_size: usize,
     rms_norm_eps: f32,
-) -> Result<
-    (
-        Tensor<'ctx, f32>,
-        Tensor<'ctx, f32>,
-        Tensor<'ctx, f32>,
-        Tensor<'ctx, f32>,
-        Graph<'ctx>,
-    ),
-    E2eError,
-> {
+) -> Result<LmHeadGraphParts<'ctx>, E2eError> {
     let w_out = ctx
         .new_tensor_2d::<f32>(Shape2D::new(hidden_features, vocab_size))
         .map_err(|source| E2eError::ggml("new_tensor_2d<W_OUT>(plm)", source))?;
@@ -486,7 +494,13 @@ pub(super) fn build_lm_head_graph<'ctx>(
         .map_err(|source| E2eError::ggml("new_graph(plm)", source))?;
     graph.build_forward_expand(&logits);
 
-    Ok((w_out, norm_w, x_in, logits, graph))
+    Ok(LmHeadGraphParts {
+        w_out,
+        norm_w,
+        x_in,
+        logits,
+        graph,
+    })
 }
 
 /// Argmax over a logits vector — returns the token index with the highest value.
@@ -652,6 +666,32 @@ pub(super) fn recommended_persistent_linear_attention_memory(
     Ok(Bytes::new(total))
 }
 
+/// Built parts of a persistent full attention projection graph pair.
+///
+/// Returned by [`build_persistent_full_attention_graphs`].
+pub(super) struct FullAttentionGraphParts<'ctx> {
+    /// Input tensor (hidden state) — written per step.
+    pub x_in: Tensor<'ctx, f32>,
+    /// Weight tensors (uploaded once after allocation).
+    pub w_q: Tensor<'ctx, f32>,
+    pub w_k: Tensor<'ctx, f32>,
+    pub w_v: Tensor<'ctx, f32>,
+    /// Projection outputs — read per step.
+    pub q_out: Tensor<'ctx, f32>,
+    pub k_out: Tensor<'ctx, f32>,
+    pub v_out: Tensor<'ctx, f32>,
+    /// Input projection compute graph.
+    pub input_graph: Graph<'ctx>,
+    /// Output projection input tensor — written per step.
+    pub out_x: Tensor<'ctx, f32>,
+    /// Output projection weight tensor (uploaded once).
+    pub w_out: Tensor<'ctx, f32>,
+    /// Output projection result — read per step.
+    pub out_y: Tensor<'ctx, f32>,
+    /// Output projection compute graph.
+    pub output_graph: Graph<'ctx>,
+}
+
 /// Build a persistent full-attention input + output projection graph.
 ///
 /// Creates tensors and graph nodes in `ctx`. After calling this, the caller
@@ -659,30 +699,13 @@ pub(super) fn recommended_persistent_linear_attention_memory(
 ///
 /// Returns the constructed `PersistentDecodeProjection::FullAttention` variant
 /// (minus `_buffer` — the caller must attach it after allocation).
-#[allow(clippy::type_complexity)]
 pub(super) fn build_persistent_full_attention_graphs<'ctx>(
     ctx: &'ctx Context,
     hidden_features: usize,
     query_features_x2: usize,
     kv_features: usize,
     query_features: usize,
-) -> Result<
-    (
-        Tensor<'ctx, f32>, // x_in
-        Tensor<'ctx, f32>, // w_q
-        Tensor<'ctx, f32>, // w_k
-        Tensor<'ctx, f32>, // w_v
-        Tensor<'ctx, f32>, // q_out
-        Tensor<'ctx, f32>, // k_out
-        Tensor<'ctx, f32>, // v_out
-        Graph<'ctx>,       // input_graph
-        Tensor<'ctx, f32>, // out_x (input to output projection)
-        Tensor<'ctx, f32>, // w_out
-        Tensor<'ctx, f32>, // out_y (result)
-        Graph<'ctx>,       // output_graph
-    ),
-    E2eError,
-> {
+) -> Result<FullAttentionGraphParts<'ctx>, E2eError> {
     // Input projection tensors
     let w_q = ctx
         .new_tensor_2d::<f32>(Shape2D::new(hidden_features, query_features_x2))
@@ -730,7 +753,7 @@ pub(super) fn build_persistent_full_attention_graphs<'ctx>(
         .map_err(|source| E2eError::ggml("new_graph(pfa_out)", source))?;
     output_graph.build_forward_expand(&out_y);
 
-    Ok((
+    Ok(FullAttentionGraphParts {
         x_in,
         w_q,
         w_k,
@@ -743,36 +766,45 @@ pub(super) fn build_persistent_full_attention_graphs<'ctx>(
         w_out,
         out_y,
         output_graph,
-    ))
+    })
+}
+
+/// Built parts of a persistent linear attention projection graph pair.
+///
+/// Returned by [`build_persistent_linear_attention_graphs`].
+pub(super) struct LinearAttentionGraphParts<'ctx> {
+    /// Input tensor (hidden state) — written per step.
+    pub x_in: Tensor<'ctx, f32>,
+    /// Weight tensors (uploaded once after allocation).
+    pub w_qkv: Tensor<'ctx, f32>,
+    pub w_z: Tensor<'ctx, f32>,
+    pub w_alpha: Tensor<'ctx, f32>,
+    pub w_beta: Tensor<'ctx, f32>,
+    /// Projection outputs — read per step.
+    pub qkv_out: Tensor<'ctx, f32>,
+    pub z_out: Tensor<'ctx, f32>,
+    pub alpha_out: Tensor<'ctx, f32>,
+    pub beta_out: Tensor<'ctx, f32>,
+    /// Input projection compute graph.
+    pub input_graph: Graph<'ctx>,
+    /// Output projection input tensor — written per step.
+    pub out_x: Tensor<'ctx, f32>,
+    /// Output projection weight tensor (uploaded once).
+    pub w_out: Tensor<'ctx, f32>,
+    /// Output projection result — read per step.
+    pub out_y: Tensor<'ctx, f32>,
+    /// Output projection compute graph.
+    pub output_graph: Graph<'ctx>,
 }
 
 /// Build a persistent linear attention input + output projection graph.
-#[allow(clippy::type_complexity)]
 pub(super) fn build_persistent_linear_attention_graphs<'ctx>(
     ctx: &'ctx Context,
     hidden_features: usize,
     conv_channels: usize,
     inner_size: usize,
     time_step_rank: usize,
-) -> Result<
-    (
-        Tensor<'ctx, f32>, // x_in
-        Tensor<'ctx, f32>, // w_qkv
-        Tensor<'ctx, f32>, // w_z
-        Tensor<'ctx, f32>, // w_alpha
-        Tensor<'ctx, f32>, // w_beta
-        Tensor<'ctx, f32>, // qkv_out
-        Tensor<'ctx, f32>, // z_out
-        Tensor<'ctx, f32>, // alpha_out
-        Tensor<'ctx, f32>, // beta_out
-        Graph<'ctx>,       // input_graph
-        Tensor<'ctx, f32>, // out_x
-        Tensor<'ctx, f32>, // w_out
-        Tensor<'ctx, f32>, // out_y
-        Graph<'ctx>,       // output_graph
-    ),
-    E2eError,
-> {
+) -> Result<LinearAttentionGraphParts<'ctx>, E2eError> {
     let w_qkv = ctx
         .new_tensor_2d::<f32>(Shape2D::new(hidden_features, conv_channels))
         .map_err(|source| E2eError::ggml("new_tensor_2d<W_QKV>(pla)", source))?;
@@ -825,7 +857,7 @@ pub(super) fn build_persistent_linear_attention_graphs<'ctx>(
         .map_err(|source| E2eError::ggml("new_graph(pla_out)", source))?;
     output_graph.build_forward_expand(&out_y);
 
-    Ok((
+    Ok(LinearAttentionGraphParts {
         x_in,
         w_qkv,
         w_z,
@@ -840,7 +872,7 @@ pub(super) fn build_persistent_linear_attention_graphs<'ctx>(
         w_out,
         out_y,
         output_graph,
-    ))
+    })
 }
 
 impl<'ctx> PersistentDecodeProjection<'ctx> {
@@ -1140,18 +1172,26 @@ mod tests {
         // Persistent graph via build_lm_head_graph
         let ctx_size = recommended_lm_head_memory(hidden_features, vocab_size).expect("mem");
         let ctx = Context::new_no_alloc_bytes(ctx_size).expect("ctx");
-        let (w_out, norm_w, x_in, logits_t, mut graph) =
+        let mut parts =
             build_lm_head_graph(&ctx, hidden_features, vocab_size, rms_norm_eps).expect("build");
         let _buf = ctx.allocate_tensors(&backend).expect("alloc");
-        w_out
+        parts
+            .w_out
             .write_data_backend(&output_weight)
             .expect("write w_out");
-        norm_w
+        parts
+            .norm_w
             .write_data_backend(&norm_weight)
             .expect("write norm_w");
 
-        let step_token = lm_head_sample_step(&hidden_state, &x_in, &logits_t, &mut graph, &backend)
-            .expect("sample_step");
+        let step_token = lm_head_sample_step(
+            &hidden_state,
+            &parts.x_in,
+            &parts.logits,
+            &mut parts.graph,
+            &backend,
+        )
+        .expect("sample_step");
 
         assert_eq!(
             one_shot_token, step_token,
@@ -1195,36 +1235,23 @@ mod tests {
         let ctx_size =
             recommended_persistent_full_attention_memory(hidden, qf_x2, kv, qf).expect("mem");
         let ctx = Context::new_no_alloc_bytes(ctx_size).expect("ctx");
-        let (
-            x_in,
-            tw_q,
-            tw_k,
-            tw_v,
-            q_out,
-            k_out,
-            v_out,
-            input_graph,
-            out_x,
-            tw_out,
-            out_y,
-            output_graph,
-        ) = build_persistent_full_attention_graphs(&ctx, hidden, qf_x2, kv, qf).expect("build");
+        let g = build_persistent_full_attention_graphs(&ctx, hidden, qf_x2, kv, qf).expect("build");
         let _buf = ctx.allocate_tensors(&backend).expect("alloc");
 
-        tw_q.write_data_backend(&w_q).expect("write W_Q");
-        tw_k.write_data_backend(&w_k).expect("write W_K");
-        tw_v.write_data_backend(&w_v).expect("write W_V");
-        tw_out.write_data_backend(&w_out).expect("write W_OUT");
+        g.w_q.write_data_backend(&w_q).expect("write W_Q");
+        g.w_k.write_data_backend(&w_k).expect("write W_K");
+        g.w_v.write_data_backend(&w_v).expect("write W_V");
+        g.w_out.write_data_backend(&w_out).expect("write W_OUT");
 
         let mut proj = PersistentDecodeProjection::FullAttention {
-            x_in,
-            q_out,
-            k_out,
-            v_out,
-            input_graph,
-            out_x,
-            out_y,
-            output_graph,
+            x_in: g.x_in,
+            q_out: g.q_out,
+            k_out: g.k_out,
+            v_out: g.v_out,
+            input_graph: g.input_graph,
+            out_x: g.out_x,
+            out_y: g.out_y,
+            output_graph: g.output_graph,
             _buffer: _buf,
         };
         proj.project_input(&input, &backend).expect("project_input");
@@ -1308,43 +1335,28 @@ mod tests {
         let ctx_size = recommended_persistent_linear_attention_memory(hidden, conv_ch, inner, tsr)
             .expect("mem");
         let ctx = Context::new_no_alloc_bytes(ctx_size).expect("ctx");
-        let (
-            x_in,
-            tw_qkv,
-            tw_z,
-            tw_alpha,
-            tw_beta,
-            qkv_out,
-            z_out,
-            alpha_out,
-            beta_out,
-            input_graph,
-            out_x,
-            tw_out,
-            out_y,
-            output_graph,
-        ) = build_persistent_linear_attention_graphs(&ctx, hidden, conv_ch, inner, tsr)
+        let g = build_persistent_linear_attention_graphs(&ctx, hidden, conv_ch, inner, tsr)
             .expect("build");
         let _buf = ctx.allocate_tensors(&backend).expect("alloc");
 
-        tw_qkv.write_data_backend(&w_qkv).expect("write W_QKV");
-        tw_z.write_data_backend(&w_z).expect("write W_Z");
-        tw_alpha
+        g.w_qkv.write_data_backend(&w_qkv).expect("write W_QKV");
+        g.w_z.write_data_backend(&w_z).expect("write W_Z");
+        g.w_alpha
             .write_data_backend(&w_alpha)
             .expect("write W_ALPHA");
-        tw_beta.write_data_backend(&w_beta).expect("write W_BETA");
-        tw_out.write_data_backend(&w_out).expect("write W_OUT");
+        g.w_beta.write_data_backend(&w_beta).expect("write W_BETA");
+        g.w_out.write_data_backend(&w_out).expect("write W_OUT");
 
         let mut proj = PersistentDecodeProjection::LinearAttention {
-            x_in,
-            qkv_out,
-            z_out,
-            alpha_out,
-            beta_out,
-            input_graph,
-            out_x,
-            out_y,
-            output_graph,
+            x_in: g.x_in,
+            qkv_out: g.qkv_out,
+            z_out: g.z_out,
+            alpha_out: g.alpha_out,
+            beta_out: g.beta_out,
+            input_graph: g.input_graph,
+            out_x: g.out_x,
+            out_y: g.out_y,
+            output_graph: g.output_graph,
             _buffer: _buf,
         };
         proj.project_input(&input, &backend).expect("project_input");
