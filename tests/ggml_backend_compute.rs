@@ -211,6 +211,7 @@ fn multi_op_matmul_add_on_backend(kind: BackendKind) -> Result<(), Error> {
         b.write_data_backend(&[100.0_f32, 200.0, 300.0])?;
 
         backend.compute(&mut graph)?;
+        backend.synchronize()?;
 
         let output = result.read_data_backend()?;
         // W*x = [50, 110, 170], + b = [150, 310, 470]
@@ -259,6 +260,7 @@ fn backend_matmul_on(kind: BackendKind) -> Result<Vec<f32>, Error> {
         b.write_data_backend(&b_data)?;
 
         backend.compute(&mut graph)?;
+        backend.synchronize()?;
         result.read_data_backend()
     })
 }

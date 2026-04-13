@@ -83,6 +83,7 @@ fn run_backend(kind: BackendKind) -> Result<()> {
     b.write_data_backend(&MATRIX_B)?;
 
     backend.compute(&mut graph)?;
+    backend.synchronize()?;
 
     // `graph.last_node()` is the result tensor of this simple single-op graph.
     let output = graph.last_node_typed::<f32>()?;

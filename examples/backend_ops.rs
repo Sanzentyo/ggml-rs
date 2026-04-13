@@ -97,6 +97,10 @@ fn run_backend(kind: BackendKind) -> Result<()> {
     // Execute the graph.
     backend.compute(&mut graph)?;
 
+    // Ensure asynchronous backends (for example Metal) have completed
+    // execution before reading results back to the host.
+    backend.synchronize()?;
+
     // Read results back: backend → host.
     let output = result.read_data_backend()?;
 

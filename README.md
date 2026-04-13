@@ -87,7 +87,7 @@ let t1 = ctx.new_tensor_1d::<f32>(Length::new(128))?;
 let t3 = ctx.new_tensor_3d::<f32>(Shape3D::new(64, 32, 8))?;
 
 // Runtime-typed (any ggml type including quantized)
-let dyn_t = ctx.new_tensor::<2>(Type::Q4_K, Dims::new([64, 64]))?;
+let dyn_t = ctx.new_tensor::<2>(Type::Q4K, Dims::new([64, 64]))?;
 
 // Introspection
 let rank = t3.rank()?;        // 3
@@ -152,7 +152,7 @@ let head_count: Option<u32> = file.kv_value_as("llama.attention.head_count")?;
 
 ```rust
 // Decode quantized tensor data to f32
-let values: Vec<f32> = decode_tensor_data_to(tensor_type, raw_data, element_count)?;
+let values: Vec<f32> = decode_tensor_data_to(tensor_type, raw_data)?;
 ```
 
 ## llama-rs overview
