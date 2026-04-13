@@ -348,9 +348,9 @@ pub(super) fn recommended_lm_head_memory(
 
 /// One-shot LM head: rms_norm(hidden, eps) * norm_weight → matmul(output_weight).
 ///
-/// Takes a single token's hidden state `[hidden_features]` and returns logits
-/// `[vocab_size]`. For multi-step decode, prefer the inline persistent pattern
-/// used in `two_phase_loop` / `full_reprocess_loop` that uploads weights once.
+/// Kept as `#[cfg(test)]` reference implementation for parity tests and benchmarks.
+/// Production code uses the persistent `LmHeadResources` / `build_lm_head_graph` path.
+#[cfg(test)]
 pub(super) fn lm_head_graph(
     hidden_state: &[f32],
     norm_weight: &[f32],
