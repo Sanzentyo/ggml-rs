@@ -29,15 +29,38 @@ pub(super) fn qwen35_full_attention_prefill(
     qwen35_full_attention_core(attention, input, sequence_length, rms_norm_eps, Some(state))
 }
 
-fn qwen35_full_attention_core(
+/// Projected and normalized Q, K, V + gate vectors (pre-RoPE).
+struct PreparedAttention {
+    q_values: Vec<f32>,
+    k_values: Vec<f32>,
+    v_proj: Vec<f32>,
+    q_gate: Vec<f32>,
+    hidden_features: usize,
+    query_features: usize,
+}
+
+/// Shared projection + deinterleave + per-head RMS norm for both core and
+/// decode paths. The caller applies RoPE with its own position_offset.
+fn project_and_prepare_qkv(
     attention: &Qwen35FullAttentionLayerPlan,
     input: &[f32],
     sequence_length: usize,
     rms_norm_eps: f32,
-    state: Option<&mut Qwen35FullAttentionState>,
-) -> Result<Vec<f32>, E2eError> {
-    let hidden_features =
-        attention.output_weight_values.len() / attention.head_count / attention.head_dimension;
+) -> Result<PreparedAttention, E2eError> {
+    let total_output_elements = attention
+        .head_count
+        .checked_mul(attention.head_dimension)
+        .and_then(|qf| attention.output_weight_values.len().checked_div(qf))
+        .filter(|&h| {
+            h > 0
+                && h * attention.head_count * attention.head_dimension
+                    == attention.output_weight_values.len()
+        })
+        .ok_or(E2eError::BufferLengthMismatch {
+            expected: 1,
+            actual: 0,
+        })?;
+    let hidden_features = total_output_elements;
     let expected_input_len = checked_mul(hidden_features, sequence_length)?;
     if input.len() != expected_input_len {
         return Err(E2eError::BufferLengthMismatch {
@@ -70,11 +93,14 @@ fn qwen35_full_attention_core(
         &attention.v_weight_values,
     )?;
 
-    let hd = attention.head_dimension;
-    let (q_values, q_gate) =
-        deinterleave_q_gate(&q_full, sequence_length, attention.head_count, hd)?;
+    let (q_values, q_gate) = deinterleave_q_gate(
+        &q_full,
+        sequence_length,
+        attention.head_count,
+        attention.head_dimension,
+    )?;
 
-    let mut q_values = per_head_rms_norm(
+    let q_values = per_head_rms_norm(
         &q_values,
         sequence_length,
         attention.head_count,
@@ -82,7 +108,7 @@ fn qwen35_full_attention_core(
         &attention.q_norm_values,
         rms_norm_eps,
     )?;
-    let mut k_values = per_head_rms_norm(
+    let k_values = per_head_rms_norm(
         &k_proj,
         sequence_length,
         attention.kv_head_count,
@@ -90,6 +116,32 @@ fn qwen35_full_attention_core(
         &attention.k_norm_values,
         rms_norm_eps,
     )?;
+
+    Ok(PreparedAttention {
+        q_values,
+        k_values,
+        v_proj,
+        q_gate,
+        hidden_features,
+        query_features,
+    })
+}
+
+fn qwen35_full_attention_core(
+    attention: &Qwen35FullAttentionLayerPlan,
+    input: &[f32],
+    sequence_length: usize,
+    rms_norm_eps: f32,
+    state: Option<&mut Qwen35FullAttentionState>,
+) -> Result<Vec<f32>, E2eError> {
+    let PreparedAttention {
+        mut q_values,
+        mut k_values,
+        v_proj,
+        q_gate,
+        hidden_features,
+        query_features,
+    } = project_and_prepare_qkv(attention, input, sequence_length, rms_norm_eps)?;
 
     // Apply NeoX-style RoPE to Q and K after normalization.
     apply_neox_rope_in_place(
@@ -302,59 +354,16 @@ pub(super) fn qwen35_full_attention_decode_step(
     rms_norm_eps: f32,
     state: &mut Qwen35FullAttentionState,
 ) -> Result<Vec<f32>, E2eError> {
-    let hidden_features =
-        attention.output_weight_values.len() / attention.head_count / attention.head_dimension;
-    if input.len() != hidden_features {
-        return Err(E2eError::BufferLengthMismatch {
-            expected: hidden_features,
-            actual: input.len(),
-        });
-    }
+    let PreparedAttention {
+        mut q_values,
+        mut k_values,
+        v_proj,
+        q_gate,
+        hidden_features,
+        query_features,
+    } = project_and_prepare_qkv(attention, input, 1, rms_norm_eps)?;
 
-    let query_features = checked_mul(attention.head_count, attention.head_dimension)?;
-    let kv_features = checked_mul(attention.kv_head_count, attention.head_dimension)?;
-    let q_full = project_sequence(
-        input,
-        1,
-        hidden_features,
-        checked_mul(query_features, 2)?,
-        &attention.q_weight_values,
-    )?;
-    let k_proj = project_sequence(
-        input,
-        1,
-        hidden_features,
-        kv_features,
-        &attention.k_weight_values,
-    )?;
-    let v_proj = project_sequence(
-        input,
-        1,
-        hidden_features,
-        kv_features,
-        &attention.v_weight_values,
-    )?;
-
-    // De-interleave Q/Gate for single token.
     let hd = attention.head_dimension;
-    let (q_values, q_gate) = deinterleave_q_gate(&q_full, 1, attention.head_count, hd)?;
-
-    let mut q_values = per_head_rms_norm(
-        &q_values,
-        1,
-        attention.head_count,
-        attention.head_dimension,
-        &attention.q_norm_values,
-        rms_norm_eps,
-    )?;
-    let mut k_values = per_head_rms_norm(
-        &k_proj,
-        1,
-        attention.kv_head_count,
-        attention.head_dimension,
-        &attention.k_norm_values,
-        rms_norm_eps,
-    )?;
 
     // Position = number of tokens already in the cache.
     let position_offset = state.token_count();

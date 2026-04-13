@@ -32,14 +32,38 @@ pub(super) fn qwen35_linear_attention_prefill(
     qwen35_linear_attention_core(attention, input, sequence_length, rms_norm_eps, Some(state))
 }
 
-fn qwen35_linear_attention_core(
+/// Shared input projections for both core and decode paths.
+struct LinearProjections {
+    qkv: Vec<f32>,
+    z: Vec<f32>,
+    alpha: Vec<f32>,
+    beta: Vec<f32>,
+    conv_channels: usize,
+    hidden_features: usize,
+}
+
+/// Project input through QKV, gate, alpha, and beta weights. Validates
+/// input dimensions via checked arithmetic (catches malformed weights early).
+fn project_linear_inputs(
     attention: &Qwen35LinearAttentionLayerPlan,
     input: &[f32],
     sequence_length: usize,
-    rms_norm_eps: f32,
-    mut state: Option<&mut LinearAttentionState>,
-) -> Result<Vec<f32>, E2eError> {
-    let hidden_features = attention.ssm_out_weight_values.len() / attention.inner_size;
+) -> Result<LinearProjections, E2eError> {
+    let hidden_features = attention
+        .inner_size
+        .checked_div(1) // just for consistent error path
+        .filter(|&is| is > 0)
+        .and_then(|_| {
+            let total = attention.ssm_out_weight_values.len();
+            let is = attention.inner_size;
+            let h = total / is;
+            (h > 0 && h * is == total).then_some(h)
+        })
+        .ok_or(E2eError::BufferLengthMismatch {
+            expected: 1,
+            actual: 0,
+        })?;
+
     let expected_input_len = checked_mul(hidden_features, sequence_length)?;
     if input.len() != expected_input_len {
         return Err(E2eError::BufferLengthMismatch {
@@ -78,6 +102,75 @@ fn qwen35_linear_attention_core(
         attention.time_step_rank,
         &attention.beta_weight_values,
     )?;
+
+    Ok(LinearProjections {
+        qkv,
+        z,
+        alpha,
+        beta,
+        conv_channels,
+        hidden_features,
+    })
+}
+
+/// Split conv output into Q, K, V regions and L2-normalize Q and K heads.
+///
+/// Returns `(q_heads, k_heads)` — the caller retains ownership of `conv` for
+/// V slicing (avoids an extra copy).
+fn split_and_norm_qk(
+    conv: &[f32],
+    sequence_length: usize,
+    attention: &Qwen35LinearAttentionLayerPlan,
+    conv_channels: usize,
+    rms_norm_eps: f32,
+) -> Result<(Vec<f32>, Vec<f32>), E2eError> {
+    let qk_features = checked_mul(attention.group_count, attention.state_size)?;
+    let mut q_raw = vec![0.0_f32; checked_mul(sequence_length, qk_features)?];
+    let mut k_raw = vec![0.0_f32; q_raw.len()];
+    debug_assert_eq!(conv.len(), checked_mul(sequence_length, conv_channels)?);
+    for ((conv_row, q_dst), k_dst) in conv
+        .chunks_exact(conv_channels)
+        .zip(q_raw.chunks_exact_mut(qk_features))
+        .zip(k_raw.chunks_exact_mut(qk_features))
+    {
+        q_dst.copy_from_slice(&conv_row[..qk_features]);
+        k_dst.copy_from_slice(&conv_row[qk_features..qk_features * 2]);
+    }
+
+    let q_heads = per_head_l2_norm(
+        &q_raw,
+        sequence_length,
+        attention.group_count,
+        attention.state_size,
+        rms_norm_eps,
+    )?;
+    let k_heads = per_head_l2_norm(
+        &k_raw,
+        sequence_length,
+        attention.group_count,
+        attention.state_size,
+        rms_norm_eps,
+    )?;
+
+    Ok((q_heads, k_heads))
+}
+
+fn qwen35_linear_attention_core(
+    attention: &Qwen35LinearAttentionLayerPlan,
+    input: &[f32],
+    sequence_length: usize,
+    rms_norm_eps: f32,
+    mut state: Option<&mut LinearAttentionState>,
+) -> Result<Vec<f32>, E2eError> {
+    let LinearProjections {
+        qkv,
+        z,
+        alpha,
+        beta,
+        conv_channels,
+        hidden_features,
+    } = project_linear_inputs(attention, input, sequence_length)?;
+
     let conv = causal_depthwise_conv(
         &qkv,
         sequence_length,
@@ -92,35 +185,23 @@ fn qwen35_linear_attention_core(
     }
 
     let qk_features = checked_mul(attention.group_count, attention.state_size)?;
-    let mut q_heads = vec![0.0_f32; checked_mul(sequence_length, qk_features)?];
-    let mut k_heads = vec![0.0_f32; q_heads.len()];
+    let (q_heads, k_heads) = split_and_norm_qk(
+        &conv,
+        sequence_length,
+        attention,
+        conv_channels,
+        rms_norm_eps,
+    )?;
+
+    // Extract V from conv output (the region after Q and K).
     let mut v_heads = vec![0.0_f32; checked_mul(sequence_length, attention.inner_size)?];
-    debug_assert_eq!(conv.len(), checked_mul(sequence_length, conv_channels)?);
-    for (((conv_row, q_dst), k_dst), v_dst) in conv
+    for (conv_row, v_dst) in conv
         .chunks_exact(conv_channels)
-        .zip(q_heads.chunks_exact_mut(qk_features))
-        .zip(k_heads.chunks_exact_mut(qk_features))
         .zip(v_heads.chunks_exact_mut(attention.inner_size))
     {
-        q_dst.copy_from_slice(&conv_row[..qk_features]);
-        k_dst.copy_from_slice(&conv_row[qk_features..qk_features * 2]);
         v_dst.copy_from_slice(&conv_row[qk_features * 2..]);
     }
 
-    let q_heads = per_head_l2_norm(
-        &q_heads,
-        sequence_length,
-        attention.group_count,
-        attention.state_size,
-        rms_norm_eps,
-    )?;
-    let k_heads = per_head_l2_norm(
-        &k_heads,
-        sequence_length,
-        attention.group_count,
-        attention.state_size,
-        rms_norm_eps,
-    )?;
     if !attention
         .time_step_rank
         .is_multiple_of(attention.group_count)
@@ -412,71 +493,24 @@ pub(super) fn qwen35_linear_attention_decode_step(
     rms_norm_eps: f32,
     state: &mut LinearAttentionState,
 ) -> Result<Vec<f32>, E2eError> {
-    let hidden_features = attention.ssm_out_weight_values.len() / attention.inner_size;
-    if input.len() != hidden_features {
-        return Err(E2eError::BufferLengthMismatch {
-            expected: hidden_features,
-            actual: input.len(),
-        });
-    }
-
-    let conv_channels = attention.inner_size
-        + checked_mul(checked_mul(attention.group_count, attention.state_size)?, 2)?;
-
-    // Project single token.
-    let qkv = project_sequence(
-        input,
-        1,
-        hidden_features,
+    let LinearProjections {
+        qkv,
+        z,
+        alpha,
+        beta,
         conv_channels,
-        &attention.qkv_weight_values,
-    )?;
-    let z = project_sequence(
-        input,
-        1,
         hidden_features,
-        attention.inner_size,
-        &attention.gate_weight_values,
-    )?;
-    let alpha = project_sequence(
-        input,
-        1,
-        hidden_features,
-        attention.time_step_rank,
-        &attention.alpha_weight_values,
-    )?;
-    let beta = project_sequence(
-        input,
-        1,
-        hidden_features,
-        attention.time_step_rank,
-        &attention.beta_weight_values,
-    )?;
+    } = project_linear_inputs(attention, input, 1)?;
 
     // Conv: use buffer + new QKV row.
     let conv = causal_depthwise_conv_decode_step(&qkv, state, &attention.conv_weight_values)?;
 
-    // Split conv output into Q, K, V for a single token.
+    // Split conv output into Q, K and L2-normalize.
     let qk_features = checked_mul(attention.group_count, attention.state_size)?;
-    let q_raw = &conv[..qk_features];
-    let k_raw = &conv[qk_features..checked_mul(qk_features, 2)?];
-    let v_raw = &conv[checked_mul(qk_features, 2)?..conv_channels];
+    let (q_heads, k_heads) = split_and_norm_qk(&conv, 1, attention, conv_channels, rms_norm_eps)?;
 
-    // L2 norm Q and K.
-    let q_heads = per_head_l2_norm(
-        q_raw,
-        1,
-        attention.group_count,
-        attention.state_size,
-        rms_norm_eps,
-    )?;
-    let k_heads = per_head_l2_norm(
-        k_raw,
-        1,
-        attention.group_count,
-        attention.state_size,
-        rms_norm_eps,
-    )?;
+    // V is the region after Q and K — borrow directly from conv to avoid copy.
+    let v_raw = &conv[qk_features * 2..conv_channels];
 
     // One SSM recurrence step per head, using persisted states.
     let scale = 1.0_f32 / (attention.state_size as f32).sqrt();
