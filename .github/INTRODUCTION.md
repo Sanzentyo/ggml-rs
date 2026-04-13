@@ -158,6 +158,16 @@ And you should write rusty code(ADT, enum, type state pattern)
   CPU kernel requirements. Decode path (seq_len=1) unchanged. `f32_to_f16_bits` and
   `build_causal_mask_f16_bytes` added to `numeric.rs`. 182 tests pass.
 
+- **Fully fused single-graph full attention** (prefill):
+  Merged the previous two-graph pipeline (QKV projection → host deinterleave/norm/RoPE
+  → scoring) into a single ggml compute graph: `mul_mat(W_q/W_k/W_v, X) → strided
+  view_3d Q/gate deinterleave → rms_norm + weight broadcast → rope_ext (NeoX mode=2)
+  → permute → cont → flash_attn_ext → sigmoid(gate) → mul → reshape_2d → mul_mat(W_out)`.
+  Eliminates 10 host↔device transfers and 2 graph round-trips → single transfer of
+  weights/input + single compute + single readback. Post-RoPE K and raw V read back
+  conditionally for KV cache capture via `build_forward_expand`. Decode path (seq_len=1)
+  unchanged. 202 tests pass.
+
 ## Validation checkpoints completed on this branch
 
 - `cargo fmt --all`

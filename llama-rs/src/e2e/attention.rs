@@ -291,61 +291,12 @@ fn qwen35_full_attention_core(
     state: Option<&mut Qwen35FullAttentionState>,
     backend: &Backend,
 ) -> Result<Vec<f32>, E2eError> {
-    let PreparedAttention {
-        mut q_values,
-        mut k_values,
-        v_proj,
-        q_gate,
-        hidden_features,
-        query_features: _,
-    } = project_and_prepare_qkv(
+    fully_fused_attention_graph(
         attention,
         input,
         sequence_length,
         rms_norm_eps,
-        Some(backend),
-    )?;
-
-    // Apply NeoX-style RoPE to Q and K after normalization.
-    apply_neox_rope_in_place(
-        &mut q_values,
-        sequence_length,
-        attention.head_count,
-        attention.head_dimension,
-        attention.rope_n_dims,
-        attention.rope_freq_base,
-        attention.rope_freq_scale,
-        0,
-    )?;
-    apply_neox_rope_in_place(
-        &mut k_values,
-        sequence_length,
-        attention.kv_head_count,
-        attention.head_dimension,
-        attention.rope_n_dims,
-        attention.rope_freq_base,
-        attention.rope_freq_scale,
-        0,
-    )?;
-
-    // Capture post-RoPE K and raw V into the KV cache if we are in prefill mode.
-    if let Some(state) = state {
-        state.append_batch(&k_values, &v_proj, sequence_length)?;
-    }
-
-    // Fused attention scoring + gating + output projection via flash_attn_ext.
-    fused_attention_scoring_graph(
-        &q_values,
-        &k_values,
-        &v_proj,
-        &q_gate,
-        &attention.output_weight_values,
-        attention.head_dimension,
-        sequence_length,
-        attention.head_count,
-        attention.kv_head_count,
-        hidden_features,
-        attention.attention_scale,
+        state,
         backend,
     )
 }
@@ -458,30 +409,41 @@ pub(super) fn apply_neox_rope_in_place(
     Ok(())
 }
 
-/// Fused attention scoring + gating + output projection using flash_attn_ext.
+/// Fully fused attention graph: projection + deinterleave + norm + RoPE + scoring.
 ///
-/// Replaces the host-side O(T²·H·D) scoring loop with a single ggml graph:
-///   permute(Q/K/V) → flash_attn_ext → sigmoid(gate) → mul → reshape → mul_mat(output)
+/// Replaces the previous two-graph pipeline (projection → host round-trip →
+/// scoring) with a single ggml compute graph:
 ///
-/// All input vectors use `[T, H, D]` host layout (= ggml `[D, H, T, 1]`).
-/// The causal mask is built as f16 per ggml CPU kernel requirements.
+///   mul_mat(W_q/W_k/W_v, X) → strided deinterleave Q/gate
+///   → rms_norm + weight → rope_ext (NeoX mode=2)
+///   → permute → cont → flash_attn_ext → sigmoid(gate) → mul
+///   → reshape_2d → mul_mat(W_out)
+///
+/// When `state` is Some, reads back post-RoPE K and raw V for KV cache capture.
 #[allow(clippy::too_many_arguments)]
-fn fused_attention_scoring_graph(
-    q_values: &[f32],
-    k_values: &[f32],
-    v_proj: &[f32],
-    q_gate: &[f32],
-    output_weight: &[f32],
-    d: usize,
+fn fully_fused_attention_graph(
+    attention: &Qwen35FullAttentionLayerPlan,
+    input: &[f32],
     t: usize,
-    h: usize,
-    hkv: usize,
-    hidden: usize,
-    scale: f32,
+    rms_norm_eps: f32,
+    state: Option<&mut Qwen35FullAttentionState>,
     backend: &Backend,
 ) -> Result<Vec<f32>, E2eError> {
     use super::numeric::build_causal_mask_f16_bytes;
-    use ggml_rs::{Dims, Shape4D, Type};
+    use ggml_rs::{Dims, Length, RopeExtParams, Type};
+
+    let d = attention.head_dimension;
+    let h = attention.head_count;
+    let hkv = attention.kv_head_count;
+    let hidden = attention
+        .head_count
+        .checked_mul(d)
+        .and_then(|qf| attention.output_weight_values.len().checked_div(qf))
+        .filter(|&hid| hid > 0 && hid * h * d == attention.output_weight_values.len())
+        .ok_or(E2eError::BufferLengthMismatch {
+            expected: 1,
+            actual: 0,
+        })?;
 
     if !h.is_multiple_of(hkv) {
         return Err(E2eError::BufferLengthMismatch {
@@ -491,117 +453,276 @@ fn fused_attention_scoring_graph(
     }
 
     let qf = h * d;
+    let qf2 = qf * 2; // Q + gate interleaved
     let kvf = hkv * d;
-    let mask_elems = t * t;
+    let expected_input = checked_mul(hidden, t)?;
+    if input.len() != expected_input {
+        return Err(E2eError::BufferLengthMismatch {
+            expected: expected_input,
+            actual: input.len(),
+        });
+    }
 
-    // Memory: inputs + intermediates + mask + output weight + graph overhead.
-    let data_bytes = (qf * t + kvf * t * 2 + qf * t + mask_elems + qf * hidden + hidden * t) * 4;
-    let mem = Bytes::new(data_bytes * 4 + 524_288);
+    // Memory estimate: all weights + input + intermediates + mask + overhead.
+    // Conservative: sum all tensor sizes × 4 for ggml overhead.
+    let weight_bytes = (hidden * qf2 + hidden * kvf * 2 + qf * hidden + d * 2) * 4;
+    let data_bytes = (hidden * t
+        + qf2 * t
+        + kvf * t * 2
+        + qf * t * 4
+        + kvf * t * 2
+        + qf * t * 3
+        + t * t
+        + hidden * t)
+        * 4;
+    let mask_bytes_estimate = t * t * 2; // f16
+    let mem = Bytes::new((weight_bytes + data_bytes + mask_bytes_estimate) * 2 + 1_048_576);
     let ctx = Context::new_no_alloc_bytes(mem)
-        .map_err(|source| E2eError::ggml("Context::new_no_alloc_bytes(fused_attn)", source))?;
+        .map_err(|source| E2eError::ggml("Context::new(fully_fused_attn)", source))?;
 
-    // Input tensors in host [T, H, D] layout = ggml [D, H, T, 1].
-    let q = ctx
-        .new_tensor_4d::<f32>(Shape4D::new(d, h, t, 1))
-        .map_err(|source| E2eError::ggml("new_tensor_4d<Q>", source))?;
-    let k = ctx
-        .new_tensor_4d::<f32>(Shape4D::new(d, hkv, t, 1))
-        .map_err(|source| E2eError::ggml("new_tensor_4d<K>", source))?;
-    let v = ctx
-        .new_tensor_4d::<f32>(Shape4D::new(d, hkv, t, 1))
-        .map_err(|source| E2eError::ggml("new_tensor_4d<V>", source))?;
-    let gate = ctx
-        .new_tensor_4d::<f32>(Shape4D::new(d, h, t, 1))
-        .map_err(|source| E2eError::ggml("new_tensor_4d<gate>", source))?;
+    // --- Input tensors ---
+    let x = ctx
+        .new_tensor_2d::<f32>(Shape2D::new(hidden, t))
+        .map_err(|source| E2eError::ggml("new<X>", source))?;
 
-    // Causal mask as f16: [T, T, 1, 1].
-    let mask = ctx
-        .new_tensor(Type::F16, Dims::new([t, t, 1, 1]))
-        .map_err(|source| E2eError::ggml("new_tensor<mask>", source))?;
-
-    // Output weight: [H*D, hidden].
+    // Weight tensors
+    let w_q = ctx
+        .new_tensor_2d::<f32>(Shape2D::new(hidden, qf2))
+        .map_err(|source| E2eError::ggml("new<W_q>", source))?;
+    let w_k = ctx
+        .new_tensor_2d::<f32>(Shape2D::new(hidden, kvf))
+        .map_err(|source| E2eError::ggml("new<W_k>", source))?;
+    let w_v = ctx
+        .new_tensor_2d::<f32>(Shape2D::new(hidden, kvf))
+        .map_err(|source| E2eError::ggml("new<W_v>", source))?;
     let w_out = ctx
         .new_tensor_2d::<f32>(Shape2D::new(qf, hidden))
-        .map_err(|source| E2eError::ggml("new_tensor_2d<W_out>", source))?;
+        .map_err(|source| E2eError::ggml("new<W_out>", source))?;
 
-    // Permute Q/K/V from [D, H, T, 1] to [D, T, H, 1] for flash_attn_ext.
+    // Norm weight tensors: [D] each, broadcast across H and T.
+    let q_norm_w = ctx
+        .new_tensor_1d::<f32>(Length::new(d))
+        .map_err(|source| E2eError::ggml("new<q_norm>", source))?;
+    let k_norm_w = ctx
+        .new_tensor_1d::<f32>(Length::new(d))
+        .map_err(|source| E2eError::ggml("new<k_norm>", source))?;
+
+    // Position tensor for RoPE: [T] i32
+    let positions = ctx
+        .new_tensor_1d::<i32>(Length::new(t))
+        .map_err(|source| E2eError::ggml("new<positions>", source))?;
+
+    // Causal mask as f16: [T, T, 1, 1]
+    let mask = ctx
+        .new_tensor(Type::F16, Dims::new([t, t, 1, 1]))
+        .map_err(|source| E2eError::ggml("new<mask>", source))?;
+
+    // --- QKV Projection ---
+    let q_full = ctx
+        .mul_mat(&w_q, &x)
+        .map_err(|source| E2eError::ggml("mul_mat(Q)", source))?; // [qf2, T]
+    let k_proj = ctx
+        .mul_mat(&w_k, &x)
+        .map_err(|source| E2eError::ggml("mul_mat(K)", source))?; // [kvf, T]
+    let v_proj = ctx
+        .mul_mat(&w_v, &x)
+        .map_err(|source| E2eError::ggml("mul_mat(V)", source))?; // [kvf, T]
+
+    // --- Deinterleave Q and Gate via strided view ---
+    // Q_full layout per token: [Q_h0(D), G_h0(D), Q_h1(D), G_h1(D), ...]
+    // Reshape to [D, 2*H, T] then take every-other slice along dim 1.
+    let q_full_3d = ctx
+        .reshape_3d(&q_full, d, 2 * h, t)
+        .map_err(|source| E2eError::ggml("reshape_3d(Q_full)", source))?;
+
+    let elem = std::mem::size_of::<f32>();
+    let stride_h = 2 * d * elem; // skip one Q + one gate head
+    let stride_t = 2 * h * d * elem; // full token
+
+    // Q: even-indexed heads (offset 0)
+    let q_view = ctx
+        .view_3d(&q_full_3d, d, h, t, stride_h, stride_t, 0)
+        .map_err(|source| E2eError::ggml("view_3d(Q)", source))?;
+    let q_cont = ctx
+        .cont(&q_view)
+        .map_err(|source| E2eError::ggml("cont(Q_deinterleave)", source))?; // [D, H, T]
+
+    // Gate: odd-indexed heads (offset D*sizeof(f32))
+    let gate_view = ctx
+        .view_3d(&q_full_3d, d, h, t, stride_h, stride_t, d * elem)
+        .map_err(|source| E2eError::ggml("view_3d(Gate)", source))?;
+    let gate_cont = ctx
+        .cont(&gate_view)
+        .map_err(|source| E2eError::ggml("cont(Gate_deinterleave)", source))?; // [D, H, T]
+
+    // --- Per-head RMS norm ---
+    // rms_norm normalizes along ne[0]=D for each (h, t) pair.
+    let k_3d = ctx
+        .reshape_3d(&k_proj, d, hkv, t)
+        .map_err(|source| E2eError::ggml("reshape_3d(K)", source))?;
+
+    let q_normed = ctx
+        .rms_norm(&q_cont, rms_norm_eps)
+        .map_err(|source| E2eError::ggml("rms_norm(Q)", source))?;
+    let q_scaled = ctx
+        .mul(&q_normed, &q_norm_w)
+        .map_err(|source| E2eError::ggml("mul(Q_norm, weight)", source))?; // [D, H, T]
+
+    let k_normed = ctx
+        .rms_norm(&k_3d, rms_norm_eps)
+        .map_err(|source| E2eError::ggml("rms_norm(K)", source))?;
+    let k_scaled = ctx
+        .mul(&k_normed, &k_norm_w)
+        .map_err(|source| E2eError::ggml("mul(K_norm, weight)", source))?; // [D, Hkv, T]
+
+    // --- NeoX RoPE (mode=2) ---
+    let rope_params = RopeExtParams {
+        n_dims: attention.rope_n_dims as i32,
+        mode: 2, // NeoX: rotate first half, keep second half
+        n_ctx_orig: 0,
+        freq_base: attention.rope_freq_base,
+        freq_scale: attention.rope_freq_scale,
+        ext_factor: 0.0,
+        attn_factor: 1.0,
+        beta_fast: 0.0,
+        beta_slow: 0.0,
+    };
+
+    let q_rope = ctx
+        .rope_ext_with_i32_positions(&q_scaled, &positions, None, rope_params)
+        .map_err(|source| E2eError::ggml("rope_ext(Q)", source))?; // [D, H, T]
+    let k_rope = ctx
+        .rope_ext_with_i32_positions(&k_scaled, &positions, None, rope_params)
+        .map_err(|source| E2eError::ggml("rope_ext(K)", source))?; // [D, Hkv, T]
+
+    // --- Prepare for flash_attn_ext: [D, T, H, 1] ---
+    let q_4d = ctx
+        .reshape_4d(&q_rope, d, h, t, 1)
+        .map_err(|source| E2eError::ggml("reshape_4d(Q)", source))?;
+    let k_4d = ctx
+        .reshape_4d(&k_rope, d, hkv, t, 1)
+        .map_err(|source| E2eError::ggml("reshape_4d(K)", source))?;
+    let v_3d = ctx
+        .reshape_3d(&v_proj, d, hkv, t)
+        .map_err(|source| E2eError::ggml("reshape_3d(V)", source))?;
+    let v_4d = ctx
+        .reshape_4d(&v_3d, d, hkv, t, 1)
+        .map_err(|source| E2eError::ggml("reshape_4d(V)", source))?;
+
+    // Permute [D, H, T, 1] → [D, T, H, 1] + cont for flash_attn_ext.
     let q_perm = ctx
-        .permute(&q, 0, 2, 1, 3)
+        .permute(&q_4d, 0, 2, 1, 3)
         .map_err(|source| E2eError::ggml("permute(Q)", source))?;
     let k_perm = ctx
-        .permute(&k, 0, 2, 1, 3)
+        .permute(&k_4d, 0, 2, 1, 3)
         .map_err(|source| E2eError::ggml("permute(K)", source))?;
     let v_perm = ctx
-        .permute(&v, 0, 2, 1, 3)
+        .permute(&v_4d, 0, 2, 1, 3)
         .map_err(|source| E2eError::ggml("permute(V)", source))?;
 
-    // flash_attn_ext may need contiguous inputs on some backends.
-    let q_cont = ctx
+    let q_c = ctx
         .cont(&q_perm)
-        .map_err(|source| E2eError::ggml("cont(Q)", source))?;
-    let k_cont = ctx
+        .map_err(|source| E2eError::ggml("cont(Q_perm)", source))?;
+    let k_c = ctx
         .cont(&k_perm)
-        .map_err(|source| E2eError::ggml("cont(K)", source))?;
-    let v_cont = ctx
+        .map_err(|source| E2eError::ggml("cont(K_perm)", source))?;
+    let v_c = ctx
         .cont(&v_perm)
-        .map_err(|source| E2eError::ggml("cont(V)", source))?;
+        .map_err(|source| E2eError::ggml("cont(V_perm)", source))?;
 
-    // Flash attention → [D, H, T, 1] (permuted output).
+    // --- Flash attention + gating + output projection ---
     let attn = ctx
-        .flash_attn_ext(&q_cont, &k_cont, &v_cont, Some(&mask), scale, 0.0, 0.0)
-        .map_err(|source| E2eError::ggml("flash_attn_ext", source))?;
+        .flash_attn_ext(
+            &q_c,
+            &k_c,
+            &v_c,
+            Some(&mask),
+            attention.attention_scale,
+            0.0,
+            0.0,
+        )
+        .map_err(|source| E2eError::ggml("flash_attn_ext", source))?; // [D, H, T, 1]
 
-    // Gate: sigmoid(gate) in [D, H, T, 1] — same layout as flash output.
+    // Gate: reshape to 4D for sigmoid + element-wise mul with flash output.
+    let gate_4d = ctx
+        .reshape_4d(&gate_cont, d, h, t, 1)
+        .map_err(|source| E2eError::ggml("reshape_4d(Gate)", source))?;
     let gate_sig = ctx
-        .sigmoid(&gate)
-        .map_err(|source| E2eError::ggml("sigmoid(gate)", source))?;
-
-    // Element-wise gating: attn * sigmoid(gate).
+        .sigmoid(&gate_4d)
+        .map_err(|source| E2eError::ggml("sigmoid(Gate)", source))?;
     let gated = ctx
         .mul(&attn, &gate_sig)
-        .map_err(|source| E2eError::ggml("mul(attn, sigmoid_gate)", source))?;
+        .map_err(|source| E2eError::ggml("mul(attn, gate)", source))?; // [D, H, T, 1]
 
-    // Reshape for output projection: [D, H, T, 1] → [H*D, T].
-    // [D, H, T, 1] in memory is d-fastest, h-next, t-slowest — same as [H*D, T].
+    // Output projection: [D, H, T, 1] → [H*D, T] → mul_mat(W_out) → [hidden, T]
     let gated_2d = ctx
         .reshape_2d(&gated, qf, t)
         .map_err(|source| E2eError::ggml("reshape_2d(gated)", source))?;
-
-    // Output projection: mul_mat(W_out, gated) → [hidden, T].
     let output = ctx
         .mul_mat(&w_out, &gated_2d)
-        .map_err(|source| E2eError::ggml("mul_mat(output)", source))?;
+        .map_err(|source| E2eError::ggml("mul_mat(output)", source))?; // [hidden, T]
 
+    // --- Build, allocate, write, compute ---
     let mut graph = ctx
         .new_graph()
-        .map_err(|source| E2eError::ggml("new_graph(fused_attn)", source))?;
+        .map_err(|source| E2eError::ggml("new_graph(fully_fused)", source))?;
     graph.build_forward_expand(&output);
+    // Also include K_rope and V_proj in the graph for intermediate readback.
+    graph.build_forward_expand(&k_rope);
+    graph.build_forward_expand(&v_proj);
 
     let _buffer = ctx
         .allocate_tensors(backend)
-        .map_err(|source| E2eError::ggml("allocate_tensors(fused_attn)", source))?;
+        .map_err(|source| E2eError::ggml("allocate_tensors(fully_fused)", source))?;
 
     // Write input data.
-    q.write_data_backend(q_values)
-        .map_err(|source| E2eError::ggml("write<Q>", source))?;
-    k.write_data_backend(k_values)
-        .map_err(|source| E2eError::ggml("write<K>", source))?;
-    v.write_data_backend(v_proj)
-        .map_err(|source| E2eError::ggml("write<V>", source))?;
-    gate.write_data_backend(q_gate)
-        .map_err(|source| E2eError::ggml("write<gate>", source))?;
+    x.write_data_backend(input)
+        .map_err(|source| E2eError::ggml("write<X>", source))?;
 
+    // Write weight data.
+    w_q.write_data_backend(&attention.q_weight_values)
+        .map_err(|source| E2eError::ggml("write<W_q>", source))?;
+    w_k.write_data_backend(&attention.k_weight_values)
+        .map_err(|source| E2eError::ggml("write<W_k>", source))?;
+    w_v.write_data_backend(&attention.v_weight_values)
+        .map_err(|source| E2eError::ggml("write<W_v>", source))?;
+    w_out
+        .write_data_backend(&attention.output_weight_values)
+        .map_err(|source| E2eError::ggml("write<W_out>", source))?;
+
+    // Norm weights.
+    q_norm_w
+        .write_data_backend(&attention.q_norm_values)
+        .map_err(|source| E2eError::ggml("write<q_norm>", source))?;
+    k_norm_w
+        .write_data_backend(&attention.k_norm_values)
+        .map_err(|source| E2eError::ggml("write<k_norm>", source))?;
+
+    // Position indices: [0, 1, 2, ..., T-1]
+    let pos_data: Vec<i32> = (0..t as i32).collect();
+    positions
+        .write_data_backend(&pos_data)
+        .map_err(|source| E2eError::ggml("write<positions>", source))?;
+
+    // Causal mask as f16.
     let mask_bytes = build_causal_mask_f16_bytes(t);
     mask.write_bytes_backend(&mask_bytes)
         .map_err(|source| E2eError::ggml("write<mask>", source))?;
 
-    w_out
-        .write_data_backend(output_weight)
-        .map_err(|source| E2eError::ggml("write<W_out>", source))?;
-
     backend
         .compute(&mut graph)
-        .map_err(|source| E2eError::ggml("compute(fused_attn)", source))?;
+        .map_err(|source| E2eError::ggml("compute(fully_fused)", source))?;
+
+    // Read back post-RoPE K and raw V for KV cache state capture.
+    if let Some(state) = state {
+        let k_rope_data: Vec<f32> = k_rope
+            .read_data_backend()
+            .map_err(|source| E2eError::ggml("read<K_rope>", source))?;
+        let v_data: Vec<f32> = v_proj
+            .read_data_backend()
+            .map_err(|source| E2eError::ggml("read<V_proj>", source))?;
+        state.append_batch(&k_rope_data, &v_data, t)?;
+    }
 
     output
         .read_data_backend()

@@ -217,3 +217,18 @@ llama-rs uses explicit `copy_from_slice`.
    — no extra permute for gating. Decode path (seq_len=1) stays host-side.
    `f32_to_f16_bits` + `build_causal_mask_f16_bytes` added to `numeric.rs`.
    See `docs/llama-rs/worklog/2026-04-20-fused-attention-scoring.md`.
+9. **Fully fused single-graph full attention**: Merged the two-graph pipeline
+   (Graph 1: QKV projection → host round-trip → Graph 2: scoring) into one
+   ggml graph that performs everything:
+   ```
+   mul_mat(W_q/W_k/W_v, X)
+   → view_3d strided deinterleave Q/gate
+   → rms_norm + weight broadcast
+   → rope_ext (NeoX mode=2)
+   → permute → cont → flash_attn_ext → sigmoid → mul
+   → reshape_2d → mul_mat(W_out)
+   ```
+   Eliminates 10 host↔device transfers and 2 graph round-trips. Post-RoPE K
+   and raw V conditionally read back for KV cache capture. Decode path
+   unchanged. 202 tests pass.
+   See `docs/llama-rs/worklog/2026-04-20-fully-fused-attention.md`.
