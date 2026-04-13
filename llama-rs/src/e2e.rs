@@ -21,6 +21,8 @@
 //! - [`session`] — Resumable step-by-step generation session
 
 mod attention;
+#[cfg(test)]
+mod bench_graphs;
 mod checkpoint;
 mod config;
 mod decode;

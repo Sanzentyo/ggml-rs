@@ -180,6 +180,15 @@ And you should write rusty code(ADT, enum, type state pattern)
   applies host-side norm to match in-graph norm, tolerance still within 1e-5
   (ggml f32 vs host f64 accumulation). 201 tests pass.
 
+- **CPU vs Metal microbenchmarks** (`bench_graphs.rs`):
+  Synthetic benchmarks at Qwen3.5 0.6B dimensions (hidden=1536, ffn=8960).
+  Metal provides 2.4–3.1× speedup at seq_len=64 (MLP: 45.6→14.9ms, full attn:
+  7.0→2.9ms). CPU is faster for short sequences (seq_len ≤ 4) due to Metal
+  dispatch overhead — validates keeping decode path host-side. MLP is the
+  throughput bottleneck (3× 1536×8960 matmuls). Linear attention Metal gain
+  limited by host-side SSM recurrence. See `docs/llama-rs/worklog/2026-04-13-conv-qkv-comparison.md`
+  item 12 for full table.
+
 ## Validation checkpoints completed on this branch
 
 - `cargo fmt --all`

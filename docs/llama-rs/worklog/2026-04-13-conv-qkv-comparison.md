@@ -240,3 +240,44 @@ llama-rs uses explicit `copy_from_slice`.
     Decode path keeps host-side norm (single-token overhead not worthwhile).
     Standard attention also keeps host-side norm. ggml f32 rms_norm vs host f64
     accumulation verified within 1e-5 tolerance. 201 tests pass.
+
+11. **Q/K L2 norm fusion: skipped** (not worthwhile).
+    The conv output must be read back to host anyway for the SSM delta-net
+    recurrence (which cannot run in a ggml graph). Q/K L2 norm operates on
+    this already-transferred data with small vectors (`state_size` per head).
+    ggml has no native L2 norm op — only `rms_norm` which differs in
+    normalization factor (`1/sqrt(mean)` vs `1/max(sqrt(sum), eps)`).
+    Fusing would add graph complexity and separate readback tensors for minimal
+    or negative throughput benefit.
+
+12. **CPU vs Metal benchmark results** (Qwen3.5 0.6B dimensions, release mode,
+    warmup=3, iters=20, Apple Silicon):
+
+    | Graph                  | SeqLen | CPU (ms) | Metal (ms) | Speedup |
+    |------------------------|-------:|---------:|-----------:|--------:|
+    | full_attention_fused   |      1 |    1.865 |      2.654 |   0.70× |
+    | full_attention_fused   |      4 |    2.005 |      2.487 |   0.81× |
+    | full_attention_fused   |     16 |    2.894 |      2.603 |   1.11× |
+    | full_attention_fused   |     64 |    7.005 |      2.865 |   2.45× |
+    | linear_attention_fused |      1 |    2.193 |      3.019 |   0.73× |
+    | linear_attention_fused |      4 |    2.501 |      2.991 |   0.84× |
+    | linear_attention_fused |     16 |    4.026 |      3.426 |   1.18× |
+    | linear_attention_fused |     64 |   10.162 |      5.927 |   1.71× |
+    | mlp_fused              |      1 |   13.004 |     15.059 |   0.86× |
+    | mlp_fused              |      4 |   14.172 |     14.801 |   0.96× |
+    | mlp_fused              |     16 |   20.067 |     14.812 |   1.35× |
+    | mlp_fused              |     64 |   45.618 |     14.910 |   3.06× |
+
+    Key observations:
+    - **Metal overhead dominates for short sequences** (seq_len ≤ 4): CPU is
+      faster for single-token decode due to Metal command buffer dispatch
+      latency. This validates the decision to keep decode path host-side.
+    - **Metal wins at seq_len ≥ 16**: Cross-over occurs around 8–16 tokens.
+      At 64 tokens, Metal is 2.4–3.1× faster.
+    - **MLP is the bottleneck**: 3 large matmuls (1536×8960) dominate. At
+      seq_len=64, MLP takes 45.6ms CPU vs attention's 7.0ms.
+    - **Linear attention Metal gain is limited** by host-side SSM recurrence
+      (delta-net sequential loop), which doesn't benefit from GPU.
+    - Benchmark module: `llama-rs/src/e2e/bench_graphs.rs` (run with
+      `--ignored --nocapture`).
+
