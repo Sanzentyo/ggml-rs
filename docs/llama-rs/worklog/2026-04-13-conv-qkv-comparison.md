@@ -577,4 +577,322 @@ Transform:   permute(0, 2, 1, 3) + cont()
 - New test: `gpu_scoring_matches_host_scoring` — GQA (H=4, Hkv=2), 5+1 tokens,
   verifies GPU path output matches host scoring loop within 1e-4
 - All existing tests pass (including `full_attention_prefill_then_decode_matches_full_reprocess`)
+
+## 17. Causal Depthwise Conv Decode Path: Host vs GPU Analysis
+
+### 17.1 Problem
+
+After offloading decode projections (item 15) and attention scoring (item 16),
+the **causal depthwise conv decode step** remains host-side. Each decode step
+runs a scalar loop over `conv_channels × kernel_size` taps, applies SiLU, and
+updates the conv buffer.
+
+Current implementation (`causal_depthwise_conv_decode_step` in `linear_attention.rs`):
+
+```
+for channel in 0..conv_channels:
+    sum = 0
+    for tap in 0..kernel_size:
+        value = conv_buffer[lookback] or new_row[channel]
+        sum += value * weight[channel * kernel_size + tap]
+    output[channel] = silu(sum)
+push new_row into conv_buffer
+```
+
+### 17.2 Complexity Analysis
+
+For Qwen3.5 0.6B:
+- `conv_channels = inner_size + 2 × group_count × state_size`
+  (typically ~700 for 0.6B model)
+- `kernel_size = 4` (from GGUF metadata `ssm_conv_kernel`)
+- FLOPs per decode step: `conv_channels × kernel_size × 2` ≈ **5,600 FLOPs**
+- This is 0.07% of the attention scoring FLOPs (~8.2M at T=1000)
+- Wall-clock: sub-microsecond on modern CPUs
+
+### 17.3 GPU Offload Feasibility
+
+**Available kernel**: `ggml_ssm_conv` (already used in prefill, item 6):
+- Input `sx`: `[padded_len, channels, 1]` — time-fast layout with left-padding
+- Weight `c`: `[kernel_size, channels]`
+- Output: `[channels, seq_len, 1]`
+
+**For decode (seq_len=1)**:
+- `padded_len = kernel_size` (4 tokens: 3 from buffer + 1 new)
+- Total data to upload: `4 × conv_channels × 4 bytes` ≈ 11.2 KB
+- But requires host-side transpose: `conv_buffer[row * channels + ch]` →
+  `sx_data[ch * padded_len + pad + token]` (channel-fast → time-fast)
+- Plus graph build + allocate + compute + readback overhead
+
+**Benchmark evidence** (item 12, `bench_graphs.rs`):
+- `linear_attention_fused` at seq_len=1: CPU = 2.193 ms, Metal = 3.019 ms
+- CPU is **0.73× faster** than Metal for single-token linear attention
+- Note: this benchmarks the full fused graph, not a conv-only micro-benchmark.
+  However, the conv-only work (~5.6K FLOPs) is orders of magnitude smaller than
+  the full graph, so the ~0.8 ms Metal dispatch overhead alone is likely to
+  dominate a standalone `ssm_conv(seq_len=d_conv)` graph.
+
+**Verdict**: GPU offload is very likely a **net negative** for decode conv. The
+computation is too small (5.6K FLOPs) to amortize dispatch overhead (~0.8 ms on
+Metal). Host scalar loop completes in under 1 µs. A dedicated conv-step
+microbenchmark could confirm this, but the cost mismatch is ~3 orders of
+magnitude.
+
+### 17.4 Fused Projection + Conv Graph
+
+Could we fuse conv into the persistent projection graph (item 15)?
+
+| Consideration | Assessment |
+|---------------|------------|
+| Conv buffer changes every token | Must upload `(kernel_size-1) × channels` bytes per step |
+| Transpose required | Host-side channel-fast → time-fast layout conversion |
+| Raw QKV needed before conv | Conv buffer must capture pre-conv QKV for next step's lookback |
+| Graph complexity | Adds ssm_conv + silu nodes + extra tensor IO |
+| Benefit | Eliminates one host function call — negligible savings |
+
+**Verdict**: Not worth the complexity. The conv buffer state management requires
+per-step data upload regardless, and the pre-conv QKV readback (for buffer update)
+creates a mandatory host round-trip that fusion cannot eliminate.
+
+### 17.5 Comparison with llama.cpp
+
+| Aspect | llama-rs (decode) | llama.cpp (decode) |
+|--------|-------------------|-------------------|
+| Conv execution | Host scalar loop | In compute graph (`ggml_ssm_conv`) |
+| Conv state | Host-side `conv_buffer` array | Backend-resident `conv_states` tensor |
+| State update | `push_conv_row` after conv | Graph builds `concat(conv_states, new_qkv)` |
+| Why different? | Host SSM recurrence after conv → must read back | Full-graph architecture → stays on backend |
+
+llama.cpp can keep conv on GPU because their **entire layer** (projection + conv +
+SSM + output) is a single compute graph. Our architecture has host-side SSM
+recurrence after conv (Delta-Net, see item 19), so fusing just conv doesn't
+eliminate the host ↔ device boundary.
+
+### 17.6 Conclusion
+
+The decode conv step is the **smallest** remaining host operation (~5.6K FLOPs).
+It stays on host because:
+1. GPU dispatch overhead (0.8+ ms) vastly exceeds computation cost (<1 µs)
+2. Conv buffer state requires per-step upload regardless
+3. Host-side SSM recurrence after conv creates a mandatory readback boundary
+4. No measurable impact on end-to-end decode latency
+
+## 18. QKV Packing/Routing in Decode Path
+
+### 18.1 Current Decode QKV Flow
+
+After persistent projections (item 15), the decode QKV flow for linear attention is:
+
+```
+GPU: persistent_projection_graph(hidden_input)
+     → QKV [conv_channels], Z [inner_size], alpha [time_step_rank], beta [time_step_rank]
+       ↓ (readback to host)
+Host: causal_depthwise_conv_decode_step(QKV, conv_buffer, conv_weight)
+     → conv_output [conv_channels]  (with SiLU)
+       ↓
+Host: split conv_output into Q_heads, K_heads, V_region
+      Q = conv_output[0..qk_features]          → per-group Q vectors
+      K = conv_output[qk_features..2*qk_features]  → per-group K vectors
+      V = conv_output[2*qk_features..conv_channels] → per-head V vectors
+       ↓
+Host: RMS norm on Q and K heads (per-group normalization)
+       ↓
+Host: SSM recurrence per head (Delta-Net, item 19)
+       ↓
+Host: Z-gating: output[head] = rms_norm(ssm_out) * silu(z[head])
+       ↓
+GPU: persistent_output_projection(gated_output)
+     → layer_output [hidden_features]
+```
+
+### 18.2 QKV Split Logic
+
+The post-conv split is identical between prefill and decode:
+
+```
+conv_channels = inner_size + 2 × group_count × state_size
+qk_features = group_count × state_size
+
+Q_heads: conv_output[0 .. qk_features]
+K_heads: conv_output[qk_features .. 2 × qk_features]
+V_heads: conv_output[2 × qk_features .. conv_channels]
+```
+
+This is **logically contiguous** — just `[Q|K|V]` regions within the conv output
+buffer. The V region is borrowed directly (`&conv[qk_features * 2..conv_channels]`),
+but Q and K are copied into fresh buffers by `split_and_norm_qk` before applying
+per-group RMS normalization. These copies are small (group_count × state_size
+elements each) and are not a meaningful bottleneck.
+
+### 18.3 Comparison with llama.cpp QKV Routing
+
+| Aspect | llama-rs (decode) | llama.cpp (decode) |
+|--------|-------------------|-------------------|
+| QKV split | Host slice indexing (zero-cost) | Graph `view` ops (zero-copy) |
+| Post-split norm | Host `rms_norm_single` per group | Graph `rms_norm` + weight broadcast |
+| Head routing | `head % group_count` modular mapping | `ggml_repeat_4d` block tiling |
+| Group→head expansion | Implicit via index mapping in SSM loop | Explicit tensor repeat in graph |
+
+**Key difference**: llama.cpp's graph-based approach processes all heads in
+parallel (SIMD/GPU threads), while our host-side loop is sequential per head.
+However, the head count for linear attention is small (`time_step_rank` heads),
+so parallelism has limited benefit.
+
+### 18.4 Decode vs Prefill QKV Packing Differences
+
+| Dimension | Prefill | Decode |
+|-----------|---------|--------|
+| Input to conv | `[seq_len × conv_channels]` | `[1 × conv_channels]` (single row) |
+| Conv state | Not needed (full sequence) | Buffer of last `kernel_size-1` rows |
+| QKV readback | Entire sequence | Single token's projections |
+| Projection path | Fused in single graph (projection + conv + silu) | Persistent projection graph (no conv) |
+
+### 18.5 Optimization Opportunity: Head-Parallel SSM
+
+The current decode path processes heads sequentially:
+```rust
+for head in 0..time_step_rank {
+    ssm_recurrence_step(state[head], q[head], k[head], v[head], ...);
+}
+```
+
+Each head's recurrence is independent (separate state matrix). A `rayon` parallel
+iterator or SIMD batching could process multiple heads simultaneously. However:
+- Per-head state is `state_size × state_size` (small matrix, ~128² = 16K floats)
+- Memory access pattern is already cache-friendly (contiguous per-head blocks)
+- Parallelism overhead may exceed computation for small head counts
+- Deferred to future optimization (see item 19 for SSM analysis)
+
+### 18.6 Conclusion
+
+QKV packing/routing in the decode path is **already optimal** — the split is
+zero-cost slice indexing, and projections are GPU-offloaded via persistent graphs.
+The remaining host work (conv + SSM recurrence) is sequential by nature and too
+small for GPU dispatch overhead. The architecture difference from llama.cpp
+(host-side SSM vs full-graph) is fundamental and stems from the Delta-Net
+recurrence incompatibility with `ggml_ssm_scan` (item 19).
+
+## 19. SSM Recurrence: Delta-Net vs ggml_ssm_scan Compatibility
+
+### 19.1 Problem
+
+The SSM recurrence (`ssm_recurrence_step`) is the **largest** remaining host-side
+decode operation (~460K FLOPs at `time_step_rank` heads × `state_size²` per head).
+The ggml library provides `ggml_ssm_scan` for GPU-accelerated SSM recurrence.
+Can we use it for Qwen3.5?
+
+### 19.2 ggml_ssm_scan Semantics (Linear Selective Scan)
+
+`ggml_ssm_scan` implements a **linear selective scan** supporting Mamba-family
+variants (both scalar-decay Mamba-2 and element-wise decay Mamba-1). The key
+property is that the update term is **state-independent**:
+
+```
+// Input shapes:
+s:  [d_state, dim, n_head, n_seqs]    // state matrix per head
+x:  [dim, n_head, n_seq_tokens, n_seqs]  // input
+dt: [n_head, n_seq_tokens, n_seqs]       // time step
+A:  [1, n_head] or [d_state, n_head]     // decay factor
+B:  [d_state, n_group, n_seq_tokens, n_seqs]  // input projection
+C:  [d_state, n_group, n_seq_tokens, n_seqs]  // output projection
+
+// Per-head recurrence (scalar-decay variant):
+dA = exp(softplus(dt[h]) * A[h])           // scalar decay
+for each dim i, state j:
+    s[j,i,h] = s[j,i,h] * dA + B[j,g] * x[i,h] * softplus(dt[h])
+y[i,h] = sum_j(s[j,i,h] * C[j,g])        // linear readout
+```
+
+The update term `B[j] * x[i] * dt` depends only on the **input**, not on the
+current state. This is the defining property of a linear selective scan.
+
+### 19.3 Qwen3.5 Delta-Net Recurrence
+
+```
+// Per-head recurrence (ssm_recurrence_step):
+decay = exp(softplus(alpha + dt_bias) * ssm_a)   // scalar decay
+beta_value = sigmoid(beta)                         // scalar scale
+
+// Step 1: Decay + compute sk (state-dependent!)
+for row, col:
+    state[row][col] *= decay
+    sk[col] += state[row][col] * k[row]            // sk = K^T · (decayed state)
+
+// Step 2: Delta rule (uses sk → state feedback)
+delta[col] = (v[col] - sk[col]) * beta_value       // correction term
+
+// Step 3: Rank-1 update
+state[row][col] += k[row] * delta[col]             // s += k ⊗ delta
+
+// Step 4: Linear readout
+out[col] = sum_row(state[row][col] * q[row] * scale)  // out = Q^T · s
+```
+
+### 19.4 Key Incompatibility
+
+| Property | Linear Selective Scan (`ssm_scan`) | Delta-Net (Qwen3.5) |
+|----------|-------------------------------------|---------------------|
+| Update rule | `s += B ⊗ (x * dt)` | `s += k ⊗ ((v - k^T·s) * β)` |
+| State dependency | Update is **independent** of current state | Update **depends** on current state (via `sk = k^T·s`) |
+| Feedback term | None | `sk` feeds back into delta computation |
+| Input vectors | Separate B (input) and C (output) projections | Q (read), K (write/feedback), V (target) |
+| Activation on dt | `softplus(dt)` applied inside kernel | `softplus(α + dt_bias) * A` applied before, then `exp()` |
+
+The **delta rule feedback** `sk = k^T · (decayed state)` is the fundamental
+blocker. `ggml_ssm_scan` computes the state update as `s += B * x_dt` where
+`x_dt` depends only on the input, not on the state. Delta-Net's update term
+`delta = (v - sk) * β` requires the intermediate value `sk` which depends on
+the state AFTER decay.
+
+### 19.5 Alternative: Express as Separate ggml Ops
+
+Could we decompose the Delta-Net recurrence into individual ggml operations?
+
+```
+1. scale(state, decay)           → decayed state
+2. mul_mat(k^T, state)           → sk vector [state_size]
+3. sub(v, sk)                    → (v - sk) [state_size]
+4. scale((v-sk), beta)           → delta [state_size]
+5. outer_product(k, delta)       → rank-1 matrix [state_size × state_size]
+6. add(state, outer)             → updated state
+7. mul_mat(q^T * scale, state)   → output [state_size]
+```
+
+**Problem**: This requires 7+ graph nodes per head per decode step, with the
+state tensor being both read and written within the same graph. ggml graphs
+are DAGs (directed acyclic) — in-place state mutation within a graph is not
+straightforward. The state would need to flow through the graph as an
+intermediate, not as a mutated tensor.
+
+**Additional concerns**:
+- `state_size × state_size` matrix is small (e.g., 128 × 128 = 64 KB)
+- 7 graph nodes + dispatch overhead likely exceeds host scalar loop cost
+- Per-head graphs can't be batched across heads (different state matrices)
+- Would need ~7 × time_step_rank graph nodes per decode step
+
+**Verdict**: Not viable. The overhead of building, allocating, and computing
+a multi-op graph for a ~460K FLOP computation on small matrices is prohibitive.
+
+### 19.6 Future Opportunities
+
+| Approach | Feasibility | Notes |
+|----------|-------------|-------|
+| Custom ggml op (`GGML_OP_DELTANET_SCAN`) | Medium | Would need C implementation in ggml, Metal/CUDA kernels. Upstream contribution. |
+| Batched BLAS (all heads at once) | Low | Heads have data dependencies on shared QK groups; state_size too small for BLAS efficiency |
+| SIMD intrinsics (host-side) | Medium | Hand-vectorize the inner loops with NEON/AVX; avoids graph overhead. Most promising near-term. |
+| Rayon parallel heads | Low | Per-head work too small; thread spawn overhead > computation |
+
+### 19.7 Conclusion
+
+`ggml_ssm_scan` **cannot** be used for Qwen3.5's Delta-Net recurrence due to
+the state-dependent delta rule feedback term. The linear selective scan assumes
+state-independent updates (`s = s * decay + input_term`), while Delta-Net's
+correction `delta = (v - k^T·s) * β` creates a read-modify-write dependency
+within each recurrence step where the update term itself depends on the decayed
+state.
+
+The SSM recurrence stays on host for now. The most promising optimization path
+is **SIMD vectorization** of the inner loops (decay + sk accumulation, delta
+computation, rank-1 update, readout), which avoids graph dispatch overhead while
+exploiting data-level parallelism within each head's `state_size × state_size`
+matrix operations.
 - `DecodeStrategy` preserved as reference implementation for `full_reprocess_loop`

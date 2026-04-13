@@ -226,6 +226,15 @@ And you should write rusty code(ADT, enum, type state pattern)
   `full_attention_decode_core` now accepts `backend: Option<&Backend>` — GPU-first
   with silent fallback to host loop. GQA-aware parity test passes within 1e-4.
   See comparison doc item 16.
+- **Decode conv/QKV/SSM analysis** (items 17–19):
+  Analyzed remaining host-side decode bottlenecks. Causal depthwise conv decode
+  (~5.6K FLOPs) stays on host — GPU dispatch overhead (~0.8 ms) vastly exceeds
+  scalar loop cost (<1 µs). QKV routing is logically contiguous split with small
+  Q/K copies for per-group normalization — already optimal. SSM recurrence
+  (Delta-Net) is **incompatible** with `ggml_ssm_scan` — the delta rule feedback
+  `sk = k^T·(decayed state)` creates state-dependent updates that linear selective
+  scan cannot express. SIMD vectorization of inner loops identified as most
+  promising near-term optimization. See comparison doc items 17–19.
 
 ## Validation checkpoints completed on this branch
 
