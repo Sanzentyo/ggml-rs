@@ -338,6 +338,13 @@ And you should write rusty code(ADT, enum, type state pattern)
   helper. Added graceful fallback in `full_reprocess_loop` when build fails.
   See comparison doc item 35.
 
+- **Attention dispatch helpers** (item 36):
+  Added `is_standard()` predicate method to `AttentionLayerPlan` for
+  boolean-query use sites. Applied in `generate_from_plans()` mode
+  selection (2 sites). Dispatch match arms keep explicit variant
+  patterns to preserve exhaustiveness checking.
+  See comparison doc item 36.
+
 ## Validation checkpoints completed on this branch
 
 - `cargo fmt --all`

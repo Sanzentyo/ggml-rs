@@ -2562,4 +2562,66 @@ internal struct organization.
 | File | Changes |
 |------|---------|
 | `llama-rs/src/e2e/generation.rs` | Added `LmHeadResources` struct (~70 lines), embedded in `PersistentDecodeResources`, refactored `full_reprocess_loop`, removed `graph_sample_at` |
+
+---
+
+## 36. Attention dispatch helpers — `is_standard()` predicate
+
+### 36.1 Goal
+
+Reduce repetitive `matches!(p.attention, Some(AttentionLayerPlan::Standard(_)))`
+patterns. Provide a predicate method on `AttentionLayerPlan` for boolean-query
+use sites while preserving exhaustive pattern matching at dispatch sites.
+
+### 36.2 Analysis
+
+Explore agent identified 15+ match sites on `AttentionLayerPlan` across 5 files
+(~40 individual match arms). Categorized as:
+
+| Category | Count | Refactorable? |
+|----------|-------|---------------|
+| DISPATCH | 3 | ✅ via trait (Phase 2, deferred) |
+| PAIRED_DISPATCH | 4 | ⚠️ Partial (borrow checker) |
+| CONSTRUCTION | 5+ | ❌ Keep as-is (structural) |
+| PREDICATE_CHECK | 2 | ✅ Done — `is_standard()` |
+| QUERY_ACCESSOR | 1 | Already a method |
+
+### 36.3 Implementation
+
+Added `is_standard()` method to `AttentionLayerPlan` in `plan.rs`:
+
+```rust
+pub(super) fn is_standard(&self) -> bool {
+    matches!(self, Self::Standard(_))
+}
+```
+
+Applied at 2 predicate-check sites in `generate_from_plans()`:
+
+```rust
+// Before:
+.any(|p| matches!(p.attention, Some(AttentionLayerPlan::Standard(_))))
+
+// After:
+.any(|p| p.attention.as_ref().is_some_and(|a| a.is_standard()))
+```
+
+**Important**: Dispatch match arms (e.g., `try_build_persistent_projections`)
+keep explicit `AttentionLayerPlan::Standard(_)` patterns. Using `is_standard()`
+as a match guard would require a catch-all `_ =>` arm, weakening exhaustiveness
+checking — the compiler would no longer force updating the match when new
+variants are added.
+
+### 36.4 Phase 2 (deferred)
+
+Trait dispatch for `InferenceStrategy::process_attention()` would replace 3
+match arms with per-variant methods. Deferred because only 3 variants exist
+and new variants are infrequent.
+
+### 36.5 Files Modified
+
+| File | Changes |
+|------|---------|
+| `llama-rs/src/e2e/plan.rs` | Added `is_standard()` method to `AttentionLayerPlan` |
+| `llama-rs/src/e2e/generation.rs` | Replaced 2 `matches!()` predicates with `is_standard()` |
 | `llama-rs/Cargo.toml` | Added `postcard` + `serde` dependencies |
