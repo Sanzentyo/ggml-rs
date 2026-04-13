@@ -8,9 +8,17 @@
 //! Sessions can be checkpointed mid-generation via
 //! [`checkpoint()`](GenerationSession::checkpoint) and later resumed from
 //! a saved [`GenerationCheckpoint`](super::checkpoint::GenerationCheckpoint).
+//!
+//! # Execution modes
+//!
+//! - **TwoPhase** (Qwen3.5 layers): Prefill captures KV/conv/SSM state,
+//!   then decode uses cached state. Checkpoints are performance-preserving.
+//! - **FullReprocess** (Standard attention / zero max_new_tokens): All tokens
+//!   are reprocessed each step. Checkpoints save token IDs and position but
+//!   state is recomputed on resume — useful for persistence, not performance.
 
 use super::checkpoint::{CaptureInput, CheckpointV1, GenerationCheckpoint, ModelFingerprint};
-use super::config::E2eGenerationConfig;
+use super::config::{E2eGenerationConfig, MixedLayerPolicy};
 use super::decode::decode_norm_tensor;
 use super::error::E2eError;
 use super::generation::{
@@ -23,7 +31,7 @@ use super::planner::build_layer_plans;
 use super::resolve::resolve_global_tensor_names;
 use super::state::GenerationState;
 use super::tensor_ops::{gather_embeddings, rms_norm_with_weight};
-use crate::backend::ensure_backends_loaded;
+use crate::backend::{LlamaBackend, ensure_backends_loaded};
 use crate::metadata::resolve_transformer_metadata;
 use crate::model::GgufModel;
 use ggml_rs::Backend;
@@ -200,12 +208,24 @@ impl GenerationSession {
     /// Resume a session from a saved checkpoint.
     ///
     /// The model must be compatible with the one used to create the checkpoint
-    /// (same layer count, types, and dimensions).
+    /// (same layer count, types, and dimensions). Only `backend` and
+    /// `mixed_layer_policy` are taken from the caller — all other parameters
+    /// (prompt, max_new_tokens, EOS, pad) are restored from the checkpoint.
+    ///
+    /// # Note on backend switching
+    ///
+    /// Cross-backend resume (e.g. CPU → Metal) is allowed but **not
+    /// guaranteed** to produce identical tokens due to floating-point
+    /// precision differences in greedy argmax.
     pub fn resume(
         model: &GgufModel,
-        config: &E2eGenerationConfig,
+        backend: LlamaBackend,
+        mixed_layer_policy: MixedLayerPolicy,
         checkpoint: GenerationCheckpoint,
     ) -> Result<Self, E2eError> {
+        // Validate checkpoint internal consistency first
+        checkpoint.inner.validate_invariants()?;
+
         // Resolve model to get current fingerprint
         let metadata = resolve_transformer_metadata(model)
             .map_err(|source| E2eError::metadata("resolve_transformer_metadata", source))?;
@@ -255,7 +275,7 @@ impl GenerationSession {
             &metadata,
             hidden_features,
             checkpoint.inner.total_sequence_length,
-            config.mixed_layer_policy,
+            mixed_layer_policy,
         )?;
 
         let current_fingerprint =
@@ -276,10 +296,7 @@ impl GenerationSession {
         let mut all_token_ids = vec![cp.pad_token_id; cp.total_sequence_length];
         all_token_ids[..cp.prompt_token_count].copy_from_slice(&cp.prompt_token_ids);
         for (i, &token_id) in cp.generated_token_ids.iter().enumerate() {
-            let pos = cp.prompt_token_count + i;
-            if pos < all_token_ids.len() {
-                all_token_ids[pos] = token_id;
-            }
+            all_token_ids[cp.prompt_token_count + i] = token_id;
         }
 
         let effective_mode = {
@@ -294,7 +311,7 @@ impl GenerationSession {
         };
 
         ensure_backends_loaded();
-        let backend = Backend::new(config.backend.into())
+        let backend = Backend::new(backend.into())
             .map_err(|source| E2eError::ggml("Backend::new", source))?;
 
         Ok(Self {

@@ -62,6 +62,7 @@ impl GenerationCheckpoint {
                 expected_version: CHECKPOINT_VERSION,
             });
         }
+        inner.validate_invariants()?;
         Ok(Self { inner })
     }
 
@@ -359,6 +360,82 @@ impl CheckpointV1 {
         }
     }
 
+    /// Validate internal invariants of a deserialized checkpoint.
+    ///
+    /// Prevents panics from malformed or corrupted data by checking all
+    /// structural invariants before constructing a session.
+    pub(super) fn validate_invariants(&self) -> Result<(), E2eError> {
+        let err = |msg: String| E2eError::CheckpointDeserialize(msg);
+
+        if self.prompt_token_count != self.prompt_token_ids.len() {
+            return Err(err(format!(
+                "prompt_token_count ({}) != prompt_token_ids.len() ({})",
+                self.prompt_token_count,
+                self.prompt_token_ids.len()
+            )));
+        }
+        let expected_token_count = self
+            .prompt_token_count
+            .checked_add(self.generated_token_ids.len())
+            .ok_or(E2eError::MemorySizeOverflow)?;
+        if self.current_token_count != expected_token_count {
+            return Err(err(format!(
+                "current_token_count ({}) != prompt + generated ({})",
+                self.current_token_count, expected_token_count
+            )));
+        }
+        if self.current_token_count > self.total_sequence_length {
+            return Err(err(format!(
+                "current_token_count ({}) > total_sequence_length ({})",
+                self.current_token_count, self.total_sequence_length
+            )));
+        }
+        if self.generated_token_ids.len() > self.max_new_tokens {
+            return Err(err(format!(
+                "generated count ({}) > max_new_tokens ({})",
+                self.generated_token_ids.len(),
+                self.max_new_tokens
+            )));
+        }
+        if self.layer_states.len() != self.fingerprint.layer_count {
+            return Err(err(format!(
+                "layer_states.len() ({}) != fingerprint.layer_count ({})",
+                self.layer_states.len(),
+                self.fingerprint.layer_count
+            )));
+        }
+        if self.prompt_token_count == 0 {
+            return Err(err("prompt_token_count must be > 0".into()));
+        }
+        // Validate token IDs are in vocab range
+        let vocab = self.fingerprint.vocab_size;
+        for &token_id in self
+            .prompt_token_ids
+            .iter()
+            .chain(&self.generated_token_ids)
+        {
+            if token_id < 0 || token_id as usize >= vocab {
+                return Err(err(format!(
+                    "token id {token_id} out of vocab range [0, {vocab})"
+                )));
+            }
+        }
+        if self.pad_token_id < 0 || self.pad_token_id as usize >= vocab {
+            return Err(err(format!(
+                "pad_token_id {} out of vocab range [0, {vocab})",
+                self.pad_token_id
+            )));
+        }
+        if let Some(eos) = self.eos_token_id
+            && (eos < 0 || eos as usize >= vocab)
+        {
+            return Err(err(format!(
+                "eos_token_id {eos} out of vocab range [0, {vocab})"
+            )));
+        }
+        Ok(())
+    }
+
     /// Restore `GenerationState` from checkpoint DTOs.
     pub(super) fn restore_state(&self) -> Result<GenerationState, E2eError> {
         let layers: Result<Vec<_>, _> = self
@@ -527,5 +604,59 @@ mod tests {
         } else {
             panic!("expected Qwen35Full state");
         }
+    }
+
+    #[test]
+    fn validate_invariants_rejects_prompt_count_mismatch() {
+        let mut cp = sample_checkpoint().inner;
+        cp.prompt_token_count = 99;
+        let err = cp.validate_invariants().unwrap_err().to_string();
+        assert!(err.contains("prompt_token_count"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_invariants_rejects_token_count_mismatch() {
+        let mut cp = sample_checkpoint().inner;
+        cp.current_token_count = 99;
+        let err = cp.validate_invariants().unwrap_err().to_string();
+        assert!(err.contains("current_token_count"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_invariants_rejects_overflow_sequence() {
+        let mut cp = sample_checkpoint().inner;
+        cp.total_sequence_length = 4; // less than current_token_count (5)
+        let err = cp.validate_invariants().unwrap_err().to_string();
+        assert!(err.contains("total_sequence_length"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_invariants_rejects_too_many_generated() {
+        let mut cp = sample_checkpoint().inner;
+        cp.max_new_tokens = 1; // but generated 2
+        let err = cp.validate_invariants().unwrap_err().to_string();
+        assert!(err.contains("max_new_tokens"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_invariants_rejects_layer_state_count_mismatch() {
+        let mut cp = sample_checkpoint().inner;
+        cp.layer_states.push(LayerStateDto::None);
+        let err = cp.validate_invariants().unwrap_err().to_string();
+        assert!(err.contains("layer_states"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_invariants_rejects_out_of_vocab_token() {
+        let mut cp = sample_checkpoint().inner;
+        cp.generated_token_ids[0] = 9999; // vocab is 1000
+        let err = cp.validate_invariants().unwrap_err().to_string();
+        assert!(err.contains("out of vocab"), "got: {err}");
+    }
+
+    #[test]
+    fn validate_invariants_passes_for_valid_checkpoint() {
+        let cp = sample_checkpoint().inner;
+        cp.validate_invariants().unwrap();
     }
 }

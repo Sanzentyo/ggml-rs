@@ -37,9 +37,9 @@ pub use bench_report::{
     render_markdown_summary,
 };
 pub use e2e::{
-    E2eError, E2eGenerationConfig, E2eGenerationReport, MixedLayerPolicy,
-    generate_token_ids_from_model, generate_token_ids_from_path, resolve_eos_token_id,
-    tokenize_prompt_text,
+    E2eError, E2eGenerationConfig, E2eGenerationReport, GenerationCheckpoint, GenerationSession,
+    MixedLayerPolicy, generate_token_ids_from_model, generate_token_ids_from_path,
+    resolve_eos_token_id, tokenize_prompt_text,
 };
 pub use embedding::{EmbeddingError, EmbeddingStats, summarize_embedding_tensor};
 pub use error::{LlamaError, LlamaResult};
