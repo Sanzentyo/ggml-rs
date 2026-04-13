@@ -11,6 +11,7 @@
 //! [`PrefillStrategy`] (captures state), and [`DecodeStrategy`] (uses state).
 
 use super::attention::{
+    full_attention_decode_core, full_attention_hidden_features, prepare_qkv_from_raw,
     qwen35_full_attention_decode_step, qwen35_full_attention_inference,
     qwen35_full_attention_prefill,
 };
@@ -18,18 +19,24 @@ use super::config::{E2eGenerationConfig, E2eGenerationReport};
 use super::decode::decode_norm_tensor;
 use super::error::E2eError;
 use super::linear_attention::{
-    qwen35_linear_attention_decode_step, qwen35_linear_attention_inference,
-    qwen35_linear_attention_prefill,
+    LinearProjections, linear_attention_conv_channels, linear_attention_decode_core,
+    linear_attention_hidden_features, qwen35_linear_attention_decode_step,
+    qwen35_linear_attention_inference, qwen35_linear_attention_prefill,
 };
 use super::mlp::mlp_sequence_inference_with_weights;
 use super::numeric::{checked_mul, validate_token_id, value_to_i32};
-use super::plan::{AttentionLayerPlan, LayerPlan};
+use super::plan::{
+    AttentionLayerPlan, LayerPlan, Qwen35FullAttentionLayerPlan, Qwen35LinearAttentionLayerPlan,
+};
 use super::planner::build_layer_plans;
 use super::resolve::resolve_global_tensor_names;
 use super::state::{GenerationState, LayerAttentionState};
 use super::tensor_ops::{
-    add_in_place, build_lm_head_graph, gather_embeddings, lm_head_sample_step,
-    recommended_lm_head_memory, rms_norm_with_weight,
+    PersistentDecodeProjection, add_in_place, build_lm_head_graph,
+    build_persistent_full_attention_graphs, build_persistent_linear_attention_graphs,
+    gather_embeddings, lm_head_sample_step, recommended_lm_head_memory,
+    recommended_persistent_full_attention_memory, recommended_persistent_linear_attention_memory,
+    rms_norm_with_weight,
 };
 use crate::backend::ensure_backends_loaded;
 use crate::inference::attention_inference_with_weights_on_backend_repeats_with_length;
@@ -276,6 +283,289 @@ pub(super) fn process_all_layers(
             &layer_plan.mlp.weights,
             hidden,
             seq_len,
+            &layer_plan.mlp.norm_values,
+            rms_norm_eps,
+            backend,
+        )?;
+        add_in_place(hidden, &mlp_output)?;
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Persistent decode projections: build once, step per-token
+// ---------------------------------------------------------------------------
+
+type PersistentProjectionSets = (
+    Vec<Option<Context>>,
+    Vec<Option<PersistentDecodeProjection<'static>>>,
+);
+
+/// Attempt to build persistent projection contexts and graphs for all layers.
+///
+/// Returns `None` on any failure (opportunistic — caller falls back to
+/// `DecodeStrategy`). On success returns `(contexts, projections)` where both
+/// vecs are aligned to `layer_plans` and each slot is `Some` for attention
+/// layers, `None` otherwise.
+fn try_build_persistent_projections(
+    layer_plans: &[LayerPlan],
+    backend: &Backend,
+) -> Option<PersistentProjectionSets> {
+    // SAFETY reasoning for the 'static transmute below:
+    //
+    // `Tensor<'ctx, T>`, `Graph<'ctx>`, and `BackendBuffer<'ctx>` all carry
+    // `PhantomData<&'ctx Context>` — they contain raw pointers, not actual
+    // Rust references.  The lifetime exists solely so the borrow-checker can
+    // enforce "Context outlives its derived handles" at the API boundary.
+    //
+    // Inside `two_phase_loop` we store `proj_ctxs` (the owning `Vec<Option<Context>>`)
+    // and `decode_projs` (the derived handles) as sibling locals declared in
+    // strict order so that `decode_projs` drops *before* `proj_ctxs`.
+    // This maintains the real invariant: handles never outlive their context.
+    //
+    // The transmute erases the unnameable local borrow `'ctx` that would
+    // otherwise require GATs or self-referential structs.  Because both
+    // containers live for the same scope and drop in the correct order, this
+    // is sound.
+
+    let mut contexts: Vec<Option<Context>> = Vec::with_capacity(layer_plans.len());
+    let mut projections: Vec<Option<PersistentDecodeProjection<'static>>> =
+        Vec::with_capacity(layer_plans.len());
+
+    for layer_plan in layer_plans {
+        let attention = match &layer_plan.attention {
+            Some(a) => a,
+            None => {
+                contexts.push(None);
+                projections.push(None);
+                continue;
+            }
+        };
+
+        let result: Result<(Context, PersistentDecodeProjection<'static>), E2eError> =
+            match attention {
+                AttentionLayerPlan::Qwen35Full(attn) => build_one_persistent_full(attn, backend),
+                AttentionLayerPlan::Qwen35Linear(attn) => {
+                    build_one_persistent_linear(attn, backend)
+                }
+                AttentionLayerPlan::Standard(_) => {
+                    // Standard attention doesn't support persistent projections.
+                    return None;
+                }
+            };
+
+        match result {
+            Ok((ctx, proj)) => {
+                contexts.push(Some(ctx));
+                projections.push(Some(proj));
+            }
+            Err(_) => return None, // Any failure → give up on persistent path
+        }
+    }
+
+    debug_assert_eq!(contexts.len(), layer_plans.len());
+    debug_assert_eq!(projections.len(), layer_plans.len());
+    Some((contexts, projections))
+}
+
+fn build_one_persistent_full(
+    attn: &Qwen35FullAttentionLayerPlan,
+    backend: &Backend,
+) -> Result<(Context, PersistentDecodeProjection<'static>), E2eError> {
+    let hidden_features = full_attention_hidden_features(attn)?;
+    let query_features = checked_mul(attn.head_count, attn.head_dimension)?;
+    let kv_features = checked_mul(attn.kv_head_count, attn.head_dimension)?;
+    let query_features_x2 = checked_mul(query_features, 2)?;
+
+    let ctx_size = recommended_persistent_full_attention_memory(
+        hidden_features,
+        query_features_x2,
+        kv_features,
+        query_features,
+    )?;
+    let ctx = Context::new_no_alloc_bytes(ctx_size)
+        .map_err(|source| E2eError::ggml("Context(pfa)", source))?;
+
+    let (x_in, w_q, w_k, w_v, q_out, k_out, v_out, input_graph, out_x, w_out, out_y, output_graph) =
+        build_persistent_full_attention_graphs(
+            &ctx,
+            hidden_features,
+            query_features_x2,
+            kv_features,
+            query_features,
+        )?;
+
+    let buffer = ctx
+        .allocate_tensors(backend)
+        .map_err(|source| E2eError::ggml("allocate(pfa)", source))?;
+
+    // Upload weights once.
+    w_q.write_data_backend(&attn.q_weight_values)
+        .map_err(|source| E2eError::ggml("write<W_Q>(pfa)", source))?;
+    w_k.write_data_backend(&attn.k_weight_values)
+        .map_err(|source| E2eError::ggml("write<W_K>(pfa)", source))?;
+    w_v.write_data_backend(&attn.v_weight_values)
+        .map_err(|source| E2eError::ggml("write<W_V>(pfa)", source))?;
+    w_out
+        .write_data_backend(&attn.output_weight_values)
+        .map_err(|source| E2eError::ggml("write<W_OUT>(pfa)", source))?;
+
+    // SAFETY: see the comment block in `try_build_persistent_projections`.
+    let proj = unsafe {
+        std::mem::transmute::<PersistentDecodeProjection<'_>, PersistentDecodeProjection<'static>>(
+            PersistentDecodeProjection::FullAttention {
+                x_in,
+                q_out,
+                k_out,
+                v_out,
+                input_graph,
+                out_x,
+                out_y,
+                output_graph,
+                _buffer: buffer,
+            },
+        )
+    };
+    Ok((ctx, proj))
+}
+
+fn build_one_persistent_linear(
+    attn: &Qwen35LinearAttentionLayerPlan,
+    backend: &Backend,
+) -> Result<(Context, PersistentDecodeProjection<'static>), E2eError> {
+    let hidden_features = linear_attention_hidden_features(attn)?;
+    let conv_channels = linear_attention_conv_channels(attn)?;
+    let inner_size = attn.inner_size;
+    let time_step_rank = attn.time_step_rank;
+
+    let ctx_size = recommended_persistent_linear_attention_memory(
+        hidden_features,
+        conv_channels,
+        inner_size,
+        time_step_rank,
+    )?;
+    let ctx = Context::new_no_alloc_bytes(ctx_size)
+        .map_err(|source| E2eError::ggml("Context(pla)", source))?;
+
+    let (
+        x_in,
+        w_qkv,
+        w_z,
+        w_alpha,
+        w_beta,
+        qkv_out,
+        z_out,
+        alpha_out,
+        beta_out,
+        input_graph,
+        out_x,
+        w_out,
+        out_y,
+        output_graph,
+    ) = build_persistent_linear_attention_graphs(
+        &ctx,
+        hidden_features,
+        conv_channels,
+        inner_size,
+        time_step_rank,
+    )?;
+
+    let buffer = ctx
+        .allocate_tensors(backend)
+        .map_err(|source| E2eError::ggml("allocate(pla)", source))?;
+
+    w_qkv
+        .write_data_backend(&attn.qkv_weight_values)
+        .map_err(|source| E2eError::ggml("write<W_QKV>(pla)", source))?;
+    w_z.write_data_backend(&attn.gate_weight_values)
+        .map_err(|source| E2eError::ggml("write<W_Z>(pla)", source))?;
+    w_alpha
+        .write_data_backend(&attn.alpha_weight_values)
+        .map_err(|source| E2eError::ggml("write<W_ALPHA>(pla)", source))?;
+    w_beta
+        .write_data_backend(&attn.beta_weight_values)
+        .map_err(|source| E2eError::ggml("write<W_BETA>(pla)", source))?;
+    w_out
+        .write_data_backend(&attn.ssm_out_weight_values)
+        .map_err(|source| E2eError::ggml("write<W_OUT>(pla)", source))?;
+
+    let proj = unsafe {
+        std::mem::transmute::<PersistentDecodeProjection<'_>, PersistentDecodeProjection<'static>>(
+            PersistentDecodeProjection::LinearAttention {
+                x_in,
+                qkv_out,
+                z_out,
+                alpha_out,
+                beta_out,
+                input_graph,
+                out_x,
+                out_y,
+                output_graph,
+                _buffer: buffer,
+            },
+        )
+    };
+    Ok((ctx, proj))
+}
+
+/// Process all layers in decode mode using persistent projections.
+///
+/// For each layer: host norm → persistent input proj → core logic → persistent
+/// output proj → residual add → MLP (unchanged).
+fn persistent_decode_all_layers(
+    hidden: &mut [f32],
+    layer_plans: &[LayerPlan],
+    projections: &mut [Option<PersistentDecodeProjection<'static>>],
+    state: &mut GenerationState,
+    hidden_features: usize,
+    rms_norm_eps: f32,
+    backend: &Backend,
+) -> Result<(), E2eError> {
+    debug_assert_eq!(layer_plans.len(), projections.len());
+
+    for (layer_idx, layer_plan) in layer_plans.iter().enumerate() {
+        if let (Some(attention), Some(proj)) =
+            (&layer_plan.attention, projections[layer_idx].as_mut())
+        {
+            let norm_weight = attention.norm_values();
+            let normalized =
+                rms_norm_with_weight(hidden, hidden_features, 1, norm_weight, rms_norm_eps)?;
+
+            proj.project_input(&normalized, backend)?;
+
+            let attention_output = match (attention, &mut state.layers[layer_idx]) {
+                (AttentionLayerPlan::Qwen35Full(attn), LayerAttentionState::Qwen35Full(s)) => {
+                    let (q_full, k_proj, v_proj) = proj.read_full_attention_projections()?;
+                    let hf = full_attention_hidden_features(attn)?;
+                    let prepared =
+                        prepare_qkv_from_raw(attn, q_full, k_proj, v_proj, 1, hf, rms_norm_eps)?;
+                    let head_outputs = full_attention_decode_core(prepared, attn, s)?;
+                    proj.project_output(&head_outputs, backend)?
+                }
+                (AttentionLayerPlan::Qwen35Linear(attn), LayerAttentionState::Qwen35Linear(s)) => {
+                    let (qkv, z, alpha, beta) = proj.read_linear_attention_projections()?;
+                    let conv_channels = linear_attention_conv_channels(attn)?;
+                    let hf = linear_attention_hidden_features(attn)?;
+                    let projections = LinearProjections {
+                        qkv,
+                        z,
+                        alpha,
+                        beta,
+                        conv_channels,
+                        hidden_features: hf,
+                    };
+                    let output = linear_attention_decode_core(projections, attn, rms_norm_eps, s)?;
+                    proj.project_output(&output, backend)?
+                }
+                _ => return Err(E2eError::UnsupportedTwoPhase),
+            };
+            add_in_place(hidden, &attention_output)?;
+        }
+
+        let mlp_output = mlp_sequence_inference_with_weights(
+            &layer_plan.mlp.weights,
+            hidden,
+            1,
             &layer_plan.mlp.norm_values,
             rms_norm_eps,
             backend,
@@ -651,37 +941,77 @@ fn two_phase_loop(
     }
 
     // Phase 2: Decode — one token at a time using cached state.
-    let mut strategy = DecodeStrategy { state: &mut state };
-    for _step in 1..inputs.max_new_tokens {
-        let new_token_id = all_token_ids[*current_token_count - 1];
-        let mut hidden = gather_embeddings(
-            inputs.token_embedding_values,
-            inputs.hidden_features,
-            inputs.vocab_size,
-            &[new_token_id],
-        )?;
+    // Attempt persistent projections (upload weights once for all layers).
+    // Falls back to DecodeStrategy if build fails.
+    let persistent = try_build_persistent_projections(inputs.layer_plans, inputs.backend);
+    if let Some((_proj_ctxs, mut decode_projs)) = persistent {
+        // Persistent path: no per-token weight upload.
+        for _step in 1..inputs.max_new_tokens {
+            let new_token_id = all_token_ids[*current_token_count - 1];
+            let mut hidden = gather_embeddings(
+                inputs.token_embedding_values,
+                inputs.hidden_features,
+                inputs.vocab_size,
+                &[new_token_id],
+            )?;
 
-        process_all_layers(
-            &mut hidden,
-            inputs.layer_plans,
-            &mut strategy,
-            inputs.hidden_features,
-            1,
-            inputs.rms_norm_eps,
-            inputs.backend,
-        )?;
+            persistent_decode_all_layers(
+                &mut hidden,
+                inputs.layer_plans,
+                &mut decode_projs,
+                &mut state,
+                inputs.hidden_features,
+                inputs.rms_norm_eps,
+                inputs.backend,
+            )?;
 
-        // Decode phase: hidden is [1 × hidden_features], so token_index=0.
-        let next_token_id = graph_sample_at(&hidden, 0, inputs, &x_in, &logits_t, &mut lm_graph)?;
+            let next_token_id =
+                graph_sample_at(&hidden, 0, inputs, &x_in, &logits_t, &mut lm_graph)?;
 
-        generated_token_ids.push(next_token_id);
-        if *current_token_count < inputs.total_sequence_length {
-            all_token_ids[*current_token_count] = next_token_id;
-            *current_token_count += 1;
+            generated_token_ids.push(next_token_id);
+            if *current_token_count < inputs.total_sequence_length {
+                all_token_ids[*current_token_count] = next_token_id;
+                *current_token_count += 1;
+            }
+
+            if inputs.eos_token_id.is_some_and(|eos| eos == next_token_id) {
+                break;
+            }
         }
+    } else {
+        // Fallback: per-token weight upload via DecodeStrategy.
+        let mut strategy = DecodeStrategy { state: &mut state };
+        for _step in 1..inputs.max_new_tokens {
+            let new_token_id = all_token_ids[*current_token_count - 1];
+            let mut hidden = gather_embeddings(
+                inputs.token_embedding_values,
+                inputs.hidden_features,
+                inputs.vocab_size,
+                &[new_token_id],
+            )?;
 
-        if inputs.eos_token_id.is_some_and(|eos| eos == next_token_id) {
-            break;
+            process_all_layers(
+                &mut hidden,
+                inputs.layer_plans,
+                &mut strategy,
+                inputs.hidden_features,
+                1,
+                inputs.rms_norm_eps,
+                inputs.backend,
+            )?;
+
+            let next_token_id =
+                graph_sample_at(&hidden, 0, inputs, &x_in, &logits_t, &mut lm_graph)?;
+
+            generated_token_ids.push(next_token_id);
+            if *current_token_count < inputs.total_sequence_length {
+                all_token_ids[*current_token_count] = next_token_id;
+                *current_token_count += 1;
+            }
+
+            if inputs.eos_token_id.is_some_and(|eos| eos == next_token_id) {
+                break;
+            }
         }
     }
     Ok(())

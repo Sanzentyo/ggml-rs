@@ -55,13 +55,13 @@ pub(super) fn qwen35_linear_attention_prefill(
 }
 
 /// Shared input projections for both core and decode paths.
-struct LinearProjections {
-    qkv: Vec<f32>,
-    z: Vec<f32>,
-    alpha: Vec<f32>,
-    beta: Vec<f32>,
-    conv_channels: usize,
-    hidden_features: usize,
+pub(super) struct LinearProjections {
+    pub(super) qkv: Vec<f32>,
+    pub(super) z: Vec<f32>,
+    pub(super) alpha: Vec<f32>,
+    pub(super) beta: Vec<f32>,
+    pub(super) conv_channels: usize,
+    pub(super) hidden_features: usize,
 }
 
 /// Output of the fused projection + conv graph, which computes all four linear
@@ -226,6 +226,135 @@ fn project_linear_inputs_graph(
         conv_channels,
         hidden_features,
     })
+}
+
+/// Derive `hidden_features` from the output weight matrix dimensions.
+pub(super) fn linear_attention_hidden_features(
+    attention: &Qwen35LinearAttentionLayerPlan,
+) -> Result<usize, E2eError> {
+    let is = attention.inner_size;
+    if is == 0 {
+        return Err(E2eError::BufferLengthMismatch {
+            expected: 1,
+            actual: 0,
+        });
+    }
+    let total = attention.ssm_out_weight_values.len();
+    let h = total / is;
+    if h > 0 && h * is == total {
+        Ok(h)
+    } else {
+        Err(E2eError::BufferLengthMismatch {
+            expected: 1,
+            actual: 0,
+        })
+    }
+}
+
+/// Compute `conv_channels` from plan dimensions.
+pub(super) fn linear_attention_conv_channels(
+    attention: &Qwen35LinearAttentionLayerPlan,
+) -> Result<usize, E2eError> {
+    Ok(attention.inner_size
+        + checked_mul(checked_mul(attention.group_count, attention.state_size)?, 2)?)
+}
+
+/// Core linear attention decode logic: conv → split/norm → SSM recurrence → z-gating.
+///
+/// Takes raw projections and returns the SSM output (before output projection).
+/// The caller is responsible for projecting the output.
+pub(super) fn linear_attention_decode_core(
+    projections: LinearProjections,
+    attention: &Qwen35LinearAttentionLayerPlan,
+    rms_norm_eps: f32,
+    state: &mut LinearAttentionState,
+) -> Result<Vec<f32>, E2eError> {
+    let LinearProjections {
+        qkv,
+        z,
+        alpha,
+        beta,
+        conv_channels,
+        hidden_features: _,
+    } = projections;
+
+    if attention.group_count == 0 || attention.state_size == 0 || attention.time_step_rank == 0 {
+        return Err(E2eError::BufferLengthMismatch {
+            expected: 1,
+            actual: 0,
+        });
+    }
+
+    let conv = causal_depthwise_conv_decode_step(&qkv, state, &attention.conv_weight_values)?;
+
+    let qk_features = checked_mul(attention.group_count, attention.state_size)?;
+    let (q_heads, k_heads) = split_and_norm_qk(&conv, 1, attention, conv_channels, rms_norm_eps)?;
+
+    let v_raw = &conv[qk_features * 2..conv_channels];
+
+    let scale = 1.0_f32 / (attention.state_size as f32).sqrt();
+    let mut output = vec![0.0_f32; attention.inner_size];
+    let mut scratch = SsmScratch::new(attention.state_size);
+
+    for head in 0..attention.time_step_rank {
+        let src_group = head % attention.group_count;
+        let q = head_slice(
+            &q_heads,
+            0,
+            src_group,
+            attention.group_count,
+            attention.state_size,
+        );
+        let k = head_slice(
+            &k_heads,
+            0,
+            src_group,
+            attention.group_count,
+            attention.state_size,
+        );
+        let v = head_slice(
+            v_raw,
+            0,
+            head,
+            attention.time_step_rank,
+            attention.state_size,
+        );
+        let z_head = head_slice(&z, 0, head, attention.time_step_rank, attention.state_size);
+
+        let gate = softplus_scalar(alpha[head] + attention.dt_bias_values[head])
+            * attention.ssm_a_values[head];
+        let beta_value = sigmoid_scalar(beta[head]);
+
+        let state_size_sq = checked_mul(attention.state_size, attention.state_size)?;
+        let state_offset = checked_mul(head, state_size_sq)?;
+        let ssm_state = &mut state.ssm_states[state_offset..state_offset + state_size_sq];
+
+        ssm_recurrence_step(
+            ssm_state,
+            q,
+            k,
+            v,
+            z_head,
+            gate.exp(),
+            beta_value,
+            attention.state_size,
+            scale,
+            &mut scratch,
+        );
+        let normalized = rms_norm_single(&scratch.out, &attention.ssm_norm_values, rms_norm_eps)?;
+        let dst = head_slice_mut(
+            &mut output,
+            0,
+            head,
+            attention.time_step_rank,
+            attention.state_size,
+        );
+        dst.iter_mut()
+            .zip(normalized.iter().zip(z_head.iter()))
+            .for_each(|(d, (&n, &z))| *d = n * silu_scalar(z));
+    }
+
+    Ok(output)
 }
 
 /// Project input through QKV, gate, alpha, and beta weights. Validates
@@ -1090,87 +1219,10 @@ pub(super) fn qwen35_linear_attention_decode_step(
     state: &mut LinearAttentionState,
     backend: &Backend,
 ) -> Result<Vec<f32>, E2eError> {
-    let LinearProjections {
-        qkv,
-        z,
-        alpha,
-        beta,
-        conv_channels,
-        hidden_features,
-    } = project_linear_inputs(attention, input, 1, Some(backend))?;
+    let projections = project_linear_inputs(attention, input, 1, Some(backend))?;
+    let hidden_features = projections.hidden_features;
 
-    // Conv: use buffer + new QKV row.
-    let conv = causal_depthwise_conv_decode_step(&qkv, state, &attention.conv_weight_values)?;
-
-    // Split conv output into Q, K and L2-normalize.
-    let qk_features = checked_mul(attention.group_count, attention.state_size)?;
-    let (q_heads, k_heads) = split_and_norm_qk(&conv, 1, attention, conv_channels, rms_norm_eps)?;
-
-    // V is the region after Q and K — borrow directly from conv to avoid copy.
-    let v_raw = &conv[qk_features * 2..conv_channels];
-
-    // One SSM recurrence step per head, using persisted states.
-    let scale = 1.0_f32 / (attention.state_size as f32).sqrt();
-    let mut output = vec![0.0_f32; attention.inner_size];
-    let mut scratch = SsmScratch::new(attention.state_size);
-
-    for head in 0..attention.time_step_rank {
-        let src_group = head % attention.group_count;
-        let q = head_slice(
-            &q_heads,
-            0,
-            src_group,
-            attention.group_count,
-            attention.state_size,
-        );
-        let k = head_slice(
-            &k_heads,
-            0,
-            src_group,
-            attention.group_count,
-            attention.state_size,
-        );
-        let v = head_slice(
-            v_raw,
-            0,
-            head,
-            attention.time_step_rank,
-            attention.state_size,
-        );
-        let z_head = head_slice(&z, 0, head, attention.time_step_rank, attention.state_size);
-
-        let gate = softplus_scalar(alpha[head] + attention.dt_bias_values[head])
-            * attention.ssm_a_values[head];
-        let beta_value = sigmoid_scalar(beta[head]);
-
-        let state_size_sq = checked_mul(attention.state_size, attention.state_size)?;
-        let state_offset = checked_mul(head, state_size_sq)?;
-        let ssm_state = &mut state.ssm_states[state_offset..state_offset + state_size_sq];
-
-        ssm_recurrence_step(
-            ssm_state,
-            q,
-            k,
-            v,
-            z_head,
-            gate.exp(),
-            beta_value,
-            attention.state_size,
-            scale,
-            &mut scratch,
-        );
-        let normalized = rms_norm_single(&scratch.out, &attention.ssm_norm_values, rms_norm_eps)?;
-        let dst = head_slice_mut(
-            &mut output,
-            0,
-            head,
-            attention.time_step_rank,
-            attention.state_size,
-        );
-        dst.iter_mut()
-            .zip(normalized.iter().zip(z_head.iter()))
-            .for_each(|(d, (&n, &z))| *d = n * silu_scalar(z));
-    }
+    let output = linear_attention_decode_core(projections, attention, rms_norm_eps, state)?;
 
     project_sequence_graph(
         &output,

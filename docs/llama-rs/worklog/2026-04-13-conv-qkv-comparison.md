@@ -389,3 +389,105 @@ decode_step callsites.
 - All 205 tests pass, 0 new warnings
 
 
+## 15. Persistent Decode Projections — Eliminate Per-Token Weight Upload
+
+### 15.1 Problem
+
+After offloading decode-path projections to the Metal backend (item 14), each
+decode step still creates a fresh ggml `Context`, builds tensors, allocates
+backend memory, uploads ALL layer weights (~756 MB for 28 layers), computes,
+reads results, and tears down. The per-token overhead is dominated by weight
+upload, not computation.
+
+### 15.2 Solution
+
+**Persistent projection graphs**: build one ggml `Context` + graph per layer at
+the start of the decode phase, upload weights once, then reuse the graph for
+every decode step — only transferring the ~6 KB input/output hidden vectors per
+token.
+
+Architecture:
+```
+PersistentDecodeProjection<'ctx>
+├── FullAttention { x_in, q/k/v_out, input_graph, out_x, out_y, output_graph, _buffer }
+└── LinearAttention { x_in, qkv/z/alpha/beta_out, input_graph, out_x, out_y, output_graph, _buffer }
+```
+
+Each variant holds:
+- **Input graph**: `hidden_features → projection outputs` (3 matmuls for full, 4 for linear)
+- **Output graph**: `core_result → hidden_features` (1 matmul)
+- **BackendBuffer**: keeps allocated Metal memory alive
+
+### 15.3 Phase 1 — Core Extraction (Pure Refactoring)
+
+Extracted reusable decode core logic to enable composition with persistent
+projections:
+
+| Function | File | Purpose |
+|----------|------|---------|
+| `full_attention_hidden_features()` | attention.rs | Derive hidden_features from output weight dims |
+| `prepare_qkv_from_raw()` | attention.rs | Post-process raw Q/K/V: deinterleave + per-head RMS norm |
+| `full_attention_decode_core()` | attention.rs | RoPE → KV cache → scoring → gating (before output proj) |
+| `linear_attention_hidden_features()` | linear_attention.rs | Derive hidden_features from SSM output weight dims |
+| `linear_attention_conv_channels()` | linear_attention.rs | Compute conv_channels from plan dimensions |
+| `linear_attention_decode_core()` | linear_attention.rs | Conv → split/norm → SSM recurrence → z-gating |
+
+Existing `qwen35_full_attention_decode_step` and
+`qwen35_linear_attention_decode_step` refactored to delegate to these cores.
+All existing tests pass unchanged.
+
+### 15.4 Phase 2 — Persistent Projection Infrastructure (tensor_ops.rs)
+
+| Component | Purpose |
+|-----------|---------|
+| `PersistentDecodeProjection` enum | FullAttention / LinearAttention variants holding tensor handles |
+| `recommended_persistent_full_attention_memory()` | Context size estimation for full attention |
+| `recommended_persistent_linear_attention_memory()` | Context size estimation for linear attention |
+| `build_persistent_full_attention_graphs()` | Build input + output matmul graphs in one context |
+| `build_persistent_linear_attention_graphs()` | Build 4-input + 1-output matmul graphs in one context |
+| `project_input()` method | Write hidden → compute input graph |
+| `read_*_projections()` methods | Read raw projection outputs from GPU |
+| `project_output()` method | Write core result → compute output graph → read hidden |
+
+### 15.5 Phase 3 — Integration into two_phase_loop (generation.rs)
+
+The decode loop in `two_phase_loop` now:
+
+1. Attempts `try_build_persistent_projections()` for all layers
+2. On **success**: uses `persistent_decode_all_layers()` — no per-token weight upload
+3. On **failure**: falls back to original `DecodeStrategy` via `process_all_layers()`
+
+Runtime fallback ensures robustness: if any context creation, allocation, or
+weight upload fails (e.g., insufficient GPU memory), the loop seamlessly
+degrades to the per-token path.
+
+### 15.6 Drop Safety
+
+Uses `transmute` to erase unnameable lifetime from `PersistentDecodeProjection`.
+Soundness maintained because:
+- `Tensor`/`Graph`/`BackendBuffer` hold `PhantomData<&'ctx Context>`, not real references
+- Owning `Vec<Option<Context>>` lives as sibling local in same scope
+- Projections drop BEFORE contexts due to declaration order
+
+### 15.7 Performance Impact (Estimated)
+
+| Metric | Before (item 14) | After (item 15) |
+|--------|-------------------|------------------|
+| Per-token weight upload | ~756 MB (all layers) | ~6 KB (hidden vectors only) |
+| Context creation/teardown | 28 × 2 per token | 0 per token (built once) |
+| Decode latency | Dominated by weight transfer | Dominated by computation |
+
+### 15.8 Files Changed
+
+| File | Changes |
+|------|---------|
+| `attention.rs` | `PreparedAttention` pub(super); add `full_attention_hidden_features`, `prepare_qkv_from_raw`, `full_attention_decode_core` with head-count divisibility check |
+| `linear_attention.rs` | `LinearProjections` pub(super); add `linear_attention_hidden_features`, `linear_attention_conv_channels`, `linear_attention_decode_core` with group/state/rank validation |
+| `tensor_ops.rs` | Add `PersistentDecodeProjection` enum, memory estimators, graph builders, step methods |
+| `generation.rs` | Add `try_build_persistent_projections`, `build_one_persistent_full/linear`, `persistent_decode_all_layers`; modify `two_phase_loop` decode phase with fallback |
+
+### 15.9 Test Results
+
+- All existing tests pass (behavior-preserving refactoring + additive feature)
+- Fallback path exercised when persistent build is not available
+- `DecodeStrategy` preserved as reference implementation for `full_reprocess_loop`

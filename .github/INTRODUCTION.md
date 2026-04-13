@@ -209,6 +209,16 @@ And you should write rusty code(ADT, enum, type state pattern)
   `DecodeStrategy` in `generation.rs` forwards `backend` (was `_backend`) to both
   callsites. All 205 tests pass. See comparison doc item 14.
 
+- **Persistent decode projections** (eliminate per-token weight upload):
+  Build ggml projection graphs once per layer at decode-phase start, upload weights
+  once, then reuse for every token — only ~6 KB hidden vector I/O per layer per token
+  vs ~756 MB weight upload before. `PersistentDecodeProjection` enum (FullAttention /
+  LinearAttention) in `tensor_ops.rs` holds persistent tensor handles, graphs, and
+  backend buffers. Core decode logic extracted into `full_attention_decode_core` and
+  `linear_attention_decode_core` (pure refactoring, all tests pass). `two_phase_loop`
+  tries persistent path first, falls back to `DecodeStrategy` on failure (runtime
+  robustness). See comparison doc item 15.
+
 ## Validation checkpoints completed on this branch
 
 - `cargo fmt --all`

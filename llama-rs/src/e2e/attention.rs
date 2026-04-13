@@ -53,13 +53,13 @@ pub(super) fn qwen35_full_attention_prefill(
 }
 
 /// Projected and normalized Q, K, V + gate vectors (pre-RoPE).
-struct PreparedAttention {
-    q_values: Vec<f32>,
-    k_values: Vec<f32>,
-    v_proj: Vec<f32>,
-    q_gate: Vec<f32>,
-    hidden_features: usize,
-    query_features: usize,
+pub(super) struct PreparedAttention {
+    pub(super) q_values: Vec<f32>,
+    pub(super) k_values: Vec<f32>,
+    pub(super) v_proj: Vec<f32>,
+    pub(super) q_gate: Vec<f32>,
+    pub(super) hidden_features: usize,
+    pub(super) query_features: usize,
 }
 
 /// Estimate the backend memory needed for attention QKV projections.
@@ -185,6 +185,73 @@ fn project_qkv_graph(
 /// When `backend` is `Some`, uses ggml compute graphs for projections
 /// (prefill/inference path). When `None`, falls back to host-side scalar
 /// dot products (decode path, where graph overhead exceeds benefit).
+/// Derive `hidden_features` from the output weight matrix dimensions.
+pub(super) fn full_attention_hidden_features(
+    attention: &Qwen35FullAttentionLayerPlan,
+) -> Result<usize, E2eError> {
+    let query_features = attention
+        .head_count
+        .checked_mul(attention.head_dimension)
+        .ok_or(E2eError::MemorySizeOverflow)?;
+    attention
+        .output_weight_values
+        .len()
+        .checked_div(query_features)
+        .filter(|&h| h > 0 && h * query_features == attention.output_weight_values.len())
+        .ok_or(E2eError::BufferLengthMismatch {
+            expected: 1,
+            actual: 0,
+        })
+}
+
+/// Post-process raw QKV projection outputs: deinterleave Q/gate and apply
+/// per-head RMS norm. Usable from both the one-shot and persistent projection
+/// paths.
+pub(super) fn prepare_qkv_from_raw(
+    attention: &Qwen35FullAttentionLayerPlan,
+    q_full: Vec<f32>,
+    k_proj: Vec<f32>,
+    v_proj: Vec<f32>,
+    sequence_length: usize,
+    hidden_features: usize,
+    rms_norm_eps: f32,
+) -> Result<PreparedAttention, E2eError> {
+    let query_features = checked_mul(attention.head_count, attention.head_dimension)?;
+
+    let (q_values, q_gate) = deinterleave_q_gate(
+        &q_full,
+        sequence_length,
+        attention.head_count,
+        attention.head_dimension,
+    )?;
+
+    let q_values = per_head_rms_norm(
+        &q_values,
+        sequence_length,
+        attention.head_count,
+        attention.head_dimension,
+        &attention.q_norm_values,
+        rms_norm_eps,
+    )?;
+    let k_values = per_head_rms_norm(
+        &k_proj,
+        sequence_length,
+        attention.kv_head_count,
+        attention.head_dimension,
+        &attention.k_norm_values,
+        rms_norm_eps,
+    )?;
+
+    Ok(PreparedAttention {
+        q_values,
+        k_values,
+        v_proj,
+        q_gate,
+        hidden_features,
+        query_features,
+    })
+}
+
 fn project_and_prepare_qkv(
     attention: &Qwen35FullAttentionLayerPlan,
     input: &[f32],
@@ -192,20 +259,7 @@ fn project_and_prepare_qkv(
     rms_norm_eps: f32,
     backend: Option<&Backend>,
 ) -> Result<PreparedAttention, E2eError> {
-    let total_output_elements = attention
-        .head_count
-        .checked_mul(attention.head_dimension)
-        .and_then(|qf| attention.output_weight_values.len().checked_div(qf))
-        .filter(|&h| {
-            h > 0
-                && h * attention.head_count * attention.head_dimension
-                    == attention.output_weight_values.len()
-        })
-        .ok_or(E2eError::BufferLengthMismatch {
-            expected: 1,
-            actual: 0,
-        })?;
-    let hidden_features = total_output_elements;
+    let hidden_features = full_attention_hidden_features(attention)?;
     let expected_input_len = checked_mul(hidden_features, sequence_length)?;
     if input.len() != expected_input_len {
         return Err(E2eError::BufferLengthMismatch {
@@ -255,38 +309,15 @@ fn project_and_prepare_qkv(
         (q_full, k_proj, v_proj)
     };
 
-    let (q_values, q_gate) = deinterleave_q_gate(
-        &q_full,
-        sequence_length,
-        attention.head_count,
-        attention.head_dimension,
-    )?;
-
-    let q_values = per_head_rms_norm(
-        &q_values,
-        sequence_length,
-        attention.head_count,
-        attention.head_dimension,
-        &attention.q_norm_values,
-        rms_norm_eps,
-    )?;
-    let k_values = per_head_rms_norm(
-        &k_proj,
-        sequence_length,
-        attention.kv_head_count,
-        attention.head_dimension,
-        &attention.k_norm_values,
-        rms_norm_eps,
-    )?;
-
-    Ok(PreparedAttention {
-        q_values,
-        k_values,
+    prepare_qkv_from_raw(
+        attention,
+        q_full,
+        k_proj,
         v_proj,
-        q_gate,
+        sequence_length,
         hidden_features,
-        query_features,
-    })
+        rms_norm_eps,
+    )
 }
 
 fn qwen35_full_attention_core(
@@ -758,29 +789,34 @@ fn fully_fused_attention_graph(
         .read_data_backend()
         .map_err(|source| E2eError::ggml("read<output>", source))
 }
+/// Core full attention decode logic: RoPE → KV cache append → scoring → gating.
 ///
-/// Processes one token using the KV cache accumulated during prefill (and
-/// previous decode steps). The new K/V are appended to `state` BEFORE attention
-/// so the token attends to itself.
-pub(super) fn qwen35_full_attention_decode_step(
+/// Takes prepared QKV projections and returns gated head outputs (before output
+/// projection). The caller is responsible for projecting the output.
+pub(super) fn full_attention_decode_core(
+    prepared: PreparedAttention,
     attention: &Qwen35FullAttentionLayerPlan,
-    input: &[f32],
-    rms_norm_eps: f32,
     state: &mut Qwen35FullAttentionState,
-    backend: &Backend,
 ) -> Result<Vec<f32>, E2eError> {
     let PreparedAttention {
         mut q_values,
         mut k_values,
         v_proj,
         q_gate,
-        hidden_features,
+        hidden_features: _,
         query_features,
-    } = project_and_prepare_qkv(attention, input, 1, rms_norm_eps, Some(backend))?;
+    } = prepared;
+
+    if attention.kv_head_count == 0 || !attention.head_count.is_multiple_of(attention.kv_head_count)
+    {
+        return Err(E2eError::BufferLengthMismatch {
+            expected: attention.head_count,
+            actual: attention.kv_head_count,
+        });
+    }
 
     let hd = attention.head_dimension;
 
-    // Position = number of tokens already in the cache.
     let position_offset = state.token_count();
     apply_neox_rope_in_place(
         &mut q_values,
@@ -803,7 +839,6 @@ pub(super) fn qwen35_full_attention_decode_step(
         position_offset,
     )?;
 
-    // Append new K/V to cache BEFORE attention so the token attends to itself.
     state.append_batch(&k_values, &v_proj, 1)?;
     let total_tokens = state.token_count();
 
@@ -813,7 +848,6 @@ pub(super) fn qwen35_full_attention_decode_step(
         let kv_head = head / groups;
         let q = &q_values[head * hd..(head + 1) * hd];
 
-        // Score against all cached K vectors.
         let mut scores = vec![f32::NEG_INFINITY; total_tokens];
         for (source, score) in scores.iter_mut().enumerate().take(total_tokens) {
             let k = state.k_head_at(source, kv_head, hd);
@@ -834,6 +868,25 @@ pub(super) fn qwen35_full_attention_decode_step(
             dst[index] *= sigmoid_scalar(gate[index]);
         }
     }
+
+    Ok(head_outputs)
+}
+
+///
+/// Processes one token using the KV cache accumulated during prefill (and
+/// previous decode steps). The new K/V are appended to `state` BEFORE attention
+/// so the token attends to itself.
+pub(super) fn qwen35_full_attention_decode_step(
+    attention: &Qwen35FullAttentionLayerPlan,
+    input: &[f32],
+    rms_norm_eps: f32,
+    state: &mut Qwen35FullAttentionState,
+    backend: &Backend,
+) -> Result<Vec<f32>, E2eError> {
+    let prepared = project_and_prepare_qkv(attention, input, 1, rms_norm_eps, Some(backend))?;
+    let hidden_features = prepared.hidden_features;
+    let query_features = prepared.query_features;
+    let head_outputs = full_attention_decode_core(prepared, attention, state)?;
 
     project_sequence_graph(
         &head_outputs,

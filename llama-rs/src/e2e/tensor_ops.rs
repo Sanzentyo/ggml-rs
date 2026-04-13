@@ -487,6 +487,448 @@ pub(super) fn lm_head_sample_step(
     argmax_token_id(&logits_data)
 }
 
+// ---------------------------------------------------------------------------
+// Persistent decode projections: built once, reused every decode step.
+// ---------------------------------------------------------------------------
+
+use ggml_rs::BackendBuffer;
+
+/// Pre-built projection graphs for a single attention layer's decode step.
+///
+/// Each variant holds an input graph (hidden → projections) and an output graph
+/// (core result → hidden), along with all tensor handles needed for per-step
+/// I/O. The `BackendBuffer` keeps allocated memory alive.
+///
+/// # Lifetime
+///
+/// The `'ctx` lifetime ties all tensor/graph handles to the `Context` that
+/// created them. The caller must ensure the `Context` outlives this value.
+pub(super) enum PersistentDecodeProjection<'ctx> {
+    FullAttention {
+        x_in: Tensor<'ctx, f32>,
+        q_out: Tensor<'ctx, f32>,
+        k_out: Tensor<'ctx, f32>,
+        v_out: Tensor<'ctx, f32>,
+        input_graph: Graph<'ctx>,
+        out_x: Tensor<'ctx, f32>,
+        out_y: Tensor<'ctx, f32>,
+        output_graph: Graph<'ctx>,
+        _buffer: BackendBuffer<'ctx>,
+    },
+    LinearAttention {
+        x_in: Tensor<'ctx, f32>,
+        qkv_out: Tensor<'ctx, f32>,
+        z_out: Tensor<'ctx, f32>,
+        alpha_out: Tensor<'ctx, f32>,
+        beta_out: Tensor<'ctx, f32>,
+        input_graph: Graph<'ctx>,
+        out_x: Tensor<'ctx, f32>,
+        out_y: Tensor<'ctx, f32>,
+        output_graph: Graph<'ctx>,
+        _buffer: BackendBuffer<'ctx>,
+    },
+}
+
+/// Estimate ggml context metadata bytes for a full attention persistent
+/// projection (both input and output graphs in a single context).
+pub(super) fn recommended_persistent_full_attention_memory(
+    hidden_features: usize,
+    query_features_x2: usize,
+    kv_features: usize,
+    query_features: usize,
+) -> Result<Bytes, E2eError> {
+    let input_shape = Shape2D::new(hidden_features, 1);
+    let q_mem = Context::recommended_backend_matmul_memory::<f32>(
+        Shape2D::new(hidden_features, query_features_x2),
+        input_shape,
+    )
+    .map_err(|source| E2eError::ggml("mem(pfa_q)", source))?;
+    let k_mem = Context::recommended_backend_matmul_memory::<f32>(
+        Shape2D::new(hidden_features, kv_features),
+        input_shape,
+    )
+    .map_err(|source| E2eError::ggml("mem(pfa_k)", source))?;
+    let v_mem = Context::recommended_backend_matmul_memory::<f32>(
+        Shape2D::new(hidden_features, kv_features),
+        input_shape,
+    )
+    .map_err(|source| E2eError::ggml("mem(pfa_v)", source))?;
+    let out_mem = Context::recommended_backend_matmul_memory::<f32>(
+        Shape2D::new(query_features, hidden_features),
+        Shape2D::new(query_features, 1),
+    )
+    .map_err(|source| E2eError::ggml("mem(pfa_out)", source))?;
+
+    let total = q_mem
+        .get()
+        .checked_add(k_mem.get())
+        .and_then(|v| v.checked_add(v_mem.get()))
+        .and_then(|v| v.checked_add(out_mem.get()))
+        .and_then(|v| v.checked_add(PROJECTION_SLACK_BYTES * 2))
+        .ok_or(E2eError::MemorySizeOverflow)?;
+    Ok(Bytes::new(total))
+}
+
+/// Estimate ggml context metadata bytes for a linear attention persistent
+/// projection (both input and output graphs in a single context).
+pub(super) fn recommended_persistent_linear_attention_memory(
+    hidden_features: usize,
+    conv_channels: usize,
+    inner_size: usize,
+    time_step_rank: usize,
+) -> Result<Bytes, E2eError> {
+    let input_shape = Shape2D::new(hidden_features, 1);
+    let qkv_mem = Context::recommended_backend_matmul_memory::<f32>(
+        Shape2D::new(hidden_features, conv_channels),
+        input_shape,
+    )
+    .map_err(|source| E2eError::ggml("mem(pla_qkv)", source))?;
+    let z_mem = Context::recommended_backend_matmul_memory::<f32>(
+        Shape2D::new(hidden_features, inner_size),
+        input_shape,
+    )
+    .map_err(|source| E2eError::ggml("mem(pla_z)", source))?;
+    let alpha_mem = Context::recommended_backend_matmul_memory::<f32>(
+        Shape2D::new(hidden_features, time_step_rank),
+        input_shape,
+    )
+    .map_err(|source| E2eError::ggml("mem(pla_alpha)", source))?;
+    let beta_mem = Context::recommended_backend_matmul_memory::<f32>(
+        Shape2D::new(hidden_features, time_step_rank),
+        input_shape,
+    )
+    .map_err(|source| E2eError::ggml("mem(pla_beta)", source))?;
+    let out_mem = Context::recommended_backend_matmul_memory::<f32>(
+        Shape2D::new(inner_size, hidden_features),
+        Shape2D::new(inner_size, 1),
+    )
+    .map_err(|source| E2eError::ggml("mem(pla_out)", source))?;
+
+    let total = qkv_mem
+        .get()
+        .checked_add(z_mem.get())
+        .and_then(|v| v.checked_add(alpha_mem.get()))
+        .and_then(|v| v.checked_add(beta_mem.get()))
+        .and_then(|v| v.checked_add(out_mem.get()))
+        .and_then(|v| v.checked_add(PROJECTION_SLACK_BYTES * 2))
+        .ok_or(E2eError::MemorySizeOverflow)?;
+    Ok(Bytes::new(total))
+}
+
+/// Build a persistent full-attention input + output projection graph.
+///
+/// Creates tensors and graph nodes in `ctx`. After calling this, the caller
+/// must call `ctx.allocate_tensors(backend)` and upload weights once.
+///
+/// Returns the constructed `PersistentDecodeProjection::FullAttention` variant
+/// (minus `_buffer` — the caller must attach it after allocation).
+#[allow(clippy::type_complexity)]
+pub(super) fn build_persistent_full_attention_graphs<'ctx>(
+    ctx: &'ctx Context,
+    hidden_features: usize,
+    query_features_x2: usize,
+    kv_features: usize,
+    query_features: usize,
+) -> Result<
+    (
+        Tensor<'ctx, f32>, // x_in
+        Tensor<'ctx, f32>, // w_q
+        Tensor<'ctx, f32>, // w_k
+        Tensor<'ctx, f32>, // w_v
+        Tensor<'ctx, f32>, // q_out
+        Tensor<'ctx, f32>, // k_out
+        Tensor<'ctx, f32>, // v_out
+        Graph<'ctx>,       // input_graph
+        Tensor<'ctx, f32>, // out_x (input to output projection)
+        Tensor<'ctx, f32>, // w_out
+        Tensor<'ctx, f32>, // out_y (result)
+        Graph<'ctx>,       // output_graph
+    ),
+    E2eError,
+> {
+    // Input projection tensors
+    let w_q = ctx
+        .new_tensor_2d::<f32>(Shape2D::new(hidden_features, query_features_x2))
+        .map_err(|source| E2eError::ggml("new_tensor_2d<W_Q>(pfa)", source))?;
+    let w_k = ctx
+        .new_tensor_2d::<f32>(Shape2D::new(hidden_features, kv_features))
+        .map_err(|source| E2eError::ggml("new_tensor_2d<W_K>(pfa)", source))?;
+    let w_v = ctx
+        .new_tensor_2d::<f32>(Shape2D::new(hidden_features, kv_features))
+        .map_err(|source| E2eError::ggml("new_tensor_2d<W_V>(pfa)", source))?;
+    let x_in = ctx
+        .new_tensor_2d::<f32>(Shape2D::new(hidden_features, 1))
+        .map_err(|source| E2eError::ggml("new_tensor_2d<X_IN>(pfa)", source))?;
+
+    let q_out = ctx
+        .mul_mat(&w_q, &x_in)
+        .map_err(|source| E2eError::ggml("mul_mat<Q>(pfa)", source))?;
+    let k_out = ctx
+        .mul_mat(&w_k, &x_in)
+        .map_err(|source| E2eError::ggml("mul_mat<K>(pfa)", source))?;
+    let v_out = ctx
+        .mul_mat(&w_v, &x_in)
+        .map_err(|source| E2eError::ggml("mul_mat<V>(pfa)", source))?;
+
+    let mut input_graph = ctx
+        .new_graph()
+        .map_err(|source| E2eError::ggml("new_graph(pfa_in)", source))?;
+    input_graph.build_forward_expand(&q_out);
+    input_graph.build_forward_expand(&k_out);
+    input_graph.build_forward_expand(&v_out);
+
+    // Output projection tensors
+    let w_out = ctx
+        .new_tensor_2d::<f32>(Shape2D::new(query_features, hidden_features))
+        .map_err(|source| E2eError::ggml("new_tensor_2d<W_OUT>(pfa)", source))?;
+    let out_x = ctx
+        .new_tensor_2d::<f32>(Shape2D::new(query_features, 1))
+        .map_err(|source| E2eError::ggml("new_tensor_2d<OUT_X>(pfa)", source))?;
+    let out_y = ctx
+        .mul_mat(&w_out, &out_x)
+        .map_err(|source| E2eError::ggml("mul_mat<OUT>(pfa)", source))?;
+
+    let mut output_graph = ctx
+        .new_graph()
+        .map_err(|source| E2eError::ggml("new_graph(pfa_out)", source))?;
+    output_graph.build_forward_expand(&out_y);
+
+    Ok((
+        x_in,
+        w_q,
+        w_k,
+        w_v,
+        q_out,
+        k_out,
+        v_out,
+        input_graph,
+        out_x,
+        w_out,
+        out_y,
+        output_graph,
+    ))
+}
+
+/// Build a persistent linear attention input + output projection graph.
+#[allow(clippy::type_complexity)]
+pub(super) fn build_persistent_linear_attention_graphs<'ctx>(
+    ctx: &'ctx Context,
+    hidden_features: usize,
+    conv_channels: usize,
+    inner_size: usize,
+    time_step_rank: usize,
+) -> Result<
+    (
+        Tensor<'ctx, f32>, // x_in
+        Tensor<'ctx, f32>, // w_qkv
+        Tensor<'ctx, f32>, // w_z
+        Tensor<'ctx, f32>, // w_alpha
+        Tensor<'ctx, f32>, // w_beta
+        Tensor<'ctx, f32>, // qkv_out
+        Tensor<'ctx, f32>, // z_out
+        Tensor<'ctx, f32>, // alpha_out
+        Tensor<'ctx, f32>, // beta_out
+        Graph<'ctx>,       // input_graph
+        Tensor<'ctx, f32>, // out_x
+        Tensor<'ctx, f32>, // w_out
+        Tensor<'ctx, f32>, // out_y
+        Graph<'ctx>,       // output_graph
+    ),
+    E2eError,
+> {
+    let w_qkv = ctx
+        .new_tensor_2d::<f32>(Shape2D::new(hidden_features, conv_channels))
+        .map_err(|source| E2eError::ggml("new_tensor_2d<W_QKV>(pla)", source))?;
+    let w_z = ctx
+        .new_tensor_2d::<f32>(Shape2D::new(hidden_features, inner_size))
+        .map_err(|source| E2eError::ggml("new_tensor_2d<W_Z>(pla)", source))?;
+    let w_alpha = ctx
+        .new_tensor_2d::<f32>(Shape2D::new(hidden_features, time_step_rank))
+        .map_err(|source| E2eError::ggml("new_tensor_2d<W_ALPHA>(pla)", source))?;
+    let w_beta = ctx
+        .new_tensor_2d::<f32>(Shape2D::new(hidden_features, time_step_rank))
+        .map_err(|source| E2eError::ggml("new_tensor_2d<W_BETA>(pla)", source))?;
+    let x_in = ctx
+        .new_tensor_2d::<f32>(Shape2D::new(hidden_features, 1))
+        .map_err(|source| E2eError::ggml("new_tensor_2d<X_IN>(pla)", source))?;
+
+    let qkv_out = ctx
+        .mul_mat(&w_qkv, &x_in)
+        .map_err(|source| E2eError::ggml("mul_mat<QKV>(pla)", source))?;
+    let z_out = ctx
+        .mul_mat(&w_z, &x_in)
+        .map_err(|source| E2eError::ggml("mul_mat<Z>(pla)", source))?;
+    let alpha_out = ctx
+        .mul_mat(&w_alpha, &x_in)
+        .map_err(|source| E2eError::ggml("mul_mat<ALPHA>(pla)", source))?;
+    let beta_out = ctx
+        .mul_mat(&w_beta, &x_in)
+        .map_err(|source| E2eError::ggml("mul_mat<BETA>(pla)", source))?;
+
+    let mut input_graph = ctx
+        .new_graph()
+        .map_err(|source| E2eError::ggml("new_graph(pla_in)", source))?;
+    input_graph.build_forward_expand(&qkv_out);
+    input_graph.build_forward_expand(&z_out);
+    input_graph.build_forward_expand(&alpha_out);
+    input_graph.build_forward_expand(&beta_out);
+
+    let w_out = ctx
+        .new_tensor_2d::<f32>(Shape2D::new(inner_size, hidden_features))
+        .map_err(|source| E2eError::ggml("new_tensor_2d<W_OUT>(pla)", source))?;
+    let out_x = ctx
+        .new_tensor_2d::<f32>(Shape2D::new(inner_size, 1))
+        .map_err(|source| E2eError::ggml("new_tensor_2d<OUT_X>(pla)", source))?;
+    let out_y = ctx
+        .mul_mat(&w_out, &out_x)
+        .map_err(|source| E2eError::ggml("mul_mat<OUT>(pla)", source))?;
+
+    let mut output_graph = ctx
+        .new_graph()
+        .map_err(|source| E2eError::ggml("new_graph(pla_out)", source))?;
+    output_graph.build_forward_expand(&out_y);
+
+    Ok((
+        x_in,
+        w_qkv,
+        w_z,
+        w_alpha,
+        w_beta,
+        qkv_out,
+        z_out,
+        alpha_out,
+        beta_out,
+        input_graph,
+        out_x,
+        w_out,
+        out_y,
+        output_graph,
+    ))
+}
+
+impl<'ctx> PersistentDecodeProjection<'ctx> {
+    /// Run the input projection step: upload hidden state, compute, read outputs.
+    pub(super) fn project_input(
+        &mut self,
+        hidden_state: &[f32],
+        backend: &Backend,
+    ) -> Result<(), E2eError> {
+        match self {
+            Self::FullAttention {
+                x_in, input_graph, ..
+            }
+            | Self::LinearAttention {
+                x_in, input_graph, ..
+            } => {
+                x_in.write_data_backend(hidden_state)
+                    .map_err(|source| E2eError::ggml("write<X_IN>(proj_step)", source))?;
+                backend
+                    .compute(input_graph)
+                    .map_err(|source| E2eError::ggml("compute(proj_input_step)", source))?;
+                Ok(())
+            }
+        }
+    }
+
+    /// Read raw QKV projection outputs for full attention.
+    ///
+    /// Returns `(q_full, k_proj, v_proj)`.
+    #[allow(clippy::type_complexity)]
+    pub(super) fn read_full_attention_projections(
+        &self,
+    ) -> Result<(Vec<f32>, Vec<f32>, Vec<f32>), E2eError> {
+        match self {
+            Self::FullAttention {
+                q_out,
+                k_out,
+                v_out,
+                ..
+            } => {
+                let q: Vec<f32> = q_out
+                    .read_data_backend()
+                    .map_err(|source| E2eError::ggml("read<Q>(pfa_step)", source))?;
+                let k: Vec<f32> = k_out
+                    .read_data_backend()
+                    .map_err(|source| E2eError::ggml("read<K>(pfa_step)", source))?;
+                let v: Vec<f32> = v_out
+                    .read_data_backend()
+                    .map_err(|source| E2eError::ggml("read<V>(pfa_step)", source))?;
+                Ok((q, k, v))
+            }
+            Self::LinearAttention { .. } => Err(E2eError::BufferLengthMismatch {
+                expected: 0,
+                actual: 1,
+            }),
+        }
+    }
+
+    /// Read raw linear attention projection outputs.
+    #[allow(clippy::type_complexity)]
+    pub(super) fn read_linear_attention_projections(
+        &self,
+    ) -> Result<(Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>), E2eError> {
+        match self {
+            Self::LinearAttention {
+                qkv_out,
+                z_out,
+                alpha_out,
+                beta_out,
+                ..
+            } => {
+                let qkv: Vec<f32> = qkv_out
+                    .read_data_backend()
+                    .map_err(|source| E2eError::ggml("read<QKV>(pla_step)", source))?;
+                let z: Vec<f32> = z_out
+                    .read_data_backend()
+                    .map_err(|source| E2eError::ggml("read<Z>(pla_step)", source))?;
+                let alpha: Vec<f32> = alpha_out
+                    .read_data_backend()
+                    .map_err(|source| E2eError::ggml("read<ALPHA>(pla_step)", source))?;
+                let beta: Vec<f32> = beta_out
+                    .read_data_backend()
+                    .map_err(|source| E2eError::ggml("read<BETA>(pla_step)", source))?;
+                Ok((qkv, z, alpha, beta))
+            }
+            Self::FullAttention { .. } => Err(E2eError::BufferLengthMismatch {
+                expected: 0,
+                actual: 1,
+            }),
+        }
+    }
+
+    /// Run the output projection step: upload core result, compute, read hidden.
+    pub(super) fn project_output(
+        &mut self,
+        core_output: &[f32],
+        backend: &Backend,
+    ) -> Result<Vec<f32>, E2eError> {
+        match self {
+            Self::FullAttention {
+                out_x,
+                out_y,
+                output_graph,
+                ..
+            }
+            | Self::LinearAttention {
+                out_x,
+                out_y,
+                output_graph,
+                ..
+            } => {
+                out_x
+                    .write_data_backend(core_output)
+                    .map_err(|source| E2eError::ggml("write<OUT_X>(proj_out_step)", source))?;
+                backend
+                    .compute(output_graph)
+                    .map_err(|source| E2eError::ggml("compute(proj_output_step)", source))?;
+                out_y
+                    .read_data_backend()
+                    .map_err(|source| E2eError::ggml("read<OUT_Y>(proj_out_step)", source))
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
