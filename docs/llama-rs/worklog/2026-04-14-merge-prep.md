@@ -58,7 +58,7 @@ API improvements.
 
 ## Test Coverage
 
-- **136 tests** pass with `--features link-system` (1 ignored: upstream suite)
+- **138 tests** pass with `--features link-system` (1 ignored: upstream suite)
 - **0 clippy warnings**
 - **0 fmt issues**
 - Key test categories:
@@ -69,6 +69,8 @@ API improvements.
   - 53 llama-rs tests (attention, linear attention, state, generation, etc.)
   - 2 attention parity tests (CPU vs Metal)
   - 2 MLP parity tests (CPU vs Metal, CPU vs C++ reference)
+  - 2 regression tests (TwoPhase+Standard→error, TwoPhase+zero tokens→empty)
+  - Plus: AttentionStrategy trait extraction verified via existing test suite
 
 ## Known Limitations
 
@@ -82,8 +84,12 @@ API improvements.
 - [x] `cargo fmt --all`
 - [x] `cargo clippy --workspace --all-targets`
 - [x] `cargo test --workspace`
-- [x] `cargo test --workspace --features link-system` (136 pass)
+- [x] `cargo test --workspace --features link-system` (138 pass)
 - [x] Zero TODOs/FIXMEs in codebase
 - [x] All docs updated and consistent
 - [x] Module doc comments on all e2e submodules
 - [x] INTRODUCTION.md items 1-8 all marked DONE
+- [x] CPU runtime smoke test: avg=0.252 ms (no regression from 0.256 ms baseline)
+- [x] Metal runtime smoke test: avg=0.595 ms, checksum matches CPU
+- [x] Self code review: no issues found (5 areas verified)
+- [x] PR #1 created: https://github.com/Sanzentyo/ggml-rs/pull/1
