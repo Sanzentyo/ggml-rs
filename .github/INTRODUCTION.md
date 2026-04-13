@@ -381,6 +381,19 @@ And you should write rusty code(ADT, enum, type state pattern)
   eliminated from `llama-rs` crate.
   See comparison doc item 41.
 
+- **`QkvProjections` struct** (item 42):
+  Replaced `(Vec<f32>, Vec<f32>, Vec<f32>)` return type from `project_qkv_graph`
+  with named struct (`q_full`, `k_proj`, `v_proj`). Eliminates
+  `clippy::type_complexity` warning. Self-documenting field access at call sites.
+  See comparison doc item 42.
+
+- **`FullAttentionDims` struct** (item 43):
+  Consolidated dimension validation + memory estimation from
+  `fully_fused_attention_graph` into a reusable struct. `new()` validates GQA
+  divisibility and derives hidden size from output weight matrix. `estimate_memory(t)`
+  replaces inline calculation. Reduces function preamble from ~30 lines to 2.
+  See comparison doc item 43.
+
 ## Validation checkpoints completed on this branch
 
 - `cargo fmt --all`

@@ -2898,4 +2898,93 @@ in `ggml-rs` (`flash_attn_ext`: 8/7, ggml API surface) and test helpers (low pri
 | `llama-rs/src/e2e/attention.rs` | `project_qkv_graph` accepts `&Qwen35FullAttentionLayerPlan` instead of 3 weight slices |
 | `llama-rs/src/e2e/generation.rs` | `try_build` accepts `LmHeadResources`, returns `Self`; `two_phase_loop` caller updated |
 | `llama-rs/src/e2e/session.rs` | `ensure_persistent_resources` builds LM head first, uses `Option::map` pattern |
+
+---
+
+## Item 42 — `QkvProjections` Struct (type_complexity elimination)
+
+**Commit:** `48f8b99 refactor(llama-rs): extract QkvProjections struct to eliminate type_complexity warning (item 42)`
+
+### 42.1 Motivation
+
+`project_qkv_graph` returned `Result<(Vec<f32>, Vec<f32>, Vec<f32>), E2eError>`. Clippy
+flagged this as `type_complexity`. Positional tuple access (`result.0`, `result.1`, etc.)
+was also error-prone.
+
+### 42.2 New Struct
+
+```rust
+#[derive(Debug)]
+struct QkvProjections {
+    q_full: Vec<f32>,   // [H * D * 2, T] — Q + gate interleaved
+    k_proj: Vec<f32>,   // [Hkv * D, T] — K projection
+    v_proj: Vec<f32>,   // [Hkv * D, T] — V projection
+}
+```
+
+### 42.3 Result
+
+- Eliminated `type_complexity` warning
+- Both branches (graph and host-side fallback) construct `QkvProjections` directly
+- Call site uses `qkv.q_full`, `qkv.k_proj`, `qkv.v_proj` (self-documenting)
+- **llama-rs crate now has ZERO clippy warnings**
+
+### 42.4 Files Modified
+
+| File | Changes |
+|------|---------|
+| `llama-rs/src/e2e/attention.rs` | Added `QkvProjections` struct, updated return type + call site |
+
+---
+
+## Item 43 — `FullAttentionDims` Struct (dimension consolidation)
+
+**Commit:** `dbbb883 refactor(llama-rs): extract FullAttentionDims struct from fully_fused_attention_graph (item 43)`
+
+### 43.1 Motivation
+
+`fully_fused_attention_graph` (338 lines, 7 params) inlined ~30 lines of dimension validation
+and memory estimation at the top of the function. The same dimension pattern (`d, h, hkv, hidden,
+qf, qf2, kvf`) appeared in at least 4 places across attention.rs. Consolidating into a struct:
+- Makes validation reusable across functions
+- Eliminates inline dimension derivation from weight tensor sizes
+- Replaces ad-hoc memory estimation with a named method
+
+### 43.2 New Struct
+
+```rust
+#[derive(Debug, Clone, Copy)]
+struct FullAttentionDims {
+    d: usize,      // Per-head feature dimension (D)
+    h: usize,      // Number of query/gate heads (H)
+    hkv: usize,    // Number of KV heads (Hkv ≤ H, for GQA)
+    hidden: usize,  // Model hidden size (H * D, from output weight matrix)
+    qf: usize,     // Total query features (H * D)
+    qf2: usize,    // Q+gate interleaved features (H * D * 2)
+    kvf: usize,    // KV features per tensor (Hkv * D)
+}
+```
+
+### 43.3 Key Methods
+
+- `FullAttentionDims::new(attention)` — validates GQA divisibility, derives hidden size from
+  output weight matrix, returns `Result<Self, E2eError>`
+- `estimate_memory(t)` — conservative memory estimate for the fully-fused attention graph:
+  weight tensors + data tensors + f16 causal mask + 1 MB overhead headroom
+
+### 43.4 Integration
+
+`fully_fused_attention_graph` now starts with:
+```rust
+let dims = FullAttentionDims::new(attention)?;
+let FullAttentionDims { d, h, hkv, hidden, qf, qf2, kvf } = dims;
+```
+replacing ~30 lines of inline validation + memory calculation with 2 lines + a destructure.
+The function body continues to use the destructured locals — no `dims.` prefix noise.
+
+### 43.5 Files Modified
+
+| File | Changes |
+|------|---------|
+| `llama-rs/src/e2e/attention.rs` | Added `FullAttentionDims` struct + `new()` + `estimate_memory()`, updated `fully_fused_attention_graph` |
 | `llama-rs/Cargo.toml` | Added `postcard` + `serde` dependencies |
