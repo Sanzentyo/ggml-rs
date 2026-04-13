@@ -277,6 +277,20 @@ And you should write rusty code(ADT, enum, type state pattern)
   into `two_phase_loop` with early-return when `remaining_decode_steps == 0`.
   See comparison doc item 28.
 
+- **GraphAllocator safe wrapper** (item 29):
+  Safe Rust wrapper for `ggml_gallocr` C API. Pre-reserves a buffer for the
+  maximum graph size, then reuses it via `alloc_graph()` on each step —
+  eliminating per-step Metal buffer allocation. `!Send + !Sync`, skips
+  tensors with existing backend buffers. 5 integration tests.
+  See comparison doc item 29.
+
+- **PersistentScoringContext** (item 30):
+  Uses GraphAllocator to eliminate per-step Metal buffer allocation in
+  FA decode scoring. Extracts graph construction into `build_scoring_graph()`,
+  reserves at max_tokens, reuses buffer each step. One shared context across
+  all FA layers (serial execution, same dimensions). Eliminates ~800µs/step
+  (8 layers × ~100µs). See comparison doc item 30.
+
 ## Validation checkpoints completed on this branch
 
 - `cargo fmt --all`

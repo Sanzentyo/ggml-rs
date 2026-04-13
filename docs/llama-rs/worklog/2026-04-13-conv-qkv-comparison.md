@@ -1968,3 +1968,129 @@ compute-bound (matmuls on device) rather than transfer-bound.
 | `llama-rs/src/e2e/generation.rs` | Added `PersistentMlpSets`, `try_build_persistent_mlps()`; updated `process_all_layers`, `persistent_decode_all_layers`, `two_phase_loop` |
 | `llama-rs/src/e2e/session.rs` | Updated 3 `process_all_layers` call sites |
 - `DecodeStrategy` preserved as reference implementation for `full_reprocess_loop`
+
+## 29. GraphAllocator Safe Wrapper (ggml_gallocr)
+
+### 29.1 Problem
+
+The ggml-rs crate had no safe wrapper for `ggml_gallocr` — the graph
+allocator that pre-reserves a buffer for the maximum graph size and reuses
+it across steps. Every decode step called `Context::allocate_tensors()`,
+which created a new Metal buffer allocation (~100µs per layer on Apple
+Silicon). This overhead accumulated to ~800µs/step across 8 FA layers.
+
+### 29.2 Design
+
+`GraphAllocator` wraps the `ggml_gallocr` C API:
+
+```rust
+pub struct GraphAllocator {
+    raw: *mut ffi::ggml_gallocr,
+    _not_send_sync: PhantomData<*mut ()>,
+}
+```
+
+Lifecycle:
+1. `GraphAllocator::new(&Backend)` — creates allocator with backend's default buffer type
+2. `reserve(&Graph)` — pre-allocates buffer for the maximum graph topology
+3. `alloc_graph(&mut Graph)` — maps graph tensors to pre-reserved buffer (no new alloc)
+4. `buffer_size()` — queries reserved buffer size in bytes
+
+Key properties:
+- `!Send + !Sync` via `PhantomData<*mut ()>` (matches `Backend` pattern)
+- Skips tensors that already have a backend buffer (safe for persistent KV
+  cross-context views)
+- `Drop` implementation calls `ggml_gallocr_free`
+
+### 29.3 Error Handling
+
+Added `AllocationFailed { context: String }` variant to `ggml_rs::Error`
+with `allocation_failed()` helper for ergonomic construction.
+
+### 29.4 Tests
+
+5 integration tests in `tests/ggml_graph_allocator.rs`:
+1. `basic_lifecycle` — new → reserve → alloc → compute → read
+2. `reuse_across_steps` — 10 sequential steps with same allocator
+3. `skips_preallocated_tensors` — gallocr respects existing backend buffers
+4. `matmul_with_gallocr` — matrix multiplication through gallocr
+5. `buffer_size_before_reserve` — validates 0 before first reserve
+
+### 29.5 Files Modified
+
+| File | Changes |
+|------|---------|
+| `src/compute.rs` | Added `GraphAllocator` struct (~80 lines) |
+| `src/error.rs` | Added `AllocationFailed` variant + helper |
+| `src/lib.rs` | Re-export `GraphAllocator` in public API and prelude |
+| `tests/ggml_graph_allocator.rs` | New: 5 integration tests |
+
+## 30. PersistentScoringContext (Decode-Path Buffer Reuse)
+
+### 30.1 Problem
+
+`decode_scoring_gpu_persistent()` called `ctx.allocate_tensors(backend)`
+every step, triggering a Metal buffer allocation for the scoring graph
+(Q, gate, intermediates from permute+cont+flash_attn+sigmoid+mul). With
+8 FA layers, this cost ~800µs/step — roughly 3% of total decode time at
+T=1000.
+
+### 30.2 Design
+
+#### `build_scoring_graph()`
+
+Extracted the common graph construction into a standalone function:
+
+```rust
+fn build_scoring_graph<'ctx>(
+    ctx: &'ctx Context,
+    attention: &Qwen35FullAttentionLayerPlan,
+    total_tokens: usize,
+    kv_cache: &PersistentKvCache<'static>,
+) -> Result<ScoringGraph<'ctx>, E2eError>
+```
+
+Returns a `ScoringGraph` struct holding Q, gate, gated output, and the
+compute graph. This is used by both `PersistentScoringContext::new()`
+(for reservation) and `decode_scoring_gpu_persistent()` (per-step).
+
+#### `PersistentScoringContext`
+
+```rust
+pub(super) struct PersistentScoringContext {
+    gallocr: GraphAllocator,
+}
+```
+
+- `new()` builds a reservation graph at `max_tokens`, calls
+  `gallocr.reserve()` to pre-allocate the worst-case buffer
+- One context is shared across all FA layers (they run serially and
+  share identical dimensions in Qwen3.5)
+
+#### Integration
+
+`decode_scoring_gpu_persistent()` now accepts `Option<&mut PersistentScoringContext>`:
+- When `Some`: uses `gallocr.alloc_graph()` (no new buffer allocation)
+- When `None`: falls back to `ctx.allocate_tensors()` (original behavior)
+
+Threading:
+- `full_attention_decode_core()` → new `scoring_ctx` parameter
+- `persistent_decode_all_layers()` → new `scoring_ctx` parameter
+- `two_phase_loop()` → builds context after KV caches, passes to decode loop
+
+### 30.3 Performance Impact
+
+| Metric | Before | After |
+|--------|--------|-------|
+| Metal buffer alloc/step | 8 allocations (~100µs each) | 0 (pre-reserved) |
+| Overhead/step | ~800µs | ~0µs |
+| Over 1000 steps | ~800ms (~3%) | negligible |
+| Memory | Transient per-step | One persistent buffer |
+
+### 30.4 Files Modified
+
+| File | Changes |
+|------|---------|
+| `llama-rs/src/e2e/attention.rs` | Added `PersistentScoringContext`, `ScoringGraph`, `build_scoring_graph()`; refactored `decode_scoring_gpu_persistent()`; updated `full_attention_decode_core()` signature |
+| `llama-rs/src/e2e/generation.rs` | Updated `persistent_decode_all_layers()` and `two_phase_loop()` to build and thread `PersistentScoringContext` |
+- `DecodeStrategy` preserved as reference implementation for `full_reprocess_loop`
