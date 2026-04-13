@@ -12,7 +12,7 @@ use super::tensor_ops::{
     PROJECTION_SLACK_BYTES, head_slice, head_slice_mut, per_head_l2_norm, project_sequence,
     project_sequence_graph, rms_norm_single,
 };
-use ggml_rs::{Backend, Bytes, Context, Shape2D};
+use ggml_rs::{Backend, Bytes, Context, Shape2D, Shape3D};
 
 pub(super) fn qwen35_linear_attention_inference(
     attention: &Qwen35LinearAttentionLayerPlan,
@@ -356,12 +356,13 @@ fn qwen35_linear_attention_core(
         hidden_features,
     } = project_linear_inputs(attention, input, sequence_length, Some(backend))?;
 
-    let conv = causal_depthwise_conv(
+    let conv = causal_depthwise_conv_graph(
         &qkv,
         sequence_length,
         conv_channels,
         attention.conv_kernel,
         &attention.conv_weight_values,
+        backend,
     )?;
 
     // Capture pre-conv QKV into conv buffer for future decode steps.
@@ -581,7 +582,8 @@ fn ssm_recurrence_step(
     }
 }
 
-pub(super) fn causal_depthwise_conv(
+#[cfg(test)]
+fn causal_depthwise_conv(
     input: &[f32],
     sequence_length: usize,
     channels: usize,
@@ -616,6 +618,115 @@ pub(super) fn causal_depthwise_conv(
         }
     }
     Ok(output)
+}
+
+/// Graph-accelerated causal depthwise convolution via `ggml_ssm_conv` + SiLU.
+///
+/// Equivalent to `causal_depthwise_conv` (host-only reference) but runs on the backend (CPU/Metal/
+/// CUDA). The input is transposed and left-padded on the host before upload so
+/// that `ggml_ssm_conv` produces a causal result.
+///
+/// # Tensor layout
+///
+/// - `sx` (pre-padded input): `[kernel_size - 1 + seq_len, channels, 1]`
+///   (time-fast, channels-slow — the transpose of our row-major convention).
+/// - `c` (kernel weights): `[kernel_size, channels]` — matches our weight
+///   layout directly.
+/// - Output: `[channels, seq_len, 1]` — channels-fast, tokens-slow — matches
+///   our row-major `[token * channels + channel]` convention.
+fn causal_depthwise_conv_graph(
+    input: &[f32],
+    sequence_length: usize,
+    channels: usize,
+    kernel_size: usize,
+    weight: &[f32],
+    backend: &Backend,
+) -> Result<Vec<f32>, E2eError> {
+    if kernel_size == 0 {
+        return Err(E2eError::BufferLengthMismatch {
+            expected: 1,
+            actual: 0,
+        });
+    }
+    let expected_input_len = checked_mul(sequence_length, channels)?;
+    if input.len() != expected_input_len {
+        return Err(E2eError::BufferLengthMismatch {
+            expected: expected_input_len,
+            actual: input.len(),
+        });
+    }
+    let expected_weight_len = checked_mul(kernel_size, channels)?;
+    if weight.len() != expected_weight_len {
+        return Err(E2eError::BufferLengthMismatch {
+            expected: expected_weight_len,
+            actual: weight.len(),
+        });
+    }
+
+    let pad = kernel_size - 1;
+    let padded_len = pad + sequence_length;
+
+    // Transpose input [seq_len × channels] (channels-fast) →
+    // [channels][padded_len] (time-fast) with kernel_size-1 zero-padding on
+    // the left of each channel row.
+    let mut sx_data = vec![0.0_f32; padded_len * channels];
+    for token in 0..sequence_length {
+        for ch in 0..channels {
+            sx_data[ch * padded_len + pad + token] = input[token * channels + ch];
+        }
+    }
+
+    // Context metadata: 3 tensors (sx, c, conv_out) + graph + silu output.
+    // ggml_ssm_conv is a direct loop — no large intermediates.
+    let tensor_overhead = 3
+        * std::mem::size_of::<f32>()
+        * (padded_len * channels + kernel_size * channels + sequence_length * channels);
+    let ctx_size = Bytes::new(tensor_overhead + PROJECTION_SLACK_BYTES);
+
+    let ctx = Context::new_no_alloc_bytes(ctx_size)
+        .map_err(|source| E2eError::ggml("Context::new_no_alloc_bytes(conv)", source))?;
+
+    // sx: [padded_len, channels, 1] — ggml ne[0]=padded_len, ne[1]=channels, ne[2]=1
+    let sx = ctx
+        .new_tensor_3d::<f32>(Shape3D::new(padded_len, channels, 1))
+        .map_err(|source| E2eError::ggml("new_tensor_3d<sx>", source))?;
+
+    // c: [kernel_size, channels] — ggml ne[0]=kernel_size, ne[1]=channels
+    let c = ctx
+        .new_tensor_2d::<f32>(Shape2D::new(kernel_size, channels))
+        .map_err(|source| E2eError::ggml("new_tensor_2d<c>", source))?;
+
+    // ssm_conv(sx, c) → [channels, seq_len, 1]
+    let conv_out = ctx
+        .ssm_conv(&sx, &c)
+        .map_err(|source| E2eError::ggml("ssm_conv", source))?;
+
+    // SiLU activation
+    let result = ctx
+        .silu(&conv_out)
+        .map_err(|source| E2eError::ggml("silu(conv)", source))?;
+
+    let mut graph = ctx
+        .new_graph()
+        .map_err(|source| E2eError::ggml("new_graph(conv)", source))?;
+    graph.build_forward_expand(&result);
+
+    let _buffer = ctx
+        .allocate_tensors(backend)
+        .map_err(|source| E2eError::ggml("allocate_tensors(conv)", source))?;
+
+    sx.write_data_backend(&sx_data)
+        .map_err(|source| E2eError::ggml("write_data_backend<sx>", source))?;
+    c.write_data_backend(weight)
+        .map_err(|source| E2eError::ggml("write_data_backend<c>", source))?;
+
+    backend
+        .compute(&mut graph)
+        .map_err(|source| E2eError::ggml("compute(conv)", source))?;
+
+    result
+        .read_data_backend()
+        .map_err(|source| E2eError::ggml("read_data_backend(conv)", source))
 }
 
 /// Convolve a single new QKV row using the conv buffer from previous tokens.
@@ -970,5 +1081,107 @@ mod tests {
                 (a - b).abs()
             );
         }
+    }
+
+    #[test]
+    fn conv_graph_matches_host_basic() {
+        let channels = 6;
+        let kernel_size = 3;
+        let seq_len = 5;
+
+        let weight: Vec<f32> = (0..channels * kernel_size)
+            .map(|i| (i as f32 + 1.0) * 0.1)
+            .collect();
+        let input: Vec<f32> = (0..seq_len * channels)
+            .map(|i| (i as f32 + 1.0) * 0.05)
+            .collect();
+
+        let host_out = causal_depthwise_conv(&input, seq_len, channels, kernel_size, &weight)
+            .expect("host conv");
+
+        crate::backend::ensure_backends_loaded();
+        let backend =
+            Backend::new(ggml_rs::BackendKind::Cpu).expect("CPU backend should be available");
+
+        let graph_out =
+            causal_depthwise_conv_graph(&input, seq_len, channels, kernel_size, &weight, &backend)
+                .expect("graph conv");
+
+        assert_eq!(host_out.len(), graph_out.len());
+        for (i, (h, g)) in host_out.iter().zip(graph_out.iter()).enumerate() {
+            assert!(
+                (h - g).abs() < 1e-5,
+                "index {i}: host={h} vs graph={g}, diff={}",
+                (h - g).abs()
+            );
+        }
+    }
+
+    #[test]
+    fn conv_graph_matches_host_single_token() {
+        let channels = 4;
+        let kernel_size = 3;
+        let seq_len = 1;
+
+        let weight: Vec<f32> = (0..channels * kernel_size)
+            .map(|i| (i as f32 + 0.5) * 0.2)
+            .collect();
+        let input: Vec<f32> = (0..channels).map(|i| i as f32 + 1.0).collect();
+
+        let host_out =
+            causal_depthwise_conv(&input, seq_len, channels, kernel_size, &weight).unwrap();
+
+        crate::backend::ensure_backends_loaded();
+        let backend = Backend::new(ggml_rs::BackendKind::Cpu).unwrap();
+
+        let graph_out =
+            causal_depthwise_conv_graph(&input, seq_len, channels, kernel_size, &weight, &backend)
+                .unwrap();
+
+        for (i, (h, g)) in host_out.iter().zip(graph_out.iter()).enumerate() {
+            assert!(
+                (h - g).abs() < 1e-5,
+                "seq=1 index {i}: host={h} vs graph={g}",
+            );
+        }
+    }
+
+    #[test]
+    fn conv_graph_matches_host_seq_less_than_kernel() {
+        let channels = 4;
+        let kernel_size = 4;
+        let seq_len = 2;
+
+        let weight: Vec<f32> = (0..channels * kernel_size)
+            .map(|i| (i as f32 + 1.0) * 0.05)
+            .collect();
+        let input: Vec<f32> = (0..seq_len * channels)
+            .map(|i| (i as f32 + 1.0) * 0.1)
+            .collect();
+
+        let host_out =
+            causal_depthwise_conv(&input, seq_len, channels, kernel_size, &weight).unwrap();
+
+        crate::backend::ensure_backends_loaded();
+        let backend = Backend::new(ggml_rs::BackendKind::Cpu).unwrap();
+
+        let graph_out =
+            causal_depthwise_conv_graph(&input, seq_len, channels, kernel_size, &weight, &backend)
+                .unwrap();
+
+        for (i, (h, g)) in host_out.iter().zip(graph_out.iter()).enumerate() {
+            assert!(
+                (h - g).abs() < 1e-5,
+                "seq<kernel index {i}: host={h} vs graph={g}",
+            );
+        }
+    }
+
+    #[test]
+    fn conv_graph_rejects_kernel_size_zero() {
+        crate::backend::ensure_backends_loaded();
+        let backend = Backend::new(ggml_rs::BackendKind::Cpu).unwrap();
+        let result = causal_depthwise_conv_graph(&[1.0], 1, 1, 0, &[], &backend);
+        assert!(result.is_err());
     }
 }

@@ -670,6 +670,26 @@ impl Context {
             .map_err(|error| error.with_context("ggml_silu"))
     }
 
+    /// SSM-style depthwise 1D convolution (causal, stride-1).
+    ///
+    /// - `sx`: pre-padded input `[d_conv - 1 + n_tokens, d_inner]` (3D with
+    ///   batch: `[…, d_inner, n_sequences]`). The first `d_conv - 1` positions
+    ///   along dimension 0 are the left-padding (past context or zeros).
+    /// - `c`: kernel weights `[d_conv, d_inner]`.
+    ///
+    /// Returns `[d_inner, n_tokens]` (or 3D with batch).
+    ///
+    /// Only `f32` tensors are supported by the ggml backend kernels.
+    pub fn ssm_conv<'ctx>(
+        &'ctx self,
+        sx: &Tensor<'ctx, f32>,
+        c: &Tensor<'ctx, f32>,
+    ) -> Result<Tensor<'ctx, f32>> {
+        let raw = unsafe { ffi::ggml_ssm_conv(self.raw.as_ptr(), sx.raw.as_ptr(), c.raw.as_ptr()) };
+        self.wrap_typed_tensor(raw)
+            .map_err(|error| error.with_context("ggml_ssm_conv"))
+    }
+
     pub fn rms_norm<'ctx, T: GgmlElement>(
         &'ctx self,
         a: &Tensor<'ctx, T>,
