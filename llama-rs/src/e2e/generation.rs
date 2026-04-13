@@ -710,32 +710,17 @@ pub(super) struct PersistentDecodeResources {
 impl PersistentDecodeResources {
     /// Build persistent decode resources from layer plans and model weights.
     ///
-    /// The LM head graph is always built. Projections, KV caches, scoring
-    /// context, linear scratch, and MLPs are each independently optional —
-    /// a failure in one category does not affect others.
-    ///
-    /// Returns `None` only if the LM head graph fails to build (critical path).
+    /// The LM head must be pre-built by the caller. Projections, KV caches,
+    /// scoring context, linear scratch, and MLPs are each independently
+    /// optional — a failure in one category does not affect others.
     pub(super) fn try_build(
         layer_plans: &[LayerPlan],
-        hidden_features: usize,
-        vocab_size: usize,
+        lm_head: LmHeadResources,
         rms_norm_eps: f32,
         total_sequence_length: usize,
-        output_weight_values: &[f32],
-        output_norm_values: &[f32],
         backend: &Backend,
-    ) -> Option<Self> {
-        // 1. LM head (always required)
-        let lm_head = LmHeadResources::try_build(
-            hidden_features,
-            vocab_size,
-            rms_norm_eps,
-            output_weight_values,
-            output_norm_values,
-            backend,
-        )?;
-
-        // 2. Persistent MLPs (per-layer opportunistic)
+    ) -> Self {
+        // 1. Persistent MLPs (per-layer opportunistic)
         let (_mlp_ctxs, persistent_mlps) =
             try_build_persistent_mlps(layer_plans, rms_norm_eps, backend);
 
@@ -784,7 +769,7 @@ impl PersistentDecodeResources {
             }
         });
 
-        Some(Self {
+        Self {
             scoring_ctx,
             linear_scratch,
             persistent_mlps,
@@ -794,7 +779,7 @@ impl PersistentDecodeResources {
             _mlp_ctxs,
             _proj_ctxs,
             _kv_ctxs,
-        })
+        }
     }
 
     /// Seed persistent KV caches from host-side prefill state.
@@ -1287,16 +1272,23 @@ fn two_phase_loop(
     // Build all persistent resources upfront (LM head, projections, KV caches,
     // scoring ctx, linear scratch, MLPs). LM head is reused for both prefill
     // sampling and decode loop — no duplicate graph build.
-    let mut resources = PersistentDecodeResources::try_build(
-        inputs.layer_plans,
+    let mut resources = LmHeadResources::try_build(
         inputs.hidden_features,
         inputs.vocab_size,
         inputs.rms_norm_eps,
-        inputs.total_sequence_length,
         inputs.output_weight_values,
         inputs.output_norm_values,
         inputs.backend,
-    );
+    )
+    .map(|lm_head| {
+        PersistentDecodeResources::try_build(
+            inputs.layer_plans,
+            lm_head,
+            inputs.rms_norm_eps,
+            inputs.total_sequence_length,
+            inputs.backend,
+        )
+    });
 
     // Phase 1: Prefill — process all prompt tokens at once, capturing state.
     let prompt_ids = &all_token_ids[..prompt_token_count];

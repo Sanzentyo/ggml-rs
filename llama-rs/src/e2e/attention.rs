@@ -426,9 +426,7 @@ fn project_qkv_graph(
     hidden_features: usize,
     query_features_x2: usize,
     kv_features: usize,
-    q_weights: &[f32],
-    k_weights: &[f32],
-    v_weights: &[f32],
+    attention: &Qwen35FullAttentionLayerPlan,
     backend: &Backend,
 ) -> Result<(Vec<f32>, Vec<f32>, Vec<f32>), E2eError> {
     let ctx_size = recommended_qkv_projection_memory(
@@ -474,11 +472,11 @@ fn project_qkv_graph(
         .allocate_tensors(backend)
         .map_err(|source| E2eError::ggml("allocate_tensors(QKV)", source))?;
 
-    w_q.write_data_backend(q_weights)
+    w_q.write_data_backend(&attention.q_weight_values)
         .map_err(|source| E2eError::ggml("write_data_backend<W_Q>", source))?;
-    w_k.write_data_backend(k_weights)
+    w_k.write_data_backend(&attention.k_weight_values)
         .map_err(|source| E2eError::ggml("write_data_backend<W_K>", source))?;
-    w_v.write_data_backend(v_weights)
+    w_v.write_data_backend(&attention.v_weight_values)
         .map_err(|source| E2eError::ggml("write_data_backend<W_V>", source))?;
     x.write_data_backend(input)
         .map_err(|source| E2eError::ggml("write_data_backend<X>", source))?;
@@ -599,9 +597,7 @@ fn project_and_prepare_qkv(
             hidden_features,
             query_features_x2,
             kv_features,
-            &attention.q_weight_values,
-            &attention.k_weight_values,
-            &attention.v_weight_values,
+            attention,
             backend,
         )?
     } else {

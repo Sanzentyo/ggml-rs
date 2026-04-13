@@ -22,8 +22,8 @@ use super::config::{E2eGenerationConfig, MixedLayerPolicy};
 use super::decode::decode_norm_tensor;
 use super::error::E2eError;
 use super::generation::{
-    DecodeStrategy, GenerationMode, InferenceStrategy, PersistentDecodeResources, PrefillStrategy,
-    greedy_next_token_id, process_all_layers,
+    DecodeStrategy, GenerationMode, InferenceStrategy, LmHeadResources, PersistentDecodeResources,
+    PrefillStrategy, greedy_next_token_id, process_all_layers,
 };
 use super::numeric::{checked_mul, validate_token_id};
 use super::plan::{AttentionLayerPlan, LayerPlan};
@@ -503,16 +503,23 @@ impl GenerationSession {
             return;
         }
 
-        let resources = PersistentDecodeResources::try_build(
-            &self.layer_plans,
+        let resources = LmHeadResources::try_build(
             self.hidden_features,
             self.vocab_size,
             self.rms_norm_eps,
-            self.total_sequence_length,
             &self.output_weight_values,
             &self.output_norm_values,
             &self.backend,
-        );
+        )
+        .map(|lm_head| {
+            PersistentDecodeResources::try_build(
+                &self.layer_plans,
+                lm_head,
+                self.rms_norm_eps,
+                self.total_sequence_length,
+                &self.backend,
+            )
+        });
 
         if let Some(ref res) = resources {
             res.seed_kv_caches(&self.state);
