@@ -250,6 +250,12 @@ And you should write rusty code(ADT, enum, type state pattern)
   pattern — **reordered** to row-major for auto-vectorization (all tests pass).
   End-to-end cost model shows KV transfer (~64 MB across 8 FA layers at T=1000)
   as dominant bottleneck, not compute. See comparison doc items 22–24.
+- **Cross-context view API** (`view_Nd_of`) in `ggml-rs`:
+  Added `view_1d_of` through `view_4d_of` to `Context`, enabling zero-copy
+  views from tensors in a different (longer-lived) context. Safe `'src: 'ctx`
+  lifetime bound replaces `'static` transmute. Unblocks persistent KV cache
+  (item 22). 5 integration tests including compute graph scenario. 213 tests pass.
+  See comparison doc item 25.
 
 ## Validation checkpoints completed on this branch
 

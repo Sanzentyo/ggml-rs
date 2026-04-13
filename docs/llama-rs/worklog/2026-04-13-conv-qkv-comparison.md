@@ -1335,4 +1335,85 @@ bandwidth. The ~64 MB for full attention layers is the KV re-upload at T=1000 ×
 | 4 | Persistent scoring context | Amortize alloc overhead | Medium |
 | 5 | Explicit SIMD (phases 1/3) | ~2–4× additional SSM gain | Medium |
 | 6 | Custom DELTANET_SCAN op | Full GPU SSM | Very High (upstream) |
+
+## 25. Cross-Context View API (`view_Nd_of`)
+
+### 25.1 Problem
+
+Persistent KV cache (item 22) requires an ephemeral scoring graph context
+to reference tensors owned by a long-lived cache context.  The existing
+`view_1d`..`view_4d` methods on `Context` enforce `&Tensor<'ctx, T>` — the
+source tensor must belong to the *same* context.  This is a Rust-side
+limitation; the ggml C API supports cross-context views natively
+(`ggml_view_Nd` only requires a valid pointer, not a matching context).
+
+The workaround used by `PersistentDecodeProjection` (`generation.rs` L314-330)
+is `'static` transmute — sound in practice but breaks Rust borrow-checking
+guarantees and prevents the compiler from detecting use-after-drop.
+
+### 25.2 Solution: `view_Nd_of` with `'src: 'ctx` Bound
+
+Four new methods on `Context`:
+
+```rust
+pub fn view_1d_of<'ctx, 'src: 'ctx, T: GgmlElement>(
+    &'ctx self, a: &Tensor<'src, T>, ne0: usize, offset: usize
+) -> Result<Tensor<'ctx, T>>
+```
+
+(and `view_2d_of`, `view_3d_of`, `view_4d_of` with matching stride/offset params)
+
+**Key lifetime constraint**: `'src: 'ctx` means the source context must
+outlive the view context.  The borrow checker enforces this at every call
+site — `drop(src_ctx)` while the view is live is a compile error.
+
+**Soundness argument**:
+- `Tensor<'src, T>` carries `PhantomData<&'src Context>`, keeping `src_ctx`
+  borrowed for `'src`
+- The `'src: 'ctx` bound makes the compiler enforce `src_ctx` outlives the
+  view context's borrow
+- The returned `Tensor<'ctx, T>` lives at most `'ctx`, which is ≤ `'src`
+- No unsafe beyond the FFI call to `ggml_view_Nd` (same as existing `view_Nd`)
+
+### 25.3 Validation
+
+All `view_Nd_of` variants reuse the existing `validate_view_extent` helper
+(which is already lifetime-agnostic: `&Tensor<'_, T>`), providing the same
+OOB bounds checks as same-context views.
+
+### 25.4 Tests (5 new)
+
+| Test | Covers |
+|------|--------|
+| `cross_context_view_1d_smoke` | Basic cross-context 1D view + offset |
+| `cross_context_view_2d_smoke` | Strided 2D view across contexts |
+| `cross_context_view_4d_backend` | 4D view with backend-allocated tensors |
+| `cross_context_view_oob_rejected` | OOB checks work across contexts |
+| `cross_context_view_in_graph` | **Key use case**: persistent ctx tensor + ephemeral graph → `add` → correct output |
+
+### 25.5 Files Changed
+
+| File | Change |
+|------|--------|
+| `src/compute.rs` | `view_1d_of` through `view_4d_of` (+145 lines) |
+| `tests/ggml_tensor_ops.rs` | 5 cross-context view tests (+125 lines) |
+
+### 25.6 Impact on Persistent KV Cache
+
+This API is the safe foundation for item 22's design.  The ephemeral scoring
+context can now create views into a persistent KV cache context without
+`'static` transmute:
+
+```rust
+let persistent_ctx = Context::new_no_alloc(mem)?;
+let k_cache = persistent_ctx.new_tensor_3d::<f32>(shape)?;
+// ... (persist across decode steps)
+
+// Per-step: ephemeral context views into persistent cache
+let graph_ctx = Context::new_no_alloc(mem)?;
+let k_prefix = graph_ctx.view_3d_of(&k_cache, d, t, hkv, nb1, nb2, 0)?;
+// ... build flash_attn_ext graph using k_prefix ...
+```
+
+All 213 tests pass (208 existing + 5 new).
 - `DecodeStrategy` preserved as reference implementation for `full_reprocess_loop`
