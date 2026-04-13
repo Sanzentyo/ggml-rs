@@ -60,6 +60,13 @@ And you should write rusty code(ADT, enum, type state pattern)
   `generate_from_plans` core loop. Integration test
   `two_phase_matches_full_reprocess_multi_layer` verifies both execution
   paths produce identical token sequences on a 3-layer synthetic model.
+- **Iterator/chunks_exact refactoring**: Replaced procedural index loops with
+  idiomatic Rust iterators across e2e modules. Extracted `SsmScratch` reusable
+  buffer + `ssm_recurrence_step` helper (eliminates 60-line duplication in
+  `linear_attention.rs`). Extracted `deinterleave_q_gate` helper with unified
+  validation (was duplicated in prefill + decode paths). QKV split uses
+  `chunks_exact` zip. Per-head norm functions use `chunks_exact_mut`.
+  Conv inner loop uses `saturating_sub` for tap range. All 136 tests pass.
 
 ## Validation checkpoints completed on this branch
 

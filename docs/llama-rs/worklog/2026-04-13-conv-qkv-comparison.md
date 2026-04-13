@@ -173,8 +173,9 @@ llama-rs uses explicit `copy_from_slice`.
 5. **Performance**: llama-rs uses scalar loops with explicit copies; llama.cpp
    uses graph-level zero-copy views and multi-threaded kernels. This is
    expected for a reference implementation vs production runtime.
-6. **Future optimization**: Replace `copy_from_slice` splits with strided
-   iterators or views when the ggml-rs safe API supports it.
+6. **Future optimization**: The `copy_from_slice` QKV splits now use
+   `chunks_exact` iterators, eliminating manual index arithmetic. Further
+   optimization (strided views) possible when ggml-rs safe API supports it.
 7. **Multi-layer orchestration verified**: `generation.rs` extracted a
    `GenerationMode` enum (`Auto | FullReprocess | TwoPhase`) and a
    `generate_from_plans` helper.  Integration test

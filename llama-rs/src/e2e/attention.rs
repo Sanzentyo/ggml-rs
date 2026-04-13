@@ -70,31 +70,9 @@ fn qwen35_full_attention_core(
         &attention.v_weight_values,
     )?;
 
-    let mut q_values = vec![0.0_f32; checked_mul(sequence_length, query_features)?];
-    let mut q_gate = vec![0.0_f32; checked_mul(sequence_length, query_features)?];
     let hd = attention.head_dimension;
-    // ggml layout per token: [Q_h0(D), G_h0(D), Q_h1(D), G_h1(D), ...]
-    let per_token_qg_features = checked_mul(checked_mul(attention.head_count, hd)?, 2)?;
-    let expected_qg_len = checked_mul(sequence_length, per_token_qg_features)?;
-    if q_full.len() != expected_qg_len {
-        return Err(E2eError::BufferLengthMismatch {
-            expected: expected_qg_len,
-            actual: q_full.len(),
-        });
-    }
-    for token in 0..sequence_length {
-        let token_base = token * per_token_qg_features;
-        let dst_token_base = token * query_features;
-        for head in 0..attention.head_count {
-            for dim in 0..hd {
-                let src_q = token_base + head * 2 * hd + dim;
-                let src_g = token_base + head * 2 * hd + hd + dim;
-                let dst = dst_token_base + head * hd + dim;
-                q_values[dst] = q_full[src_q];
-                q_gate[dst] = q_full[src_g];
-            }
-        }
-    }
+    let (q_values, q_gate) =
+        deinterleave_q_gate(&q_full, sequence_length, attention.head_count, hd)?;
 
     let mut q_values = per_head_rms_norm(
         &q_values,
@@ -203,6 +181,48 @@ fn qwen35_full_attention_core(
         hidden_features,
         &attention.output_weight_values,
     )
+}
+
+/// De-interleave ggml's `[Q_h0, G_h0, Q_h1, G_h1, ...]` layout into
+/// separate Q and gate buffers.
+///
+/// Both call sites (prefill multi-token and decode single-token) go through
+/// this function so validation is unified.
+fn deinterleave_q_gate(
+    q_full: &[f32],
+    sequence_length: usize,
+    head_count: usize,
+    head_dimension: usize,
+) -> Result<(Vec<f32>, Vec<f32>), E2eError> {
+    let query_features = checked_mul(head_count, head_dimension)?;
+    let per_token_qg = checked_mul(query_features, 2)?;
+    let expected_len = checked_mul(sequence_length, per_token_qg)?;
+    if q_full.len() != expected_len {
+        return Err(E2eError::BufferLengthMismatch {
+            expected: expected_len,
+            actual: q_full.len(),
+        });
+    }
+
+    let total_out = checked_mul(sequence_length, query_features)?;
+    let mut q_values = vec![0.0_f32; total_out];
+    let mut q_gate = vec![0.0_f32; total_out];
+
+    for ((src_token, q_dst_token), g_dst_token) in q_full
+        .chunks_exact(per_token_qg)
+        .zip(q_values.chunks_exact_mut(query_features))
+        .zip(q_gate.chunks_exact_mut(query_features))
+    {
+        for head in 0..head_count {
+            let hd = head_dimension;
+            q_dst_token[head * hd..(head + 1) * hd]
+                .copy_from_slice(&src_token[head * 2 * hd..head * 2 * hd + hd]);
+            g_dst_token[head * hd..(head + 1) * hd]
+                .copy_from_slice(&src_token[head * 2 * hd + hd..(head + 1) * 2 * hd]);
+        }
+    }
+
+    Ok((q_values, q_gate))
 }
 
 /// Apply NeoX-style rotary position embedding in-place.
@@ -317,17 +337,7 @@ pub(super) fn qwen35_full_attention_decode_step(
 
     // De-interleave Q/Gate for single token.
     let hd = attention.head_dimension;
-    let mut q_values = vec![0.0_f32; query_features];
-    let mut q_gate = vec![0.0_f32; query_features];
-    for head in 0..attention.head_count {
-        for dim in 0..hd {
-            let src_q = head * 2 * hd + dim;
-            let src_g = head * 2 * hd + hd + dim;
-            let dst = head * hd + dim;
-            q_values[dst] = q_full[src_q];
-            q_gate[dst] = q_full[src_g];
-        }
-    }
+    let (q_values, q_gate) = deinterleave_q_gate(&q_full, 1, attention.head_count, hd)?;
 
     let mut q_values = per_head_rms_norm(
         &q_values,
@@ -416,66 +426,20 @@ mod tests {
 
     #[test]
     fn qwen35_full_attention_qgate_split_is_head_interleaved() {
-        let head_count = 2;
-        let hd = 3;
-        let query_features = head_count * hd;
-        let per_token_qg = query_features * 2;
-        let sequence_length = 1;
-
         let q_full: Vec<f32> = vec![
             1.0, 2.0, 3.0, 10.0, 20.0, 30.0, 4.0, 5.0, 6.0, 40.0, 50.0, 60.0,
         ];
-        assert_eq!(q_full.len(), per_token_qg);
-
-        let mut q_values = vec![0.0_f32; query_features];
-        let mut q_gate = vec![0.0_f32; query_features];
-        for token in 0..sequence_length {
-            let token_base = token * per_token_qg;
-            let dst_token_base = token * query_features;
-            for head in 0..head_count {
-                for dim in 0..hd {
-                    let src_q = token_base + head * 2 * hd + dim;
-                    let src_g = token_base + head * 2 * hd + hd + dim;
-                    let dst = dst_token_base + head * hd + dim;
-                    q_values[dst] = q_full[src_q];
-                    q_gate[dst] = q_full[src_g];
-                }
-            }
-        }
-
+        let (q_values, q_gate) = deinterleave_q_gate(&q_full, 1, 2, 3).unwrap();
         assert_eq!(q_values, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
         assert_eq!(q_gate, vec![10.0, 20.0, 30.0, 40.0, 50.0, 60.0]);
     }
 
     #[test]
     fn qwen35_full_attention_qgate_split_multi_token() {
-        let head_count = 2;
-        let hd = 2;
-        let query_features = head_count * hd;
-        let per_token_qg = query_features * 2;
-        let sequence_length = 2;
-
         let q_full: Vec<f32> = vec![
             1.0, 2.0, 10.0, 20.0, 3.0, 4.0, 30.0, 40.0, 5.0, 6.0, 50.0, 60.0, 7.0, 8.0, 70.0, 80.0,
         ];
-        assert_eq!(q_full.len(), sequence_length * per_token_qg);
-
-        let mut q_values = vec![0.0_f32; sequence_length * query_features];
-        let mut q_gate = vec![0.0_f32; sequence_length * query_features];
-        for token in 0..sequence_length {
-            let token_base = token * per_token_qg;
-            let dst_token_base = token * query_features;
-            for head in 0..head_count {
-                for dim in 0..hd {
-                    let src_q = token_base + head * 2 * hd + dim;
-                    let src_g = token_base + head * 2 * hd + hd + dim;
-                    let dst = dst_token_base + head * hd + dim;
-                    q_values[dst] = q_full[src_q];
-                    q_gate[dst] = q_full[src_g];
-                }
-            }
-        }
-
+        let (q_values, q_gate) = deinterleave_q_gate(&q_full, 2, 2, 2).unwrap();
         assert_eq!(q_values, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]);
         assert_eq!(q_gate, vec![10.0, 20.0, 30.0, 40.0, 50.0, 60.0, 70.0, 80.0]);
     }

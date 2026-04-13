@@ -91,28 +91,20 @@ fn qwen35_linear_attention_core(
         state.capture_conv_buffer(&qkv, sequence_length)?;
     }
 
-    let mut q_heads = vec![
-        0.0_f32;
-        checked_mul(
-            sequence_length,
-            checked_mul(attention.group_count, attention.state_size)?
-        )?
-    ];
+    let qk_features = checked_mul(attention.group_count, attention.state_size)?;
+    let mut q_heads = vec![0.0_f32; checked_mul(sequence_length, qk_features)?];
     let mut k_heads = vec![0.0_f32; q_heads.len()];
     let mut v_heads = vec![0.0_f32; checked_mul(sequence_length, attention.inner_size)?];
-    let qk_features = checked_mul(attention.group_count, attention.state_size)?;
-    for token in 0..sequence_length {
-        let src_offset = checked_mul(token, conv_channels)?;
-        let q_offset = checked_mul(token, qk_features)?;
-        let v_offset = checked_mul(token, attention.inner_size)?;
-        q_heads[q_offset..q_offset + qk_features]
-            .copy_from_slice(&conv[src_offset..src_offset + qk_features]);
-        k_heads[q_offset..q_offset + qk_features].copy_from_slice(
-            &conv[src_offset + qk_features..src_offset + checked_mul(qk_features, 2)?],
-        );
-        v_heads[v_offset..v_offset + attention.inner_size].copy_from_slice(
-            &conv[src_offset + checked_mul(qk_features, 2)?..src_offset + conv_channels],
-        );
+    debug_assert_eq!(conv.len(), checked_mul(sequence_length, conv_channels)?);
+    for (((conv_row, q_dst), k_dst), v_dst) in conv
+        .chunks_exact(conv_channels)
+        .zip(q_heads.chunks_exact_mut(qk_features))
+        .zip(k_heads.chunks_exact_mut(qk_features))
+        .zip(v_heads.chunks_exact_mut(attention.inner_size))
+    {
+        q_dst.copy_from_slice(&conv_row[..qk_features]);
+        k_dst.copy_from_slice(&conv_row[qk_features..qk_features * 2]);
+        v_dst.copy_from_slice(&conv_row[qk_features * 2..]);
     }
 
     let q_heads = per_head_l2_norm(
@@ -153,6 +145,7 @@ fn qwen35_linear_attention_core(
         )?
     ];
     let scale = 1.0_f32 / (attention.state_size as f32).sqrt();
+    let mut scratch = SsmScratch::new(attention.state_size);
 
     for token in 0..sequence_length {
         for head in 0..attention.time_step_rank {
@@ -197,30 +190,20 @@ fn qwen35_linear_attention_core(
             )?;
             let state = &mut states[state_offset
                 ..state_offset + checked_mul(attention.state_size, attention.state_size)?];
-            let mut sk = vec![0.0_f32; attention.state_size];
-            let decay = gate.exp();
-            for row in 0..attention.state_size {
-                for col in 0..attention.state_size {
-                    state[row * attention.state_size + col] *= decay;
-                    sk[col] += state[row * attention.state_size + col] * k[row];
-                }
-            }
-            let mut delta = vec![0.0_f32; attention.state_size];
-            for index in 0..attention.state_size {
-                delta[index] = (v[index] - sk[index]) * beta_value;
-            }
-            for row in 0..attention.state_size {
-                for col in 0..attention.state_size {
-                    state[row * attention.state_size + col] += k[row] * delta[col];
-                }
-            }
-            let mut out = vec![0.0_f32; attention.state_size];
-            for col in 0..attention.state_size {
-                for row in 0..attention.state_size {
-                    out[col] += state[row * attention.state_size + col] * (q[row] * scale);
-                }
-            }
-            let normalized = rms_norm_single(&out, &attention.ssm_norm_values, rms_norm_eps)?;
+            ssm_recurrence_step(
+                state,
+                q,
+                k,
+                v,
+                z_head,
+                gate.exp(),
+                beta_value,
+                attention.state_size,
+                scale,
+                &mut scratch,
+            );
+            let normalized =
+                rms_norm_single(&scratch.out, &attention.ssm_norm_values, rms_norm_eps)?;
             let dst = head_slice_mut(
                 &mut output,
                 token,
@@ -228,9 +211,9 @@ fn qwen35_linear_attention_core(
                 attention.time_step_rank,
                 attention.state_size,
             );
-            for index in 0..attention.state_size {
-                dst[index] = normalized[index] * silu_scalar(z_head[index]);
-            }
+            dst.iter_mut()
+                .zip(normalized.iter().zip(z_head.iter()))
+                .for_each(|(d, (&n, &z))| *d = n * silu_scalar(z));
         }
     }
 
@@ -246,6 +229,89 @@ fn qwen35_linear_attention_core(
         hidden_features,
         &attention.ssm_out_weight_values,
     )
+}
+
+/// Reusable scratch buffers for SSM recurrence, avoiding per-head allocation.
+struct SsmScratch {
+    sk: Vec<f32>,
+    delta: Vec<f32>,
+    out: Vec<f32>,
+}
+
+impl SsmScratch {
+    fn new(state_size: usize) -> Self {
+        Self {
+            sk: vec![0.0_f32; state_size],
+            delta: vec![0.0_f32; state_size],
+            out: vec![0.0_f32; state_size],
+        }
+    }
+
+    fn clear(&mut self) {
+        self.sk.fill(0.0);
+        self.delta.fill(0.0);
+        self.out.fill(0.0);
+    }
+}
+
+/// Single SSM recurrence step: decay → sk → delta → update → read.
+///
+/// Operates on one head's `state_size × state_size` state matrix. Results are
+/// written into `scratch.out`; the caller is responsible for post-processing
+/// (RMS norm, SiLU gating, etc.).
+///
+/// The loop order is preserved exactly to match the original implementation and
+/// maintain floating-point parity.
+#[allow(clippy::too_many_arguments)]
+fn ssm_recurrence_step(
+    state: &mut [f32],
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    _z: &[f32],
+    decay: f32,
+    beta_value: f32,
+    state_size: usize,
+    scale: f32,
+    scratch: &mut SsmScratch,
+) {
+    debug_assert_eq!(state.len(), state_size * state_size);
+    debug_assert_eq!(q.len(), state_size);
+    debug_assert_eq!(k.len(), state_size);
+    debug_assert_eq!(v.len(), state_size);
+
+    scratch.clear();
+
+    // Decay state and accumulate sk (row-major order preserved).
+    for (row, row_slice) in state.chunks_exact_mut(state_size).enumerate() {
+        let k_row = k[row];
+        for (col, s) in row_slice.iter_mut().enumerate() {
+            *s *= decay;
+            scratch.sk[col] += *s * k_row;
+        }
+    }
+
+    // Delta = (v - sk) * beta
+    scratch
+        .delta
+        .iter_mut()
+        .zip(v.iter().zip(scratch.sk.iter()))
+        .for_each(|(d, (&vi, &ski))| *d = (vi - ski) * beta_value);
+
+    // State update: state[row][col] += k[row] * delta[col]
+    for (row_slice, &k_row) in state.chunks_exact_mut(state_size).zip(k.iter()) {
+        row_slice
+            .iter_mut()
+            .zip(scratch.delta.iter())
+            .for_each(|(s, &d)| *s += k_row * d);
+    }
+
+    // Read output (column-major order preserved for parity).
+    for col in 0..state_size {
+        for row in 0..state_size {
+            scratch.out[col] += state[row * state_size + col] * (q[row] * scale);
+        }
+    }
 }
 
 pub(super) fn causal_depthwise_conv(
@@ -271,17 +337,15 @@ pub(super) fn causal_depthwise_conv(
     }
     let mut output = vec![0.0_f32; input.len()];
     for token in 0..sequence_length {
+        let start_tap = kernel_size.saturating_sub(token + 1);
         for channel in 0..channels {
+            let weight_base = channel * kernel_size;
             let mut sum = 0.0_f32;
-            for tap in 0..kernel_size {
-                if token + 1 < kernel_size - tap {
-                    continue;
-                }
+            for tap in start_tap..kernel_size {
                 let src_token = token + tap + 1 - kernel_size;
-                sum += input[checked_mul(src_token, channels)? + channel]
-                    * weight[checked_mul(channel, kernel_size)? + tap];
+                sum += input[src_token * channels + channel] * weight[weight_base + tap];
             }
-            output[checked_mul(token, channels)? + channel] = silu_scalar(sum);
+            output[token * channels + channel] = silu_scalar(sum);
         }
     }
     Ok(output)
@@ -417,6 +481,7 @@ pub(super) fn qwen35_linear_attention_decode_step(
     // One SSM recurrence step per head, using persisted states.
     let scale = 1.0_f32 / (attention.state_size as f32).sqrt();
     let mut output = vec![0.0_f32; attention.inner_size];
+    let mut scratch = SsmScratch::new(attention.state_size);
 
     for head in 0..attention.time_step_rank {
         let src_group = head % attention.group_count;
@@ -451,32 +516,19 @@ pub(super) fn qwen35_linear_attention_decode_step(
         let state_offset = checked_mul(head, state_size_sq)?;
         let ssm_state = &mut state.ssm_states[state_offset..state_offset + state_size_sq];
 
-        // decay → sk → delta → update → read (exact same order as sequence path)
-        let decay = gate.exp();
-        let mut sk = vec![0.0_f32; attention.state_size];
-        for row in 0..attention.state_size {
-            for col in 0..attention.state_size {
-                ssm_state[row * attention.state_size + col] *= decay;
-                sk[col] += ssm_state[row * attention.state_size + col] * k[row];
-            }
-        }
-        let mut delta = vec![0.0_f32; attention.state_size];
-        for index in 0..attention.state_size {
-            delta[index] = (v[index] - sk[index]) * beta_value;
-        }
-        for row in 0..attention.state_size {
-            for col in 0..attention.state_size {
-                ssm_state[row * attention.state_size + col] += k[row] * delta[col];
-            }
-        }
-        let mut out = vec![0.0_f32; attention.state_size];
-        for col in 0..attention.state_size {
-            for row in 0..attention.state_size {
-                out[col] += ssm_state[row * attention.state_size + col] * (q[row] * scale);
-            }
-        }
-
-        let normalized = rms_norm_single(&out, &attention.ssm_norm_values, rms_norm_eps)?;
+        ssm_recurrence_step(
+            ssm_state,
+            q,
+            k,
+            v,
+            z_head,
+            gate.exp(),
+            beta_value,
+            attention.state_size,
+            scale,
+            &mut scratch,
+        );
+        let normalized = rms_norm_single(&scratch.out, &attention.ssm_norm_values, rms_norm_eps)?;
         let dst = head_slice_mut(
             &mut output,
             0,
@@ -484,9 +536,9 @@ pub(super) fn qwen35_linear_attention_decode_step(
             attention.time_step_rank,
             attention.state_size,
         );
-        for index in 0..attention.state_size {
-            dst[index] = normalized[index] * silu_scalar(z_head[index]);
-        }
+        dst.iter_mut()
+            .zip(normalized.iter().zip(z_head.iter()))
+            .for_each(|(d, (&n, &z))| *d = n * silu_scalar(z));
     }
 
     project_sequence(

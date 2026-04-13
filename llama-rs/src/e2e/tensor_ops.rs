@@ -23,19 +23,20 @@ pub(super) fn rms_norm_with_weight(
     }
 
     let mut output = vec![0.0_f32; input.len()];
-    for token in 0..sequence_length {
-        let offset = checked_mul(token, hidden_features)?;
-        let slice = &input[offset..offset + hidden_features];
-        let mean_square = slice
+    for (src, dst) in input
+        .chunks_exact(hidden_features)
+        .zip(output.chunks_exact_mut(hidden_features))
+    {
+        let mean_square = src
             .iter()
             .copied()
             .map(|value| f64::from(value) * f64::from(value))
             .sum::<f64>()
             / hidden_features as f64;
         let inv_rms = 1.0_f32 / ((mean_square as f32) + eps).sqrt();
-        for (index, value) in slice.iter().copied().enumerate() {
-            output[offset + index] = value * inv_rms * weight[index];
-        }
+        dst.iter_mut()
+            .zip(src.iter().zip(weight.iter()))
+            .for_each(|(d, (&s, &w))| *d = s * inv_rms * w);
     }
     Ok(output)
 }
@@ -102,11 +103,10 @@ pub(super) fn project_sequence(
     }
 
     let mut output = vec![0.0_f32; checked_mul(sequence_length, output_features)?];
-    for token in 0..sequence_length {
-        let input_row =
-            &input[checked_mul(token, input_features)?..checked_mul(token + 1, input_features)?];
-        let dst_row = &mut output
-            [checked_mul(token, output_features)?..checked_mul(token + 1, output_features)?];
+    for (input_row, dst_row) in input
+        .chunks_exact(input_features)
+        .zip(output.chunks_exact_mut(output_features))
+    {
         for (feature, weights_row) in weight.chunks_exact(input_features).enumerate() {
             dst_row[feature] = super::numeric::dot(input_row, weights_row);
         }
@@ -140,7 +140,7 @@ pub(super) fn head_slice_mut(
 
 pub(super) fn per_head_rms_norm(
     input: &[f32],
-    sequence_length: usize,
+    _sequence_length: usize,
     head_count: usize,
     head_dimension: usize,
     weight: &[f32],
@@ -152,12 +152,12 @@ pub(super) fn per_head_rms_norm(
             actual: weight.len(),
         });
     }
+    let token_features = checked_mul(head_count, head_dimension)?;
     let mut output = input.to_vec();
-    for token in 0..sequence_length {
-        for head in 0..head_count {
-            let slice = head_slice_mut(&mut output, token, head, head_count, head_dimension);
-            let normalized = rms_norm_single(slice, weight, eps)?;
-            slice.copy_from_slice(&normalized);
+    for token_slice in output.chunks_exact_mut(token_features) {
+        for head_slice in token_slice.chunks_exact_mut(head_dimension) {
+            let normalized = rms_norm_single(head_slice, weight, eps)?;
+            head_slice.copy_from_slice(&normalized);
         }
     }
     Ok(output)
@@ -165,20 +165,18 @@ pub(super) fn per_head_rms_norm(
 
 pub(super) fn per_head_l2_norm(
     input: &[f32],
-    sequence_length: usize,
+    _sequence_length: usize,
     head_count: usize,
     head_dimension: usize,
     eps: f32,
 ) -> Result<Vec<f32>, E2eError> {
+    let token_features = checked_mul(head_count, head_dimension)?;
     let mut output = input.to_vec();
-    for token in 0..sequence_length {
-        for head in 0..head_count {
-            let slice = head_slice_mut(&mut output, token, head, head_count, head_dimension);
-            let norm = slice.iter().map(|value| value * value).sum::<f32>();
+    for token_slice in output.chunks_exact_mut(token_features) {
+        for head_slice in token_slice.chunks_exact_mut(head_dimension) {
+            let norm = head_slice.iter().map(|v| v * v).sum::<f32>();
             let inv = 1.0_f32 / norm.sqrt().max(eps);
-            for value in slice.iter_mut() {
-                *value *= inv;
-            }
+            head_slice.iter_mut().for_each(|v| *v *= inv);
         }
     }
     Ok(output)
@@ -199,12 +197,13 @@ pub(super) fn gather_embeddings(
     }
 
     let mut output = vec![0.0_f32; checked_mul(hidden_features, token_ids.len())?];
-    for (position, &token_id) in token_ids.iter().enumerate() {
+    for (dst_slice, &token_id) in output
+        .chunks_exact_mut(hidden_features)
+        .zip(token_ids.iter())
+    {
         let token_index = super::numeric::validate_token_id(token_id, vocab_size)?;
-        let src_offset = checked_mul(token_index, hidden_features)?;
-        let dst_offset = checked_mul(position, hidden_features)?;
-        output[dst_offset..dst_offset + hidden_features]
-            .copy_from_slice(&embedding_values[src_offset..src_offset + hidden_features]);
+        let src_offset = token_index * hidden_features;
+        dst_slice.copy_from_slice(&embedding_values[src_offset..src_offset + hidden_features]);
     }
     Ok(output)
 }
