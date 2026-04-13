@@ -2624,4 +2624,111 @@ and new variants are infrequent.
 |------|---------|
 | `llama-rs/src/e2e/plan.rs` | Added `is_standard()` method to `AttentionLayerPlan` |
 | `llama-rs/src/e2e/generation.rs` | Replaced 2 `matches!()` predicates with `is_standard()` |
+
+---
+
+## Item 37 — Dead Code Cleanup
+
+**Commit:** `f63af61 refactor(llama-rs): remove unused _hidden_features param + demote lm_head_graph to #[cfg(test)] (item 37)`
+
+### 37.1 Motivation
+
+The explore-agent analysis (item 38 prep) flagged two dead-code issues:
+
+1. `process_all_layers` had an unused `_hidden_features` parameter (8 args, 7 call sites).
+2. The one-shot `lm_head_graph` function was superseded by `LmHeadResources` (item 35) but still
+   `pub(super)` — only test/bench code used it.
+
+### 37.2 Changes
+
+- **`process_all_layers`**: Removed `_hidden_features: usize` from signature and all 7 call sites
+  (4 in `generation.rs`, 3 in `session.rs`). Function now has 7 parameters (at clippy limit).
+- **`lm_head_graph`**: Demoted from `pub(super)` to `#[cfg(test)]`. Still used by parity tests
+  and `bench_graphs.rs` benchmarks.
+
+### 37.3 Files Modified
+
+| File | Changes |
+|------|---------|
+| `llama-rs/src/e2e/tensor_ops.rs` | Removed `_hidden_features` from `process_all_layers`, gated `lm_head_graph` with `#[cfg(test)]` |
+| `llama-rs/src/e2e/generation.rs` | Updated 4 `process_all_layers` call sites |
+| `llama-rs/src/e2e/session.rs` | Updated 3 `process_all_layers` call sites |
+
+---
+
+## Item 38 — Tuple-to-Struct for Persistent Graph Builders
+
+**Commit:** `0625a25 refactor(llama-rs): replace tuple returns with named structs for persistent graph builders (item 38)`
+
+### 38.1 Motivation
+
+Three persistent graph builder functions returned large anonymous tuples (5, 12, and 14 elements).
+Two required `#[allow(clippy::type_complexity)]` annotations. Positional destructuring was fragile
+and unreadable — swapping two fields of the same type would compile silently but produce wrong results.
+
+### 38.2 New Structs
+
+```rust
+pub(super) struct LmHeadGraphParts<'ctx> {
+    pub w_out: Tensor<'ctx, f32>,
+    pub norm_w: Tensor<'ctx, f32>,
+    pub x_in: Tensor<'ctx, f32>,
+    pub logits: Tensor<'ctx, f32>,
+    pub graph: Graph<'ctx>,
+}
+
+pub(super) struct FullAttentionGraphParts<'ctx> {
+    pub x_in: Tensor<'ctx, f32>,
+    pub w_q: Tensor<'ctx, f32>,
+    pub w_k: Tensor<'ctx, f32>,
+    pub w_v: Tensor<'ctx, f32>,
+    pub q_out: Tensor<'ctx, f32>,
+    pub k_out: Tensor<'ctx, f32>,
+    pub v_out: Tensor<'ctx, f32>,
+    pub input_graph: Graph<'ctx>,
+    pub out_x: Tensor<'ctx, f32>,
+    pub w_out: Tensor<'ctx, f32>,
+    pub out_y: Tensor<'ctx, f32>,
+    pub output_graph: Graph<'ctx>,
+}
+
+pub(super) struct LinearAttentionGraphParts<'ctx> {
+    pub x_in: Tensor<'ctx, f32>,
+    pub w_qkv: Tensor<'ctx, f32>,
+    pub w_z: Tensor<'ctx, f32>,
+    pub w_alpha: Tensor<'ctx, f32>,
+    pub w_beta: Tensor<'ctx, f32>,
+    pub qkv_out: Tensor<'ctx, f32>,
+    pub z_out: Tensor<'ctx, f32>,
+    pub alpha_out: Tensor<'ctx, f32>,
+    pub beta_out: Tensor<'ctx, f32>,
+    pub input_graph: Graph<'ctx>,
+    pub out_x: Tensor<'ctx, f32>,
+    pub w_out: Tensor<'ctx, f32>,
+    pub out_y: Tensor<'ctx, f32>,
+    pub output_graph: Graph<'ctx>,
+}
+```
+
+### 38.3 Call Site Migration Pattern
+
+```rust
+// Before (fragile positional destructuring):
+let (x_in, w_q, w_k, w_v, q_out, k_out, v_out, input_graph,
+     out_x, w_out, out_y, output_graph) =
+    build_persistent_full_attention_graphs(&ctx, ...)?;
+w_q.write_data_backend(&attn.q_weight_values)?;
+
+// After (named field access):
+let g = build_persistent_full_attention_graphs(&ctx, ...)?;
+g.w_q.write_data_backend(&attn.q_weight_values)?;
+```
+
+### 38.4 Files Modified
+
+| File | Changes |
+|------|---------|
+| `llama-rs/src/e2e/tensor_ops.rs` | Added 3 structs, updated 3 builder return types, updated 3 test call sites |
+| `llama-rs/src/e2e/generation.rs` | Updated 3 call sites (LmHeadResources::try_build, build_one_persistent_full, build_one_persistent_linear) |
+| `llama-rs/src/e2e/bench_graphs.rs` | Updated lm_head benchmark call site |
 | `llama-rs/Cargo.toml` | Added `postcard` + `serde` dependencies |

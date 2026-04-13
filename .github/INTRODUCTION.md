@@ -345,6 +345,20 @@ And you should write rusty code(ADT, enum, type state pattern)
   patterns to preserve exhaustiveness checking.
   See comparison doc item 36.
 
+- **Dead code cleanup** (item 37):
+  Removed unused `_hidden_features` parameter from `process_all_layers`
+  (8→7 args, 7 call sites). Demoted one-shot `lm_head_graph` function
+  to `#[cfg(test)]` (replaced by `LmHeadResources` in production).
+  See comparison doc item 37.
+
+- **Tuple-to-struct for persistent graph builders** (item 38):
+  Replaced fragile 5/12/14-element tuple returns with named structs:
+  `LmHeadGraphParts`, `FullAttentionGraphParts`, `LinearAttentionGraphParts`.
+  Eliminated `#[allow(clippy::type_complexity)]` on two builder functions.
+  All call sites updated to use field access (e.g. `g.w_q`) instead of
+  positional destructuring.
+  See comparison doc item 38.
+
 ## Validation checkpoints completed on this branch
 
 - `cargo fmt --all`
