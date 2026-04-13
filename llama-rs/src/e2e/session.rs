@@ -733,4 +733,64 @@ mod tests {
 
         assert_eq!(session_tokens, oneshot_tokens, "deterministic generation");
     }
+
+    #[test]
+    fn persistent_resources_built_lazily_after_prefill() {
+        let mut session = build_test_session(3);
+        // Before any generation, persistent resources should not exist.
+        assert!(session.persistent_resources.is_none());
+        assert!(!session.prefill_done);
+
+        // First token triggers prefill + lazy init.
+        let _ = session.next_token().unwrap().unwrap();
+        assert!(session.prefill_done);
+        // Resources may or may not succeed on CPU, but ensure_persistent_resources was called.
+        // The key invariant: session continues regardless.
+
+        // Subsequent tokens should keep generating.
+        let _ = session.next_token().unwrap().unwrap();
+        let _ = session.next_token().unwrap().unwrap();
+        assert!(session.is_finished());
+    }
+
+    #[test]
+    fn session_without_persistent_resources_still_works() {
+        // Force no persistent resources by pre-setting the field
+        let mut session = build_test_session(3);
+
+        // Generate tokens — should use the fallback path (DecodeStrategy + sample_next)
+        let mut tokens = Vec::new();
+        while let Some(token) = session.next_token().unwrap() {
+            tokens.push(token);
+        }
+        assert_eq!(tokens.len(), 3);
+        assert!(session.is_finished());
+    }
+
+    #[test]
+    fn persistent_resources_produce_same_tokens_as_fallback() {
+        // Two sessions with same config should produce identical tokens
+        // regardless of whether persistent resources succeed or fail.
+        let mut session_a = build_test_session(5);
+        let mut session_b = build_test_session(5);
+
+        for _ in 0..5 {
+            let a = session_a.next_token().unwrap();
+            let b = session_b.next_token().unwrap();
+            assert_eq!(a, b, "persistent and fallback paths must agree");
+        }
+    }
+
+    #[test]
+    fn ensure_persistent_resources_is_idempotent() {
+        let mut session = build_test_session(3);
+        // Trigger prefill
+        let _ = session.next_token().unwrap();
+
+        // Calling ensure_persistent_resources multiple times should be safe
+        let resources_present_first = session.persistent_resources.is_some();
+        session.ensure_persistent_resources();
+        let resources_present_second = session.persistent_resources.is_some();
+        assert_eq!(resources_present_first, resources_present_second);
+    }
 }

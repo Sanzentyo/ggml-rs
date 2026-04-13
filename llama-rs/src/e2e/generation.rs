@@ -932,7 +932,10 @@ fn graph_sample_at(
     lm_head_sample_step(last_hidden, x_in, logits_t, lm_graph, inputs.backend)
 }
 
-/// CPU-only greedy sampling fallback when persistent LM head is unavailable.
+/// Greedy sampling fallback when the persistent LM head graph is unavailable.
+///
+/// Performs host-side norm + matmul + argmax instead of GPU graph execution.
+/// Used in both `two_phase_loop` and `single_phase_loop` fallback paths.
 fn graph_sample_fallback(
     hidden: &[f32],
     token_index: usize,
