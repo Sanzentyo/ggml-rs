@@ -17,8 +17,11 @@
 //! - [`linear_attention`] — Linear attention inference (delta-net) + causal depthwise conv
 //! - [`mlp`] — MLP sequence inference on backend
 //! - [`generation`] — Token generation loop and public API entry points
+//! - [`checkpoint`] — Serializable checkpoint DTOs and save/load
+//! - [`session`] — Resumable step-by-step generation session
 
 mod attention;
+mod checkpoint;
 mod config;
 mod decode;
 mod error;
@@ -29,12 +32,15 @@ mod numeric;
 mod plan;
 mod planner;
 mod resolve;
+mod session;
 mod state;
 mod tensor_ops;
 
+pub use checkpoint::GenerationCheckpoint;
 pub use config::{E2eGenerationConfig, E2eGenerationReport, MixedLayerPolicy};
 pub use error::E2eError;
 pub use generation::{
     generate_token_ids_from_model, generate_token_ids_from_path, resolve_eos_token_id,
     tokenize_prompt_text,
 };
+pub use session::GenerationSession;

@@ -103,6 +103,19 @@ pub enum E2eError {
     },
     #[error("TwoPhase mode requires all attention layers to be Qwen3.5 (Full or Linear)")]
     UnsupportedTwoPhase,
+    #[error("checkpoint version mismatch: file has v{file_version}, expected v{expected_version}")]
+    CheckpointVersionMismatch {
+        file_version: u32,
+        expected_version: u32,
+    },
+    #[error("checkpoint is incompatible with current model: {reason}")]
+    CheckpointModelMismatch { reason: String },
+    #[error("checkpoint I/O error: {0}")]
+    CheckpointIo(#[from] std::io::Error),
+    #[error("checkpoint deserialization failed: {0}")]
+    CheckpointDeserialize(String),
+    #[error("generation session is already finished")]
+    SessionFinished,
 }
 
 impl E2eError {

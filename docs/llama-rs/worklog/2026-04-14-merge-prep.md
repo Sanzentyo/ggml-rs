@@ -49,6 +49,13 @@ API improvements.
    - 3-prompt+5-gen: `[31, 2, 5, 1, 271]`
    - 5-prompt+5-gen: `[6, 24218, 10, 4838, 1665]`
 
+10. **Resumable generation session**: `GenerationSession` with step-by-step
+    `next_token()`, `checkpoint()` snapshot, `resume(model, checkpoint)` restore.
+    `GenerationCheckpoint` DTO with postcard binary format, model fingerprint
+    validation, and KV cache trimming. Separate DTO layer keeps serde types
+    distinct from runtime state. Session reuses `AttentionStrategy` trait +
+    `process_all_layers` shared infrastructure.
+
 ### Documentation
 
 10. Conv & QKV packing comparison document (llama-rs vs llama.cpp).
@@ -58,7 +65,7 @@ API improvements.
 
 ## Test Coverage
 
-- **138 tests** pass with `--features link-system` (1 ignored: upstream suite)
+- **149 tests** pass with `--features link-system` (1 ignored: upstream suite)
 - **0 clippy warnings**
 - **0 fmt issues**
 - Key test categories:
@@ -66,11 +73,12 @@ API improvements.
   - 15 backend compute tests (CPU + Metal parity)
   - 18 error path tests
   - 20 typed tensor tests
-  - 53 llama-rs tests (attention, linear attention, state, generation, etc.)
+  - 66 llama-rs tests (attention, linear attention, state, generation, checkpoint, session, etc.)
   - 2 attention parity tests (CPU vs Metal)
   - 2 MLP parity tests (CPU vs Metal, CPU vs C++ reference)
   - 2 regression tests (TwoPhase+Standard→error, TwoPhase+zero tokens→empty)
-  - Plus: AttentionStrategy trait extraction verified via existing test suite
+  - 7 checkpoint roundtrip/validation tests
+  - 4 session step/resume/parity tests
 
 ## Known Limitations
 

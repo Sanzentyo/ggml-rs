@@ -84,7 +84,7 @@ pub(super) struct GenerationOutput {
 /// - [`InferenceStrategy`]: stateless, full-reprocess (supports all layer types)
 /// - [`PrefillStrategy`]: captures per-layer state during prompt processing
 /// - [`DecodeStrategy`]: uses cached state for single-token decode
-trait AttentionStrategy {
+pub(super) trait AttentionStrategy {
     fn process_attention(
         &mut self,
         layer_idx: usize,
@@ -97,7 +97,7 @@ trait AttentionStrategy {
 }
 
 /// Stateless strategy: dispatches to `*_inference` functions.
-struct InferenceStrategy;
+pub(super) struct InferenceStrategy;
 
 impl AttentionStrategy for InferenceStrategy {
     fn process_attention(
@@ -136,8 +136,8 @@ impl AttentionStrategy for InferenceStrategy {
 }
 
 /// Prefill strategy: dispatches to `*_prefill` functions, capturing state.
-struct PrefillStrategy<'a> {
-    state: &'a mut GenerationState,
+pub(super) struct PrefillStrategy<'a> {
+    pub(super) state: &'a mut GenerationState,
 }
 
 impl AttentionStrategy for PrefillStrategy<'_> {
@@ -163,8 +163,8 @@ impl AttentionStrategy for PrefillStrategy<'_> {
 }
 
 /// Decode strategy: dispatches to `*_decode_step` functions using cached state.
-struct DecodeStrategy<'a> {
-    state: &'a mut GenerationState,
+pub(super) struct DecodeStrategy<'a> {
+    pub(super) state: &'a mut GenerationState,
 }
 
 impl AttentionStrategy for DecodeStrategy<'_> {
@@ -196,7 +196,7 @@ impl AttentionStrategy for DecodeStrategy<'_> {
 // ---------------------------------------------------------------------------
 
 /// Process all layers using the given attention strategy.
-fn process_all_layers(
+pub(super) fn process_all_layers(
     hidden: &mut [f32],
     layer_plans: &[LayerPlan],
     strategy: &mut impl AttentionStrategy,
@@ -610,7 +610,7 @@ fn two_phase_loop(
     Ok(())
 }
 
-fn greedy_next_token_id(
+pub(super) fn greedy_next_token_id(
     hidden_states: &[f32],
     token_index: usize,
     hidden_features: usize,
@@ -931,7 +931,7 @@ mod tests {
         let ffn = 8_usize;
         let vocab = 3_usize;
         let inner_size = 4_usize;
-        let conv_channels = inner_size + 2 * 1 * 1;
+        let conv_channels = inner_size + 2; // inner_size + 2 * group_count * state_size (both 1)
 
         let config = MlpInferenceConfig::new(hidden, ffn).unwrap();
         let layer_plans = vec![LayerPlan {

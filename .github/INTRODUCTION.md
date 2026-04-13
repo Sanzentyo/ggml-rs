@@ -80,6 +80,16 @@ And you should write rusty code(ADT, enum, type state pattern)
   `LinearProjections` + `split_and_norm_qk` in `linear_attention.rs`. Shared by
   core and decode_step paths. Validates dimension divisibility upfront. Decode
   path borrows `v_raw` directly from conv output (avoids extra copy).
+- **Resumable generation session + state serialization** (`save-load-state`):
+  `GenerationSession` (session.rs) provides step-by-step token generation via
+  `new()` → `next_token()` loop, with `checkpoint()` to snapshot state and
+  `resume(model, checkpoint)` to restore. `GenerationCheckpoint` (checkpoint.rs)
+  uses postcard binary format with `LRCK` magic, model fingerprint validation
+  (layer count, types, dims, vocab, rms_norm_eps), and KV cache trimming for
+  compact serialization. Separate DTO layer (`CheckpointV1`, `LayerStateDto`,
+  `ModelFingerprint`) keeps serde types distinct from runtime state. Session
+  reuses `AttentionStrategy` trait + `process_all_layers` shared infrastructure.
+  11 unit tests (7 checkpoint + 4 session) all passing.
 
 ## Validation checkpoints completed on this branch
 
