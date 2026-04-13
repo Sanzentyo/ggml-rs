@@ -20,9 +20,10 @@ use super::config::{E2eGenerationConfig, E2eGenerationReport};
 use super::decode::decode_norm_tensor;
 use super::error::E2eError;
 use super::linear_attention::{
-    LinearProjections, linear_attention_conv_channels, linear_attention_decode_core,
-    linear_attention_hidden_features, qwen35_linear_attention_decode_step,
-    qwen35_linear_attention_inference, qwen35_linear_attention_prefill,
+    LinearDecodeScratch, LinearProjections, linear_attention_conv_channels,
+    linear_attention_decode_core, linear_attention_hidden_features,
+    qwen35_linear_attention_decode_step, qwen35_linear_attention_inference,
+    qwen35_linear_attention_prefill,
 };
 use super::mlp::{PersistentMlp, build_persistent_mlp, mlp_sequence_inference_with_weights};
 use super::numeric::{checked_mul, validate_token_id, value_to_i32};
@@ -615,6 +616,7 @@ fn persistent_decode_all_layers(
     kv_caches: &[Option<PersistentKvCache<'static>>],
     persistent_mlps: &mut [Option<PersistentMlp<'static>>],
     mut scoring_ctx: Option<&mut PersistentScoringContext>,
+    linear_scratch: &mut Option<LinearDecodeScratch>,
     state: &mut GenerationState,
     hidden_features: usize,
     rms_norm_eps: f32,
@@ -666,7 +668,13 @@ fn persistent_decode_all_layers(
                         conv_channels,
                         hidden_features: hf,
                     };
-                    let output = linear_attention_decode_core(projections, attn, rms_norm_eps, s)?;
+                    let output = linear_attention_decode_core(
+                        projections,
+                        attn,
+                        rms_norm_eps,
+                        s,
+                        linear_scratch.as_mut(),
+                    )?;
                     proj.project_output(&output, backend)?
                 }
                 _ => return Err(E2eError::UnsupportedTwoPhase),
@@ -1133,6 +1141,16 @@ fn two_phase_loop(
                 .ok()
             });
 
+        // Build reusable scratch buffers for linear attention decode.
+        // Uses the first linear attention layer as template (all share dimensions).
+        let mut linear_scratch = inputs.layer_plans.iter().find_map(|lp| {
+            if let Some(AttentionLayerPlan::Qwen35Linear(attn)) = lp.attention.as_ref() {
+                Some(LinearDecodeScratch::new(attn.state_size, attn.inner_size))
+            } else {
+                None
+            }
+        });
+
         // Persistent path: no per-token weight upload.
         for _step in 1..inputs.max_new_tokens {
             let new_token_id = all_token_ids[*current_token_count - 1];
@@ -1150,6 +1168,7 @@ fn two_phase_loop(
                 kv_caches_for_decode,
                 &mut persistent_mlps,
                 scoring_ctx.as_mut(),
+                &mut linear_scratch,
                 &mut state,
                 inputs.hidden_features,
                 inputs.rms_norm_eps,

@@ -50,10 +50,29 @@ pub(super) fn rms_norm_single(
     weight: &[f32],
     eps: f32,
 ) -> Result<Vec<f32>, E2eError> {
+    let mut output = vec![0.0_f32; input.len()];
+    rms_norm_single_into(input, weight, eps, &mut output)?;
+    Ok(output)
+}
+
+/// In-place variant of [`rms_norm_single`] that writes into a pre-allocated
+/// destination buffer, avoiding a heap allocation per call.
+pub(super) fn rms_norm_single_into(
+    input: &[f32],
+    weight: &[f32],
+    eps: f32,
+    dst: &mut [f32],
+) -> Result<(), E2eError> {
     if input.len() != weight.len() {
         return Err(E2eError::BufferLengthMismatch {
             expected: weight.len(),
             actual: input.len(),
+        });
+    }
+    if dst.len() < input.len() {
+        return Err(E2eError::BufferLengthMismatch {
+            expected: input.len(),
+            actual: dst.len(),
         });
     }
     let mean_square = input
@@ -63,12 +82,31 @@ pub(super) fn rms_norm_single(
         .sum::<f64>()
         / input.len() as f64;
     let inv_rms = 1.0_f32 / ((mean_square as f32) + eps).sqrt();
-    Ok(input
+    dst.iter_mut()
+        .zip(input.iter().copied().zip(weight.iter().copied()))
+        .for_each(|(d, (value, scale))| *d = value * inv_rms * scale);
+    Ok(())
+}
+
+/// In-place RMS normalization that reads and writes the same buffer.
+fn rms_norm_single_in_place(data: &mut [f32], weight: &[f32], eps: f32) -> Result<(), E2eError> {
+    if data.len() != weight.len() {
+        return Err(E2eError::BufferLengthMismatch {
+            expected: weight.len(),
+            actual: data.len(),
+        });
+    }
+    let mean_square = data
         .iter()
         .copied()
+        .map(|value| f64::from(value) * f64::from(value))
+        .sum::<f64>()
+        / data.len() as f64;
+    let inv_rms = 1.0_f32 / ((mean_square as f32) + eps).sqrt();
+    data.iter_mut()
         .zip(weight.iter().copied())
-        .map(|(value, scale)| value * inv_rms * scale)
-        .collect())
+        .for_each(|(d, scale)| *d *= inv_rms * scale);
+    Ok(())
 }
 
 pub(super) fn add_in_place(accumulator: &mut [f32], addend: &[f32]) -> Result<(), E2eError> {
@@ -160,8 +198,7 @@ pub(super) fn per_head_rms_norm(
     let mut output = input.to_vec();
     for token_slice in output.chunks_exact_mut(token_features) {
         for head_slice in token_slice.chunks_exact_mut(head_dimension) {
-            let normalized = rms_norm_single(head_slice, weight, eps)?;
-            head_slice.copy_from_slice(&normalized);
+            rms_norm_single_in_place(head_slice, weight, eps)?;
         }
     }
     Ok(output)

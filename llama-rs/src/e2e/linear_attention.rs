@@ -10,7 +10,7 @@ use super::plan::Qwen35LinearAttentionLayerPlan;
 use super::state::LinearAttentionState;
 use super::tensor_ops::{
     PROJECTION_SLACK_BYTES, head_slice, head_slice_mut, per_head_l2_norm, project_sequence,
-    project_sequence_graph, rms_norm_single,
+    project_sequence_graph, rms_norm_single, rms_norm_single_into,
 };
 use ggml_rs::{Backend, Bytes, Context, Length, Shape2D};
 
@@ -268,6 +268,7 @@ pub(super) fn linear_attention_decode_core(
     attention: &Qwen35LinearAttentionLayerPlan,
     rms_norm_eps: f32,
     state: &mut LinearAttentionState,
+    decode_scratch: Option<&mut LinearDecodeScratch>,
 ) -> Result<Vec<f32>, E2eError> {
     let LinearProjections {
         qkv,
@@ -293,8 +294,19 @@ pub(super) fn linear_attention_decode_core(
     let v_raw = &conv[qk_features * 2..conv_channels];
 
     let scale = 1.0_f32 / (attention.state_size as f32).sqrt();
-    let mut output = vec![0.0_f32; attention.inner_size];
-    let mut scratch = SsmScratch::new(attention.state_size);
+
+    // Use pre-allocated scratch when available, falling back to fresh allocation.
+    let mut owned_scratch;
+    let scratch = match decode_scratch {
+        Some(s) => {
+            s.output.fill(0.0);
+            s
+        }
+        None => {
+            owned_scratch = LinearDecodeScratch::new(attention.state_size, attention.inner_size);
+            &mut owned_scratch
+        }
+    };
 
     for head in 0..attention.time_step_rank {
         let src_group = head % attention.group_count;
@@ -339,22 +351,27 @@ pub(super) fn linear_attention_decode_core(
             beta_value,
             attention.state_size,
             scale,
-            &mut scratch,
+            &mut scratch.ssm,
         );
-        let normalized = rms_norm_single(&scratch.out, &attention.ssm_norm_values, rms_norm_eps)?;
+        rms_norm_single_into(
+            &scratch.ssm.out,
+            &attention.ssm_norm_values,
+            rms_norm_eps,
+            &mut scratch.norm_buf,
+        )?;
         let dst = head_slice_mut(
-            &mut output,
+            &mut scratch.output,
             0,
             head,
             attention.time_step_rank,
             attention.state_size,
         );
         dst.iter_mut()
-            .zip(normalized.iter().zip(z_head.iter()))
+            .zip(scratch.norm_buf.iter().zip(z_head.iter()))
             .for_each(|(d, (&n, &z))| *d = n * silu_scalar(z));
     }
 
-    Ok(output)
+    Ok(scratch.output.clone())
 }
 
 /// Project input through QKV, gate, alpha, and beta weights. Validates
@@ -695,6 +712,32 @@ impl SsmScratch {
         self.sk.fill(0.0);
         self.delta.fill(0.0);
         self.out.fill(0.0);
+    }
+}
+
+/// Reusable scratch buffers for [`linear_attention_decode_core`], avoiding
+/// per-call and per-head heap allocations during autoregressive decode.
+///
+/// Created once per decode session and passed into every decode step.
+/// Bundles the SSM recurrence scratch, the per-call output buffer, and a
+/// temporary buffer for RMS normalization.
+pub(super) struct LinearDecodeScratch {
+    ssm: SsmScratch,
+    /// Per-call output accumulator, sized to `inner_size`.
+    output: Vec<f32>,
+    /// Temporary for RMS norm result, sized to `state_size`.
+    norm_buf: Vec<f32>,
+}
+
+impl LinearDecodeScratch {
+    /// Create scratch buffers for a linear attention layer with the given
+    /// `state_size` and `inner_size`.
+    pub(super) fn new(state_size: usize, inner_size: usize) -> Self {
+        Self {
+            ssm: SsmScratch::new(state_size),
+            output: vec![0.0_f32; inner_size],
+            norm_buf: vec![0.0_f32; state_size],
+        }
     }
 }
 
@@ -1226,7 +1269,7 @@ pub(super) fn qwen35_linear_attention_decode_step(
     let projections = project_linear_inputs(attention, input, 1, Some(backend))?;
     let hidden_features = projections.hidden_features;
 
-    let output = linear_attention_decode_core(projections, attention, rms_norm_eps, state)?;
+    let output = linear_attention_decode_core(projections, attention, rms_norm_eps, state, None)?;
 
     project_sequence_graph(
         &output,
