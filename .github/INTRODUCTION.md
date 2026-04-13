@@ -319,6 +319,16 @@ And you should write rusty code(ADT, enum, type state pattern)
   validation, invariant checking, and fingerprint mismatch.
   See comparison doc item 33.
 
+- **PersistentDecodeResources — unified session decode optimization** (item 34):
+  `PersistentDecodeResources` encapsulates all GPU-resident persistent state
+  (LM head, projections, KV caches, scoring context, linear scratch, MLPs)
+  in a single struct with safety-critical drop ordering. Granular optionality:
+  LM head always present, all other resources independently optional.
+  Refactored `two_phase_loop` from ~170 lines of inline resource management
+  to ~50 lines. Integrated into `GenerationSession` with lazy init after
+  prefill + fallback to slow path. Eliminated duplicate LM head builds.
+  See comparison doc item 34.
+
 ## Validation checkpoints completed on this branch
 
 - `cargo fmt --all`

@@ -2405,4 +2405,98 @@ produce identical tokens due to floating-point precision differences.
 | `llama-rs/src/e2e.rs` | Added `mod session`, `mod checkpoint`, public re-exports |
 | `llama-rs/src/lib.rs` | Added `GenerationSession`, `GenerationCheckpoint` to re-exports |
 | `llama-rs/src/e2e/error.rs` | Added `CheckpointDeserialize`, `CheckpointVersionMismatch`, `CheckpointModelMismatch` variants |
+
+---
+
+## Item 34: PersistentDecodeResources — unified session decode optimization
+
+### 34.1 Problem
+
+The `two_phase_loop` function built persistent resources (projections, KV
+caches, scoring context, linear scratch, MLPs) using ~170 lines of inline
+resource management with complex ownership (5 separate `_ctx` variables,
+2 fallback branches, manual lifetime transmutes scattered across the
+function body).
+
+Meanwhile, `GenerationSession.step_two_phase()` used **none** of these
+optimizations — every decode step rebuilt attention graphs, re-uploaded
+weights, and computed MLPs ephemerally, resulting in an estimated
+20-200x slowdown per token compared to the standalone generation path.
+
+### 34.2 Design
+
+**`PersistentDecodeResources`** encapsulates all GPU-resident state in a
+single struct with safety-critical field ordering:
+
+```
+Resources (dropped first — top of struct):
+  scoring_ctx: Option<PersistentScoringContext>
+  linear_scratch: Option<LinearDecodeScratch>
+  persistent_mlps: Vec<Option<PersistentMlp<'static>>>
+  decode_projs: Option<Vec<Option<PersistentDecodeProjection<'static>>>>
+  kv_caches: Vec<Option<PersistentKvCache<'static>>>
+  lm_x_in, lm_logits_t, lm_graph  (LM head tensors)
+
+Contexts (dropped last — bottom of struct):
+  _lm_buffer, _lm_ctx
+  _mlp_ctxs, _proj_ctxs, _kv_ctxs
+```
+
+**Granular optionality**: LM head is always present (try_build returns
+None if it fails). All other resource groups are independently optional.
+Failure in one category (e.g., KV caches) does not prevent others
+(e.g., MLPs) from being used.
+
+**`decode_step()` fallback**: When `decode_projs` is None, falls back
+to `process_all_layers` with `DecodeStrategy` but still uses persistent
+MLPs — partial optimization rather than all-or-nothing.
+
+**`'static` transmute pattern**: All persistent types use
+`PhantomData<&'ctx Context>` (raw pointers, not real references).
+The transmute erases unnameable local lifetimes. Sound because struct
+field ordering ensures contexts outlive their derived handles.
+
+### 34.3 Changes to `two_phase_loop`
+
+Before: ~170 lines of inline resource building with 2 branches
+(persistent projections succeed -> full fast path; fail -> fallback with
+persistent MLPs only). Duplicate LM head build (one for prefill sampling,
+one for decode loop).
+
+After: ~50 lines. Resources built once via `try_build()`, shared between
+prefill sampling and decode loop. Single fallback path using
+`graph_sample_fallback()` for CPU-only greedy sampling when persistent
+LM head unavailable.
+
+### 34.4 GenerationSession integration
+
+- Added `persistent_resources: Option<PersistentDecodeResources>` field
+  **before** `backend` field (drop ordering: resources drop before backend)
+- Lazy initialization via `ensure_persistent_resources()`:
+  - After prefill completes (first `next_token()` call)
+  - On first decode step after checkpoint resume (if `prefill_done = true`)
+- KV caches seeded from host prefill state after build
+- Fallback: if `try_build()` returns None, session uses the slow
+  `DecodeStrategy` + `sample_next()` path (existing behavior preserved)
+
+### 34.5 New helper: `graph_sample_fallback`
+
+CPU-only greedy sampling for when persistent LM head is unavailable:
+`rms_norm_with_weight` then `greedy_next_token_id`. Used in both
+`two_phase_loop` fallback and as conceptual reference for the session
+slow path.
+
+### 34.6 Test results
+
+All 218 tests pass (0 failures, 7 ignored). Session tests exercise the
+new `persistent_resources` field initialization and fallback path
+(test sessions use CPU backend with tiny models where `try_build()` may
+succeed or fail depending on backend capabilities).
+
+### 34.7 Files Modified
+
+| File | Changes |
+|------|---------|
+| `llama-rs/src/e2e/generation.rs` | Added `PersistentDecodeResources` struct (~220 lines), `graph_sample_fallback()`, refactored `two_phase_loop` to use unified resources |
+| `llama-rs/src/e2e/session.rs` | Added `persistent_resources` field, `ensure_persistent_resources()`, refactored `step_two_phase()` to use persistent resources with lazy init |
 | `llama-rs/Cargo.toml` | Added `postcard` + `serde` dependencies |
