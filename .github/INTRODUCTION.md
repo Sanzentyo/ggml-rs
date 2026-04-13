@@ -143,6 +143,21 @@ And you should write rusty code(ADT, enum, type state pattern)
   reads. Standalone `causal_depthwise_conv_graph` demoted to `#[cfg(test)]`.
   196 tests pass.
 
+- **Sigmoid + flash_attn_ext safe wrappers** (`ggml-rs`):
+  Added `sigmoid` (elementwise σ(x)) and `flash_attn_ext` (fused multi-head
+  scaled dot-product attention with optional f16 causal mask) to the safe API.
+  `DynTensor::write_bytes_backend` enables raw byte writes for non-f32/i32 types
+  (needed for f16 mask). 5 new integration tests: sigmoid CPU/Metal parity,
+  flash_attn MHA/GQA reference match, output shape validation.
+
+- **Fused attention scoring graph** (full attention prefill):
+  Replaced the host-side O(T²·H·D) scoring loop in `qwen35_full_attention_core`
+  with a single ggml compute graph: `permute → cont → flash_attn_ext → sigmoid(gate)
+  → mul → reshape_2d → mul_mat(W_out)`. Flash output `[D, H, T, 1]` matches gate
+  layout directly (no extra permute for gating). Causal mask built as f16 per ggml
+  CPU kernel requirements. Decode path (seq_len=1) unchanged. `f32_to_f16_bits` and
+  `build_causal_mask_f16_bytes` added to `numeric.rs`. 182 tests pass.
+
 ## Validation checkpoints completed on this branch
 
 - `cargo fmt --all`

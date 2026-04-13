@@ -205,3 +205,15 @@ llama-rs uses explicit `copy_from_slice`.
    model (Qwen35Linear → Qwen35Full → Qwen35Linear) through both paths
    and asserts identical token sequences.  This validates the residual
    connections, MLP pass-through, and state orchestration across layers.
+8. **Full attention scoring graph-fused**: The host-side O(T²·H·D) scoring
+   loop (softmax + dot product + sigmoid gating + output projection) in
+   `qwen35_full_attention_core` is now a single ggml graph using
+   `flash_attn_ext`:
+   ```
+   permute(Q/K/V, 0,2,1,3) → cont → flash_attn_ext(mask_f16, scale)
+   → sigmoid(gate) → mul → reshape_2d → mul_mat(W_out)
+   ```
+   Key insight: flash output `[D, H, T, 1]` matches gate layout directly
+   — no extra permute for gating. Decode path (seq_len=1) stays host-side.
+   `f32_to_f16_bits` + `build_causal_mask_f16_bytes` added to `numeric.rs`.
+   See `docs/llama-rs/worklog/2026-04-20-fused-attention-scoring.md`.
