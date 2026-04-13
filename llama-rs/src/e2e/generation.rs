@@ -1165,7 +1165,7 @@ pub(super) fn generate_from_plans(
             let has_standard = inputs
                 .layer_plans
                 .iter()
-                .any(|p| matches!(p.attention, Some(AttentionLayerPlan::Standard(_))));
+                .any(|p| p.attention.as_ref().is_some_and(|a| a.is_standard()));
             if has_standard || inputs.max_new_tokens == 0 {
                 GenerationMode::FullReprocess
             } else {
@@ -1179,7 +1179,7 @@ pub(super) fn generate_from_plans(
         let has_unsupported = inputs
             .layer_plans
             .iter()
-            .any(|p| matches!(p.attention, Some(AttentionLayerPlan::Standard(_))));
+            .any(|p| p.attention.as_ref().is_some_and(|a| a.is_standard()));
         if has_unsupported {
             return Err(E2eError::UnsupportedTwoPhase);
         }
