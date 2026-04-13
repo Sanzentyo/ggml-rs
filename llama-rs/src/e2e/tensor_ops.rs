@@ -1121,4 +1121,229 @@ mod tests {
             "one-shot token {one_shot_token} != step token {step_token}"
         );
     }
+
+    #[test]
+    fn persistent_full_attention_projection_matches_one_shot() {
+        use crate::backend::ensure_backends_loaded;
+        use ggml_rs::BackendKind;
+
+        let hidden = 8_usize;
+        let qf_x2 = 12_usize; // query_features * 2 (Q+gate interleaved)
+        let kv = 4_usize;
+        let qf = 6_usize; // query_features (for output proj)
+
+        let w_q: Vec<f32> = (0..hidden * qf_x2)
+            .map(|i| ((i % 7) as f32 - 3.0) * 0.1)
+            .collect();
+        let w_k: Vec<f32> = (0..hidden * kv)
+            .map(|i| ((i % 5) as f32 - 2.0) * 0.08)
+            .collect();
+        let w_v: Vec<f32> = (0..hidden * kv)
+            .map(|i| ((i % 11) as f32 - 5.0) * 0.03)
+            .collect();
+        let w_out: Vec<f32> = (0..qf * hidden)
+            .map(|i| ((i % 13) as f32 - 6.0) * 0.02)
+            .collect();
+        let input: Vec<f32> = (0..hidden).map(|i| (i as f32 + 1.0) * 0.2).collect();
+
+        ensure_backends_loaded();
+        let backend = Backend::new(BackendKind::Cpu).expect("CPU backend");
+
+        // One-shot host projection
+        let q_host = project_sequence(&input, 1, hidden, qf_x2, &w_q).expect("host Q");
+        let k_host = project_sequence(&input, 1, hidden, kv, &w_k).expect("host K");
+        let v_host = project_sequence(&input, 1, hidden, kv, &w_v).expect("host V");
+
+        // Persistent projection
+        let ctx_size =
+            recommended_persistent_full_attention_memory(hidden, qf_x2, kv, qf).expect("mem");
+        let ctx = Context::new_no_alloc_bytes(ctx_size).expect("ctx");
+        let (
+            x_in,
+            tw_q,
+            tw_k,
+            tw_v,
+            q_out,
+            k_out,
+            v_out,
+            input_graph,
+            out_x,
+            tw_out,
+            out_y,
+            output_graph,
+        ) = build_persistent_full_attention_graphs(&ctx, hidden, qf_x2, kv, qf).expect("build");
+        let _buf = ctx.allocate_tensors(&backend).expect("alloc");
+
+        tw_q.write_data_backend(&w_q).expect("write W_Q");
+        tw_k.write_data_backend(&w_k).expect("write W_K");
+        tw_v.write_data_backend(&w_v).expect("write W_V");
+        tw_out.write_data_backend(&w_out).expect("write W_OUT");
+
+        let mut proj = PersistentDecodeProjection::FullAttention {
+            x_in,
+            q_out,
+            k_out,
+            v_out,
+            input_graph,
+            out_x,
+            out_y,
+            output_graph,
+            _buffer: _buf,
+        };
+        proj.project_input(&input, &backend).expect("project_input");
+        let (q_pers, k_pers, v_pers) = proj.read_full_attention_projections().expect("read QKV");
+
+        for (i, (h, p)) in q_host.iter().zip(q_pers.iter()).enumerate() {
+            assert!(
+                (h - p).abs() < 1e-5,
+                "Q[{i}]: host={h} vs persistent={p}, diff={}",
+                (h - p).abs()
+            );
+        }
+        for (i, (h, p)) in k_host.iter().zip(k_pers.iter()).enumerate() {
+            assert!(
+                (h - p).abs() < 1e-5,
+                "K[{i}]: host={h} vs persistent={p}, diff={}",
+                (h - p).abs()
+            );
+        }
+        for (i, (h, p)) in v_host.iter().zip(v_pers.iter()).enumerate() {
+            assert!(
+                (h - p).abs() < 1e-5,
+                "V[{i}]: host={h} vs persistent={p}, diff={}",
+                (h - p).abs()
+            );
+        }
+
+        // Output projection parity
+        let core_out: Vec<f32> = (0..qf).map(|i| (i as f32 + 0.5) * 0.3).collect();
+        let out_host = project_sequence(&core_out, 1, qf, hidden, &w_out).expect("host out");
+        let out_pers = proj
+            .project_output(&core_out, &backend)
+            .expect("persistent out");
+
+        for (i, (h, p)) in out_host.iter().zip(out_pers.iter()).enumerate() {
+            assert!(
+                (h - p).abs() < 1e-5,
+                "OUT[{i}]: host={h} vs persistent={p}, diff={}",
+                (h - p).abs()
+            );
+        }
+    }
+
+    #[test]
+    fn persistent_linear_attention_projection_matches_one_shot() {
+        use crate::backend::ensure_backends_loaded;
+        use ggml_rs::BackendKind;
+
+        let hidden = 8_usize;
+        let conv_ch = 10_usize;
+        let inner = 6_usize;
+        let tsr = 4_usize; // time_step_rank
+
+        let w_qkv: Vec<f32> = (0..hidden * conv_ch)
+            .map(|i| ((i % 7) as f32 - 3.0) * 0.1)
+            .collect();
+        let w_z: Vec<f32> = (0..hidden * inner)
+            .map(|i| ((i % 5) as f32 - 2.0) * 0.08)
+            .collect();
+        let w_alpha: Vec<f32> = (0..hidden * tsr)
+            .map(|i| ((i % 11) as f32 - 5.0) * 0.03)
+            .collect();
+        let w_beta: Vec<f32> = (0..hidden * tsr)
+            .map(|i| ((i % 13) as f32 - 6.0) * 0.02)
+            .collect();
+        let w_out: Vec<f32> = (0..inner * hidden)
+            .map(|i| ((i % 9) as f32 - 4.0) * 0.04)
+            .collect();
+        let input: Vec<f32> = (0..hidden).map(|i| (i as f32 + 1.0) * 0.2).collect();
+
+        ensure_backends_loaded();
+        let backend = Backend::new(BackendKind::Cpu).expect("CPU backend");
+
+        // One-shot host projections
+        let qkv_host = project_sequence(&input, 1, hidden, conv_ch, &w_qkv).expect("host QKV");
+        let z_host = project_sequence(&input, 1, hidden, inner, &w_z).expect("host Z");
+        let alpha_host = project_sequence(&input, 1, hidden, tsr, &w_alpha).expect("host alpha");
+        let beta_host = project_sequence(&input, 1, hidden, tsr, &w_beta).expect("host beta");
+
+        // Persistent projection
+        let ctx_size = recommended_persistent_linear_attention_memory(hidden, conv_ch, inner, tsr)
+            .expect("mem");
+        let ctx = Context::new_no_alloc_bytes(ctx_size).expect("ctx");
+        let (
+            x_in,
+            tw_qkv,
+            tw_z,
+            tw_alpha,
+            tw_beta,
+            qkv_out,
+            z_out,
+            alpha_out,
+            beta_out,
+            input_graph,
+            out_x,
+            tw_out,
+            out_y,
+            output_graph,
+        ) = build_persistent_linear_attention_graphs(&ctx, hidden, conv_ch, inner, tsr)
+            .expect("build");
+        let _buf = ctx.allocate_tensors(&backend).expect("alloc");
+
+        tw_qkv.write_data_backend(&w_qkv).expect("write W_QKV");
+        tw_z.write_data_backend(&w_z).expect("write W_Z");
+        tw_alpha
+            .write_data_backend(&w_alpha)
+            .expect("write W_ALPHA");
+        tw_beta.write_data_backend(&w_beta).expect("write W_BETA");
+        tw_out.write_data_backend(&w_out).expect("write W_OUT");
+
+        let mut proj = PersistentDecodeProjection::LinearAttention {
+            x_in,
+            qkv_out,
+            z_out,
+            alpha_out,
+            beta_out,
+            input_graph,
+            out_x,
+            out_y,
+            output_graph,
+            _buffer: _buf,
+        };
+        proj.project_input(&input, &backend).expect("project_input");
+        let (qkv_pers, z_pers, alpha_pers, beta_pers) = proj
+            .read_linear_attention_projections()
+            .expect("read linear");
+
+        for (name, host, pers) in [
+            ("QKV", &qkv_host, &qkv_pers),
+            ("Z", &z_host, &z_pers),
+            ("alpha", &alpha_host, &alpha_pers),
+            ("beta", &beta_host, &beta_pers),
+        ] {
+            assert_eq!(host.len(), pers.len(), "{name} length mismatch");
+            for (i, (h, p)) in host.iter().zip(pers.iter()).enumerate() {
+                assert!(
+                    (h - p).abs() < 1e-5,
+                    "{name}[{i}]: host={h} vs persistent={p}, diff={}",
+                    (h - p).abs()
+                );
+            }
+        }
+
+        // Output projection parity
+        let core_out: Vec<f32> = (0..inner).map(|i| (i as f32 + 0.5) * 0.3).collect();
+        let out_host = project_sequence(&core_out, 1, inner, hidden, &w_out).expect("host out");
+        let out_pers = proj
+            .project_output(&core_out, &backend)
+            .expect("persistent out");
+
+        for (i, (h, p)) in out_host.iter().zip(out_pers.iter()).enumerate() {
+            assert!(
+                (h - p).abs() < 1e-5,
+                "OUT[{i}]: host={h} vs persistent={p}, diff={}",
+                (h - p).abs()
+            );
+        }
+    }
 }
