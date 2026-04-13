@@ -416,6 +416,13 @@ fn recommended_qkv_projection_memory(
     Ok(Bytes::new(total))
 }
 
+/// Host-side QKV projection outputs.
+struct QkvProjections {
+    q_full: Vec<f32>,
+    k_proj: Vec<f32>,
+    v_proj: Vec<f32>,
+}
+
 /// Compute Q, K, V projections using a single ggml compute graph.
 ///
 /// Batches three `mul_mat` operations sharing the same input tensor into one
@@ -428,7 +435,7 @@ fn project_qkv_graph(
     kv_features: usize,
     attention: &Qwen35FullAttentionLayerPlan,
     backend: &Backend,
-) -> Result<(Vec<f32>, Vec<f32>, Vec<f32>), E2eError> {
+) -> Result<QkvProjections, E2eError> {
     let ctx_size = recommended_qkv_projection_memory(
         hidden_features,
         query_features_x2,
@@ -494,7 +501,11 @@ fn project_qkv_graph(
     let v_proj = v_out
         .read_data_backend()
         .map_err(|source| E2eError::ggml("read_data_backend<V>", source))?;
-    Ok((q_full, k_proj, v_proj))
+    Ok(QkvProjections {
+        q_full,
+        k_proj,
+        v_proj,
+    })
 }
 
 /// Shared projection + deinterleave + per-head RMS norm for both core and
@@ -590,7 +601,7 @@ fn project_and_prepare_qkv(
     let kv_features = checked_mul(attention.kv_head_count, attention.head_dimension)?;
     let query_features_x2 = checked_mul(query_features, 2)?;
 
-    let (q_full, k_proj, v_proj) = if let Some(backend) = backend {
+    let qkv = if let Some(backend) = backend {
         project_qkv_graph(
             input,
             sequence_length,
@@ -622,14 +633,18 @@ fn project_and_prepare_qkv(
             kv_features,
             &attention.v_weight_values,
         )?;
-        (q_full, k_proj, v_proj)
+        QkvProjections {
+            q_full,
+            k_proj,
+            v_proj,
+        }
     };
 
     prepare_qkv_from_raw(
         attention,
-        q_full,
-        k_proj,
-        v_proj,
+        qkv.q_full,
+        qkv.k_proj,
+        qkv.v_proj,
         sequence_length,
         hidden_features,
         rms_norm_eps,
