@@ -2435,10 +2435,9 @@ Resources (dropped first — top of struct):
   persistent_mlps: Vec<Option<PersistentMlp<'static>>>
   decode_projs: Option<Vec<Option<PersistentDecodeProjection<'static>>>>
   kv_caches: Vec<Option<PersistentKvCache<'static>>>
-  lm_x_in, lm_logits_t, lm_graph  (LM head tensors)
+  lm_head: LmHeadResources  (self-contained; see item 35)
 
 Contexts (dropped last — bottom of struct):
-  _lm_buffer, _lm_ctx
   _mlp_ctxs, _proj_ctxs, _kv_ctxs
 ```
 
@@ -2499,4 +2498,68 @@ succeed or fail depending on backend capabilities).
 |------|---------|
 | `llama-rs/src/e2e/generation.rs` | Added `PersistentDecodeResources` struct (~220 lines), `graph_sample_fallback()`, refactored `two_phase_loop` to use unified resources |
 | `llama-rs/src/e2e/session.rs` | Added `persistent_resources` field, `ensure_persistent_resources()`, refactored `step_two_phase()` to use persistent resources with lazy init |
+
+## Item 35: LmHeadResources extraction — self-contained LM head struct
+
+### 35.1 Problem
+
+The LM head graph resources (ggml context, buffer, input/output tensors,
+compute graph) were duplicated in two places:
+
+1. **`PersistentDecodeResources`**: 6 inline fields (`lm_x_in`, `lm_logits_t`,
+   `lm_graph`, `_lm_buffer`, `_lm_ctx`) with transmute logic in `try_build()`.
+2. **`full_reprocess_loop`**: ~20 lines of inline LM head construction with
+   separate error handling (different error messages, no transmute needed).
+
+The `graph_sample_at` helper was also a thin wrapper around
+`lm_head_sample_step` with offset calculation — duplicated with
+`PersistentDecodeResources::sample_token()`.
+
+### 35.2 Design
+
+**`LmHeadResources`** — self-contained struct owning all LM head graph state:
+
+```
+LmHeadResources
+├── x_in: Tensor<'static, f32>       (graph input — dropped first)
+├── logits_t: Tensor<'static, f32>   (graph output — dropped first)
+├── graph: Graph<'static>            (compute graph — dropped first)
+├── _buffer: BackendBuffer<'static>  (device memory — dropped second)
+└── _ctx: Context                    (ggml context — dropped last)
+```
+
+- `try_build()` takes model dimensions + weight slices + backend, returns
+  `Option<Self>` (None on any failure).
+- `sample_hidden(&mut self, hidden_state: &[f32], backend: &Backend) -> Result<i32>`
+  runs one sampling step through the graph.
+- Drop ordering (declaration order) ensures soundness: tensors and graph
+  reference `_ctx` memory, so they drop before `_ctx` and `_buffer`.
+
+### 35.3 Changes
+
+| Area | Before | After |
+|------|--------|-------|
+| `PersistentDecodeResources` | 6 inline LM head fields + inline transmute | Embedded `lm_head: LmHeadResources` field |
+| `PersistentDecodeResources::try_build()` | ~25 lines of LM head construction | `LmHeadResources::try_build(...)?` (1 line) |
+| `PersistentDecodeResources::sample_token()` | Called `lm_head_sample_step` directly | Delegates to `self.lm_head.sample_hidden()` |
+| `full_reprocess_loop` | ~20 lines inline LM head construction | `LmHeadResources::try_build(...)` with fallback |
+| `graph_sample_at` helper | Standalone function | **Removed** — replaced by `LmHeadResources::sample_hidden()` |
+
+### 35.4 Behavioral improvement
+
+`full_reprocess_loop` now has graceful fallback: if `LmHeadResources::try_build()`
+returns `None` (e.g., on a backend that cannot allocate the graph), the loop falls
+back to `graph_sample_fallback()` (host-side norm + matmul + argmax). Previously
+it would return `Err` immediately.
+
+### 35.5 Test results
+
+All 222 tests pass (0 failures, 7 ignored). No behavioral changes — only
+internal struct organization.
+
+### 35.6 Files Modified
+
+| File | Changes |
+|------|---------|
+| `llama-rs/src/e2e/generation.rs` | Added `LmHeadResources` struct (~70 lines), embedded in `PersistentDecodeResources`, refactored `full_reprocess_loop`, removed `graph_sample_at` |
 | `llama-rs/Cargo.toml` | Added `postcard` + `serde` dependencies |

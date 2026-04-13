@@ -329,6 +329,15 @@ And you should write rusty code(ADT, enum, type state pattern)
   prefill + fallback to slow path. Eliminated duplicate LM head builds.
   See comparison doc item 34.
 
+- **LmHeadResources extraction** (item 35):
+  Extracted self-contained `LmHeadResources` struct from inline LM head fields
+  in `PersistentDecodeResources`. Owns its own ggml context, buffer, tensors,
+  and graph with correct drop ordering. `try_build()` + `sample_hidden()` API.
+  Embedded in `PersistentDecodeResources`, also used by `full_reprocess_loop`
+  (eliminates duplicate LM head construction). Removed `graph_sample_at()`
+  helper. Added graceful fallback in `full_reprocess_loop` when build fails.
+  See comparison doc item 35.
+
 ## Validation checkpoints completed on this branch
 
 - `cargo fmt --all`
