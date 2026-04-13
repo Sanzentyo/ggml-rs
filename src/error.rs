@@ -96,6 +96,9 @@ pub enum Error {
         extent: usize,
         source_size: usize,
     },
+
+    #[error("graph allocator operation failed ({context})")]
+    AllocationFailed { context: String },
 }
 
 impl Error {
@@ -108,6 +111,12 @@ impl Error {
 
     pub(crate) fn null_pointer(context: &'static str) -> Self {
         Self::NullPointer {
+            context: context.to_owned(),
+        }
+    }
+
+    pub(crate) fn allocation_failed(context: &'static str) -> Self {
+        Self::AllocationFailed {
             context: context.to_owned(),
         }
     }

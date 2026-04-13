@@ -2130,3 +2130,94 @@ fn ensure_matmul_compatible(lhs_cols: usize, rhs_cols: usize) -> Result<()> {
         Err(Error::IncompatibleMatmulShapes { lhs_cols, rhs_cols })
     }
 }
+
+// ---------------------------------------------------------------------------
+// GraphAllocator — pre-reserved graph-level memory allocator
+// ---------------------------------------------------------------------------
+
+/// Graph-level memory allocator that pre-reserves device buffers.
+///
+/// Unlike [`Context::allocate_tensors`] which allocates a new backend buffer
+/// per call, `GraphAllocator` reserves a buffer once for the maximum expected
+/// graph size, then reuses that buffer across multiple graph computations.
+///
+/// Tensors that already have a backend buffer assigned (e.g., persistent KV
+/// cache tensors accessed via `view_Nd_of`) are automatically skipped during
+/// allocation.
+///
+/// # Usage pattern
+///
+/// ```ignore
+/// let mut gallocr = GraphAllocator::new(&backend)?;
+///
+/// // Reserve for the maximum graph size (e.g., at max sequence length).
+/// gallocr.reserve(&max_graph)?;
+///
+/// // Per-step: build a graph and allocate from the pre-reserved buffer.
+/// gallocr.alloc_graph(&mut step_graph)?;
+/// // ... write inputs, compute, read outputs ...
+/// // step graph/context can be dropped; buffer persists for the next step.
+/// ```
+///
+/// # Safety invariant
+///
+/// The `GraphAllocator` must outlive any [`Context`] whose graph tensors it
+/// has allocated. In practice, create the allocator at an outer scope and
+/// build ephemeral contexts within inner scopes.
+pub struct GraphAllocator {
+    raw: NonNull<ffi::ggml_gallocr>,
+    _not_send_sync: PhantomData<*mut ()>,
+}
+
+impl GraphAllocator {
+    /// Creates a new graph allocator for the given backend's default buffer type.
+    pub fn new(backend: &Backend) -> Result<Self> {
+        let buft = unsafe { ffi::ggml_backend_get_default_buffer_type(backend.raw.as_ptr()) };
+        let raw = unsafe { ffi::ggml_gallocr_new(buft) };
+        let raw = NonNull::new(raw).ok_or_else(|| Error::null_pointer("ggml_gallocr_new"))?;
+        Ok(Self {
+            raw,
+            _not_send_sync: PhantomData,
+        })
+    }
+
+    /// Reserves memory for the maximum expected graph size.
+    ///
+    /// Call this once with the largest graph you expect to use. Subsequent
+    /// calls to [`alloc_graph`](Self::alloc_graph) reuse this buffer as long
+    /// as the graph fits. If a later graph exceeds the reservation, the
+    /// underlying ggml allocator will re-reserve automatically.
+    pub fn reserve(&mut self, graph: &Graph<'_>) -> Result<()> {
+        let ok = unsafe { ffi::ggml_gallocr_reserve(self.raw.as_ptr(), graph.raw.as_ptr()) };
+        if ok {
+            Ok(())
+        } else {
+            Err(Error::allocation_failed("ggml_gallocr_reserve"))
+        }
+    }
+
+    /// Allocates tensor memory from the pre-reserved buffer for this graph.
+    ///
+    /// Tensors with existing backend buffers are skipped automatically. The
+    /// allocated tensor data remains valid until the next `alloc_graph` call
+    /// or until this `GraphAllocator` is dropped.
+    pub fn alloc_graph(&mut self, graph: &mut Graph<'_>) -> Result<()> {
+        let ok = unsafe { ffi::ggml_gallocr_alloc_graph(self.raw.as_ptr(), graph.raw.as_ptr()) };
+        if ok {
+            Ok(())
+        } else {
+            Err(Error::allocation_failed("ggml_gallocr_alloc_graph"))
+        }
+    }
+
+    /// Returns the size of the reserved buffer in bytes for buffer index 0.
+    pub fn buffer_size(&self) -> usize {
+        unsafe { ffi::ggml_gallocr_get_buffer_size(self.raw.as_ptr(), 0) }
+    }
+}
+
+impl Drop for GraphAllocator {
+    fn drop(&mut self) {
+        unsafe { ffi::ggml_gallocr_free(self.raw.as_ptr()) }
+    }
+}
