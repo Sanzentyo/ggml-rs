@@ -965,18 +965,374 @@ state.gpu_scoring_available: Option<bool>
 
 ### 21.3 Implementation
 
-**Modified**: `Qwen35FullAttentionState` gains `gpu_scoring_probed: bool` field
+**Modified**: `Qwen35FullAttentionState` gains `gpu_scoring_failed: bool` field
 (default `false`). After first GPU attempt:
 - Success → leave probed as false (keep trying)
 - Failure → set probed to true (skip future attempts)
 
-**Modified**: `full_attention_decode_core` checks `state.gpu_scoring_probed`
+**Modified**: `full_attention_decode_core` checks `state.gpu_scoring_failed`
 before attempting GPU path.
 
 ### 21.4 Files Changed
 
 | File | Changes |
 |------|---------|
-| `state.rs` | Add `gpu_scoring_probed: bool` to `Qwen35FullAttentionState` |
+| `state.rs` | Add `gpu_scoring_failed: bool` to `Qwen35FullAttentionState` |
 | `attention.rs` | Check flag before GPU attempt, set on failure |
+
+## 22. Persistent Backend-Resident KV Cache Design
+
+### 22.1 Problem
+
+Every decode step in `decode_scoring_gpu` (attention.rs L876–886) uploads the
+**entire** KV cache to the backend:
+
+```rust
+let kv_prefix_len = t * state.kv_features;
+k_raw.write_data_backend(&state.k_cache[..kv_prefix_len])?;
+v_raw.write_data_backend(&state.v_cache[..kv_prefix_len])?;
+```
+
+For Qwen3.5 0.6B: `kv_features = kv_head_count(4) × head_dim(128) = 512`.
+At T=1000 tokens, each step uploads `2 × 1000 × 512 × 4 bytes = 4 MB`.
+This grows **linearly** with sequence length.
+
+### 22.2 Proposed Design
+
+Keep KV tensors persistent on-backend, pre-allocated at `max_tokens` size.
+Each decode step appends only the **new** K/V pair:
+
+1. `write_data_backend_at(offset=T*kv_features, &new_k)` — 1024 floats = 4 KB
+2. Build graph with `view_4d` into the first `T+1` rows of the persistent tensor
+3. Run scoring — no full re-upload
+
+**API note**: `Tensor<f32>` already exposes `write_data_backend_at` and
+`read_data_backend_at` (compute.rs L1548–1582). No `DynTensor` workaround needed.
+
+### 22.3 Architecture
+
+The persistent KV tensors, their views, and the scoring graph must all live in
+the **same** `Context` — ggml views are context-bound (compute.rs L955–1002).
+This means the persistent scoring context encompasses:
+
+```
+PersistentScoringContext {
+    ctx: Context,                      // single ggml context
+    k_persistent: Tensor<f32>,         // [D, Hkv, max_T, 1] on backend
+    v_persistent: Tensor<f32>,         // [D, Hkv, max_T, 1] on backend
+    q_input: Tensor<f32>,              // [D, 1, H, 1]
+    gate_input: Tensor<f32>,           // [D, H, 1, 1]
+    // Graph rebuilt per step (T changes → view changes)
+    _buffer: BackendBuffer,
+}
+```
+
+**Key constraint**: the graph must be rebuilt each step because the KV prefix
+length changes (the `view_4d` parameters depend on `T`). The weights and KV
+data stay resident; only the view + graph metadata changes.
+
+### 22.4 Remaining O(T) Work: On-Device Permute + Cont
+
+**Critical**: eliminating the host→backend KV upload does NOT eliminate all O(T)
+work per step. The current scoring path does:
+
+```rust
+let k_perm = ctx.permute(&k_raw, 0, 2, 1, 3)?;   // [D,Hkv,T] → [D,T,Hkv]
+let k = ctx.cont(&k_perm)?;                        // materialize contiguous copy
+```
+
+This `permute + cont` runs on-device but still copies O(T × D × Hkv) floats per
+step. At T=1000: `1000 × 128 × 4 × 4 bytes = 2 MB` device-local copy per K/V.
+
+**Mitigation options**:
+- **Store KV in flash-friendly layout** `[D, T, Hkv]` from the start. Then no
+  permute/cont needed, but this changes the append pattern (non-contiguous write).
+- **Accept device-local O(T)**: on Metal/unified memory this is a memcpy within
+  shared address space (~10 GB/s), not a PCIe transfer. The 4 MB total is ~0.4 ms
+  — comparable to Metal dispatch overhead itself.
+- **Investigate** whether `flash_attn_ext` can accept permuted (non-contiguous)
+  inputs via stride metadata (unlikely given ggml kernel assumptions, but worth
+  checking the Metal kernel implementation).
+
+### 22.5 Memory Residency Trade-off
+
+Current state already allocates max-token host KV caches
+(`state.rs` L80–81: `vec![0.0; cache_size]`). Adding backend-resident KV
+**doubles** memory usage:
+
+| Component | Host (current) | Host + Backend |
+|-----------|---------------|----------------|
+| K cache (per FA layer) | T×512×4 = 2 MB @ T=1000 | 2 MB + 2 MB |
+| V cache (per FA layer) | T×512×4 = 2 MB @ T=1000 | 2 MB + 2 MB |
+| Total (8 FA layers) | 32 MB | 64 MB |
+
+Options to mitigate:
+- Keep host as canonical source of truth + backend as mirror (simplest; checkpoint
+  serialization from `checkpoint.rs` L183–219 stays unchanged)
+- Make backend canonical, drop host cache (saves memory, but readback on checkpoint
+  save and on GPU-fallback-to-host)
+- Lazy eviction: only keep last N tokens on host for fallback, full cache on backend
+
+**Recommendation**: Host-canonical + backend mirror is simplest for the first
+implementation. Memory duplication is acceptable for 0.6B model sizes.
+
+### 22.6 Upload Savings Estimate
+
+| Sequence Length | Current Upload/Step | Persistent (append only) | Savings |
+|----------------:|--------------------:|-------------------------:|--------:|
+| 100 | 400 KB | 4 KB | 100× |
+| 500 | 2 MB | 4 KB | 500× |
+| 1000 | 4 MB | 4 KB | 1000× |
+| 4096 | 16 MB | 4 KB | 4096× |
+
+Note: on Metal/unified memory the "upload" is a shared-memory copy, not a PCIe
+DMA. The absolute cost is lower than on discrete GPUs, but the linear growth
+still matters for long contexts.
+
+### 22.7 ggml-rs Lifetime Constraint
+
+The safe Rust wrapper ties tensor lifetimes to their creating `Context` via
+`Tensor<'ctx, T>`. ggml's C API allows cross-context views: `ggml_view_4d(ctx_a,
+tensor_from_ctx_b, ...)` — the view belongs to `ctx_a` but references data from
+`ctx_b`. The Rust wrapper requires both to share `'ctx`.
+
+This blocks the natural design of "persistent KV Context + ephemeral scoring
+Context". Workarounds:
+
+1. **`'static` transmute** (used by `PersistentDecodeProjection`): transmute
+   the persistent KV tensors to `'static`, then transmute back to the ephemeral
+   lifetime when creating views. Sound if the persistent context outlives the
+   ephemeral one. Requires `unsafe` + careful drop ordering.
+2. **Cross-context view API**: Add a safe `view_4d_cross` method to ggml-rs
+   that accepts `Tensor<'other, T>` with a bound `'other: 'ctx`. Encodes the
+   real safety requirement (source outlives view) in the type system.
+3. **Single-context with reset**: Add `Context::reset_graph()` that frees
+   graph/view metadata while preserving data tensors. Not supported by ggml C API.
+
+Option 2 is the cleanest long-term solution. Until then, the `'static` transmute
+pattern from `generation.rs` can be extended.
+
+### 22.8 Implementation Status
+
+**Not yet implemented** — design documented for future work. The on-device
+`permute+cont` O(T) remains the deeper issue; solving only the upload would
+give diminishing returns on Metal where the upload is already cheap. The
+ggml-rs lifetime constraint adds implementation complexity that warrants a
+dedicated cross-context view API (option 2 above) before proceeding.
+
+## 23. SIMD Vectorization of SSM Recurrence
+
+### 23.1 Current Implementation
+
+`ssm_recurrence_step` (linear_attention.rs L710–759) is pure scalar Rust
+operating on a `state_size × state_size` matrix (64×64 = 4096 f32 for Qwen3.5).
+
+Four phases:
+
+| Phase | Operation | Inner Size | FLOPs |
+|-------|-----------|-----------|-------|
+| 1. Decay + sk | `s *= decay; sk[col] += s * k_row` | 64 cols × 64 rows | 8192 |
+| 2. Delta | `delta[col] = (v[col] - sk[col]) * beta` | 64 | 128 |
+| 3. State update | `s[col] += k_row * delta[col]` | 64 cols × 64 rows | 8192 |
+| 4. Output | `out[col] += state[row*ss+col] * (q[row]*scale)` | 64 cols × 64 rows | 8192 |
+
+Total: ~24.7K FLOPs/head/step × 12 heads (Qwen3.5 linear layers) ≈ 296K FLOPs.
+
+### 23.2 Vectorization Analysis
+
+**Phases 1 and 3** are the best SIMD candidates. Inner loops iterate over
+contiguous `row_slice` of 64 f32 elements:
+
+```rust
+// Phase 1 — contiguous row slice, broadcast k_row
+for (col, s) in row_slice.iter_mut().enumerate() {
+    *s *= decay;                        // vmul(row_slice, decay_broadcast)
+    scratch.sk[col] += *s * k_row;      // vfmadd(sk, row_slice, k_broadcast)
+}
+
+// Phase 3 — contiguous row slice, broadcast k_row
+row_slice.iter_mut().zip(scratch.delta.iter())
+    .for_each(|(s, &d)| *s += k_row * d);  // vfmadd(row_slice, k_broadcast, delta)
+```
+
+With `state_size = 64`:
+- **NEON (128-bit)**: 4 f32 lanes → 16 iterations per row
+- **AVX2/FMA (256-bit)**: 8 f32 lanes → 8 iterations per row
+- **AVX-512 (512-bit)**: 16 f32 lanes → 4 iterations per row
+
+**Phase 2** (delta computation) operates on a 64-element vector — trivially
+vectorizable but so small it's negligible.
+
+**Phase 4** (output readout) is the **structural problem**. The current loop
+is column-major over a row-major matrix:
+
+```rust
+for col in 0..state_size {
+    for row in 0..state_size {
+        scratch.out[col] += state[row * state_size + col] * (q[row] * scale);
+    }
+}
+```
+
+Access pattern `state[row * 64 + col]` reads with stride 64 — **not contiguous**
+in the inner loop dimension. LLVM cannot auto-vectorize this efficiently.
+
+**Fix**: Transpose the loop order to row-major:
+
+```rust
+for row in 0..state_size {
+    let qr_scaled = q[row] * scale;
+    for col in 0..state_size {
+        scratch.out[col] += state[row * state_size + col] * qr_scaled;
+    }
+}
+```
+
+This makes the inner loop access contiguous `state[row*ss + 0..64]` and
+broadcast `qr_scaled` — identical to phases 1/3 and fully SIMD-friendly.
+
+### 23.3 Auto-Vectorization Baseline
+
+Before adding explicit SIMD, check LLVM auto-vectorization in release mode:
+
+```bash
+cargo rustc --release -p llama-rs -- --emit asm \
+  -C target-cpu=native -C opt-level=3
+```
+
+Phases 1/3 likely already auto-vectorize with `-C opt-level=3` on both
+x86 (AVX2/FMA) and AArch64 (NEON). Phase 4 almost certainly does NOT
+auto-vectorize due to the strided access pattern.
+
+### 23.4 Approach Options
+
+| Option | Pros | Cons |
+|--------|------|------|
+| Loop reorder + auto-vec | Zero dependencies, safe | Relies on LLVM heuristics |
+| `std::simd` (nightly) | Portable, safe | Requires nightly — against project policy |
+| `std::arch` intrinsics | Maximum control | `unsafe`, platform-specific `cfg` |
+| `pulp` / `safe_arch` crate | Safe wrappers, portable | External dependency |
+
+**Recommended first step**: Reorder phase 4 loop (pure refactoring, measurable),
+then verify auto-vectorization via disassembly. Explicit SIMD only if
+auto-vectorization proves insufficient.
+
+### 23.5 Expected Gains
+
+The SSM recurrence is already sub-millisecond on host (~296K FLOPs at ~10
+GFLOPS/s scalar = ~30 µs). SIMD at 4–16× lane width would reduce to ~2–8 µs.
+The absolute saving is small, but this is called 12× per token (once per linear
+attention layer), so total savings across all layers: ~250–340 µs/token.
+
+Compared to other per-token costs (MLP ~15 ms, attention scoring ~3 ms on Metal),
+SSM recurrence optimization is low priority. The phase 4 loop reorder is the
+highest-value change: correct loop order costs nothing and may already unlock
+LLVM auto-vectorization.
+
+### 23.6 Implementation Status
+
+**Phase 4 loop reorder**: **IMPLEMENTED** — `ssm_recurrence_step` phase 4 now
+uses row-major traversal with iterator zip. All 208 tests pass, including decode
+equivalence tests that verify numerical parity.
+**Explicit SIMD**: deferred — auto-vectorization analysis needed first.
+
+## 24. End-to-End Decode Per-Token Cost Model (Qwen3.5 0.6B)
+
+### 24.1 Full Cost Breakdown
+
+Per-token decode costs at T=1000, combining findings from items 13–23.
+Qwen3.5 0.6B: H=1536, D=128, Hq=24, Hkv=4, FFN=8960, vocab=151936,
+8 full attention layers, 24 linear attention layers.
+
+| # | Component | Where | FLOPs | Data I/O | Status |
+|---|-----------|-------|-------|----------|--------|
+| 1 | QKV projection (full attn) | GPU persistent | 3×H²=7.1M | 6 KB in, ~14 KB out | ✓ Item 15 |
+| 2 | QKV projection (linear attn) | GPU persistent | 4×H²=9.4M | 6 KB in, ~18 KB out | ✓ Item 15 |
+| 3 | Attention scoring + gating | GPU flash_attn | ~8.2M | 4 MB KV upload | ✓ Item 16 |
+| 4 | Output projection (full) | GPU persistent | H²=2.4M | ~6 KB each way | ✓ Item 15 |
+| 5 | Output projection (linear) | GPU persistent | H²=2.4M | ~6 KB each way | ✓ Item 15 |
+| 6 | MLP | GPU graph | 3×H×FFN=41.3M | ~6 KB each way | ✓ Graph |
+| 7 | LM head | GPU persistent | H×V=233M | 6 KB in, 608 KB out | ✓ Item 13 |
+| 8 | Conv decode | Host scalar | 5.6K | <1 KB | Item 17 |
+| 9 | RoPE decode | Host scalar | 6K | <1 KB | Item 20 |
+| 10 | SSM recurrence | Host scalar | 296K | <100 KB | Item 19 |
+| 11 | QKV split/norm | Host | ~2K | <4 KB | Item 18 |
+| 12 | KV cache upload | Host→Backend | — | 4 MB @ T=1000 | ⚠ O(T) |
+| 13 | Temp scoring ctx/graph | Overhead | — | ~2 MB metadata alloc | Per-step |
+| 14 | KV permute+cont (device) | Backend | O(T×D×Hkv) | 4 MB device copy | O(T) |
+| 15 | Host rms_norm (decode pre-norm) | Host | 2×H=3K | <12 KB | Item 10 |
+| 16 | Persistent proj readback | Host←Backend | — | ~20 KB/layer | Per-step |
+
+### 24.2 Per-Layer Subtotals
+
+**Full attention layer** (×8 layers):
+- GPU compute: QKV proj (7.1M) + scoring (8.2M) + output proj (2.4M) = 17.7M FLOPs
+- Host compute: RoPE (6K) + QKV split (~1K) + rms_norm (3K) ≈ 10K FLOPs
+- Data transfer: 6 KB (hidden in) + 4 MB (KV upload) + 4 MB (device permute) + ~20 KB (readbacks) ≈ 8 MB
+- **Bottleneck**: KV cache transfer (O(T)), not compute
+
+**Linear attention layer** (×24 layers):
+- GPU compute: QKV proj (9.4M) + output proj (2.4M) = 11.8M FLOPs
+- Host compute: Conv (5.6K) + SSM recurrence (296K) + split/norm (~2K) + rms_norm (3K) ≈ 307K FLOPs
+- Data transfer: 6 KB (hidden in) + ~20 KB (readbacks) ≈ 26 KB
+- **Bottleneck**: SSM recurrence (host scalar), but absolute cost is small (~30 µs)
+
+**MLP** (×32 layers):
+- GPU compute: 41.3M FLOPs
+- Data transfer: ~12 KB round-trip
+- No host bottleneck
+
+**LM head** (×1):
+- GPU compute: 233M FLOPs
+- Data transfer: 6 KB in + 608 KB out = 614 KB
+
+### 24.3 Aggregate Per-Token Estimate
+
+| Category | Total FLOPs | Total Transfer | Wall Time (est.) |
+|----------|------------|----------------|-----------------|
+| Full attn layers (×8) | 142M | ~64 MB | ~24 ms (KV-dominated) |
+| Linear attn layers (×24) | 283M | ~0.6 MB | ~7 ms |
+| MLP layers (×32) | 1,322M | ~0.4 MB | ~15 ms |
+| LM head (×1) | 233M | ~0.6 MB | ~3 ms |
+| **Total** | **1,980M** | **~66 MB** | **~49 ms** |
+
+**Note**: wall time estimates are rough and assume Metal backend on Apple Silicon.
+Actual performance depends on pipeline overlap, backend scheduling, and memory
+bandwidth. The ~64 MB for full attention layers is the KV re-upload at T=1000 ×
+8 layers — this is the dominant data transfer cost.
+
+### 24.4 Key Bottleneck Identification
+
+1. **KV cache data transfer** (O(T) per step): The dominant host↔backend
+   transfer bottleneck for long sequences. At T=1000, ~64 MB total across
+   8 full attention layers. On Metal/unified memory this is a shared-memory
+   copy (not PCIe DMA), but the linear growth still matters at long contexts.
+   **Persistent backend-resident KV** (item 22) would reduce this to ~32 KB/step
+   for the upload portion, but the on-device `permute+cont` O(T) remains.
+
+2. **MLP compute** (1,322M FLOPs): The largest single compute category, but
+   already on GPU with persistent weights. At Metal speeds (~1 TFLOPS f32),
+   this is ~1.3 ms — fast.
+
+3. **LM head compute** (233M FLOPs): Large but single-shot per token. Already
+   persistent on GPU.
+
+4. **SSM recurrence** (7.1M FLOPs total across 24 layers): Tiny in absolute
+   terms (~720 µs total at 10 GFLOPS/s scalar). Phase 4 loop reorder (item 23)
+   could reduce by 2–4× through auto-vectorization.
+
+5. **Temporary scoring context allocation**: Creates a new ggml Context +
+   BackendBuffer + graph per decode step per full attention layer.
+   Persistent scoring context (item 22) would amortize this overhead.
+
+### 24.5 Optimization Priority (Effort vs Impact)
+
+| Priority | Optimization | Impact | Effort |
+|----------|-------------|--------|--------|
+| 1 | Persistent KV cache (item 22) | Eliminate ~64 MB upload | Medium |
+| 2 | Phase 4 loop reorder (item 23) | ~2–4× SSM speedup, free | Trivial |
+| 3 | Flash-friendly KV layout | Eliminate O(T) device copy | High |
+| 4 | Persistent scoring context | Amortize alloc overhead | Medium |
+| 5 | Explicit SIMD (phases 1/3) | ~2–4× additional SSM gain | Medium |
+| 6 | Custom DELTANET_SCAN op | Full GPU SSM | Very High (upstream) |
 - `DecodeStrategy` preserved as reference implementation for `full_reprocess_loop`

@@ -242,6 +242,14 @@ And you should write rusty code(ADT, enum, type state pattern)
   `Qwen35FullAttentionState` prevents repeated GPU scoring attempts after the
   first failure per sequence. Eliminates wasted dispatch overhead on CPU-only
   backends (~0.8 ms/layer/token savings). See comparison doc items 20–21.
+- **Persistent KV cache design + SIMD analysis + cost model** (items 22–24):
+  Designed persistent backend-resident KV cache to eliminate O(T) per-step
+  upload (4 MB→4 KB at T=1000). Identified that on-device `permute+cont` O(T)
+  remains even with persistent KV. Analyzed SSM recurrence SIMD vectorization:
+  phases 1/3 are contiguous-access SIMD candidates; phase 4 had strided access
+  pattern — **reordered** to row-major for auto-vectorization (all tests pass).
+  End-to-end cost model shows KV transfer (~64 MB across 8 FA layers at T=1000)
+  as dominant bottleneck, not compute. See comparison doc items 22–24.
 
 ## Validation checkpoints completed on this branch
 

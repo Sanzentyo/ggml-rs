@@ -750,11 +750,15 @@ fn ssm_recurrence_step(
             .for_each(|(s, &d)| *s += k_row * d);
     }
 
-    // Read output (column-major order preserved for parity).
-    for col in 0..state_size {
-        for row in 0..state_size {
-            scratch.out[col] += state[row * state_size + col] * (q[row] * scale);
-        }
+    // Read output: row-major traversal for contiguous access + auto-vectorization.
+    for row in 0..state_size {
+        let qr_scaled = q[row] * scale;
+        let row_slice = &state[row * state_size..(row + 1) * state_size];
+        scratch
+            .out
+            .iter_mut()
+            .zip(row_slice.iter())
+            .for_each(|(o, &s)| *o += s * qr_scaled);
     }
 }
 
