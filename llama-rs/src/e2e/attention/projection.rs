@@ -8,7 +8,7 @@ use crate::e2e::tensor_ops::{
     MATMUL_GRAPH_SLACK_BYTES, ProjectionSpec, execute_batch_projections, per_head_rms_norm,
     project_sequence,
 };
-use ggml_rs::{Backend, Bytes, Context, Shape2D};
+use ggml_rs::{Backend, Bytes, Context, Shape2D, Tensor};
 
 /// Base slack for the full-attention (Qwen3.5) memory estimate.
 ///
@@ -179,6 +179,48 @@ pub(super) fn deinterleave_q_gate(
     }
 
     Ok((q_values, q_gate))
+}
+
+/// Graph-side deinterleave of the fused Q+gate projection output.
+///
+/// Given `q_full` shaped `[qf2, T]` where `qf2 = 2 × H × D` (interleaved
+/// `[Q_h0(D), G_h0(D), Q_h1(D), G_h1(D), ...]` per token), builds strided
+/// views that extract contiguous Q `[D, H, T]` and gate `[D, H, T]` tensors.
+///
+/// Both output tensors are made contiguous via `ctx.cont()` so downstream
+/// operations (RoPE, RMS norm) see standard strides.
+pub(super) fn graph_deinterleave_q_gate<'ctx>(
+    ctx: &'ctx Context,
+    q_full: &Tensor<'ctx, f32>,
+    head_dimension: usize,
+    head_count: usize,
+    sequence_length: usize,
+) -> Result<(Tensor<'ctx, f32>, Tensor<'ctx, f32>), E2eError> {
+    let d = head_dimension;
+    let h = head_count;
+    let t = sequence_length;
+
+    let q_full_3d = ctx
+        .reshape_3d(q_full, d, 2 * h, t)
+        .ggml_ctx("reshape_3d(Q_full)")?;
+
+    let elem = std::mem::size_of::<f32>();
+    let stride_h = 2 * d * elem; // skip one Q + one gate head
+    let stride_t = 2 * h * d * elem; // full token
+
+    // Q: even-indexed heads (offset 0)
+    let q_view = ctx
+        .view_3d(&q_full_3d, d, h, t, stride_h, stride_t, 0)
+        .ggml_ctx("view_3d(Q)")?;
+    let q_cont = ctx.cont(&q_view).ggml_ctx("cont(Q_deinterleave)")?;
+
+    // Gate: odd-indexed heads (offset D × sizeof(f32))
+    let gate_view = ctx
+        .view_3d(&q_full_3d, d, h, t, stride_h, stride_t, d * elem)
+        .ggml_ctx("view_3d(Gate)")?;
+    let gate_cont = ctx.cont(&gate_view).ggml_ctx("cont(Gate_deinterleave)")?;
+
+    Ok((q_cont, gate_cont))
 }
 
 // ---------------------------------------------------------------------------

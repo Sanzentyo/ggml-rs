@@ -3,7 +3,9 @@
 use super::persistent::{
     PersistentKvCache, PersistentScoringContext, decode_scoring_gpu_persistent,
 };
-use super::projection::{FullAttentionDims, PreparedAttention, project_and_prepare_qkv};
+use super::projection::{
+    FullAttentionDims, PreparedAttention, graph_deinterleave_q_gate, project_and_prepare_qkv,
+};
 use super::shared::{
     FlashAttentionConfig, RopeParams, apply_neox_rope_in_place, apply_optional_per_head_norm,
     graph_norm_input, host_attention_scoring, run_flash_attention_pipeline, validate_gqa_heads,
@@ -179,27 +181,7 @@ fn fully_fused_attention_graph(
         .ggml_ctx("new<mask>")?;
 
     // --- Deinterleave Q and Gate via strided view ---
-    // Q_full layout per token: [Q_h0(D), G_h0(D), Q_h1(D), G_h1(D), ...]
-    // Reshape to [D, 2*H, T] then take every-other slice along dim 1.
-    let q_full_3d = ctx
-        .reshape_3d(q_full, d, 2 * h, t)
-        .ggml_ctx("reshape_3d(Q_full)")?;
-
-    let elem = std::mem::size_of::<f32>();
-    let stride_h = 2 * d * elem; // skip one Q + one gate head
-    let stride_t = 2 * h * d * elem; // full token
-
-    // Q: even-indexed heads (offset 0)
-    let q_view = ctx
-        .view_3d(&q_full_3d, d, h, t, stride_h, stride_t, 0)
-        .ggml_ctx("view_3d(Q)")?;
-    let q_cont = ctx.cont(&q_view).ggml_ctx("cont(Q_deinterleave)")?; // [D, H, T]
-
-    // Gate: odd-indexed heads (offset D*sizeof(f32))
-    let gate_view = ctx
-        .view_3d(&q_full_3d, d, h, t, stride_h, stride_t, d * elem)
-        .ggml_ctx("view_3d(Gate)")?;
-    let gate_cont = ctx.cont(&gate_view).ggml_ctx("cont(Gate_deinterleave)")?; // [D, H, T]
+    let (q_cont, gate_cont) = graph_deinterleave_q_gate(&ctx, q_full, d, h, t)?;
 
     // --- Per-head RMS norm (unconditional for Qwen3.5) ---
     let k_3d = ctx
