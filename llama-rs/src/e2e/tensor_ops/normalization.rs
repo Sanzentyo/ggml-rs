@@ -1,6 +1,19 @@
 use super::super::error::E2eError;
 use super::super::numeric::checked_mul;
 
+/// Compute the inverse root-mean-square of `values` with epsilon stabilization.
+///
+/// Shared core used by all RMS normalization variants.
+fn compute_inv_rms(values: &[f32], eps: f32) -> f32 {
+    let mean_square = values
+        .iter()
+        .copied()
+        .map(|v| f64::from(v) * f64::from(v))
+        .sum::<f64>()
+        / values.len() as f64;
+    1.0_f32 / ((mean_square as f32) + eps).sqrt()
+}
+
 pub(in crate::e2e) fn rms_norm_with_weight(
     input: &[f32],
     hidden_features: usize,
@@ -27,13 +40,7 @@ pub(in crate::e2e) fn rms_norm_with_weight(
         .chunks_exact(hidden_features)
         .zip(output.chunks_exact_mut(hidden_features))
     {
-        let mean_square = src
-            .iter()
-            .copied()
-            .map(|value| f64::from(value) * f64::from(value))
-            .sum::<f64>()
-            / hidden_features as f64;
-        let inv_rms = 1.0_f32 / ((mean_square as f32) + eps).sqrt();
+        let inv_rms = compute_inv_rms(src, eps);
         dst.iter_mut()
             .zip(src.iter().zip(weight.iter()))
             .for_each(|(d, (&s, &w))| *d = s * inv_rms * w);
@@ -71,13 +78,7 @@ pub(in crate::e2e) fn rms_norm_single_into(
             actual: dst.len(),
         });
     }
-    let mean_square = input
-        .iter()
-        .copied()
-        .map(|value| f64::from(value) * f64::from(value))
-        .sum::<f64>()
-        / input.len() as f64;
-    let inv_rms = 1.0_f32 / ((mean_square as f32) + eps).sqrt();
+    let inv_rms = compute_inv_rms(input, eps);
     dst.iter_mut()
         .zip(input.iter().copied().zip(weight.iter().copied()))
         .for_each(|(d, (value, scale))| *d = value * inv_rms * scale);
@@ -92,13 +93,7 @@ fn rms_norm_single_in_place(data: &mut [f32], weight: &[f32], eps: f32) -> Resul
             actual: data.len(),
         });
     }
-    let mean_square = data
-        .iter()
-        .copied()
-        .map(|value| f64::from(value) * f64::from(value))
-        .sum::<f64>()
-        / data.len() as f64;
-    let inv_rms = 1.0_f32 / ((mean_square as f32) + eps).sqrt();
+    let inv_rms = compute_inv_rms(data, eps);
     data.iter_mut()
         .zip(weight.iter().copied())
         .for_each(|(d, scale)| *d *= inv_rms * scale);
