@@ -11,14 +11,31 @@ use super::plan::{AttentionLayerPlan, LayerPlan};
 /// Per-layer attention state for autoregressive generation.
 #[derive(Debug, Clone)]
 pub(super) enum LayerAttentionState {
-    /// Standard attention: no incremental decode (full reprocess each step).
-    Standard,
+    /// Standard attention: KV cache (post-RoPE K, raw V) for incremental decode.
+    Standard(StandardAttentionState),
     /// Qwen3.5 full attention: KV cache (post-RoPE K, raw V).
     Qwen35Full(Qwen35FullAttentionState),
     /// Qwen3.5 linear attention: conv buffer + SSM recurrence states.
     Qwen35Linear(LinearAttentionState),
     /// No attention in this layer (MLP-only).
     None,
+}
+
+/// KV cache for standard attention layers.
+///
+/// Stores post-norm, post-RoPE K values and raw V values for all processed
+/// tokens. Structurally identical to [`Qwen35FullAttentionState`] but without
+/// Qwen3.5-specific GPU scoring fallback tracking.
+#[derive(Debug, Clone)]
+pub(super) struct StandardAttentionState {
+    /// Post-RoPE K values (post per-head norm if applicable), flat `[max_tokens × kv_features]`.
+    pub(super) k_cache: Vec<f32>,
+    /// Raw V values, flat `[max_tokens × kv_features]`.
+    pub(super) v_cache: Vec<f32>,
+    /// Number of tokens currently in the cache.
+    pub(super) cached_len: usize,
+    /// Features per KV token (`kv_head_count × head_dimension`).
+    pub(super) kv_features: usize,
 }
 
 /// KV cache for Qwen3.5 full attention layers.
@@ -68,6 +85,67 @@ pub(super) struct LinearAttentionState {
 #[derive(Debug, Clone)]
 pub(super) struct GenerationState {
     pub(super) layers: Vec<LayerAttentionState>,
+}
+
+impl StandardAttentionState {
+    pub(super) fn new(
+        max_tokens: usize,
+        kv_head_count: usize,
+        head_dimension: usize,
+    ) -> Result<Self, E2eError> {
+        let kv_features = checked_mul(kv_head_count, head_dimension)?;
+        let cache_size = checked_mul(max_tokens, kv_features)?;
+        Ok(Self {
+            k_cache: vec![0.0; cache_size],
+            v_cache: vec![0.0; cache_size],
+            cached_len: 0,
+            kv_features,
+        })
+    }
+
+    /// Append K and V for `count` tokens at once.
+    pub(super) fn append_batch(
+        &mut self,
+        k_values: &[f32],
+        v_values: &[f32],
+        count: usize,
+    ) -> Result<(), E2eError> {
+        let batch_size = checked_mul(count, self.kv_features)?;
+        if k_values.len() != batch_size || v_values.len() != batch_size {
+            return Err(E2eError::BufferLengthMismatch {
+                expected: batch_size,
+                actual: k_values.len().min(v_values.len()),
+            });
+        }
+        let offset = checked_mul(self.cached_len, self.kv_features)?;
+        if offset + batch_size > self.k_cache.len() {
+            return Err(E2eError::SequenceTooLong {
+                requested: self.cached_len + count,
+                context_length: self.k_cache.len() / self.kv_features,
+            });
+        }
+        self.k_cache[offset..offset + batch_size].copy_from_slice(k_values);
+        self.v_cache[offset..offset + batch_size].copy_from_slice(v_values);
+        self.cached_len += count;
+        Ok(())
+    }
+
+    /// Number of tokens currently in the cache.
+    pub(super) fn token_count(&self) -> usize {
+        self.cached_len
+    }
+
+    /// Get a K slice for a specific token and KV head.
+    pub(super) fn k_head_at(&self, token: usize, kv_head: usize, head_dim: usize) -> &[f32] {
+        let token_offset = token * self.kv_features + kv_head * head_dim;
+        &self.k_cache[token_offset..token_offset + head_dim]
+    }
+
+    /// Get a V slice for a specific token and KV head.
+    pub(super) fn v_head_at(&self, token: usize, kv_head: usize, head_dim: usize) -> &[f32] {
+        let token_offset = token * self.kv_features + kv_head * head_dim;
+        &self.v_cache[token_offset..token_offset + head_dim]
+    }
 }
 
 impl Qwen35FullAttentionState {
@@ -218,7 +296,14 @@ impl GenerationState {
         let mut layers = Vec::with_capacity(layer_plans.len());
         for plan in layer_plans {
             let state = match &plan.attention {
-                Some(AttentionLayerPlan::Standard(_)) => LayerAttentionState::Standard,
+                Some(AttentionLayerPlan::Standard(attn)) => {
+                    let config = &attn.weights.config;
+                    LayerAttentionState::Standard(StandardAttentionState::new(
+                        total_sequence_length,
+                        config.layout.kv_head_count(),
+                        config.layout.head_dimension(),
+                    )?)
+                }
                 Some(AttentionLayerPlan::Qwen35Full(attn)) => {
                     LayerAttentionState::Qwen35Full(Qwen35FullAttentionState::new(
                         total_sequence_length,

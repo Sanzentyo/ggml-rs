@@ -116,36 +116,6 @@ pub fn attention_inference_with_weights_repeats(
     })
 }
 
-pub(crate) fn attention_inference_with_weights_on_backend_repeats_with_length(
-    weights: &AttentionWeights,
-    input: &[f32],
-    sequence_length: usize,
-    backend: &Backend,
-    repeats: usize,
-) -> Result<Vec<f32>, InferenceError> {
-    if sequence_length == 0 {
-        return Err(InferenceError::InvalidAttentionShape {
-            hidden_features: weights.config.hidden_features(),
-            sequence_length,
-        });
-    }
-    let ctx_size = recommended_attention_backend_memory_bytes_for_lengths(
-        weights.config,
-        sequence_length,
-        sequence_length,
-    )?;
-    let ctx = Context::new_no_alloc_bytes(ctx_size)
-        .map_err(|source| InferenceError::ggml("Context::new_no_alloc_bytes", source))?;
-    attention_inference_with_weights_with_context(
-        weights,
-        input,
-        sequence_length,
-        backend,
-        &ctx,
-        repeats,
-    )
-}
-
 fn attention_inference_with_weights_with_context(
     weights: &AttentionWeights,
     input: &[f32],

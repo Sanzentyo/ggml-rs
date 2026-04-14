@@ -10,12 +10,14 @@
 
 use super::error::E2eError;
 use super::plan::AttentionLayerPlan;
-use super::state::{GenerationState, LayerAttentionState, LinearAttentionState};
+use super::state::{
+    GenerationState, LayerAttentionState, LinearAttentionState, StandardAttentionState,
+};
 use serde::{Deserialize, Serialize};
 use std::io::{Read, Write};
 
 /// Current checkpoint format version.
-const CHECKPOINT_VERSION: u32 = 1;
+const CHECKPOINT_VERSION: u32 = 2;
 
 /// Magic bytes identifying a llama-rs checkpoint file.
 const CHECKPOINT_MAGIC: [u8; 4] = *b"LRCK";
@@ -111,7 +113,10 @@ pub(super) struct ModelFingerprint {
 /// Discriminant tag for each layer's attention type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub(super) enum LayerTypeTag {
-    Standard,
+    Standard {
+        kv_head_count: usize,
+        head_dimension: usize,
+    },
     Qwen35Full {
         kv_head_count: usize,
         head_dimension: usize,
@@ -128,7 +133,12 @@ pub(super) enum LayerTypeTag {
 /// Per-layer serializable state.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(super) enum LayerStateDto {
-    Standard,
+    Standard {
+        k_cache: Vec<f32>,
+        v_cache: Vec<f32>,
+        cached_len: usize,
+        kv_features: usize,
+    },
     Qwen35Full {
         k_cache: Vec<f32>,
         v_cache: Vec<f32>,
@@ -152,7 +162,12 @@ pub(super) enum LayerStateDto {
 impl From<&LayerAttentionState> for LayerStateDto {
     fn from(state: &LayerAttentionState) -> Self {
         match state {
-            LayerAttentionState::Standard => LayerStateDto::Standard,
+            LayerAttentionState::Standard(kv) => LayerStateDto::Standard {
+                k_cache: kv.k_cache[..kv.cached_len * kv.kv_features].to_vec(),
+                v_cache: kv.v_cache[..kv.cached_len * kv.kv_features].to_vec(),
+                cached_len: kv.cached_len,
+                kv_features: kv.kv_features,
+            },
             LayerAttentionState::Qwen35Full(kv) => LayerStateDto::Qwen35Full {
                 // Only serialize the populated portion of the cache
                 k_cache: kv.k_cache[..kv.cached_len * kv.kv_features].to_vec(),
@@ -179,7 +194,41 @@ impl LayerStateDto {
         total_sequence_length: usize,
     ) -> Result<LayerAttentionState, E2eError> {
         match self {
-            LayerStateDto::Standard => Ok(LayerAttentionState::Standard),
+            LayerStateDto::Standard {
+                k_cache: k_data,
+                v_cache: v_data,
+                cached_len,
+                kv_features,
+            } => {
+                if kv_features == 0 {
+                    return Err(E2eError::CheckpointDeserialize(
+                        "standard kv_features must be > 0".into(),
+                    ));
+                }
+                let cache_size = total_sequence_length
+                    .checked_mul(kv_features)
+                    .ok_or(E2eError::MemorySizeOverflow)?;
+                let data_len = cached_len
+                    .checked_mul(kv_features)
+                    .ok_or(E2eError::MemorySizeOverflow)?;
+                if k_data.len() != data_len || v_data.len() != data_len {
+                    return Err(E2eError::CheckpointDeserialize(format!(
+                        "standard KV data length mismatch: expected {data_len}, got k={} v={}",
+                        k_data.len(),
+                        v_data.len()
+                    )));
+                }
+                let mut k_cache = vec![0.0; cache_size];
+                let mut v_cache = vec![0.0; cache_size];
+                k_cache[..data_len].copy_from_slice(&k_data);
+                v_cache[..data_len].copy_from_slice(&v_data);
+                Ok(LayerAttentionState::Standard(StandardAttentionState {
+                    k_cache,
+                    v_cache,
+                    cached_len,
+                    kv_features,
+                }))
+            }
             LayerStateDto::Qwen35Full {
                 k_cache: k_data,
                 v_cache: v_data,
@@ -251,7 +300,10 @@ impl ModelFingerprint {
         let layer_types = layer_plans
             .iter()
             .map(|plan| match &plan.attention {
-                Some(AttentionLayerPlan::Standard(_)) => LayerTypeTag::Standard,
+                Some(AttentionLayerPlan::Standard(attn)) => LayerTypeTag::Standard {
+                    kv_head_count: attn.weights.config.layout.kv_head_count(),
+                    head_dimension: attn.weights.config.layout.head_dimension(),
+                },
                 Some(AttentionLayerPlan::Qwen35Full(attn)) => LayerTypeTag::Qwen35Full {
                     kv_head_count: attn.kv_head_count,
                     head_dimension: attn.head_dimension,
@@ -504,7 +556,18 @@ impl CheckpointV1 {
                         )));
                     }
                 }
-                LayerStateDto::Standard | LayerStateDto::None => {}
+                LayerStateDto::Standard {
+                    cached_len,
+                    kv_features,
+                    ..
+                } => {
+                    if *cached_len > 0 && *kv_features == 0 {
+                        return Err(E2eError::CheckpointDeserialize(format!(
+                            "layer {i}: Standard kv_features must be > 0 when cached_len > 0"
+                        )));
+                    }
+                }
+                LayerStateDto::None => {}
             }
         }
 
@@ -637,7 +700,10 @@ mod tests {
     fn fingerprint_mismatch_layer_type() {
         let fp1 = sample_fingerprint();
         let mut fp2 = sample_fingerprint();
-        fp2.layer_types[0] = LayerTypeTag::Standard;
+        fp2.layer_types[0] = LayerTypeTag::Standard {
+            kv_head_count: 1,
+            head_dimension: 32,
+        };
         let result = fp1.validate_against(&fp2);
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("layer 0"));

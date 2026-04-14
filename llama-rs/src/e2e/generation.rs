@@ -14,7 +14,8 @@ use super::attention::{
     PersistentKvCache, PersistentScoringContext, QkvProjections, build_persistent_kv_cache,
     full_attention_decode_core, full_attention_hidden_features, prepare_qkv_from_raw,
     qwen35_full_attention_decode_step, qwen35_full_attention_inference,
-    qwen35_full_attention_prefill,
+    qwen35_full_attention_prefill, standard_attention_decode_step, standard_attention_inference,
+    standard_attention_prefill,
 };
 use super::config::{E2eGenerationConfig, E2eGenerationReport};
 use super::decode::decode_norm_tensor;
@@ -41,7 +42,6 @@ use super::tensor_ops::{
     rms_norm_with_weight, upload_weight,
 };
 use crate::backend::ensure_backends_loaded;
-use crate::inference::attention_inference_with_weights_on_backend_repeats_with_length;
 use crate::metadata::resolve_transformer_metadata;
 use crate::model::GgufModel;
 use crate::tokenizer::tokenize_text_prompt;
@@ -126,30 +126,14 @@ impl AttentionStrategy for InferenceStrategy {
         backend: &Backend,
     ) -> Result<Vec<f32>, E2eError> {
         match attention {
-            AttentionLayerPlan::Standard(attn) => {
-                // Standard attention expects pre-normed input (host-side).
-                let hidden_features = attn.norm_values.len();
-                let normalized = rms_norm_with_weight(
-                    input,
-                    hidden_features,
-                    seq_len,
-                    &attn.norm_values,
-                    rms_norm_eps,
-                )?;
-                attention_inference_with_weights_on_backend_repeats_with_length(
-                    &attn.weights,
-                    &normalized,
-                    seq_len,
-                    backend,
-                    1,
-                )
-                .map_err(|source| {
-                    E2eError::inference(
-                        "attention_inference_with_weights_on_backend_repeats_with_length",
-                        source,
-                    )
-                })
-            }
+            AttentionLayerPlan::Standard(attn) => standard_attention_inference(
+                attn,
+                input,
+                seq_len,
+                rms_norm_eps,
+                &attn.norm_values,
+                backend,
+            ),
             AttentionLayerPlan::Qwen35Full(attn) => qwen35_full_attention_inference(
                 attn,
                 input,
@@ -186,6 +170,17 @@ impl AttentionStrategy for PrefillStrategy<'_> {
         backend: &Backend,
     ) -> Result<Vec<f32>, E2eError> {
         match (attention, &mut self.state.layers[layer_idx]) {
+            (AttentionLayerPlan::Standard(attn), LayerAttentionState::Standard(s)) => {
+                standard_attention_prefill(
+                    attn,
+                    input,
+                    seq_len,
+                    rms_norm_eps,
+                    &attn.norm_values,
+                    s,
+                    backend,
+                )
+            }
             (AttentionLayerPlan::Qwen35Full(attn), LayerAttentionState::Qwen35Full(s)) => {
                 qwen35_full_attention_prefill(
                     attn,
@@ -239,6 +234,9 @@ impl AttentionStrategy for DecodeStrategy<'_> {
             rms_norm_with_weight(input, hidden_features, 1, norm_weight, rms_norm_eps)?;
 
         match (attention, &mut self.state.layers[layer_idx]) {
+            (AttentionLayerPlan::Standard(attn), LayerAttentionState::Standard(s)) => {
+                standard_attention_decode_step(attn, &normalized, rms_norm_eps, s, backend)
+            }
             (AttentionLayerPlan::Qwen35Full(attn), LayerAttentionState::Qwen35Full(s)) => {
                 qwen35_full_attention_decode_step(attn, &normalized, rms_norm_eps, s, backend)
             }
@@ -360,8 +358,11 @@ fn try_build_persistent_projections(
                     build_one_persistent_linear(attn, backend)
                 }
                 AttentionLayerPlan::Standard(_) => {
-                    // Standard attention doesn't support persistent projections.
-                    return None;
+                    // Standard attention doesn't yet have persistent projections;
+                    // skip but don't block other layers.
+                    contexts.push(None);
+                    projections.push(None);
+                    continue;
                 }
             };
 
@@ -1130,11 +1131,7 @@ pub(super) fn generate_from_plans(
 
     let effective_mode = match mode {
         GenerationMode::Auto => {
-            let has_standard = inputs
-                .layer_plans
-                .iter()
-                .any(|p| p.attention.as_ref().is_some_and(|a| a.is_standard()));
-            if has_standard || inputs.max_new_tokens == 0 {
+            if inputs.max_new_tokens == 0 {
                 GenerationMode::FullReprocess
             } else {
                 GenerationMode::TwoPhase
@@ -1142,16 +1139,6 @@ pub(super) fn generate_from_plans(
         }
         other => other,
     };
-
-    if matches!(effective_mode, GenerationMode::TwoPhase) {
-        let has_unsupported = inputs
-            .layer_plans
-            .iter()
-            .any(|p| p.attention.as_ref().is_some_and(|a| a.is_standard()));
-        if has_unsupported {
-            return Err(E2eError::UnsupportedTwoPhase);
-        }
-    }
 
     match effective_mode {
         GenerationMode::FullReprocess | GenerationMode::Auto => {
@@ -1758,7 +1745,7 @@ mod tests {
     /// Verify TwoPhase mode with Standard attention returns error, not panic.
     #[cfg(feature = "link-system")]
     #[test]
-    fn two_phase_with_standard_attention_returns_error() {
+    fn two_phase_with_standard_attention_succeeds() {
         use super::super::plan::{MlpLayerPlan, StandardAttentionLayerPlan};
         use crate::backend::ensure_backends_loaded;
         use crate::inference::{
@@ -1809,13 +1796,15 @@ mod tests {
             GenerationMode::TwoPhase,
         );
         assert!(
-            result.is_err(),
-            "TwoPhase with Standard attention should return Err"
+            result.is_ok(),
+            "TwoPhase with Standard attention should succeed, got: {:?}",
+            result.err()
         );
-        let err = result.unwrap_err();
-        assert!(
-            matches!(err, E2eError::UnsupportedTwoPhase),
-            "Expected UnsupportedTwoPhase, got: {err}"
+        let output = result.unwrap();
+        assert_eq!(
+            output.generated_token_ids.len(),
+            3,
+            "Should generate exactly max_new_tokens"
         );
     }
 }

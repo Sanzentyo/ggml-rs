@@ -26,8 +26,7 @@ use attention_ops::{LlamaRotaryApplier, RotaryApplier};
 #[cfg(test)]
 pub(crate) use attention_runtime::build_causal_mask_values;
 pub(crate) use attention_runtime::{
-    attention_decode_proxy_with_cache_repeats_inner,
-    attention_inference_with_weights_on_backend_repeats_with_length, fill_causal_mask_values,
+    attention_decode_proxy_with_cache_repeats_inner, fill_causal_mask_values,
     recommended_attention_backend_memory_bytes_for_lengths,
 };
 pub use attention_runtime::{
@@ -1341,27 +1340,27 @@ where
         })
     }
 
-    fn q_values(&self) -> &[T] {
+    pub(crate) fn q_values(&self) -> &[T] {
         &self.q_values
     }
 
-    fn k_values(&self) -> &[T] {
+    pub(crate) fn k_values(&self) -> &[T] {
         &self.k_values
     }
 
-    fn v_values(&self) -> &[T] {
+    pub(crate) fn v_values(&self) -> &[T] {
         &self.v_values
     }
 
-    fn o_values(&self) -> &[T] {
+    pub(crate) fn o_values(&self) -> &[T] {
         &self.o_values
     }
 
-    fn q_norm_values(&self) -> Option<&[T]> {
+    pub(crate) fn q_norm_values(&self) -> Option<&[T]> {
         self.q_norm_values.as_deref()
     }
 
-    fn k_norm_values(&self) -> Option<&[T]> {
+    pub(crate) fn k_norm_values(&self) -> Option<&[T]> {
         self.k_norm_values.as_deref()
     }
 }
