@@ -2307,4 +2307,230 @@ mod tests {
             );
         }
     }
+
+    /// Helper: build a small `StandardAttentionLayerPlan` with RoPE + GQA.
+    fn sample_standard_plan(
+        hidden: usize,
+        h: usize,
+        hkv: usize,
+        hd: usize,
+    ) -> (
+        super::super::plan::StandardAttentionLayerPlan,
+        crate::inference::AttentionInferenceConfig,
+    ) {
+        use crate::inference::{
+            AttentionHeadDimension, AttentionInferenceConfig, AttentionLayout, AttentionMaskPolicy,
+            RopeConfig, RotaryEmbedding,
+        };
+
+        let layout = AttentionLayout::from_projection_dimensions(hidden, h, hkv, hd).unwrap();
+        let config = AttentionInferenceConfig::from_layout(layout, 1)
+            .unwrap()
+            .with_rotary(RotaryEmbedding::Llama(RopeConfig {
+                dimensions: AttentionHeadDimension::new(hd).unwrap(),
+                base: 10000.0,
+                scale: 1.0,
+                original_context: None,
+            }))
+            .with_mask(AttentionMaskPolicy::Causal { past_tokens: 0 })
+            .with_attention_scale(1.0 / (hd as f32).sqrt());
+
+        let weights = crate::inference::AttentionWeights::deterministic(config);
+        let norm_values = vec![1.0_f32; hidden];
+
+        let plan = super::super::plan::StandardAttentionLayerPlan {
+            weights,
+            norm_values,
+        };
+        (plan, config)
+    }
+
+    #[test]
+    fn standard_attention_prefill_captures_state() {
+        let hidden = 8;
+        let h = 4;
+        let hkv = 2; // GQA: 4 query heads, 2 KV heads
+        let hd = 4;
+        let kvf = hkv * hd;
+        let prompt_len = 3;
+        let max_tokens = 16;
+
+        let (plan, _config) = sample_standard_plan(hidden, h, hkv, hd);
+
+        crate::backend::ensure_backends_loaded();
+        let backend =
+            Backend::new(ggml_rs::BackendKind::Cpu).expect("CPU backend should be available");
+
+        let input: Vec<f32> = (0..prompt_len * hidden)
+            .map(|i| (i as f32 + 1.0) * 0.1)
+            .collect();
+
+        let mut state =
+            super::super::state::StandardAttentionState::new(max_tokens, hkv, hd).unwrap();
+
+        let _output = standard_attention_prefill(
+            &plan,
+            &input,
+            prompt_len,
+            1e-5,
+            &plan.norm_values,
+            &mut state,
+            &backend,
+        )
+        .unwrap();
+
+        // token_count matches prompt length
+        assert_eq!(state.token_count(), prompt_len);
+        // kv_features matches config
+        assert_eq!(state.kv_features, kvf);
+
+        // Populated prefix is non-zero (at least one value differs from 0.0).
+        let prefix_len = prompt_len * kvf;
+        let k_prefix = &state.k_cache[..prefix_len];
+        let v_prefix = &state.v_cache[..prefix_len];
+        assert!(
+            k_prefix.iter().any(|&v| v != 0.0),
+            "K cache prefix should contain non-zero values after prefill"
+        );
+        assert!(
+            v_prefix.iter().any(|&v| v != 0.0),
+            "V cache prefix should contain non-zero values after prefill"
+        );
+
+        // Unused tail stays zero.
+        let k_tail = &state.k_cache[prefix_len..];
+        let v_tail = &state.v_cache[prefix_len..];
+        assert!(
+            k_tail.iter().all(|&v| v == 0.0),
+            "K cache tail should remain zero"
+        );
+        assert!(
+            v_tail.iter().all(|&v| v == 0.0),
+            "V cache tail should remain zero"
+        );
+    }
+
+    #[test]
+    fn standard_attention_decode_matches_reprocess() {
+        // Uses RoPE + GQA (4 query heads, 2 KV heads) — exercises position_offset
+        // and KV-head grouping in the decode path.
+        let hidden = 8;
+        let h = 4;
+        let hkv = 2;
+        let hd = 4;
+        let prompt_len = 3;
+        let max_tokens = 16;
+
+        let (plan, _config) = sample_standard_plan(hidden, h, hkv, hd);
+
+        crate::backend::ensure_backends_loaded();
+        let backend =
+            Backend::new(ggml_rs::BackendKind::Cpu).expect("CPU backend should be available");
+
+        let prompt: Vec<f32> = (0..prompt_len * hidden)
+            .map(|i| (i as f32 + 1.0) * 0.1)
+            .collect();
+        let new_token: Vec<f32> = (0..hidden).map(|i| (i as f32 + 50.0) * 0.05).collect();
+
+        // Path A: Full reprocess of [prompt + new_token] — extract last-token slice.
+        let full_input: Vec<f32> = prompt.iter().chain(new_token.iter()).copied().collect();
+        let full_output = standard_attention_inference(
+            &plan,
+            &full_input,
+            prompt_len + 1,
+            1e-5,
+            &plan.norm_values,
+            &backend,
+        )
+        .unwrap();
+        let expected = &full_output[prompt_len * hidden..(prompt_len + 1) * hidden];
+
+        // Path B: Prefill prompt, then decode new_token.
+        let mut state =
+            super::super::state::StandardAttentionState::new(max_tokens, hkv, hd).unwrap();
+
+        let _prefill_out = standard_attention_prefill(
+            &plan,
+            &prompt,
+            prompt_len,
+            1e-5,
+            &plan.norm_values,
+            &mut state,
+            &backend,
+        )
+        .unwrap();
+
+        // Decode path receives pre-normed input (matching DecodeStrategy behavior).
+        let normalized_token = super::super::tensor_ops::rms_norm_with_weight(
+            &new_token,
+            hidden,
+            1,
+            &plan.norm_values,
+            1e-5,
+        )
+        .unwrap();
+        let decode_out =
+            standard_attention_decode_step(&plan, &normalized_token, 1e-5, &mut state, &backend)
+                .unwrap();
+
+        assert_eq!(decode_out.len(), expected.len());
+        for (i, (a, b)) in decode_out.iter().zip(expected).enumerate() {
+            assert!(
+                (a - b).abs() < 1e-4,
+                "feature {i}: decode={a} vs full={b}, diff={}",
+                (a - b).abs()
+            );
+        }
+    }
+
+    #[test]
+    fn standard_attention_decode_errors_when_cache_full() {
+        let hidden = 8;
+        let h = 2;
+        let hkv = 2;
+        let hd = 4;
+        let max_tokens = 3; // small capacity
+
+        let (plan, _config) = sample_standard_plan(hidden, h, hkv, hd);
+
+        crate::backend::ensure_backends_loaded();
+        let backend =
+            Backend::new(ggml_rs::BackendKind::Cpu).expect("CPU backend should be available");
+
+        // Prefill exactly to capacity.
+        let input: Vec<f32> = (0..max_tokens * hidden)
+            .map(|i| (i as f32 + 1.0) * 0.1)
+            .collect();
+        let mut state =
+            super::super::state::StandardAttentionState::new(max_tokens, hkv, hd).unwrap();
+
+        let _out = standard_attention_prefill(
+            &plan,
+            &input,
+            max_tokens,
+            1e-5,
+            &plan.norm_values,
+            &mut state,
+            &backend,
+        )
+        .unwrap();
+
+        assert_eq!(state.token_count(), max_tokens);
+
+        // Next decode should fail — cache is full.
+        let token: Vec<f32> = (0..hidden).map(|i| (i as f32) * 0.01).collect();
+        let normalized = super::super::tensor_ops::rms_norm_with_weight(
+            &token,
+            hidden,
+            1,
+            &plan.norm_values,
+            1e-5,
+        )
+        .unwrap();
+        let result = standard_attention_decode_step(&plan, &normalized, 1e-5, &mut state, &backend);
+        assert!(
+            result.is_err(),
+            "decode should fail when KV cache is at capacity"
+        );
+    }
 }

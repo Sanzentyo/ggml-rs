@@ -515,6 +515,22 @@ And you should write rusty code(ADT, enum, type state pattern)
   via this shared spec, eliminating ~30 lines of duplicated tensor creation
   and matmul boilerplate. See comparison doc item 60.
 
+- **Incremental standard-attention decode** (item 61):
+  Standard attention previously forced FullReprocess mode (entire sequence
+  recomputed per token). Now supports TwoPhase: `StandardAttentionState` in
+  `state.rs` manages KV cache (post-RoPE K + raw V per head, with
+  `append_batch` and per-head accessors). `standard_attention_prefill()` uses
+  a fused ggml graph with KV readback via `build_forward_expand` for
+  intermediate tensors. `standard_attention_decode_step()` performs host-side
+  dot-product scoring with cached KV (matching Qwen35Full decode pattern).
+  `standard_attention_inference()` provides a stateless wrapper. Wired into
+  all three strategies (Inference/Prefill/Decode) in `generation.rs`. Removed
+  `has_standard → FullReprocess` guard. Persistent projections skip Standard
+  layers gracefully (continue, not return None). Checkpoint format bumped
+  V1→V2 with KV cache fields. Removed unused `is_standard()` and
+  `attention_inference_with_weights_on_backend_repeats_with_length`. 123 tests
+  pass, zero clippy warnings. Commit `e0e3675`.
+
 ## Validation checkpoints completed on this branch
 
 - `cargo fmt --all`

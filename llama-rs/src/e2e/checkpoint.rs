@@ -559,12 +559,37 @@ impl CheckpointV1 {
                 LayerStateDto::Standard {
                     cached_len,
                     kv_features,
-                    ..
+                    k_cache,
+                    v_cache,
                 } => {
                     if *cached_len > 0 && *kv_features == 0 {
                         return Err(E2eError::CheckpointDeserialize(format!(
                             "layer {i}: Standard kv_features must be > 0 when cached_len > 0"
                         )));
+                    }
+                    if *cached_len > self.total_sequence_length {
+                        return Err(E2eError::CheckpointDeserialize(format!(
+                            "layer {i}: Standard cached_len ({cached_len}) > total_sequence_length ({})",
+                            self.total_sequence_length
+                        )));
+                    }
+                    if *kv_features > 0 {
+                        let expected_cache = self
+                            .total_sequence_length
+                            .checked_mul(*kv_features)
+                            .ok_or(E2eError::MemorySizeOverflow)?;
+                        if k_cache.len() != expected_cache {
+                            return Err(E2eError::CheckpointDeserialize(format!(
+                                "layer {i}: Standard k_cache length mismatch: expected {expected_cache}, got {}",
+                                k_cache.len()
+                            )));
+                        }
+                        if v_cache.len() != expected_cache {
+                            return Err(E2eError::CheckpointDeserialize(format!(
+                                "layer {i}: Standard v_cache length mismatch: expected {expected_cache}, got {}",
+                                v_cache.len()
+                            )));
+                        }
                     }
                 }
                 LayerStateDto::None => {}
@@ -799,5 +824,130 @@ mod tests {
     fn validate_invariants_passes_for_valid_checkpoint() {
         let cp = sample_checkpoint().inner;
         cp.validate_invariants().unwrap();
+    }
+
+    fn sample_checkpoint_with_standard() -> GenerationCheckpoint {
+        let kv_head_count = 2;
+        let head_dimension = 4;
+        let kv_features = kv_head_count * head_dimension;
+        let total_sequence_length = 13;
+        let cached_len = 3;
+        let cache_size = total_sequence_length * kv_features;
+        let std_state = LayerStateDto::Standard {
+            k_cache: (0..cache_size).map(|i| i as f32 * 0.1).collect(),
+            v_cache: (0..cache_size).map(|i| i as f32 * 0.2).collect(),
+            cached_len,
+            kv_features,
+        };
+        let fingerprint = ModelFingerprint {
+            layer_count: 1,
+            hidden_features: 64,
+            vocab_size: 1000,
+            rms_norm_eps_bits: 1e-5_f32.to_bits(),
+            layer_types: vec![LayerTypeTag::Standard {
+                kv_head_count,
+                head_dimension,
+            }],
+        };
+        GenerationCheckpoint {
+            inner: CheckpointV1 {
+                version: CHECKPOINT_VERSION,
+                fingerprint,
+                prompt_token_ids: vec![1, 2, 3],
+                generated_token_ids: vec![42, 43],
+                current_token_count: 5,
+                prompt_token_count: 3,
+                max_new_tokens: 10,
+                total_sequence_length,
+                pad_token_id: 0,
+                eos_token_id: Some(2),
+                prefill_done: true,
+                finished: false,
+                layer_states: vec![std_state],
+            },
+        }
+    }
+
+    #[test]
+    fn standard_checkpoint_roundtrip_restores_kv() {
+        let original = sample_checkpoint_with_standard();
+        let mut buf = Vec::new();
+        original.save_to(&mut buf).unwrap();
+
+        let restored = GenerationCheckpoint::load_from(buf.as_slice()).unwrap();
+        match (
+            &original.inner.layer_states[0],
+            &restored.inner.layer_states[0],
+        ) {
+            (
+                LayerStateDto::Standard {
+                    k_cache: ok,
+                    v_cache: ov,
+                    cached_len: oc,
+                    kv_features: of,
+                },
+                LayerStateDto::Standard {
+                    k_cache: rk,
+                    v_cache: rv,
+                    cached_len: rc,
+                    kv_features: rf,
+                },
+            ) => {
+                assert_eq!(ok, rk, "k_cache mismatch");
+                assert_eq!(ov, rv, "v_cache mismatch");
+                assert_eq!(oc, rc, "cached_len mismatch");
+                assert_eq!(of, rf, "kv_features mismatch");
+            }
+            _ => panic!("expected Standard layer state"),
+        }
+    }
+
+    #[test]
+    fn standard_checkpoint_validate_rejects_cached_len_overflow() {
+        let mut cp = sample_checkpoint_with_standard();
+        if let LayerStateDto::Standard {
+            ref mut cached_len, ..
+        } = cp.inner.layer_states[0]
+        {
+            *cached_len = cp.inner.total_sequence_length + 1;
+        }
+        let err = cp.inner.validate_invariants().unwrap_err().to_string();
+        assert!(
+            err.contains("cached_len"),
+            "expected cached_len overflow error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn standard_checkpoint_validate_rejects_cache_length_mismatch() {
+        let mut cp = sample_checkpoint_with_standard();
+        if let LayerStateDto::Standard {
+            ref mut k_cache, ..
+        } = cp.inner.layer_states[0]
+        {
+            k_cache.truncate(5); // wrong length
+        }
+        let err = cp.inner.validate_invariants().unwrap_err().to_string();
+        assert!(
+            err.contains("k_cache length mismatch"),
+            "expected k_cache length error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn standard_checkpoint_validate_rejects_zero_kv_features_with_data() {
+        let mut cp = sample_checkpoint_with_standard();
+        if let LayerStateDto::Standard {
+            ref mut kv_features,
+            ..
+        } = cp.inner.layer_states[0]
+        {
+            *kv_features = 0;
+        }
+        let err = cp.inner.validate_invariants().unwrap_err().to_string();
+        assert!(
+            err.contains("kv_features must be > 0"),
+            "expected kv_features error, got: {err}"
+        );
     }
 }
