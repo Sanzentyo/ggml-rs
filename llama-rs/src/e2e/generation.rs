@@ -44,6 +44,16 @@ pub(super) enum GenerationMode {
     TwoPhase,
 }
 
+/// Bundles immutable per-model configuration needed by [`process_all_layers`].
+///
+/// Keeps `hidden` (mutable working buffer), `strategy` (stateful dispatch),
+/// `seq_len` (varies per call), and `persistent_mlps` as separate arguments.
+pub(super) struct LayerPassConfig<'a> {
+    pub layer_plans: &'a [LayerPlan],
+    pub rms_norm_eps: f32,
+    pub backend: &'a Backend,
+}
+
 /// Bundles all pre-resolved inputs needed by the core generation loop.
 pub(super) struct GenerationInputs<'a> {
     pub layer_plans: &'a [LayerPlan],
@@ -61,6 +71,17 @@ pub(super) struct GenerationInputs<'a> {
     pub total_sequence_length: usize,
 }
 
+impl<'a> GenerationInputs<'a> {
+    /// Extract the immutable layer-pass configuration shared across all calls.
+    pub fn layer_pass_config(&self) -> LayerPassConfig<'a> {
+        LayerPassConfig {
+            layer_plans: self.layer_plans,
+            rms_norm_eps: self.rms_norm_eps,
+            backend: self.backend,
+        }
+    }
+}
+
 /// Result of the core generation loop (before wrapping in the public report).
 #[derive(Debug)]
 pub(super) struct GenerationOutput {
@@ -70,41 +91,39 @@ pub(super) struct GenerationOutput {
 
 pub(super) fn process_all_layers(
     hidden: &mut [f32],
-    layer_plans: &[LayerPlan],
+    config: &LayerPassConfig<'_>,
     strategy: &mut impl AttentionStrategy,
     seq_len: usize,
-    rms_norm_eps: f32,
-    backend: &Backend,
     persistent_mlps: &mut [Option<PersistentMlp<'static>>],
 ) -> Result<(), E2eError> {
     debug_assert!(
-        persistent_mlps.is_empty() || persistent_mlps.len() == layer_plans.len(),
+        persistent_mlps.is_empty() || persistent_mlps.len() == config.layer_plans.len(),
         "persistent_mlps must be empty (disabled) or aligned to layer_plans"
     );
 
-    for (layer_idx, layer_plan) in layer_plans.iter().enumerate() {
+    for (layer_idx, layer_plan) in config.layer_plans.iter().enumerate() {
         if let Some(attention) = &layer_plan.attention {
             let attention_output = strategy.process_attention(
                 layer_idx,
                 attention,
                 hidden,
                 seq_len,
-                rms_norm_eps,
-                backend,
+                config.rms_norm_eps,
+                config.backend,
             )?;
             add_in_place(hidden, &attention_output)?;
         }
 
         let mlp_output = if let Some(Some(mlp)) = persistent_mlps.get_mut(layer_idx) {
-            mlp.step(hidden, backend)?
+            mlp.step(hidden, config.backend)?
         } else {
             mlp_sequence_inference_with_weights(
                 &layer_plan.mlp.weights,
                 hidden,
                 seq_len,
                 &layer_plan.mlp.norm_values,
-                rms_norm_eps,
-                backend,
+                config.rms_norm_eps,
+                config.backend,
             )?
         };
         add_in_place(hidden, &mlp_output)?;

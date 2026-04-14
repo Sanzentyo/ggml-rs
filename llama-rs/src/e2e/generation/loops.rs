@@ -67,6 +67,7 @@ fn full_reprocess_loop(
     current_token_count: &mut usize,
 ) -> Result<(), E2eError> {
     let mut strategy = InferenceStrategy;
+    let layer_config = inputs.layer_pass_config();
 
     // Persistent LM head: build graph and upload weights once.
     let mut lm_head = LmHeadResources::try_build(
@@ -89,11 +90,9 @@ fn full_reprocess_loop(
 
         process_all_layers(
             &mut hidden,
-            inputs.layer_plans,
+            &layer_config,
             &mut strategy,
             *current_token_count,
-            inputs.rms_norm_eps,
-            inputs.backend,
             &mut [],
         )?;
 
@@ -129,6 +128,7 @@ fn two_phase_loop(
     current_token_count: &mut usize,
 ) -> Result<(), E2eError> {
     let prompt_token_count = inputs.prompt_token_ids.len();
+    let layer_config = inputs.layer_pass_config();
 
     if inputs.max_new_tokens == 0 {
         return Ok(());
@@ -170,11 +170,9 @@ fn two_phase_loop(
         let mut strategy = PrefillStrategy { state: &mut state };
         process_all_layers(
             &mut hidden,
-            inputs.layer_plans,
+            &layer_config,
             &mut strategy,
             prompt_token_count,
-            inputs.rms_norm_eps,
-            inputs.backend,
             &mut [],
         )?;
     }
@@ -220,24 +218,14 @@ fn two_phase_loop(
         let next_token_id = if let Some(ref mut res) = resources {
             res.decode_step(
                 &mut hidden,
-                inputs.layer_plans,
+                &layer_config,
                 &mut state,
                 inputs.hidden_features,
-                inputs.rms_norm_eps,
-                inputs.backend,
             )?;
             res.sample_token(&hidden, 0, inputs.hidden_features, inputs.backend)?
         } else {
             let mut strategy = DecodeStrategy { state: &mut state };
-            process_all_layers(
-                &mut hidden,
-                inputs.layer_plans,
-                &mut strategy,
-                1,
-                inputs.rms_norm_eps,
-                inputs.backend,
-                &mut [],
-            )?;
+            process_all_layers(&mut hidden, &layer_config, &mut strategy, 1, &mut [])?;
             graph_sample_fallback(&hidden, 0, inputs)?
         };
 

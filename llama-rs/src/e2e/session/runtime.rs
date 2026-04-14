@@ -5,8 +5,8 @@
 
 use super::super::error::E2eError;
 use super::super::generation::{
-    DecodeStrategy, GenerationMode, InferenceStrategy, LmHeadResources, PersistentDecodeResources,
-    PrefillStrategy, greedy_next_token_id, process_all_layers,
+    DecodeStrategy, GenerationMode, InferenceStrategy, LayerPassConfig, LmHeadResources,
+    PersistentDecodeResources, PrefillStrategy, greedy_next_token_id, process_all_layers,
 };
 use super::super::tensor_ops::{gather_embeddings, rms_norm_with_weight};
 use super::GenerationSession;
@@ -40,16 +40,19 @@ impl GenerationSession {
                 active_token_ids,
             )?;
 
+            let layer_config = LayerPassConfig {
+                layer_plans: &self.layer_plans,
+                rms_norm_eps: self.rms_norm_eps,
+                backend: &self.backend,
+            };
             let mut strategy = PrefillStrategy {
                 state: &mut self.state,
             };
             process_all_layers(
                 &mut hidden,
-                &self.layer_plans,
+                &layer_config,
                 &mut strategy,
                 prompt_token_count,
-                self.rms_norm_eps,
-                &self.backend,
                 &mut [],
             )?;
 
@@ -83,29 +86,29 @@ impl GenerationSession {
         )?;
 
         if let Some(ref mut res) = self.persistent_resources {
+            let layer_config = LayerPassConfig {
+                layer_plans: &self.layer_plans,
+                rms_norm_eps: self.rms_norm_eps,
+                backend: &self.backend,
+            };
             res.decode_step(
                 &mut hidden,
-                &self.layer_plans,
+                &layer_config,
                 &mut self.state,
                 self.hidden_features,
-                self.rms_norm_eps,
-                &self.backend,
             )?;
             let next = res.sample_token(&hidden, 0, self.hidden_features, &self.backend)?;
             self.emit_token(next)
         } else {
+            let layer_config = LayerPassConfig {
+                layer_plans: &self.layer_plans,
+                rms_norm_eps: self.rms_norm_eps,
+                backend: &self.backend,
+            };
             let mut strategy = DecodeStrategy {
                 state: &mut self.state,
             };
-            process_all_layers(
-                &mut hidden,
-                &self.layer_plans,
-                &mut strategy,
-                1,
-                self.rms_norm_eps,
-                &self.backend,
-                &mut [],
-            )?;
+            process_all_layers(&mut hidden, &layer_config, &mut strategy, 1, &mut [])?;
             let next = self.sample_next(&hidden, 0)?;
             self.emit_token(next)
         }
@@ -160,14 +163,17 @@ impl GenerationSession {
             active_token_ids,
         )?;
 
+        let layer_config = LayerPassConfig {
+            layer_plans: &self.layer_plans,
+            rms_norm_eps: self.rms_norm_eps,
+            backend: &self.backend,
+        };
         let mut strategy = InferenceStrategy;
         process_all_layers(
             &mut hidden,
-            &self.layer_plans,
+            &layer_config,
             &mut strategy,
             self.current_token_count,
-            self.rms_norm_eps,
-            &self.backend,
             &mut [],
         )?;
 

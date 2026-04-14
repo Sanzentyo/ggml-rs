@@ -7,6 +7,7 @@
 //! - LM head graph for greedy sampling
 //! - [`PersistentDecodeResources`] — unified bundle of all decode resources
 
+use super::LayerPassConfig;
 use super::strategy::DecodeStrategy;
 use crate::e2e::attention::{
     PersistentKvCache, PersistentScoringContext, QkvProjections, build_persistent_kv_cache,
@@ -516,33 +517,23 @@ impl PersistentDecodeResources {
     pub(in crate::e2e) fn decode_step(
         &mut self,
         hidden: &mut [f32],
-        layer_plans: &[LayerPlan],
+        config: &LayerPassConfig<'_>,
         state: &mut GenerationState,
         hidden_features: usize,
-        rms_norm_eps: f32,
-        backend: &Backend,
     ) -> Result<(), E2eError> {
         if self.decode_projs.is_some() {
             self.persistent_decode_all_layers(
                 hidden,
-                layer_plans,
+                config.layer_plans,
                 state,
                 hidden_features,
-                rms_norm_eps,
-                backend,
+                config.rms_norm_eps,
+                config.backend,
             )
         } else {
             // Fallback: per-token weight upload for attention, but persistent MLPs
             let mut strategy = DecodeStrategy { state };
-            super::process_all_layers(
-                hidden,
-                layer_plans,
-                &mut strategy,
-                1,
-                rms_norm_eps,
-                backend,
-                &mut self.persistent_mlps,
-            )
+            super::process_all_layers(hidden, config, &mut strategy, 1, &mut self.persistent_mlps)
         }
     }
 
