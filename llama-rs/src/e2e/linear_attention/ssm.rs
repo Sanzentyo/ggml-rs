@@ -68,7 +68,6 @@ pub(super) fn ssm_recurrence_step(
     q: &[f32],
     k: &[f32],
     v: &[f32],
-    _z: &[f32],
     decay: f32,
     beta_value: f32,
     state_size: usize,

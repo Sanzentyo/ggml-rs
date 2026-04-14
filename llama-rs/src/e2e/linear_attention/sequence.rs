@@ -148,7 +148,6 @@ pub(super) fn qwen35_linear_attention_core(
                 q,
                 k,
                 v,
-                z_head,
                 gate.exp(),
                 beta_value,
                 state_size,

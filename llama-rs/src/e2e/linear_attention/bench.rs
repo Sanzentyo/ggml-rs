@@ -133,7 +133,6 @@ pub(in crate::e2e) fn bench_linear_attention_phases(
                 q,
                 k,
                 v,
-                z_head,
                 gate.exp(),
                 beta_value,
                 state_size,

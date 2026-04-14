@@ -103,7 +103,6 @@ pub(in crate::e2e) fn linear_attention_decode_core(
             q,
             k,
             v,
-            z_head,
             gate.exp(),
             beta_value,
             attention.state_size,
