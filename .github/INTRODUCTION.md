@@ -507,6 +507,13 @@ And you should write rusty code(ADT, enum, type state pattern)
   Reduces ~15 lines of boilerplate while preserving all error labels.
   See comparison doc item 59.
 
+- **Linear attention projections via batch helper** (item 60):
+  Extracted `linear_projection_specs` returning the 4-projection spec array
+  (QKV, Z, alpha, beta). Both `project_linear_inputs_graph` and
+  `project_and_conv_fused_graph` now delegate to `build_batch_projections`
+  via this shared spec, eliminating ~30 lines of duplicated tensor creation
+  and matmul boilerplate. See comparison doc item 60.
+
 ## Validation checkpoints completed on this branch
 
 - `cargo fmt --all`

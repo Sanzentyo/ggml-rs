@@ -3720,3 +3720,36 @@ upload_weight) were updated to pass by reference directly instead of `&owned`.
 |------|---------|
 | llama-rs/src/e2e/attention.rs | Replaced 6 QKV tensor/matmul calls with `build_batch_projections`; fixed reference passing |
 
+## Item 60: Linear Attention Projections via Batch Helper
+
+### 60.1 Problem
+
+Both `project_linear_inputs_graph` (non-fused, decode fallback) and
+`project_and_conv_fused_graph` (fused prefill) manually create the same 4
+projection tensors (QKV, Z, alpha, beta) with individual `new_tensor_2d` +
+`mul_mat` calls. This is ~15 lines of exact duplication per function.
+
+### 60.2 Solution
+
+1. Extracted `linear_projection_specs(dims) -> [ProjectionSpec; 4]` that
+   returns the shared projection specification array.
+2. Both callers now use `build_batch_projections(&ctx, &x, hidden, &linear_projection_specs(dims))`.
+3. Downstream references updated for `&Tensor` binding semantics (no extra `&`
+   on `build_forward_expand`, `upload_weight`, `transpose` calls).
+
+### 60.3 Design Decisions
+
+- **Shared spec function**: `linear_projection_specs` reads dimensions from
+  `LinearAttentionDims` directly, so callers don't need to destructure
+  `inner_size` or `time_step_rank` themselves.
+- **Fused function preserved**: `project_and_conv_fused_graph` still owns
+  its specialized conv logic — only the projection boilerplate was replaced.
+- Per rubber-duck advice: refactored both symmetric and fused cases together
+  for consistency.
+
+### 60.4 Files Modified
+
+| File | Changes |
+|------|---------|
+| llama-rs/src/e2e/linear_attention.rs | Added `linear_projection_specs`; refactored both projection functions |
+

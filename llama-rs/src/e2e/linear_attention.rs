@@ -10,8 +10,9 @@ use super::plan::Qwen35LinearAttentionLayerPlan;
 use super::state::LinearAttentionState;
 use super::tensor_ops::upload_weight;
 use super::tensor_ops::{
-    PROJECTION_SLACK_BYTES, head_slice, head_slice_mut, per_head_l2_norm, project_sequence,
-    project_sequence_graph, rms_norm_single, rms_norm_single_into,
+    PROJECTION_SLACK_BYTES, ProjectionSpec, build_batch_projections, head_slice, head_slice_mut,
+    per_head_l2_norm, project_sequence, project_sequence_graph, rms_norm_single,
+    rms_norm_single_into,
 };
 use ggml_rs::{Backend, Bytes, Context, Length, Shape2D};
 
@@ -203,6 +204,32 @@ fn recommended_linear_projection_memory(
     Ok(Bytes::new(total))
 }
 
+/// Build the 4 linear-attention projection specs (QKV, Z, alpha, beta).
+fn linear_projection_specs(dims: &LinearAttentionDims) -> [ProjectionSpec; 4] {
+    [
+        ProjectionSpec {
+            weight_label: "new<W_QKV>",
+            matmul_label: "mul_mat(QKV)",
+            out_features: dims.conv_channels,
+        },
+        ProjectionSpec {
+            weight_label: "new<W_Z>",
+            matmul_label: "mul_mat(Z)",
+            out_features: dims.inner_size,
+        },
+        ProjectionSpec {
+            weight_label: "new<W_alpha>",
+            matmul_label: "mul_mat(alpha)",
+            out_features: dims.time_step_rank,
+        },
+        ProjectionSpec {
+            weight_label: "new<W_beta>",
+            matmul_label: "mul_mat(beta)",
+            out_features: dims.time_step_rank,
+        },
+    ]
+}
+
 /// Compute QKV, gate, alpha, and beta projections in a single ggml graph.
 ///
 /// Batches four `mul_mat` operations sharing the same input tensor.
@@ -214,82 +241,66 @@ fn project_linear_inputs_graph(
     conv_channels: usize,
     backend: &Backend,
 ) -> Result<LinearProjections, E2eError> {
-    let inner_size = attention.inner_size;
-    let time_step_rank = attention.time_step_rank;
+    let dims = LinearAttentionDims::new(attention)?;
 
     let ctx_size = recommended_linear_projection_memory(
         hidden_features,
         conv_channels,
-        inner_size,
-        time_step_rank,
+        dims.inner_size,
+        dims.time_step_rank,
         sequence_length,
     )?;
     let ctx = Context::new_no_alloc_bytes(ctx_size)
         .map_err(|source| E2eError::ggml("Context::new_no_alloc_bytes(linear_proj)", source))?;
 
-    let w_qkv = ctx
-        .new_tensor_2d::<f32>(Shape2D::new(hidden_features, conv_channels))
-        .map_err(|source| E2eError::ggml("new_tensor_2d<W_QKV>", source))?;
-    let w_z = ctx
-        .new_tensor_2d::<f32>(Shape2D::new(hidden_features, inner_size))
-        .map_err(|source| E2eError::ggml("new_tensor_2d<W_Z>", source))?;
-    let w_alpha = ctx
-        .new_tensor_2d::<f32>(Shape2D::new(hidden_features, time_step_rank))
-        .map_err(|source| E2eError::ggml("new_tensor_2d<W_alpha>", source))?;
-    let w_beta = ctx
-        .new_tensor_2d::<f32>(Shape2D::new(hidden_features, time_step_rank))
-        .map_err(|source| E2eError::ggml("new_tensor_2d<W_beta>", source))?;
     let x = ctx
         .new_tensor_2d::<f32>(Shape2D::new(hidden_features, sequence_length))
-        .map_err(|source| E2eError::ggml("new_tensor_2d<X>", source))?;
+        .map_err(|source| E2eError::ggml("new<X>", source))?;
 
-    let qkv_out = ctx
-        .mul_mat(&w_qkv, &x)
-        .map_err(|source| E2eError::ggml("mul_mat(QKV)", source))?;
-    let z_out = ctx
-        .mul_mat(&w_z, &x)
-        .map_err(|source| E2eError::ggml("mul_mat(Z)", source))?;
-    let alpha_out = ctx
-        .mul_mat(&w_alpha, &x)
-        .map_err(|source| E2eError::ggml("mul_mat(alpha)", source))?;
-    let beta_out = ctx
-        .mul_mat(&w_beta, &x)
-        .map_err(|source| E2eError::ggml("mul_mat(beta)", source))?;
+    let projs =
+        build_batch_projections(&ctx, &x, hidden_features, &linear_projection_specs(&dims))?;
 
     let mut graph = ctx
         .new_graph()
         .map_err(|source| E2eError::ggml("new_graph(linear_proj)", source))?;
-    graph.build_forward_expand(&qkv_out);
-    graph.build_forward_expand(&z_out);
-    graph.build_forward_expand(&alpha_out);
-    graph.build_forward_expand(&beta_out);
+    for p in &projs {
+        graph.build_forward_expand(&p.y);
+    }
 
     let _buffer = ctx
         .allocate_tensors(backend)
         .map_err(|source| E2eError::ggml("allocate_tensors(linear_proj)", source))?;
 
-    upload_weight(&w_qkv, &attention.qkv_weight_values, "write<W_QKV>")?;
-    upload_weight(&w_z, &attention.gate_weight_values, "write<W_Z>")?;
-    upload_weight(&w_alpha, &attention.alpha_weight_values, "write<W_alpha>")?;
-    upload_weight(&w_beta, &attention.beta_weight_values, "write<W_beta>")?;
+    upload_weight(&projs[0].w, &attention.qkv_weight_values, "write<W_QKV>")?;
+    upload_weight(&projs[1].w, &attention.gate_weight_values, "write<W_Z>")?;
+    upload_weight(
+        &projs[2].w,
+        &attention.alpha_weight_values,
+        "write<W_alpha>",
+    )?;
+    upload_weight(&projs[3].w, &attention.beta_weight_values, "write<W_beta>")?;
     upload_weight(&x, input, "write<X>")?;
 
     backend
         .compute(&mut graph)
         .map_err(|source| E2eError::ggml("compute(linear_proj)", source))?;
 
-    let qkv = qkv_out
+    let qkv = projs[0]
+        .y
         .read_data_backend()
-        .map_err(|source| E2eError::ggml("read_data_backend<QKV>", source))?;
-    let z = z_out
+        .map_err(|source| E2eError::ggml("read<QKV>", source))?;
+    let z = projs[1]
+        .y
         .read_data_backend()
-        .map_err(|source| E2eError::ggml("read_data_backend<Z>", source))?;
-    let alpha = alpha_out
+        .map_err(|source| E2eError::ggml("read<Z>", source))?;
+    let alpha = projs[2]
+        .y
         .read_data_backend()
-        .map_err(|source| E2eError::ggml("read_data_backend<alpha>", source))?;
-    let beta = beta_out
+        .map_err(|source| E2eError::ggml("read<alpha>", source))?;
+    let beta = projs[3]
+        .y
         .read_data_backend()
-        .map_err(|source| E2eError::ggml("read_data_backend<beta>", source))?;
+        .map_err(|source| E2eError::ggml("read<beta>", source))?;
 
     Ok(LinearProjections {
         qkv,
@@ -995,10 +1006,9 @@ fn project_and_conv_fused_graph(
 ) -> Result<FusedLinearOutputs, E2eError> {
     let LinearAttentionDims {
         hidden,
-        inner_size,
         conv_channels,
-        time_step_rank,
         kernel_size,
+        ..
     } = *dims;
 
     if kernel_size == 0 {
@@ -1021,22 +1031,10 @@ fn project_and_conv_fused_graph(
     let ctx = Context::new_no_alloc_bytes(Bytes::new(total_bytes))
         .map_err(|source| E2eError::ggml("Context::new_no_alloc_bytes(fused)", source))?;
 
-    // --- Projection tensors ---
-    let w_qkv = ctx
-        .new_tensor_2d::<f32>(Shape2D::new(hidden, conv_channels))
-        .map_err(|source| E2eError::ggml("new_tensor_2d<W_QKV>", source))?;
-    let w_z = ctx
-        .new_tensor_2d::<f32>(Shape2D::new(hidden, inner_size))
-        .map_err(|source| E2eError::ggml("new_tensor_2d<W_Z>", source))?;
-    let w_alpha = ctx
-        .new_tensor_2d::<f32>(Shape2D::new(hidden, time_step_rank))
-        .map_err(|source| E2eError::ggml("new_tensor_2d<W_alpha>", source))?;
-    let w_beta = ctx
-        .new_tensor_2d::<f32>(Shape2D::new(hidden, time_step_rank))
-        .map_err(|source| E2eError::ggml("new_tensor_2d<W_beta>", source))?;
+    // --- Projection tensors via shared builder ---
     let x_raw = ctx
         .new_tensor_2d::<f32>(Shape2D::new(hidden, sequence_length))
-        .map_err(|source| E2eError::ggml("new_tensor_2d<X>", source))?;
+        .map_err(|source| E2eError::ggml("new<X>", source))?;
 
     // Layer pre-norm weight: [hidden]
     let norm_w = ctx
@@ -1052,18 +1050,11 @@ fn project_and_conv_fused_graph(
         .map_err(|source| E2eError::ggml("mul(X_layer_norm)", source))?;
 
     // --- Projection: 4 matmuls sharing normed input X ---
-    let qkv_out = ctx
-        .mul_mat(&w_qkv, &x)
-        .map_err(|source| E2eError::ggml("mul_mat(QKV)", source))?;
-    let z_out = ctx
-        .mul_mat(&w_z, &x)
-        .map_err(|source| E2eError::ggml("mul_mat(Z)", source))?;
-    let alpha_out = ctx
-        .mul_mat(&w_alpha, &x)
-        .map_err(|source| E2eError::ggml("mul_mat(alpha)", source))?;
-    let beta_out = ctx
-        .mul_mat(&w_beta, &x)
-        .map_err(|source| E2eError::ggml("mul_mat(beta)", source))?;
+    let projs = build_batch_projections(&ctx, &x, hidden, &linear_projection_specs(dims))?;
+    let (w_qkv, qkv_out) = (&projs[0].w, &projs[0].y);
+    let (w_z, z_out) = (&projs[1].w, &projs[1].y);
+    let (w_alpha, alpha_out) = (&projs[2].w, &projs[2].y);
+    let (w_beta, beta_out) = (&projs[3].w, &projs[3].y);
 
     // --- In-graph conv: transpose → cont → pad → ssm_conv → silu ---
     // qkv_out shape: ne[0]=conv_channels, ne[1]=seq_len (channels-fast)
@@ -1071,7 +1062,7 @@ fn project_and_conv_fused_graph(
 
     // Step 1: Transpose to [seq_len, conv_channels] (time-fast)
     let qkv_t = ctx
-        .transpose(&qkv_out)
+        .transpose(qkv_out)
         .map_err(|source| E2eError::ggml("transpose(QKV)", source))?;
     // Step 2: Make contiguous (transpose is just a stride swap)
     let qkv_cont = ctx
@@ -1126,21 +1117,21 @@ fn project_and_conv_fused_graph(
     graph.build_forward_expand(&silu_out);
     // Only keep qkv_out alive when we need to read tail rows for conv state.
     if conv_tail_rows > 0 {
-        graph.build_forward_expand(&qkv_out);
+        graph.build_forward_expand(qkv_out);
     }
-    graph.build_forward_expand(&z_out);
-    graph.build_forward_expand(&alpha_out);
-    graph.build_forward_expand(&beta_out);
+    graph.build_forward_expand(z_out);
+    graph.build_forward_expand(alpha_out);
+    graph.build_forward_expand(beta_out);
 
     let _buffer = ctx
         .allocate_tensors(backend)
         .map_err(|source| E2eError::ggml("allocate_tensors(fused)", source))?;
 
     // Upload projection weights and input.
-    upload_weight(&w_qkv, &attention.qkv_weight_values, "write<W_QKV>")?;
-    upload_weight(&w_z, &attention.gate_weight_values, "write<W_Z>")?;
-    upload_weight(&w_alpha, &attention.alpha_weight_values, "write<W_alpha>")?;
-    upload_weight(&w_beta, &attention.beta_weight_values, "write<W_beta>")?;
+    upload_weight(w_qkv, &attention.qkv_weight_values, "write<W_QKV>")?;
+    upload_weight(w_z, &attention.gate_weight_values, "write<W_Z>")?;
+    upload_weight(w_alpha, &attention.alpha_weight_values, "write<W_alpha>")?;
+    upload_weight(w_beta, &attention.beta_weight_values, "write<W_beta>")?;
     upload_weight(&x_raw, input, "write<X>")?;
     upload_weight(&norm_w, attn_norm_weight, "write<norm_w>")?;
 
