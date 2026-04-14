@@ -403,6 +403,22 @@ And you should write rusty code(ADT, enum, type state pattern)
   `project_linear_inputs_graph` (6 params) also removed.
   See comparison doc item 44.
 
+- **Stale `#[allow(clippy)]` removal** (item 45):
+  Removed 3 now-unnecessary `#[allow]` annotations:
+  - `build_lm_head_graph`: `type_complexity` stale (returns `LmHeadGraphParts` struct)
+  - `fully_fused_attention_graph`: `too_many_arguments` stale (7 params after item 43)
+  - `qwen35_linear_attention_core`: `too_many_arguments` stale (7 params after item 44)
+  Also fixed `build_lm_head_graph` doc comment (still said "returns tuple").
+
+- **Projection result struct extraction** (item 46):
+  Made `QkvProjections` `pub(super)` and reused it from `tensor_ops.rs` for
+  `read_full_attention_projections` (was `(Vec<f32>, Vec<f32>, Vec<f32>)`).
+  Added `RawLinearProjections { qkv, z, alpha, beta }` in `tensor_ops.rs` for
+  `read_linear_attention_projections` (was `(Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>)`).
+  All `#[allow(clippy::type_complexity)]` eliminated from llama-rs.
+  Only remaining `#[allow]` is `ssm_recurrence_step` (10-param math kernel, deliberate).
+  See comparison doc items 45-46.
+
 ## Validation checkpoints completed on this branch
 
 - `cargo fmt --all`

@@ -3037,4 +3037,82 @@ struct LinearAttentionDims {
 | File | Changes |
 |------|---------|
 | `llama-rs/src/e2e/linear_attention.rs` | Added `LinearAttentionDims` struct + methods; refactored 3 callers; removed 2 `#[allow]` annotations |
+
+---
+
+## Item 45 — Remove Stale `#[allow(clippy::...)]` Annotations
+
+### 45.1 Motivation
+
+After items 42–44 extracted dimension structs and reduced parameter counts,
+three `#[allow(clippy::...)]` annotations became stale:
+
+| File | Function | Annotation | Reason stale |
+|------|----------|-----------|--------------|
+| `tensor_ops.rs` | `build_lm_head_graph` | `type_complexity` | Already returns `LmHeadGraphParts<'ctx>` struct |
+| `attention.rs` | `fully_fused_attention_graph` | `too_many_arguments` | Now 7 params (limit 7, warns at 8+) |
+| `linear_attention.rs` | `qwen35_linear_attention_core` | `too_many_arguments` | Now 7 params |
+
+### 45.2 Changes
+
+- Removed all three `#[allow]` lines
+- Fixed `build_lm_head_graph` doc comment: was "Returns `(x_input_tensor, logits_tensor, graph)`",
+  now correctly references `LmHeadGraphParts`
+
+### 45.3 Remaining `#[allow]` in llama-rs
+
+Only `ssm_recurrence_step` in `linear_attention.rs` retains `#[allow(clippy::too_many_arguments)]`
+(10 params). This is a math kernel whose signature directly mirrors the recurrence formula —
+bundling parameters into a struct would obscure the mathematical relationship.
+
+---
+
+## Item 46 — Extract Projection Result Structs
+
+### 46.1 Motivation
+
+Two functions in `tensor_ops.rs` had `#[allow(clippy::type_complexity)]` because
+they returned multi-element tuples:
+
+```rust
+// Before
+fn read_full_attention_projections(&self) -> Result<(Vec<f32>, Vec<f32>, Vec<f32>), E2eError>
+fn read_linear_attention_projections(&self) -> Result<(Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>), E2eError>
+```
+
+### 46.2 Design Decision — Reuse vs New Type
+
+**Full attention**: `QkvProjections { q_full, k_proj, v_proj }` already existed in
+`attention.rs` (item 42) with identical fields. Per rubber-duck recommendation,
+made it `pub(super)` and reused it from `tensor_ops.rs`, avoiding a duplicate type.
+
+**Linear attention**: `LinearProjections` exists but carries extra dimension fields
+(`conv_channels`, `hidden_features`) that the raw GPU readback doesn't have.
+Creating dummy values would make the type lie. Instead, introduced a minimal
+`RawLinearProjections { qkv, z, alpha, beta }` — the caller in `generation.rs`
+adds the derived dimensions when constructing the full `LinearProjections`.
+
+### 46.3 After
+
+```rust
+// After
+fn read_full_attention_projections(&self) -> Result<QkvProjections, E2eError>
+fn read_linear_attention_projections(&self) -> Result<RawLinearProjections, E2eError>
+```
+
+### 46.4 Clippy `#[allow]` Status After Item 46
+
+| Scope | `type_complexity` | `too_many_arguments` |
+|-------|-------------------|---------------------|
+| llama-rs production | **0** | **1** (`ssm_recurrence_step`, deliberate) |
+| ggml-rs | 0 | 1 (`flash_attn_ext`, ggml API surface) |
+
+### 46.5 Files Modified
+
+| File | Changes |
+|------|---------|
+| `llama-rs/src/e2e/tensor_ops.rs` | Removed 2 stale `#[allow(type_complexity)]`; added `RawLinearProjections` struct; updated return types + tests |
+| `llama-rs/src/e2e/attention.rs` | Made `QkvProjections` `pub(super)` with `#[derive(Debug)]`; removed stale `#[allow(too_many_arguments)]` |
+| `llama-rs/src/e2e/linear_attention.rs` | Removed stale `#[allow(too_many_arguments)]` |
+| `llama-rs/src/e2e/generation.rs` | Updated callers to use struct destructuring |
 | `llama-rs/Cargo.toml` | Added `postcard` + `serde` dependencies |
