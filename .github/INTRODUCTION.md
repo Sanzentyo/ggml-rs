@@ -791,6 +791,20 @@ And you should write rusty code(ADT, enum, type state pattern)
   (matching LinearAttentionDims consistency). Added 10 unit tests covering both
   `full_attention_hidden_features` and `linear_attention_hidden_features`.
   322 tests pass, zero clippy warnings.
+95. **plan.rs accessor tests + conv_channels unification** — DONE (commit `439ae7f`)
+  `conv_channels()` now uses checked arithmetic (via `checked_mul`).
+  `linear_attention_conv_channels()` delegates to `plan.conv_channels()` (single
+  source of truth). 18 accessor tests: `norm_values`, `kv_head_count`,
+  `head_dimension`, `is_standard`, `conv_channels` (basic, qwen35 dims, overflow).
+96. **state.rs KV append boundary tests** — DONE (commit `439ae7f`)
+  5 tests for `kv_cache_append_batch`: exact-fill then overflow
+  (`SequenceTooLong`), buffer length mismatch, zero count no-op, multi-batch
+  placement verification, standard delegation smoke test.
+  342 tests pass, zero clippy warnings.
+97. **attention_scale → derived getter** — DROPPED
+  `attention_scale` comes from GGUF metadata (`metadata.attention_scale()` in
+  `planner.rs:273-275`), NOT always `1/sqrt(hd)`. Removing the stored field
+  would break models with non-default values.
 
 ## Validation checkpoints completed on this branch
 

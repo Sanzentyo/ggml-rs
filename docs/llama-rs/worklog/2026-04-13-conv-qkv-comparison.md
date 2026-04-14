@@ -4796,3 +4796,46 @@ variant was the only one missing it.
 - 3 files changed: +137 -8
 - 322 tests pass, zero clippy warnings
 - Commit: c4b7b1f
+
+
+## Item 95: plan.rs accessor tests + conv_channels unification
+
+### Motivation
+conv_channels() on Qwen35LinearAttentionLayerPlan was infallible and duplicated the
+same formula as linear_attention_conv_channels(). Plan accessors (norm_values,
+kv_head_count, head_dimension, is_standard) had zero test coverage.
+
+### Changes
+1. plan.rs::conv_channels() uses checked_mul for overflow safety
+2. linear_attention_conv_channels() delegates to plan.conv_channels()
+3. dto.rs::from_plans() uses unwrap_or(0) (fingerprint context)
+4. Removed unused checked_mul import from linear_attention.rs
+5. Added 18 plan.rs accessor tests covering all enum dispatch + overflow
+
+### Result
+- 4 files changed: +277 -7
+- 342 tests pass, zero clippy warnings
+
+## Item 96: state.rs KV append boundary tests
+
+### Motivation
+kv_cache_append_batch() is the shared append logic for both Standard and
+Qwen35Full KV caches. Previously only tested indirectly via
+kv_cache_append_and_retrieve.
+
+### Changes
+5 new boundary tests:
+- kv_append_exact_fill_then_overflow: fill cache to capacity, verify next append -> SequenceTooLong
+- kv_append_buffer_length_mismatch: wrong k_values length -> BufferLengthMismatch
+- kv_append_zero_count_is_noop: count=0 with empty slices succeeds
+- kv_append_multi_batch_placement: verify data lands at correct offsets across 2 batches
+- kv_append_via_standard_delegates_correctly: StandardAttentionState smoke test
+
+### Result
+- Commit: 439ae7f (combined with item 95)
+
+## Item 97: attention_scale derived getter -- DROPPED
+
+attention_scale comes from GGUF metadata (metadata.attention_scale().unwrap_or(...) in
+planner.rs:273-275). NOT always 1/sqrt(hd). Removing the stored field would break
+models with non-default attention scale values.
