@@ -942,16 +942,34 @@ fn fully_fused_attention_graph(
         .mul(&x_normed, &attn_norm_w)
         .map_err(|source| E2eError::ggml("mul(X_layer_norm)", source))?;
 
-    // Weight tensors
-    let w_q = ctx
-        .new_tensor_2d::<f32>(Shape2D::new(hidden, qf2))
-        .map_err(|source| E2eError::ggml("new<W_q>", source))?;
-    let w_k = ctx
-        .new_tensor_2d::<f32>(Shape2D::new(hidden, kvf))
-        .map_err(|source| E2eError::ggml("new<W_k>", source))?;
-    let w_v = ctx
-        .new_tensor_2d::<f32>(Shape2D::new(hidden, kvf))
-        .map_err(|source| E2eError::ggml("new<W_v>", source))?;
+    // QKV projections via shared builder (Q carries interleaved gate, hence qf2).
+    let qkv = build_batch_projections(
+        &ctx,
+        &x,
+        hidden,
+        &[
+            ProjectionSpec {
+                weight_label: "new<W_q>",
+                matmul_label: "mul_mat(Q)",
+                out_features: qf2,
+            },
+            ProjectionSpec {
+                weight_label: "new<W_k>",
+                matmul_label: "mul_mat(K)",
+                out_features: kvf,
+            },
+            ProjectionSpec {
+                weight_label: "new<W_v>",
+                matmul_label: "mul_mat(V)",
+                out_features: kvf,
+            },
+        ],
+    )?;
+    let (w_q, q_full) = (&qkv[0].w, &qkv[0].y);
+    let (w_k, k_proj) = (&qkv[1].w, &qkv[1].y);
+    let (w_v, v_proj) = (&qkv[2].w, &qkv[2].y);
+
+    // Output projection weight.
     let w_out = ctx
         .new_tensor_2d::<f32>(Shape2D::new(qf, hidden))
         .map_err(|source| E2eError::ggml("new<W_out>", source))?;
@@ -974,22 +992,11 @@ fn fully_fused_attention_graph(
         .new_tensor(Type::F16, Dims::new([t, t, 1, 1]))
         .map_err(|source| E2eError::ggml("new<mask>", source))?;
 
-    // --- QKV Projection ---
-    let q_full = ctx
-        .mul_mat(&w_q, &x)
-        .map_err(|source| E2eError::ggml("mul_mat(Q)", source))?; // [qf2, T]
-    let k_proj = ctx
-        .mul_mat(&w_k, &x)
-        .map_err(|source| E2eError::ggml("mul_mat(K)", source))?; // [kvf, T]
-    let v_proj = ctx
-        .mul_mat(&w_v, &x)
-        .map_err(|source| E2eError::ggml("mul_mat(V)", source))?; // [kvf, T]
-
     // --- Deinterleave Q and Gate via strided view ---
     // Q_full layout per token: [Q_h0(D), G_h0(D), Q_h1(D), G_h1(D), ...]
     // Reshape to [D, 2*H, T] then take every-other slice along dim 1.
     let q_full_3d = ctx
-        .reshape_3d(&q_full, d, 2 * h, t)
+        .reshape_3d(q_full, d, 2 * h, t)
         .map_err(|source| E2eError::ggml("reshape_3d(Q_full)", source))?;
 
     let elem = std::mem::size_of::<f32>();
@@ -1015,7 +1022,7 @@ fn fully_fused_attention_graph(
     // --- Per-head RMS norm ---
     // rms_norm normalizes along ne[0]=D for each (h, t) pair.
     let k_3d = ctx
-        .reshape_3d(&k_proj, d, hkv, t)
+        .reshape_3d(k_proj, d, hkv, t)
         .map_err(|source| E2eError::ggml("reshape_3d(K)", source))?;
 
     let q_normed = ctx
@@ -1060,7 +1067,7 @@ fn fully_fused_attention_graph(
         .reshape_4d(&k_rope, d, hkv, t, 1)
         .map_err(|source| E2eError::ggml("reshape_4d(K)", source))?;
     let v_3d = ctx
-        .reshape_3d(&v_proj, d, hkv, t)
+        .reshape_3d(v_proj, d, hkv, t)
         .map_err(|source| E2eError::ggml("reshape_3d(V)", source))?;
     let v_4d = ctx
         .reshape_4d(&v_3d, d, hkv, t, 1)
@@ -1126,7 +1133,7 @@ fn fully_fused_attention_graph(
     graph.build_forward_expand(&output);
     // Also include K_rope and V_proj in the graph for intermediate readback.
     graph.build_forward_expand(&k_rope);
-    graph.build_forward_expand(&v_proj);
+    graph.build_forward_expand(v_proj);
 
     let _buffer = ctx
         .allocate_tensors(backend)
@@ -1139,9 +1146,9 @@ fn fully_fused_attention_graph(
     upload_weight(&attn_norm_w, attn_norm_weight, "write<attn_norm_w>")?;
 
     // Write weight data.
-    upload_weight(&w_q, &attention.q_weight_values, "write<W_q>")?;
-    upload_weight(&w_k, &attention.k_weight_values, "write<W_k>")?;
-    upload_weight(&w_v, &attention.v_weight_values, "write<W_v>")?;
+    upload_weight(w_q, &attention.q_weight_values, "write<W_q>")?;
+    upload_weight(w_k, &attention.k_weight_values, "write<W_k>")?;
+    upload_weight(w_v, &attention.v_weight_values, "write<W_v>")?;
     upload_weight(&w_out, &attention.output_weight_values, "write<W_out>")?;
 
     // Norm weights.

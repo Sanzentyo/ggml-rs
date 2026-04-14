@@ -3685,3 +3685,38 @@ concerns:
 |------|---------|
 | llama-rs/src/e2e/mlp.rs | Added `MlpGraphParts` + `build_mlp_graph`; refactored both callers (~40 lines removed) |
 
+## Item 59: Fully-Fused Attention QKV via Batch Projections
+
+### 59.1 Problem
+
+`fully_fused_attention_graph` creates Q/K/V weight tensors and matmul
+operations with 3 nearly-identical blocks:
+
+```rust
+let w_q = ctx.new_tensor_2d(Shape2D::new(hidden, qf2)).map_err(...)?;
+// ... same for w_k, w_v
+let q_full = ctx.mul_mat(&w_q, &x).map_err(...)?;
+// ... same for k_proj, v_proj
+```
+
+This is the same pattern that `build_batch_projections` (item 56) was
+designed to eliminate.
+
+### 59.2 Solution
+
+Replaced the 6 individual tensor/matmul calls with a single
+`build_batch_projections` call using 3 `ProjectionSpec` entries (Q with
+`out_features=qf2`, K and V with `out_features=kvf`). Destructured the
+result into reference bindings for downstream use.
+
+Key consideration: since `build_batch_projections` returns `Vec<BuiltProjection>`,
+the destructured `w_q`, `k_proj`, `v_proj` etc. are `&Tensor` references
+rather than owned values. All downstream usages (reshape, build_forward_expand,
+upload_weight) were updated to pass by reference directly instead of `&owned`.
+
+### 59.3 Files Modified
+
+| File | Changes |
+|------|---------|
+| llama-rs/src/e2e/attention.rs | Replaced 6 QKV tensor/matmul calls with `build_batch_projections`; fixed reference passing |
+

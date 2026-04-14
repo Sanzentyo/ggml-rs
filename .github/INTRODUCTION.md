@@ -501,6 +501,12 @@ And you should write rusty code(ADT, enum, type state pattern)
   `build_mlp_graph`, eliminating ~40 lines of duplicated topology code.
   See comparison doc item 58.
 
+- **Fully-fused attention QKV via batch projections** (item 59):
+  Refactored `fully_fused_attention_graph` QKV creation (3 separate
+  `new_tensor_2d` + `mul_mat` blocks) to use `build_batch_projections`.
+  Reduces ~15 lines of boilerplate while preserving all error labels.
+  See comparison doc item 59.
+
 ## Validation checkpoints completed on this branch
 
 - `cargo fmt --all`
