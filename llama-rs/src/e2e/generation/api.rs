@@ -66,34 +66,14 @@ pub fn generate_token_ids_from_model(
     let rms_norm_eps = metadata.attention_layer_norm_rms_epsilon();
     let global_names = resolve_global_tensor_names(model)?;
 
-    let token_embedding_values = model
-        .tensor_values::<f32>(&global_names.token_embedding)
-        .map_err(|source| E2eError::model("GgufModel::tensor_values(token_embedding)", source))?;
-    if hidden_features == 0 || !token_embedding_values.len().is_multiple_of(hidden_features) {
-        return Err(E2eError::InvalidTokenEmbeddingShape {
-            tensor_name: global_names.token_embedding.clone(),
-            hidden_features,
-            tensor_len: token_embedding_values.len(),
-        });
-    }
-    let vocab_size = token_embedding_values.len() / hidden_features;
-
-    let output_weight_values = if let Some(output_name) = global_names.output.as_deref() {
-        let values = model.tensor_values::<f32>(output_name).map_err(|source| {
-            E2eError::model("GgufModel::tensor_values(output_projection)", source)
-        })?;
-        let expected = checked_mul(hidden_features, vocab_size)?;
-        if values.len() != expected {
-            return Err(E2eError::OutputWeightLengthMismatch {
-                tensor_name: output_name.to_string(),
-                expected,
-                actual: values.len(),
-            });
-        }
-        Some(values)
-    } else {
-        None
-    };
+    let (token_embedding_values, vocab_size) =
+        load_token_embeddings(model, &global_names.token_embedding, hidden_features)?;
+    let output_weight_values = load_output_weights(
+        model,
+        global_names.output.as_deref(),
+        hidden_features,
+        vocab_size,
+    )?;
     let output_weight_values = output_weight_values
         .as_deref()
         .unwrap_or(token_embedding_values.as_slice());
@@ -117,16 +97,8 @@ pub fn generate_token_ids_from_model(
         .count();
     let mlp_only_layer_count = layer_plans.len() - attention_layer_count;
 
-    let _ = validate_token_id(config.pad_token_id, vocab_size)?;
-    if let Some(eos_token_id) = config.eos_token_id {
-        let _ = validate_token_id(eos_token_id, vocab_size)?;
-    }
-    for &token_id in &config.prompt_token_ids {
-        let _ = validate_token_id(token_id, vocab_size)?;
-    }
+    validate_config_token_ids(config, vocab_size)?;
 
-    let mut all_token_ids = vec![config.pad_token_id; total_sequence_length];
-    all_token_ids[..prompt_token_count].copy_from_slice(&config.prompt_token_ids);
     ensure_backends_loaded();
     let backend = Backend::new(config.backend.into()).ggml_ctx("Backend::new")?;
     let backend_name = backend
@@ -162,4 +134,63 @@ pub fn generate_token_ids_from_model(
         mlp_only_layer_count,
         elapsed,
     })
+}
+
+/// Load and validate token embedding tensor, returning values and derived vocab size.
+fn load_token_embeddings(
+    model: &GgufModel,
+    tensor_name: &str,
+    hidden_features: usize,
+) -> Result<(Vec<f32>, usize), E2eError> {
+    let values = model
+        .tensor_values::<f32>(tensor_name)
+        .map_err(|source| E2eError::model("GgufModel::tensor_values(token_embedding)", source))?;
+    if hidden_features == 0 || !values.len().is_multiple_of(hidden_features) {
+        return Err(E2eError::InvalidTokenEmbeddingShape {
+            tensor_name: tensor_name.to_string(),
+            hidden_features,
+            tensor_len: values.len(),
+        });
+    }
+    let vocab_size = values.len() / hidden_features;
+    Ok((values, vocab_size))
+}
+
+/// Load optional output projection weights, validating shape against vocab × hidden.
+fn load_output_weights(
+    model: &GgufModel,
+    output_name: Option<&str>,
+    hidden_features: usize,
+    vocab_size: usize,
+) -> Result<Option<Vec<f32>>, E2eError> {
+    let Some(output_name) = output_name else {
+        return Ok(None);
+    };
+    let values = model
+        .tensor_values::<f32>(output_name)
+        .map_err(|source| E2eError::model("GgufModel::tensor_values(output_projection)", source))?;
+    let expected = checked_mul(hidden_features, vocab_size)?;
+    if values.len() != expected {
+        return Err(E2eError::OutputWeightLengthMismatch {
+            tensor_name: output_name.to_string(),
+            expected,
+            actual: values.len(),
+        });
+    }
+    Ok(Some(values))
+}
+
+/// Validate that all token IDs in the config (pad, eos, prompt) are within vocab range.
+fn validate_config_token_ids(
+    config: &E2eGenerationConfig,
+    vocab_size: usize,
+) -> Result<(), E2eError> {
+    validate_token_id(config.pad_token_id, vocab_size)?;
+    if let Some(eos_token_id) = config.eos_token_id {
+        validate_token_id(eos_token_id, vocab_size)?;
+    }
+    for &token_id in &config.prompt_token_ids {
+        validate_token_id(token_id, vocab_size)?;
+    }
+    Ok(())
 }
