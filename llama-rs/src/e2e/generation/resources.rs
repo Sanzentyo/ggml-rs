@@ -193,6 +193,7 @@ fn build_one_persistent_linear(
         "write<W_OUT>(pla)",
     )?;
 
+    // SAFETY: see the comment block in `try_build_persistent_projections`.
     let proj = unsafe {
         std::mem::transmute::<PersistentDecodeProjection<'_>, PersistentDecodeProjection<'static>>(
             PersistentDecodeProjection::LinearAttention {

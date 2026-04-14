@@ -64,14 +64,7 @@ impl FullAttentionDims {
         let h = attention.head_count;
         let hkv = attention.kv_head_count;
 
-        let hidden = h
-            .checked_mul(d)
-            .and_then(|qf| attention.output_weight_values.len().checked_div(qf))
-            .filter(|&hid| hid > 0 && hid * h * d == attention.output_weight_values.len())
-            .ok_or(E2eError::BufferLengthMismatch {
-                expected: 1,
-                actual: 0,
-            })?;
+        let hidden = full_attention_hidden_features(attention)?;
 
         validate_gqa_heads(h, hkv)?;
 
@@ -401,4 +394,84 @@ pub(super) fn project_and_prepare_qkv(
         hidden_features,
         rms_norm_eps,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Build a minimal `Qwen35FullAttentionLayerPlan` stub for dimension tests.
+    fn stub_full_plan(
+        hidden: usize,
+        heads: usize,
+        kv_heads: usize,
+        hd: usize,
+    ) -> Qwen35FullAttentionLayerPlan {
+        let qf = heads * hd;
+        let kvf = kv_heads * hd;
+        Qwen35FullAttentionLayerPlan {
+            norm_values: vec![1.0; hidden],
+            q_norm_values: vec![1.0; hd],
+            k_norm_values: vec![1.0; hd],
+            q_weight_values: vec![0.0; hidden * qf * 2],
+            k_weight_values: vec![0.0; hidden * kvf],
+            v_weight_values: vec![0.0; hidden * kvf],
+            output_weight_values: vec![0.0; qf * hidden],
+            head_count: heads,
+            kv_head_count: kv_heads,
+            head_dimension: hd,
+            attention_scale: 1.0 / (hd as f32).sqrt(),
+            rope_n_dims: hd,
+            rope_freq_base: 10000.0,
+            rope_freq_scale: 1.0,
+        }
+    }
+
+    #[test]
+    fn full_hidden_features_basic() {
+        let plan = stub_full_plan(128, 4, 2, 32);
+        assert_eq!(full_attention_hidden_features(&plan).unwrap(), 128);
+    }
+
+    #[test]
+    fn full_hidden_features_qwen35_dimensions() {
+        // Qwen3.5 0.6B: hidden=1536, heads=8, kv=4, hd=128
+        let plan = stub_full_plan(1536, 8, 4, 128);
+        assert_eq!(full_attention_hidden_features(&plan).unwrap(), 1536);
+    }
+
+    #[test]
+    fn full_hidden_features_zero_heads() {
+        // head_count=0 → query_features overflow/zero
+        let mut plan = stub_full_plan(64, 2, 1, 32);
+        plan.head_count = 0;
+        assert!(full_attention_hidden_features(&plan).is_err());
+    }
+
+    #[test]
+    fn full_hidden_features_empty_weights() {
+        let mut plan = stub_full_plan(64, 2, 1, 32);
+        plan.output_weight_values = vec![];
+        assert!(full_attention_hidden_features(&plan).is_err());
+    }
+
+    #[test]
+    fn full_attention_dims_delegates_to_hidden_features() {
+        let plan = stub_full_plan(128, 4, 2, 32);
+        let dims = FullAttentionDims::new(&plan).unwrap();
+        assert_eq!(dims.hidden, 128);
+        assert_eq!(dims.d, 32);
+        assert_eq!(dims.h, 4);
+        assert_eq!(dims.hkv, 2);
+        assert_eq!(dims.qf, 128);
+        assert_eq!(dims.qf2, 256);
+        assert_eq!(dims.kvf, 64);
+    }
+
+    #[test]
+    fn full_attention_dims_rejects_bad_gqa() {
+        // kv_heads > heads → GQA validation fails
+        let plan = stub_full_plan(128, 2, 4, 32);
+        assert!(FullAttentionDims::new(&plan).is_err());
+    }
 }

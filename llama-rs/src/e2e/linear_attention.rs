@@ -430,4 +430,59 @@ mod tests {
         let result = causal_depthwise_conv_graph(&[1.0], 1, 1, 0, &[], &backend);
         assert!(result.is_err());
     }
+
+    // -----------------------------------------------------------------------
+    // linear_attention_hidden_features tests
+    // -----------------------------------------------------------------------
+
+    fn stub_linear_plan(hidden: usize, inner_size: usize) -> Qwen35LinearAttentionLayerPlan {
+        let group_count = 2;
+        let state_size = 4;
+        let time_step_rank = 8;
+        let conv_kernel = 4;
+        let conv_channels = inner_size + 2 * group_count * state_size;
+        Qwen35LinearAttentionLayerPlan {
+            norm_values: vec![1.0; hidden],
+            qkv_weight_values: vec![0.0; hidden * conv_channels],
+            gate_weight_values: vec![0.0; hidden * inner_size],
+            alpha_weight_values: vec![0.0; hidden * time_step_rank],
+            beta_weight_values: vec![0.0; hidden * time_step_rank],
+            conv_weight_values: vec![0.0; conv_channels * conv_kernel],
+            dt_bias_values: vec![0.0; time_step_rank],
+            ssm_a_values: vec![-1.0; time_step_rank],
+            ssm_norm_values: vec![1.0; state_size],
+            ssm_out_weight_values: vec![0.0; inner_size * hidden],
+            state_size,
+            group_count,
+            time_step_rank,
+            inner_size,
+            conv_kernel,
+        }
+    }
+
+    #[test]
+    fn linear_hidden_features_basic() {
+        let plan = stub_linear_plan(64, 32);
+        assert_eq!(linear_attention_hidden_features(&plan).unwrap(), 64);
+    }
+
+    #[test]
+    fn linear_hidden_features_qwen35_dimensions() {
+        let plan = stub_linear_plan(1536, 1536);
+        assert_eq!(linear_attention_hidden_features(&plan).unwrap(), 1536);
+    }
+
+    #[test]
+    fn linear_hidden_features_zero_inner_size() {
+        let mut plan = stub_linear_plan(64, 32);
+        plan.inner_size = 0;
+        assert!(linear_attention_hidden_features(&plan).is_err());
+    }
+
+    #[test]
+    fn linear_hidden_features_empty_weights() {
+        let mut plan = stub_linear_plan(64, 32);
+        plan.ssm_out_weight_values = vec![];
+        assert!(linear_attention_hidden_features(&plan).is_err());
+    }
 }
