@@ -351,3 +351,60 @@ impl GgufModel {
         Ok(&self.bytes[start..end])
     }
 }
+
+#[cfg(test)]
+impl GgufModel {
+    /// Build a stub model containing named tensors with configurable byte sizes.
+    ///
+    /// Used for testing tensor name resolution and planner logic without real
+    /// GGUF files. Panics on duplicate tensor names (mirrors real constructor).
+    pub fn stub(tensors: &[(&str, usize)], kv_entries: Vec<crate::gguf::GgufKvEntry>) -> Self {
+        use ggml_rs::{GgufTensorInfo, Type};
+
+        let mut tensor_index = HashMap::with_capacity(tensors.len());
+        let mut infos = Vec::with_capacity(tensors.len());
+        let mut offset = 0_usize;
+        for (i, &(name, byte_size)) in tensors.iter().enumerate() {
+            assert!(
+                tensor_index.insert(name.to_string(), i).is_none(),
+                "duplicate tensor name in stub: {name}"
+            );
+            infos.push(GgufTensorInfo {
+                name: name.to_string(),
+                offset,
+                size: byte_size,
+                ggml_type: Type::F32,
+            });
+            offset += byte_size;
+        }
+
+        let mut kv_index = HashMap::with_capacity(kv_entries.len());
+        for (i, entry) in kv_entries.iter().enumerate() {
+            assert!(
+                kv_index.insert(entry.key.clone(), i).is_none(),
+                "duplicate kv key in stub: {}",
+                entry.key
+            );
+        }
+
+        Self {
+            path: PathBuf::new(),
+            bytes: vec![0u8; offset],
+            report: crate::gguf::GgufReport {
+                version: 3,
+                alignment: 32,
+                data_offset: 0,
+                kv_entries,
+                tensors: infos,
+            },
+            tensor_index,
+            kv_index,
+        }
+    }
+
+    /// Convenience: stub with only tensor names (16-byte each, no KV entries).
+    pub fn stub_from_names(names: &[&str]) -> Self {
+        let tensors: Vec<_> = names.iter().map(|&n| (n, 16_usize)).collect();
+        Self::stub(&tensors, vec![])
+    }
+}

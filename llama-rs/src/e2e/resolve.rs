@@ -182,3 +182,208 @@ pub(super) fn layer_ssm_norm_candidates(layer: usize) -> Vec<String> {
 pub(super) fn layer_ssm_out_candidates(layer: usize) -> Vec<String> {
     vec![format!("blk.{layer}.ssm_out.weight")]
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── Candidate generator tests ──────────────────────────────────────
+
+    #[test]
+    fn global_token_embedding_candidates_has_expected_patterns() {
+        let c = global_token_embedding_candidates();
+        assert_eq!(c.len(), 3);
+        assert!(c.contains(&"token_embd.weight".to_string()));
+        assert!(c.contains(&"tok_embeddings.weight".to_string()));
+        assert!(c.contains(&"model.embed_tokens.weight".to_string()));
+    }
+
+    #[test]
+    fn global_output_norm_candidates_has_expected_patterns() {
+        let c = global_output_norm_candidates();
+        assert_eq!(c.len(), 3);
+        assert!(c.contains(&"output_norm.weight".to_string()));
+        assert!(c.contains(&"norm.weight".to_string()));
+        assert!(c.contains(&"model.norm.weight".to_string()));
+    }
+
+    #[test]
+    fn global_output_projection_candidates_has_expected_patterns() {
+        let c = global_output_projection_candidates();
+        assert_eq!(c.len(), 3);
+        assert!(c.contains(&"output.weight".to_string()));
+        assert!(c.contains(&"lm_head.weight".to_string()));
+        assert!(c.contains(&"model.lm_head.weight".to_string()));
+    }
+
+    #[test]
+    fn layer_candidates_format_layer_number_correctly() {
+        let layer = 42;
+        assert!(
+            layer_ffn_norm_candidates(layer)
+                .iter()
+                .any(|s| s.contains("blk.42."))
+        );
+        assert!(
+            layer_ffn_gate_candidates(layer)
+                .iter()
+                .any(|s| s.contains("blk.42."))
+        );
+        assert!(
+            layer_ffn_up_candidates(layer)
+                .iter()
+                .any(|s| s.contains("blk.42."))
+        );
+        assert!(
+            layer_ffn_down_candidates(layer)
+                .iter()
+                .any(|s| s.contains("blk.42."))
+        );
+        assert!(
+            layer_attn_norm_candidates(layer)
+                .iter()
+                .any(|s| s.contains("blk.42."))
+        );
+    }
+
+    #[test]
+    fn layer_ssm_candidates_produce_single_pattern_each() {
+        let layer = 7;
+        assert_eq!(layer_ssm_alpha_candidates(layer).len(), 1);
+        assert_eq!(layer_ssm_beta_candidates(layer).len(), 1);
+        assert_eq!(layer_ssm_conv1d_candidates(layer).len(), 1);
+        assert_eq!(layer_ssm_dt_candidates(layer).len(), 1);
+        assert_eq!(layer_ssm_a_candidates(layer).len(), 1);
+        assert_eq!(layer_ssm_norm_candidates(layer).len(), 1);
+        assert_eq!(layer_ssm_out_candidates(layer).len(), 1);
+
+        assert_eq!(
+            layer_ssm_alpha_candidates(layer)[0],
+            "blk.7.ssm_alpha.weight"
+        );
+        assert_eq!(layer_ssm_dt_candidates(layer)[0], "blk.7.ssm_dt.bias");
+        assert_eq!(layer_ssm_a_candidates(layer)[0], "blk.7.ssm_a");
+    }
+
+    #[test]
+    fn layer_candidates_at_zero() {
+        assert!(
+            layer_ffn_norm_candidates(0)
+                .iter()
+                .any(|s| s.contains("blk.0."))
+        );
+        assert_eq!(layer_attn_qkv_candidates(0)[0], "blk.0.attn_qkv.weight");
+    }
+
+    // ── Resolution logic tests ─────────────────────────────────────────
+
+    #[test]
+    fn resolve_first_tensor_name_returns_first_candidate_match() {
+        let model = GgufModel::stub_from_names(&["b_tensor", "a_tensor"]);
+        let candidates = vec!["a_tensor".to_string(), "b_tensor".to_string()];
+        // "a_tensor" is the first *candidate*, even though "b_tensor" appears first in model.
+        let result = resolve_first_tensor_name(&model, &candidates);
+        assert_eq!(result, Some("a_tensor".to_string()));
+    }
+
+    #[test]
+    fn resolve_first_tensor_name_returns_none_on_no_match() {
+        let model = GgufModel::stub_from_names(&["x_tensor"]);
+        let candidates = vec!["a_tensor".to_string(), "b_tensor".to_string()];
+        assert_eq!(resolve_first_tensor_name(&model, &candidates), None);
+    }
+
+    #[test]
+    fn resolve_first_tensor_name_empty_candidates_returns_none() {
+        let model = GgufModel::stub_from_names(&["a_tensor"]);
+        assert_eq!(resolve_first_tensor_name(&model, &[]), None);
+    }
+
+    #[test]
+    fn resolve_required_global_returns_ok_on_match() {
+        let model = GgufModel::stub_from_names(&["token_embd.weight"]);
+        let result = resolve_required_global_tensor_name(
+            &model,
+            "token_embedding",
+            global_token_embedding_candidates(),
+        );
+        assert_eq!(result.unwrap(), "token_embd.weight");
+    }
+
+    #[test]
+    fn resolve_required_global_returns_error_with_tried_candidates() {
+        let model = GgufModel::stub_from_names(&[]);
+        let candidates = global_token_embedding_candidates();
+        let expected_tried = candidates.clone();
+        let result = resolve_required_global_tensor_name(&model, "token_embedding", candidates);
+        let err = result.unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("token_embedding"), "error should mention role");
+        for tried in &expected_tried {
+            assert!(msg.contains(tried), "error should list tried name: {tried}");
+        }
+    }
+
+    #[test]
+    fn resolve_required_layer_returns_ok_on_match() {
+        let model = GgufModel::stub_from_names(&["blk.3.ffn_norm.weight"]);
+        let result =
+            resolve_required_layer_tensor_name(&model, 3, "ffn_norm", layer_ffn_norm_candidates(3));
+        assert_eq!(result.unwrap(), "blk.3.ffn_norm.weight");
+    }
+
+    #[test]
+    fn resolve_required_layer_error_includes_layer_number() {
+        let model = GgufModel::stub_from_names(&[]);
+        let result =
+            resolve_required_layer_tensor_name(&model, 5, "ffn_norm", layer_ffn_norm_candidates(5));
+        let err = result.unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("5"), "error should mention layer number");
+        assert!(msg.contains("ffn_norm"), "error should mention role");
+    }
+
+    // ── Global tensor orchestration tests ──────────────────────────────
+
+    #[test]
+    fn resolve_global_tensor_names_all_found() {
+        let model = GgufModel::stub_from_names(&[
+            "token_embd.weight",
+            "output_norm.weight",
+            "output.weight",
+        ]);
+        let names = resolve_global_tensor_names(&model).unwrap();
+        assert_eq!(names.token_embedding, "token_embd.weight");
+        assert_eq!(names.output_norm, "output_norm.weight");
+        assert_eq!(names.output, Some("output.weight".to_string()));
+    }
+
+    #[test]
+    fn resolve_global_tensor_names_output_optional_missing() {
+        let model = GgufModel::stub_from_names(&["token_embd.weight", "output_norm.weight"]);
+        let names = resolve_global_tensor_names(&model).unwrap();
+        assert_eq!(names.output, None);
+    }
+
+    #[test]
+    fn resolve_global_tensor_names_fails_on_missing_required() {
+        // Missing token_embedding — should fail.
+        let model = GgufModel::stub_from_names(&["output_norm.weight"]);
+        let result = resolve_global_tensor_names(&model);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn resolve_global_prefers_alternative_naming_conventions() {
+        // Use HuggingFace-style names instead of ggml-style.
+        let model = GgufModel::stub_from_names(&[
+            "model.embed_tokens.weight",
+            "model.norm.weight",
+            "model.lm_head.weight",
+        ]);
+        let names = resolve_global_tensor_names(&model).unwrap();
+        assert_eq!(names.token_embedding, "model.embed_tokens.weight");
+        assert_eq!(names.output_norm, "model.norm.weight");
+        assert_eq!(names.output, Some("model.lm_head.weight".to_string()));
+    }
+}
