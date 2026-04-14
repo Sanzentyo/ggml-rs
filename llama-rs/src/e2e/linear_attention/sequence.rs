@@ -12,7 +12,7 @@ use super::super::tensor_ops::{
 };
 use super::conv::project_and_conv_fused_graph;
 use super::projection::{FusedLinearOutputs, LinearAttentionDims};
-use super::ssm::{SsmScratch, split_and_norm_qk, ssm_recurrence_step};
+use super::ssm::{SsmScratch, SsmStepScalars, split_and_norm_qk, ssm_recurrence_step};
 use ggml_rs::Backend;
 
 pub(super) fn qwen35_linear_attention_core(
@@ -148,10 +148,12 @@ pub(super) fn qwen35_linear_attention_core(
                 q,
                 k,
                 v,
-                gate.exp(),
-                beta_value,
+                SsmStepScalars {
+                    decay: gate.exp(),
+                    beta_value,
+                    scale,
+                },
                 state_size,
-                scale,
                 &mut scratch,
             );
             let normalized =

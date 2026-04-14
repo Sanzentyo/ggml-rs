@@ -13,7 +13,7 @@ use super::super::tensor_ops::{
 };
 use super::conv::causal_depthwise_conv_decode_step;
 use super::projection::{LinearProjections, project_linear_inputs};
-use super::ssm::{LinearDecodeScratch, split_and_norm_qk, ssm_recurrence_step};
+use super::ssm::{LinearDecodeScratch, SsmStepScalars, split_and_norm_qk, ssm_recurrence_step};
 use ggml_rs::Backend;
 
 /// Core linear attention decode logic: conv → split/norm → SSM recurrence → z-gating.
@@ -103,10 +103,12 @@ pub(in crate::e2e) fn linear_attention_decode_core(
             q,
             k,
             v,
-            gate.exp(),
-            beta_value,
+            SsmStepScalars {
+                decay: gate.exp(),
+                beta_value,
+                scale,
+            },
             attention.state_size,
-            scale,
             &mut scratch.ssm,
         );
         rms_norm_single_into(

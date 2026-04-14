@@ -54,6 +54,16 @@ impl LinearDecodeScratch {
     }
 }
 
+/// Per-step scalar coefficients for the SSM recurrence.
+///
+/// Bundled as a small `Copy` type to keep the hot-path call signature compact.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct SsmStepScalars {
+    pub(super) decay: f32,
+    pub(super) beta_value: f32,
+    pub(super) scale: f32,
+}
+
 /// Single SSM recurrence step: decay → sk → delta → update → read.
 ///
 /// Operates on one head's `state_size × state_size` state matrix. Results are
@@ -62,16 +72,13 @@ impl LinearDecodeScratch {
 ///
 /// The loop order is preserved exactly to match the original implementation and
 /// maintain floating-point parity.
-#[allow(clippy::too_many_arguments)]
 pub(super) fn ssm_recurrence_step(
     state: &mut [f32],
     q: &[f32],
     k: &[f32],
     v: &[f32],
-    decay: f32,
-    beta_value: f32,
+    scalars: SsmStepScalars,
     state_size: usize,
-    scale: f32,
     scratch: &mut SsmScratch,
 ) {
     debug_assert_eq!(state.len(), state_size * state_size);
@@ -85,7 +92,7 @@ pub(super) fn ssm_recurrence_step(
     for (row, row_slice) in state.chunks_exact_mut(state_size).enumerate() {
         let k_row = k[row];
         for (col, s) in row_slice.iter_mut().enumerate() {
-            *s *= decay;
+            *s *= scalars.decay;
             scratch.sk[col] += *s * k_row;
         }
     }
@@ -95,7 +102,7 @@ pub(super) fn ssm_recurrence_step(
         .delta
         .iter_mut()
         .zip(v.iter().zip(scratch.sk.iter()))
-        .for_each(|(d, (&vi, &ski))| *d = (vi - ski) * beta_value);
+        .for_each(|(d, (&vi, &ski))| *d = (vi - ski) * scalars.beta_value);
 
     // State update: state[row][col] += k[row] * delta[col]
     for (row_slice, &k_row) in state.chunks_exact_mut(state_size).zip(k.iter()) {
@@ -107,7 +114,7 @@ pub(super) fn ssm_recurrence_step(
 
     // Read output: row-major traversal for contiguous access + auto-vectorization.
     for row in 0..state_size {
-        let qr_scaled = q[row] * scale;
+        let qr_scaled = q[row] * scalars.scale;
         let row_slice = &state[row * state_size..(row + 1) * state_size];
         scratch
             .out
