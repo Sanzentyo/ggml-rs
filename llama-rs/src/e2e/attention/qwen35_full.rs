@@ -3,9 +3,7 @@
 use super::persistent::{
     PersistentKvCache, PersistentScoringContext, decode_scoring_gpu_persistent,
 };
-use super::projection::{
-    FullAttentionDims, PreparedAttention, project_and_prepare_qkv,
-};
+use super::projection::{FullAttentionDims, PreparedAttention, project_and_prepare_qkv};
 use super::shared::{
     FlashAttentionConfig, RopeParams, apply_neox_rope_in_place, apply_optional_per_head_norm,
     run_flash_attention_pipeline,

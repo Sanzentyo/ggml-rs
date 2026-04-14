@@ -21,9 +21,7 @@ mod standard;
 pub(super) use persistent::{
     PersistentKvCache, PersistentScoringContext, build_persistent_kv_cache,
 };
-pub(super) use projection::{
-    QkvProjections, full_attention_hidden_features, prepare_qkv_from_raw,
-};
+pub(super) use projection::{QkvProjections, full_attention_hidden_features, prepare_qkv_from_raw};
 pub(super) use qwen35_full::{
     full_attention_decode_core, qwen35_full_attention_decode_step, qwen35_full_attention_inference,
     qwen35_full_attention_prefill,
