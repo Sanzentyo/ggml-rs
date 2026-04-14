@@ -419,6 +419,19 @@ And you should write rusty code(ADT, enum, type state pattern)
   Only remaining `#[allow]` is `ssm_recurrence_step` (10-param math kernel, deliberate).
   See comparison doc items 45-46.
 
+- **`sum_matmul_memories` DRY helper** (item 47):
+  Extracted common memory estimation pattern from `recommended_persistent_full_attention_memory`
+  and `recommended_persistent_linear_attention_memory`. Takes a declarative slice of
+  `(weight_shape, input_shape, label)` tuples, uses `try_fold` + `checked_add`.
+  Both callers reduced from ~35 lines to ~10 lines.
+  See comparison doc item 47.
+
+- **`upload_weight` DRY helper** (item 48):
+  Extracted `write_data_backend` + `map_err` pattern from `build_one_persistent_full`
+  and `build_one_persistent_linear`. Each weight upload reduced from 3 lines to 1 line,
+  preserving per-weight error labels for debuggability.
+  See comparison doc item 48.
+
 ## Validation checkpoints completed on this branch
 
 - `cargo fmt --all`

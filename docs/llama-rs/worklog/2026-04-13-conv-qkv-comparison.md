@@ -3115,4 +3115,53 @@ fn read_linear_attention_projections(&self) -> Result<RawLinearProjections, E2eE
 | `llama-rs/src/e2e/attention.rs` | Made `QkvProjections` `pub(super)` with `#[derive(Debug)]`; removed stale `#[allow(too_many_arguments)]` |
 | `llama-rs/src/e2e/linear_attention.rs` | Removed stale `#[allow(too_many_arguments)]` |
 | `llama-rs/src/e2e/generation.rs` | Updated callers to use struct destructuring |
+
+---
+
+## Item 47 — `sum_matmul_memories` Helper
+
+### 47.1 Motivation
+
+`recommended_persistent_full_attention_memory` and `recommended_persistent_linear_attention_memory`
+in `tensor_ops.rs` follow identical patterns: compute `recommended_backend_matmul_memory` for
+each weight×input pair, chain `checked_add`, add slack. The only differences are the number
+of projections (4 vs 5) and their dimensions.
+
+### 47.2 Implementation
+
+Extracted `sum_matmul_memories(projections: &[(Shape2D, Shape2D, &'static str)])`:
+- Uses `try_fold` for clean accumulation with `checked_add`
+- Adds `PROJECTION_SLACK_BYTES * 2` at the end
+- Each caller now passes a declarative slice of `(weight_shape, input_shape, label)` tuples
+
+### 47.3 Before/After
+
+```rust
+// Before: 4 × (3 lines of memory query + map_err) + 5 lines of checked_add chain = ~17 lines
+// After: declarative 4-element slice, 1 function call = ~6 lines
+```
+
+Both `recommended_persistent_*_memory` functions reduced from ~35 lines each to ~10 lines.
+
+---
+
+## Item 48 — `upload_weight` Helper
+
+### 48.1 Motivation
+
+`build_one_persistent_full` and `build_one_persistent_linear` in `generation.rs` each
+have 4-5 repetitive `write_data_backend` + `map_err` calls for weight upload.
+
+### 48.2 Implementation
+
+Extracted `upload_weight(tensor: &Tensor<f32>, data: &[f32], label: &'static str)`:
+- Preserves per-weight error labels (`write<W_Q>(pfa)`, `write<W_ALPHA>(pla)`, etc.)
+- Each upload call reduced from 3 lines to 1 line
+
+### 48.3 Files Modified
+
+| File | Changes |
+|------|---------|
+| `llama-rs/src/e2e/tensor_ops.rs` | Added `sum_matmul_memories`; refactored both `recommended_persistent_*_memory` to use it |
+| `llama-rs/src/e2e/generation.rs` | Added `upload_weight`; refactored both `build_one_persistent_*` to use it |
 | `llama-rs/Cargo.toml` | Added `postcard` + `serde` dependencies |
