@@ -4744,3 +4744,55 @@ This creates a footgun — callers could pass mismatched norm weights.
 - 7 files changed: +22 -91
 - 312 tests pass, zero clippy warnings
 - Commit: 2d1d687
+
+---
+
+## Item 92: Remove `attn_norm_weight` from standard/full attention chains
+
+### What changed
+Same pattern as item 90 (linear attention) applied to the remaining two attention types:
+- `standard_attention_{prefill,inference,graph}` — removed `attn_norm_weight` param, reads `attention.norm_values` directly
+- `qwen35_full_attention_{inference,prefill,core,fully_fused_graph}` — same removal
+
+### Cascade
+- `generation/strategy.rs`: Removed `&attn.norm_values` / `attention.norm_values()` from 4 call sites
+- `bench_graphs/inference.rs`: Removed from 3 bench call sites, removed 2 unused `norm_w` bindings
+- `attention.rs`: Updated 6 test call sites (3 standard, 3 full)
+
+### Result
+- 5 files changed: +36 -129
+- 312 tests pass, zero clippy warnings
+- Commit: 5e2e190
+
+---
+
+## Item 93: SAFETY comment on linear attention persistent projection
+
+### What changed
+Added `// SAFETY: see the comment block in try_build_persistent_projections.`
+to the `unsafe` transmute in `build_one_persistent_linear` (resources.rs).
+The full attention variant already had this comment; the linear attention
+variant was the only one missing it.
+
+### Result
+- 1 file changed: +1 line
+- Commit: c4b7b1f (combined with item 94)
+
+---
+
+## Item 94: FullAttentionDims delegation + hidden_features unit tests
+
+### What changed
+1. `FullAttentionDims::new()` now delegates to `full_attention_hidden_features()`
+   instead of reimplementing the same derivation inline. This matches the pattern
+   already used by `LinearAttentionDims::new()`.
+
+2. Added 10 unit tests:
+   - `projection.rs`: full_hidden_features_{basic,qwen35_dimensions,zero_heads,empty_weights},
+     full_attention_dims_{delegates_to_hidden_features,rejects_bad_gqa}
+   - `linear_attention.rs`: linear_hidden_features_{basic,qwen35_dimensions,zero_inner_size,empty_weights}
+
+### Result
+- 3 files changed: +137 -8
+- 322 tests pass, zero clippy warnings
+- Commit: c4b7b1f

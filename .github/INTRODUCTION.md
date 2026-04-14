@@ -776,6 +776,21 @@ And you should write rusty code(ADT, enum, type state pattern)
   through `qwen35_linear_attention_{inference,prefill,core}` and bench functions
   (8→7 params, removes `#[allow]`). Rubber-duck recommended this over struct bundling.
   312 tests pass, zero clippy warnings.
+91. **rms_norm_eps refactoring** — DEFERRED. Rubber-duck found it's model-global
+  (used in session init, generation, checkpoint, LM head). Putting per-layer creates
+  second source of truth. Needs `ModelConstants` struct design first.
+92. **Remove `attn_norm_weight` from standard/full attention chains** — DONE (commit `5e2e190`)
+  Same pattern as item 90 for the remaining two attention types. `standard_attention_graph`
+  and `fully_fused_attention_graph` now read `attention.norm_values` directly.
+  Cascaded through strategy.rs, bench_graphs, and 6 test call sites. 312 tests, zero warnings.
+93. **Add SAFETY comment to linear attention persistent projection** — DONE (commit `c4b7b1f`)
+  The `unsafe` transmute in `build_one_persistent_linear` was missing the
+  cross-reference to the safety reasoning in `try_build_persistent_projections`.
+94. **FullAttentionDims delegation + hidden_features tests** — DONE (commit `c4b7b1f`)
+  `FullAttentionDims::new()` now delegates to `full_attention_hidden_features()`
+  (matching LinearAttentionDims consistency). Added 10 unit tests covering both
+  `full_attention_hidden_features` and `linear_attention_hidden_features`.
+  322 tests pass, zero clippy warnings.
 
 ## Validation checkpoints completed on this branch
 
