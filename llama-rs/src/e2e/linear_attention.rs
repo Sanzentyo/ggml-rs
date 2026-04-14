@@ -891,6 +891,7 @@ pub(super) fn causal_depthwise_conv(
 /// Standalone version used by tests and benchmarks for parity checking.
 /// Production code uses the fused `project_and_conv_fused_graph` which
 /// combines projection + conv.
+#[cfg(test)]
 pub(super) fn causal_depthwise_conv_graph(
     input: &[f32],
     sequence_length: usize,
