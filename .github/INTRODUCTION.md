@@ -606,6 +606,17 @@ And you should write rusty code(ADT, enum, type state pattern)
   access), emit_token(), sample_next().
   Total test count increased from 244 to 246. Zero clippy warnings.
 
+- **Split bench_graphs.rs into 4 submodules** (item 70):
+  Split the 1064-line test-only benchmark module into 4 focused submodules:
+  `bench_graphs.rs` root (~23 lines): module doc + `#[cfg(test)]` mod decls.
+  `bench_graphs/helpers.rs` (~154 lines): bench_fn, BenchResult, print_results,
+  available_backends, synthetic plan/input builders.
+  `bench_graphs/inference.rs` (~392 lines): 6 inference graph benchmarks
+  (full attention, linear attention ×3, MLP, combined).
+  `bench_graphs/lm_head.rs` (~110 lines): LM head host/cold/warm graph bench.
+  `bench_graphs/micro.rs` (~380 lines): conv vs QKV packing micro-benchmarks.
+  8 ignored bench tests preserved, 246 total tests, zero clippy warnings.
+
 ## Validation checkpoints completed on this branch
 
 - `cargo fmt --all`

@@ -4110,3 +4110,23 @@ Zero clippy warnings.
 | llama-rs/src/e2e/session.rs | Module root (~339 lines from 831) |
 | llama-rs/src/e2e/session/init.rs | NEW: Construction paths + ResolvedModel |
 | llama-rs/src/e2e/session/runtime.rs | NEW: Per-token decode + sampling |
+
+## Item 70: Split bench_graphs.rs into 4 submodules
+
+**Commit**: `b575510`
+**Motivation**: bench_graphs.rs at 1064 lines (all `#[cfg(test)]`) mixed infrastructure, inference benches, LM head bench, and micro-benchmarks. Splitting improves navigability.
+
+**Approach**:
+- Extracted shared helpers (bench_fn, BenchResult, builders) into `helpers.rs` with `pub(super)` visibility on both struct and fields (per rubber-duck feedback).
+- Grouped 6 inference benches into `inference.rs`, LM head bench into `lm_head.rs`, conv/QKV micro-benchmarks into `micro.rs`.
+- Import depth stays at `super::super::` (same as before — bench_graphs submodules are at same depth as old `mod tests`).
+
+**Result**: 246 tests pass, 8 ignored bench tests preserved, zero clippy warnings.
+
+| File | Change |
+|------|--------|
+| llama-rs/src/e2e/bench_graphs.rs | Module root (~23 lines from 1064) |
+| llama-rs/src/e2e/bench_graphs/helpers.rs | NEW: Shared bench infrastructure |
+| llama-rs/src/e2e/bench_graphs/inference.rs | NEW: 6 inference graph benches |
+| llama-rs/src/e2e/bench_graphs/lm_head.rs | NEW: LM head sampling bench |
+| llama-rs/src/e2e/bench_graphs/micro.rs | NEW: Conv vs QKV micro-benches |
