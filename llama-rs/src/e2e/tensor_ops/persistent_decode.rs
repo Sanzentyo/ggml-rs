@@ -1,5 +1,5 @@
 use super::super::attention::QkvProjections;
-use super::super::error::E2eError;
+use super::super::error::{E2eError, GgmlResultExt};
 use super::projection::{
     BuiltProjection, OutputProjectionGraph, ProjectionSpec, build_batch_projections,
     build_output_projection_graph, sum_matmul_memories,
@@ -148,7 +148,7 @@ pub(in crate::e2e) fn build_persistent_full_attention_graphs<'ctx>(
 ) -> Result<FullAttentionGraphParts<'ctx>, E2eError> {
     let x_in = ctx
         .new_tensor_2d::<f32>(Shape2D::new(hidden_features, 1))
-        .map_err(|source| E2eError::ggml("new_tensor_2d<X_IN>(pfa)", source))?;
+        .ggml_ctx("new_tensor_2d<X_IN>(pfa)")?;
 
     let projs = build_batch_projections(
         ctx,
@@ -177,9 +177,7 @@ pub(in crate::e2e) fn build_persistent_full_attention_graphs<'ctx>(
         .ok()
         .expect("internal spec mismatch: expected 3 projections");
 
-    let mut input_graph = ctx
-        .new_graph()
-        .map_err(|source| E2eError::ggml("new_graph(pfa_in)", source))?;
+    let mut input_graph = ctx.new_graph().ggml_ctx("new_graph(pfa_in)")?;
     input_graph.build_forward_expand(&q.y);
     input_graph.build_forward_expand(&k.y);
     input_graph.build_forward_expand(&v.y);
@@ -233,7 +231,7 @@ pub(in crate::e2e) fn build_persistent_linear_attention_graphs<'ctx>(
 ) -> Result<LinearAttentionGraphParts<'ctx>, E2eError> {
     let x_in = ctx
         .new_tensor_2d::<f32>(Shape2D::new(hidden_features, 1))
-        .map_err(|source| E2eError::ggml("new_tensor_2d<X_IN>(pla)", source))?;
+        .ggml_ctx("new_tensor_2d<X_IN>(pla)")?;
 
     let projs = build_batch_projections(
         ctx,
@@ -267,9 +265,7 @@ pub(in crate::e2e) fn build_persistent_linear_attention_graphs<'ctx>(
         .ok()
         .expect("internal spec mismatch: expected 4 projections");
 
-    let mut input_graph = ctx
-        .new_graph()
-        .map_err(|source| E2eError::ggml("new_graph(pla_in)", source))?;
+    let mut input_graph = ctx.new_graph().ggml_ctx("new_graph(pla_in)")?;
     input_graph.build_forward_expand(&qkv.y);
     input_graph.build_forward_expand(&z.y);
     input_graph.build_forward_expand(&alpha.y);
@@ -309,10 +305,10 @@ impl<'ctx> PersistentDecodeProjection<'ctx> {
                 x_in, input_graph, ..
             } => {
                 x_in.write_data_backend(hidden_state)
-                    .map_err(|source| E2eError::ggml("write<X_IN>(proj_step)", source))?;
+                    .ggml_ctx("write<X_IN>(proj_step)")?;
                 backend
                     .compute(input_graph)
-                    .map_err(|source| E2eError::ggml("compute(proj_input_step)", source))?;
+                    .ggml_ctx("compute(proj_input_step)")?;
                 Ok(())
             }
         }
@@ -329,15 +325,9 @@ impl<'ctx> PersistentDecodeProjection<'ctx> {
                 v_out,
                 ..
             } => {
-                let q_full: Vec<f32> = q_out
-                    .read_data_backend()
-                    .map_err(|source| E2eError::ggml("read<Q>(pfa_step)", source))?;
-                let k_proj: Vec<f32> = k_out
-                    .read_data_backend()
-                    .map_err(|source| E2eError::ggml("read<K>(pfa_step)", source))?;
-                let v_proj: Vec<f32> = v_out
-                    .read_data_backend()
-                    .map_err(|source| E2eError::ggml("read<V>(pfa_step)", source))?;
+                let q_full: Vec<f32> = q_out.read_data_backend().ggml_ctx("read<Q>(pfa_step)")?;
+                let k_proj: Vec<f32> = k_out.read_data_backend().ggml_ctx("read<K>(pfa_step)")?;
+                let v_proj: Vec<f32> = v_out.read_data_backend().ggml_ctx("read<V>(pfa_step)")?;
                 Ok(QkvProjections {
                     q_full,
                     k_proj,
@@ -365,16 +355,14 @@ impl<'ctx> PersistentDecodeProjection<'ctx> {
             } => {
                 let qkv: Vec<f32> = qkv_out
                     .read_data_backend()
-                    .map_err(|source| E2eError::ggml("read<QKV>(pla_step)", source))?;
-                let z: Vec<f32> = z_out
-                    .read_data_backend()
-                    .map_err(|source| E2eError::ggml("read<Z>(pla_step)", source))?;
+                    .ggml_ctx("read<QKV>(pla_step)")?;
+                let z: Vec<f32> = z_out.read_data_backend().ggml_ctx("read<Z>(pla_step)")?;
                 let alpha: Vec<f32> = alpha_out
                     .read_data_backend()
-                    .map_err(|source| E2eError::ggml("read<ALPHA>(pla_step)", source))?;
+                    .ggml_ctx("read<ALPHA>(pla_step)")?;
                 let beta: Vec<f32> = beta_out
                     .read_data_backend()
-                    .map_err(|source| E2eError::ggml("read<BETA>(pla_step)", source))?;
+                    .ggml_ctx("read<BETA>(pla_step)")?;
                 Ok(RawLinearProjections {
                     qkv,
                     z,
@@ -401,13 +389,13 @@ impl<'ctx> PersistentDecodeProjection<'ctx> {
         output
             .x
             .write_data_backend(core_output)
-            .map_err(|source| E2eError::ggml("write<OUT_X>(proj_out_step)", source))?;
+            .ggml_ctx("write<OUT_X>(proj_out_step)")?;
         backend
             .compute(&mut output.graph)
-            .map_err(|source| E2eError::ggml("compute(proj_output_step)", source))?;
+            .ggml_ctx("compute(proj_output_step)")?;
         output
             .y
             .read_data_backend()
-            .map_err(|source| E2eError::ggml("read<OUT_Y>(proj_out_step)", source))
+            .ggml_ctx("read<OUT_Y>(proj_out_step)")
     }
 }

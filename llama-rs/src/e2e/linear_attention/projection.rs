@@ -3,7 +3,7 @@
 //! Handles dimension validation, memory estimation, and both GPU-graph and
 //! host-fallback projection paths.
 
-use crate::e2e::error::E2eError;
+use crate::e2e::error::{E2eError, GgmlResultExt};
 use crate::e2e::numeric::checked_mul;
 use crate::e2e::plan::Qwen35LinearAttentionLayerPlan;
 use crate::e2e::tensor_ops::{
@@ -80,22 +80,22 @@ impl LinearAttentionDims {
                 Shape2D::new(self.hidden, self.conv_channels),
                 input_shape,
             )
-            .map_err(|source| E2eError::ggml("matmul_mem(QKV)", source))?,
+            .ggml_ctx("matmul_mem(QKV)")?,
             Context::recommended_backend_matmul_memory::<f32>(
                 Shape2D::new(self.hidden, self.inner_size),
                 input_shape,
             )
-            .map_err(|source| E2eError::ggml("matmul_mem(Z)", source))?,
+            .ggml_ctx("matmul_mem(Z)")?,
             Context::recommended_backend_matmul_memory::<f32>(
                 Shape2D::new(self.hidden, self.time_step_rank),
                 input_shape,
             )
-            .map_err(|source| E2eError::ggml("matmul_mem(alpha)", source))?,
+            .ggml_ctx("matmul_mem(alpha)")?,
             Context::recommended_backend_matmul_memory::<f32>(
                 Shape2D::new(self.hidden, self.time_step_rank),
                 input_shape,
             )
-            .map_err(|source| E2eError::ggml("matmul_mem(beta)", source))?,
+            .ggml_ctx("matmul_mem(beta)")?,
         ];
         let proj_total: usize = proj_mem.iter().map(|b| b.get()).sum();
 
@@ -134,22 +134,22 @@ fn recommended_linear_projection_memory(
         Shape2D::new(hidden_features, conv_channels),
         input_shape,
     )
-    .map_err(|source| E2eError::ggml("recommended_backend_matmul_memory(QKV)", source))?;
+    .ggml_ctx("recommended_backend_matmul_memory(QKV)")?;
     let z_mem = Context::recommended_backend_matmul_memory::<f32>(
         Shape2D::new(hidden_features, inner_size),
         input_shape,
     )
-    .map_err(|source| E2eError::ggml("recommended_backend_matmul_memory(Z)", source))?;
+    .ggml_ctx("recommended_backend_matmul_memory(Z)")?;
     let alpha_mem = Context::recommended_backend_matmul_memory::<f32>(
         Shape2D::new(hidden_features, time_step_rank),
         input_shape,
     )
-    .map_err(|source| E2eError::ggml("recommended_backend_matmul_memory(alpha)", source))?;
+    .ggml_ctx("recommended_backend_matmul_memory(alpha)")?;
     let beta_mem = Context::recommended_backend_matmul_memory::<f32>(
         Shape2D::new(hidden_features, time_step_rank),
         input_shape,
     )
-    .map_err(|source| E2eError::ggml("recommended_backend_matmul_memory(beta)", source))?;
+    .ggml_ctx("recommended_backend_matmul_memory(beta)")?;
     let total = qkv_mem
         .get()
         .checked_add(z_mem.get())
@@ -207,25 +207,23 @@ fn project_linear_inputs_graph(
         sequence_length,
     )?;
     let ctx = Context::new_no_alloc_bytes(ctx_size)
-        .map_err(|source| E2eError::ggml("Context::new_no_alloc_bytes(linear_proj)", source))?;
+        .ggml_ctx("Context::new_no_alloc_bytes(linear_proj)")?;
 
     let x = ctx
         .new_tensor_2d::<f32>(Shape2D::new(hidden_features, sequence_length))
-        .map_err(|source| E2eError::ggml("new<X>", source))?;
+        .ggml_ctx("new<X>")?;
 
     let projs =
         build_batch_projections(&ctx, &x, hidden_features, &linear_projection_specs(&dims))?;
 
-    let mut graph = ctx
-        .new_graph()
-        .map_err(|source| E2eError::ggml("new_graph(linear_proj)", source))?;
+    let mut graph = ctx.new_graph().ggml_ctx("new_graph(linear_proj)")?;
     for p in &projs {
         graph.build_forward_expand(&p.y);
     }
 
     let _buffer = ctx
         .allocate_tensors(backend)
-        .map_err(|source| E2eError::ggml("allocate_tensors(linear_proj)", source))?;
+        .ggml_ctx("allocate_tensors(linear_proj)")?;
 
     upload_weight(&projs[0].w, &attention.qkv_weight_values, "write<W_QKV>")?;
     upload_weight(&projs[1].w, &attention.gate_weight_values, "write<W_Z>")?;
@@ -239,24 +237,12 @@ fn project_linear_inputs_graph(
 
     backend
         .compute(&mut graph)
-        .map_err(|source| E2eError::ggml("compute(linear_proj)", source))?;
+        .ggml_ctx("compute(linear_proj)")?;
 
-    let qkv = projs[0]
-        .y
-        .read_data_backend()
-        .map_err(|source| E2eError::ggml("read<QKV>", source))?;
-    let z = projs[1]
-        .y
-        .read_data_backend()
-        .map_err(|source| E2eError::ggml("read<Z>", source))?;
-    let alpha = projs[2]
-        .y
-        .read_data_backend()
-        .map_err(|source| E2eError::ggml("read<alpha>", source))?;
-    let beta = projs[3]
-        .y
-        .read_data_backend()
-        .map_err(|source| E2eError::ggml("read<beta>", source))?;
+    let qkv = projs[0].y.read_data_backend().ggml_ctx("read<QKV>")?;
+    let z = projs[1].y.read_data_backend().ggml_ctx("read<Z>")?;
+    let alpha = projs[2].y.read_data_backend().ggml_ctx("read<alpha>")?;
+    let beta = projs[3].y.read_data_backend().ggml_ctx("read<beta>")?;
 
     Ok(LinearProjections {
         qkv,

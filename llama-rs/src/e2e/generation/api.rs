@@ -5,7 +5,7 @@
 
 use super::super::config::{E2eGenerationConfig, E2eGenerationReport};
 use super::super::decode::decode_norm_tensor;
-use super::super::error::E2eError;
+use super::super::error::{E2eError, GgmlResultExt};
 use super::super::numeric::{checked_mul, validate_token_id};
 use super::super::planner::build_layer_plans;
 use super::super::resolve::resolve_global_tensor_names;
@@ -128,12 +128,11 @@ pub fn generate_token_ids_from_model(
     let mut all_token_ids = vec![config.pad_token_id; total_sequence_length];
     all_token_ids[..prompt_token_count].copy_from_slice(&config.prompt_token_ids);
     ensure_backends_loaded();
-    let backend = Backend::new(config.backend.into())
-        .map_err(|source| E2eError::ggml("Backend::new", source))?;
+    let backend = Backend::new(config.backend.into()).ggml_ctx("Backend::new")?;
     let backend_name = backend
         .name()
-        .map(|name| name.to_string())
-        .map_err(|source| E2eError::ggml("Backend::name", source))?;
+        .map(|name: &str| name.to_string())
+        .ggml_ctx("Backend::name")?;
 
     let start = Instant::now();
     let inputs = GenerationInputs {

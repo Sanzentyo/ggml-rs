@@ -1,6 +1,6 @@
 //! Backend-resident persistent KV cache and GPU-accelerated scoring.
 
-use crate::e2e::error::E2eError;
+use crate::e2e::error::{E2eError, GgmlResultExt};
 use crate::e2e::plan::Qwen35FullAttentionLayerPlan;
 use crate::e2e::tensor_ops::upload_weight;
 use ggml_rs::{Backend, BackendBuffer, Context, GraphAllocator, Shape4D, Tensor};
@@ -64,10 +64,10 @@ impl<'ctx> PersistentKvCache<'ctx> {
             let dst_offset = h * d * max_t + cached_len * d;
             self.k_tensor
                 .write_data_backend_at(dst_offset, &k_values[src_offset..src_offset + d])
-                .map_err(|source| E2eError::ggml("append_token(K)", source))?;
+                .ggml_ctx("append_token(K)")?;
             self.v_tensor
                 .write_data_backend_at(dst_offset, &v_values[src_offset..src_offset + d])
-                .map_err(|source| E2eError::ggml("append_token(V)", source))?;
+                .ggml_ctx("append_token(V)")?;
         }
         Ok(())
     }
@@ -95,10 +95,10 @@ impl<'ctx> PersistentKvCache<'ctx> {
                 let dst_offset = h * d * max_t + t * d;
                 self.k_tensor
                     .write_data_backend_at(dst_offset, &k_cache[src_offset..src_offset + d])
-                    .map_err(|source| E2eError::ggml("seed(K)", source))?;
+                    .ggml_ctx("seed(K)")?;
                 self.v_tensor
                     .write_data_backend_at(dst_offset, &v_cache[src_offset..src_offset + d])
-                    .map_err(|source| E2eError::ggml("seed(V)", source))?;
+                    .ggml_ctx("seed(V)")?;
             }
         }
         Ok(())
@@ -121,19 +121,18 @@ pub(in crate::e2e) fn build_persistent_kv_cache(
 
     // Two 4D tensors: K + V, each [D, MaxT, Hkv, 1] (flash-friendly time-major).
     // Metadata context: ~256 KB is plenty for 2 tensors.
-    let ctx = Context::new_no_alloc(256 * 1024)
-        .map_err(|source| E2eError::ggml("Context(persistent_kv)", source))?;
+    let ctx = Context::new_no_alloc(256 * 1024).ggml_ctx("Context(persistent_kv)")?;
 
     let k_tensor = ctx
         .new_tensor_4d::<f32>(Shape4D::new(d, max_tokens, hkv, 1))
-        .map_err(|source| E2eError::ggml("k_tensor(persistent_kv)", source))?;
+        .ggml_ctx("k_tensor(persistent_kv)")?;
     let v_tensor = ctx
         .new_tensor_4d::<f32>(Shape4D::new(d, max_tokens, hkv, 1))
-        .map_err(|source| E2eError::ggml("v_tensor(persistent_kv)", source))?;
+        .ggml_ctx("v_tensor(persistent_kv)")?;
 
     let buffer = ctx
         .allocate_tensors(backend)
-        .map_err(|source| E2eError::ggml("allocate(persistent_kv)", source))?;
+        .ggml_ctx("allocate(persistent_kv)")?;
 
     // SAFETY: same argument as `PersistentDecodeProjection` — the Context is
     // stored in a sibling container that drops after this struct. The lifetime
@@ -183,17 +182,15 @@ impl PersistentScoringContext {
         kv_cache: &PersistentKvCache<'static>,
         backend: &Backend,
     ) -> Result<Self, E2eError> {
-        let mut gallocr = GraphAllocator::new(backend)
-            .map_err(|source| E2eError::ggml("GraphAllocator::new(scoring)", source))?;
+        let mut gallocr = GraphAllocator::new(backend).ggml_ctx("GraphAllocator::new(scoring)")?;
 
         // Build a reservation graph at max_tokens to determine buffer size.
-        let ctx = Context::new_no_alloc(2 * 1024 * 1024)
-            .map_err(|source| E2eError::ggml("ctx(scoring_reserve)", source))?;
+        let ctx = Context::new_no_alloc(2 * 1024 * 1024).ggml_ctx("ctx(scoring_reserve)")?;
         let sg = build_scoring_graph(&ctx, attention, max_tokens, kv_cache)?;
 
         gallocr
             .reserve(&sg.graph)
-            .map_err(|source| E2eError::ggml("gallocr.reserve(scoring)", source))?;
+            .ggml_ctx("gallocr.reserve(scoring)")?;
 
         Ok(Self { gallocr })
     }
@@ -231,10 +228,10 @@ fn build_scoring_graph<'ctx>(
 
     let q = ctx
         .new_tensor_4d::<f32>(Shape4D::new(d, 1, h, 1))
-        .map_err(|source| E2eError::ggml("q_tensor", source))?;
+        .ggml_ctx("q_tensor")?;
     let gate = ctx
         .new_tensor_4d::<f32>(Shape4D::new(d, h, 1, 1))
-        .map_err(|source| E2eError::ggml("gate_tensor", source))?;
+        .ggml_ctx("gate_tensor")?;
 
     // Direct view into flash-friendly [D, MaxT, Hkv, 1] layout.
     // View [D, T, Hkv, 1] — already in the format flash_attn_ext expects,
@@ -245,25 +242,19 @@ fn build_scoring_graph<'ctx>(
     let nb3 = nb2 * hkv; // byte stride for dim3 (trivial)
     let k = ctx
         .view_4d_of(&kv_cache.k_tensor, d, t, hkv, 1, nb1, nb2, nb3, 0)
-        .map_err(|source| E2eError::ggml("view_4d_of(K)", source))?;
+        .ggml_ctx("view_4d_of(K)")?;
     let v = ctx
         .view_4d_of(&kv_cache.v_tensor, d, t, hkv, 1, nb1, nb2, nb3, 0)
-        .map_err(|source| E2eError::ggml("view_4d_of(V)", source))?;
+        .ggml_ctx("view_4d_of(V)")?;
 
     let attn = ctx
         .flash_attn_ext(&q, &k, &v, None, attention.attention_scale, 0.0, 0.0)
-        .map_err(|source| E2eError::ggml("flash_attn_ext", source))?;
+        .ggml_ctx("flash_attn_ext")?;
 
-    let gate_sig = ctx
-        .sigmoid(&gate)
-        .map_err(|source| E2eError::ggml("sigmoid(gate)", source))?;
-    let gated = ctx
-        .mul(&attn, &gate_sig)
-        .map_err(|source| E2eError::ggml("mul(attn,gate)", source))?;
+    let gate_sig = ctx.sigmoid(&gate).ggml_ctx("sigmoid(gate)")?;
+    let gated = ctx.mul(&attn, &gate_sig).ggml_ctx("mul(attn,gate)")?;
 
-    let mut graph = ctx
-        .new_graph()
-        .map_err(|source| E2eError::ggml("new_graph(scoring)", source))?;
+    let mut graph = ctx.new_graph().ggml_ctx("new_graph(scoring)")?;
     graph.build_forward_expand(&gated);
 
     Ok(ScoringGraph {
@@ -294,8 +285,7 @@ pub(super) fn decode_scoring_gpu_persistent(
     let query_features = attention.head_dimension * attention.head_count;
 
     // Ephemeral scoring context — creates views into persistent KV tensors.
-    let ctx = Context::new_no_alloc(2 * 1024 * 1024)
-        .map_err(|source| E2eError::ggml("ctx(scoring_persistent)", source))?;
+    let ctx = Context::new_no_alloc(2 * 1024 * 1024).ggml_ctx("ctx(scoring_persistent)")?;
 
     let mut sg = build_scoring_graph(&ctx, attention, total_tokens, kv_cache)?;
 
@@ -303,12 +293,12 @@ pub(super) fn decode_scoring_gpu_persistent(
     let _buffer = if let Some(sc) = scoring_ctx {
         sc.gallocr
             .alloc_graph(&mut sg.graph)
-            .map_err(|source| E2eError::ggml("gallocr.alloc_graph(scoring)", source))?;
+            .ggml_ctx("gallocr.alloc_graph(scoring)")?;
         None
     } else {
         Some(
             ctx.allocate_tensors(backend)
-                .map_err(|source| E2eError::ggml("allocate(scoring_persistent)", source))?,
+                .ggml_ctx("allocate(scoring_persistent)")?,
         )
     };
 
@@ -318,12 +308,9 @@ pub(super) fn decode_scoring_gpu_persistent(
 
     backend
         .compute(&mut sg.graph)
-        .map_err(|source| E2eError::ggml("compute(scoring_persistent)", source))?;
+        .ggml_ctx("compute(scoring_persistent)")?;
 
-    let outputs = sg
-        .gated
-        .read_data_backend()
-        .map_err(|source| E2eError::ggml("read(gated)", source))?;
+    let outputs = sg.gated.read_data_backend().ggml_ctx("read(gated)")?;
 
     if outputs.len() != query_features {
         return Err(E2eError::BufferLengthMismatch {

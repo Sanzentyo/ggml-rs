@@ -1,4 +1,4 @@
-use super::super::error::E2eError;
+use super::super::error::{E2eError, GgmlResultExt};
 use ggml_rs::{Backend, Bytes, Context, Graph, Shape2D, Tensor};
 
 /// Slack constant added to memory estimates for ggml graph/tensor overhead.
@@ -14,7 +14,7 @@ fn recommended_single_projection_memory(
         Shape2D::new(input_features, output_features),
         Shape2D::new(input_features, sequence_length),
     )
-    .map_err(|source| E2eError::ggml("recommended_backend_matmul_memory(single)", source))?;
+    .ggml_ctx("recommended_backend_matmul_memory(single)")?;
     let total = mem
         .get()
         .checked_add(PROJECTION_SLACK_BYTES)
@@ -36,40 +36,33 @@ pub(in crate::e2e) fn project_sequence_graph(
 ) -> Result<Vec<f32>, E2eError> {
     let ctx_size =
         recommended_single_projection_memory(input_features, output_features, sequence_length)?;
-    let ctx = Context::new_no_alloc_bytes(ctx_size)
-        .map_err(|source| E2eError::ggml("Context::new_no_alloc_bytes(proj)", source))?;
+    let ctx =
+        Context::new_no_alloc_bytes(ctx_size).ggml_ctx("Context::new_no_alloc_bytes(proj)")?;
 
     let w = ctx
         .new_tensor_2d::<f32>(Shape2D::new(input_features, output_features))
-        .map_err(|source| E2eError::ggml("new_tensor_2d<W>", source))?;
+        .ggml_ctx("new_tensor_2d<W>")?;
     let x = ctx
         .new_tensor_2d::<f32>(Shape2D::new(input_features, sequence_length))
-        .map_err(|source| E2eError::ggml("new_tensor_2d<X>", source))?;
+        .ggml_ctx("new_tensor_2d<X>")?;
 
-    let y = ctx
-        .mul_mat(&w, &x)
-        .map_err(|source| E2eError::ggml("mul_mat(proj)", source))?;
+    let y = ctx.mul_mat(&w, &x).ggml_ctx("mul_mat(proj)")?;
 
-    let mut graph = ctx
-        .new_graph()
-        .map_err(|source| E2eError::ggml("new_graph(proj)", source))?;
+    let mut graph = ctx.new_graph().ggml_ctx("new_graph(proj)")?;
     graph.build_forward_expand(&y);
 
     let _buffer = ctx
         .allocate_tensors(backend)
-        .map_err(|source| E2eError::ggml("allocate_tensors(proj)", source))?;
+        .ggml_ctx("allocate_tensors(proj)")?;
 
     w.write_data_backend(weight)
-        .map_err(|source| E2eError::ggml("write_data_backend<W>", source))?;
+        .ggml_ctx("write_data_backend<W>")?;
     x.write_data_backend(input)
-        .map_err(|source| E2eError::ggml("write_data_backend<X>", source))?;
+        .ggml_ctx("write_data_backend<X>")?;
 
-    backend
-        .compute(&mut graph)
-        .map_err(|source| E2eError::ggml("compute(proj)", source))?;
+    backend.compute(&mut graph).ggml_ctx("compute(proj)")?;
 
-    y.read_data_backend()
-        .map_err(|source| E2eError::ggml("read_data_backend<Y>", source))
+    y.read_data_backend().ggml_ctx("read_data_backend<Y>")
 }
 
 /// Upload a weight buffer to a backend tensor with a descriptive error label.
@@ -78,9 +71,7 @@ pub(in crate::e2e) fn upload_weight(
     data: &[f32],
     label: &'static str,
 ) -> Result<(), E2eError> {
-    tensor
-        .write_data_backend(data)
-        .map_err(|source| E2eError::ggml(label, source))
+    tensor.write_data_backend(data).ggml_ctx(label)
 }
 
 /// Specification for a single projection in a batch.
@@ -116,10 +107,8 @@ pub(in crate::e2e) fn build_batch_projections<'ctx>(
     for spec in specs {
         let w = ctx
             .new_tensor_2d::<f32>(Shape2D::new(input_features, spec.out_features))
-            .map_err(|source| E2eError::ggml(spec.weight_label, source))?;
-        let y = ctx
-            .mul_mat(&w, x_in)
-            .map_err(|source| E2eError::ggml(spec.matmul_label, source))?;
+            .ggml_ctx(spec.weight_label)?;
+        let y = ctx.mul_mat(&w, x_in).ggml_ctx(spec.matmul_label)?;
         projs.push(BuiltProjection { w, y });
     }
     Ok(projs)
@@ -148,16 +137,12 @@ pub(super) fn build_output_projection_graph<'ctx>(
 ) -> Result<OutputProjectionGraph<'ctx>, E2eError> {
     let w = ctx
         .new_tensor_2d::<f32>(Shape2D::new(input_features, output_features))
-        .map_err(|source| E2eError::ggml(label, source))?;
+        .ggml_ctx(label)?;
     let x = ctx
         .new_tensor_2d::<f32>(Shape2D::new(input_features, 1))
-        .map_err(|source| E2eError::ggml(label, source))?;
-    let y = ctx
-        .mul_mat(&w, &x)
-        .map_err(|source| E2eError::ggml(label, source))?;
-    let mut graph = ctx
-        .new_graph()
-        .map_err(|source| E2eError::ggml(label, source))?;
+        .ggml_ctx(label)?;
+    let y = ctx.mul_mat(&w, &x).ggml_ctx(label)?;
+    let mut graph = ctx.new_graph().ggml_ctx(label)?;
     graph.build_forward_expand(&y);
     Ok(OutputProjectionGraph { w, x, y, graph })
 }
@@ -173,8 +158,8 @@ pub(super) fn sum_matmul_memories(
     let total = projections
         .iter()
         .try_fold(0usize, |acc, &(weight, input, label)| {
-            let mem = Context::recommended_backend_matmul_memory::<f32>(weight, input)
-                .map_err(|source| E2eError::ggml(label, source))?;
+            let mem =
+                Context::recommended_backend_matmul_memory::<f32>(weight, input).ggml_ctx(label)?;
             acc.checked_add(mem.get())
                 .ok_or(E2eError::MemorySizeOverflow)
         })?

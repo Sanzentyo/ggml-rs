@@ -1,6 +1,6 @@
 //! QKV projection, deinterleaving, and preparation for full attention.
 
-use crate::e2e::error::E2eError;
+use crate::e2e::error::{E2eError, GgmlResultExt};
 use crate::e2e::numeric::checked_mul;
 use crate::e2e::plan::Qwen35FullAttentionLayerPlan;
 use crate::e2e::tensor_ops::{
@@ -184,17 +184,17 @@ fn recommended_qkv_projection_memory(
         Shape2D::new(hidden_features, query_features_x2),
         Shape2D::new(hidden_features, sequence_length),
     )
-    .map_err(|source| E2eError::ggml("recommended_backend_matmul_memory(Q)", source))?;
+    .ggml_ctx("recommended_backend_matmul_memory(Q)")?;
     let k_mem = Context::recommended_backend_matmul_memory::<f32>(
         Shape2D::new(hidden_features, kv_features),
         Shape2D::new(hidden_features, sequence_length),
     )
-    .map_err(|source| E2eError::ggml("recommended_backend_matmul_memory(K)", source))?;
+    .ggml_ctx("recommended_backend_matmul_memory(K)")?;
     let v_mem = Context::recommended_backend_matmul_memory::<f32>(
         Shape2D::new(hidden_features, kv_features),
         Shape2D::new(hidden_features, sequence_length),
     )
-    .map_err(|source| E2eError::ggml("recommended_backend_matmul_memory(V)", source))?;
+    .ggml_ctx("recommended_backend_matmul_memory(V)")?;
     let total = q_mem
         .get()
         .checked_add(k_mem.get())
@@ -223,12 +223,11 @@ fn project_qkv_graph(
         kv_features,
         sequence_length,
     )?;
-    let ctx = Context::new_no_alloc_bytes(ctx_size)
-        .map_err(|source| E2eError::ggml("Context::new_no_alloc_bytes(QKV)", source))?;
+    let ctx = Context::new_no_alloc_bytes(ctx_size).ggml_ctx("Context::new_no_alloc_bytes(QKV)")?;
 
     let x = ctx
         .new_tensor_2d::<f32>(Shape2D::new(hidden_features, sequence_length))
-        .map_err(|source| E2eError::ggml("new_tensor_2d<X>", source))?;
+        .ggml_ctx("new_tensor_2d<X>")?;
 
     let projs = build_batch_projections(
         &ctx,
@@ -257,35 +256,25 @@ fn project_qkv_graph(
         .ok()
         .expect("internal spec mismatch: expected 3 projections");
 
-    let mut graph = ctx
-        .new_graph()
-        .map_err(|source| E2eError::ggml("new_graph(QKV)", source))?;
+    let mut graph = ctx.new_graph().ggml_ctx("new_graph(QKV)")?;
     graph.build_forward_expand(&q.y);
     graph.build_forward_expand(&k.y);
     graph.build_forward_expand(&v.y);
 
     let _buffer = ctx
         .allocate_tensors(backend)
-        .map_err(|source| E2eError::ggml("allocate_tensors(QKV)", source))?;
+        .ggml_ctx("allocate_tensors(QKV)")?;
 
     upload_weight(&q.w, &attention.q_weight_values, "write<W_Q>")?;
     upload_weight(&k.w, &attention.k_weight_values, "write<W_K>")?;
     upload_weight(&v.w, &attention.v_weight_values, "write<W_V>")?;
     upload_weight(&x, input, "write<X>")?;
 
-    backend
-        .compute(&mut graph)
-        .map_err(|source| E2eError::ggml("compute(QKV)", source))?;
+    backend.compute(&mut graph).ggml_ctx("compute(QKV)")?;
 
-    let q_full =
-        q.y.read_data_backend()
-            .map_err(|source| E2eError::ggml("read_data_backend<Q>", source))?;
-    let k_proj =
-        k.y.read_data_backend()
-            .map_err(|source| E2eError::ggml("read_data_backend<K>", source))?;
-    let v_proj =
-        v.y.read_data_backend()
-            .map_err(|source| E2eError::ggml("read_data_backend<V>", source))?;
+    let q_full = q.y.read_data_backend().ggml_ctx("read_data_backend<Q>")?;
+    let k_proj = k.y.read_data_backend().ggml_ctx("read_data_backend<K>")?;
+    let v_proj = v.y.read_data_backend().ggml_ctx("read_data_backend<V>")?;
     Ok(QkvProjections {
         q_full,
         k_proj,

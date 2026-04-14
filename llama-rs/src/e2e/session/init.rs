@@ -7,7 +7,7 @@
 use super::super::checkpoint::{GenerationCheckpoint, ModelFingerprint};
 use super::super::config::{E2eGenerationConfig, MixedLayerPolicy};
 use super::super::decode::decode_norm_tensor;
-use super::super::error::E2eError;
+use super::super::error::{E2eError, GgmlResultExt};
 use super::super::generation::GenerationMode;
 use super::super::numeric::{checked_mul, validate_token_id};
 use super::super::plan::{AttentionLayerPlan, LayerPlan};
@@ -161,8 +161,7 @@ impl GenerationSession {
         all_token_ids[..prompt_token_count].copy_from_slice(&config.prompt_token_ids);
 
         ensure_backends_loaded();
-        let backend = Backend::new(config.backend.into())
-            .map_err(|source| E2eError::ggml("Backend::new", source))?;
+        let backend = Backend::new(config.backend.into()).ggml_ctx("Backend::new")?;
 
         Ok(Self {
             layer_plans: resolved.layer_plans,
@@ -247,8 +246,7 @@ impl GenerationSession {
         let effective_mode = determine_mode(&resolved.layer_plans, cp.max_new_tokens);
 
         ensure_backends_loaded();
-        let backend = Backend::new(backend.into())
-            .map_err(|source| E2eError::ggml("Backend::new", source))?;
+        let backend = Backend::new(backend.into()).ggml_ctx("Backend::new")?;
 
         Ok(Self {
             layer_plans: resolved.layer_plans,

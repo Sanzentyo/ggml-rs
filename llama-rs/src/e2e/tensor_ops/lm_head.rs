@@ -1,4 +1,4 @@
-use super::super::error::E2eError;
+use super::super::error::{E2eError, GgmlResultExt};
 #[cfg(test)]
 use super::super::numeric::checked_mul;
 use super::projection::PROJECTION_SLACK_BYTES;
@@ -13,7 +13,7 @@ pub(in crate::e2e) fn recommended_lm_head_memory(
         Shape2D::new(hidden_features, vocab_size),
         Shape2D::new(hidden_features, 1),
     )
-    .map_err(|source| E2eError::ggml("recommended_backend_matmul_memory(lm_head)", source))?;
+    .ggml_ctx("recommended_backend_matmul_memory(lm_head)")?;
 
     // Extra for norm input tensor, norm weight, and intermediate tensors.
     let slack = hidden_features
@@ -64,57 +64,47 @@ pub(in crate::e2e) fn lm_head_graph(
     }
 
     let ctx_size = recommended_lm_head_memory(hidden_features, vocab_size)?;
-    let ctx = Context::new_no_alloc_bytes(ctx_size)
-        .map_err(|source| E2eError::ggml("Context::new_no_alloc_bytes(lm_head)", source))?;
+    let ctx =
+        Context::new_no_alloc_bytes(ctx_size).ggml_ctx("Context::new_no_alloc_bytes(lm_head)")?;
 
     let w_out = ctx
         .new_tensor_2d::<f32>(Shape2D::new(hidden_features, vocab_size))
-        .map_err(|source| E2eError::ggml("new_tensor_2d<W_OUT>", source))?;
+        .ggml_ctx("new_tensor_2d<W_OUT>")?;
     let norm_w = ctx
         .new_tensor_1d::<f32>(Length::new(hidden_features))
-        .map_err(|source| E2eError::ggml("new_tensor_1d<NORM_W>", source))?;
+        .ggml_ctx("new_tensor_1d<NORM_W>")?;
     let x_in = ctx
         .new_tensor_1d::<f32>(Length::new(hidden_features))
-        .map_err(|source| E2eError::ggml("new_tensor_1d<X_IN>", source))?;
+        .ggml_ctx("new_tensor_1d<X_IN>")?;
 
     let x_normed = ctx
         .rms_norm(&x_in, rms_norm_eps)
-        .map_err(|source| E2eError::ggml("rms_norm(lm_head)", source))?;
-    let x_scaled = ctx
-        .mul(&x_normed, &norm_w)
-        .map_err(|source| E2eError::ggml("mul(lm_head_norm)", source))?;
+        .ggml_ctx("rms_norm(lm_head)")?;
+    let x_scaled = ctx.mul(&x_normed, &norm_w).ggml_ctx("mul(lm_head_norm)")?;
     let x_2d = ctx
         .reshape_2d(&x_scaled, hidden_features, 1)
-        .map_err(|source| E2eError::ggml("reshape_2d(lm_head)", source))?;
-    let logits = ctx
-        .mul_mat(&w_out, &x_2d)
-        .map_err(|source| E2eError::ggml("mul_mat(lm_head)", source))?;
+        .ggml_ctx("reshape_2d(lm_head)")?;
+    let logits = ctx.mul_mat(&w_out, &x_2d).ggml_ctx("mul_mat(lm_head)")?;
 
-    let mut graph = ctx
-        .new_graph()
-        .map_err(|source| E2eError::ggml("new_graph(lm_head)", source))?;
+    let mut graph = ctx.new_graph().ggml_ctx("new_graph(lm_head)")?;
     graph.build_forward_expand(&logits);
 
     let _buffer = ctx
         .allocate_tensors(backend)
-        .map_err(|source| E2eError::ggml("allocate_tensors(lm_head)", source))?;
+        .ggml_ctx("allocate_tensors(lm_head)")?;
 
     w_out
         .write_data_backend(output_weight)
-        .map_err(|source| E2eError::ggml("write<W_OUT>", source))?;
+        .ggml_ctx("write<W_OUT>")?;
     norm_w
         .write_data_backend(norm_weight)
-        .map_err(|source| E2eError::ggml("write<NORM_W>", source))?;
+        .ggml_ctx("write<NORM_W>")?;
     x_in.write_data_backend(hidden_state)
-        .map_err(|source| E2eError::ggml("write<X_IN>", source))?;
+        .ggml_ctx("write<X_IN>")?;
 
-    backend
-        .compute(&mut graph)
-        .map_err(|source| E2eError::ggml("compute(lm_head)", source))?;
+    backend.compute(&mut graph).ggml_ctx("compute(lm_head)")?;
 
-    logits
-        .read_data_backend()
-        .map_err(|source| E2eError::ggml("read<logits>", source))
+    logits.read_data_backend().ggml_ctx("read<logits>")
 }
 
 /// Built parts of a persistent LM head graph.
@@ -151,30 +141,24 @@ pub(in crate::e2e) fn build_lm_head_graph<'ctx>(
 ) -> Result<LmHeadGraphParts<'ctx>, E2eError> {
     let w_out = ctx
         .new_tensor_2d::<f32>(Shape2D::new(hidden_features, vocab_size))
-        .map_err(|source| E2eError::ggml("new_tensor_2d<W_OUT>(plm)", source))?;
+        .ggml_ctx("new_tensor_2d<W_OUT>(plm)")?;
     let norm_w = ctx
         .new_tensor_1d::<f32>(Length::new(hidden_features))
-        .map_err(|source| E2eError::ggml("new_tensor_1d<NORM_W>(plm)", source))?;
+        .ggml_ctx("new_tensor_1d<NORM_W>(plm)")?;
     let x_in = ctx
         .new_tensor_1d::<f32>(Length::new(hidden_features))
-        .map_err(|source| E2eError::ggml("new_tensor_1d<X_IN>(plm)", source))?;
+        .ggml_ctx("new_tensor_1d<X_IN>(plm)")?;
 
     let x_normed = ctx
         .rms_norm(&x_in, rms_norm_eps)
-        .map_err(|source| E2eError::ggml("rms_norm(plm)", source))?;
-    let x_scaled = ctx
-        .mul(&x_normed, &norm_w)
-        .map_err(|source| E2eError::ggml("mul(plm_norm)", source))?;
+        .ggml_ctx("rms_norm(plm)")?;
+    let x_scaled = ctx.mul(&x_normed, &norm_w).ggml_ctx("mul(plm_norm)")?;
     let x_2d = ctx
         .reshape_2d(&x_scaled, hidden_features, 1)
-        .map_err(|source| E2eError::ggml("reshape_2d(plm)", source))?;
-    let logits = ctx
-        .mul_mat(&w_out, &x_2d)
-        .map_err(|source| E2eError::ggml("mul_mat(plm)", source))?;
+        .ggml_ctx("reshape_2d(plm)")?;
+    let logits = ctx.mul_mat(&w_out, &x_2d).ggml_ctx("mul_mat(plm)")?;
 
-    let mut graph = ctx
-        .new_graph()
-        .map_err(|source| E2eError::ggml("new_graph(plm)", source))?;
+    let mut graph = ctx.new_graph().ggml_ctx("new_graph(plm)")?;
     graph.build_forward_expand(&logits);
 
     Ok(LmHeadGraphParts {
@@ -211,12 +195,12 @@ pub(in crate::e2e) fn lm_head_sample_step(
     backend: &Backend,
 ) -> Result<i32, E2eError> {
     x_in.write_data_backend(hidden_state)
-        .map_err(|source| E2eError::ggml("write<X_IN>(step)", source))?;
+        .ggml_ctx("write<X_IN>(step)")?;
     backend
         .compute(lm_graph)
-        .map_err(|source| E2eError::ggml("compute(lm_head_step)", source))?;
+        .ggml_ctx("compute(lm_head_step)")?;
     let logits_data: Vec<f32> = logits_t
         .read_data_backend()
-        .map_err(|source| E2eError::ggml("read<logits>(step)", source))?;
+        .ggml_ctx("read<logits>(step)")?;
     argmax_token_id(&logits_data)
 }

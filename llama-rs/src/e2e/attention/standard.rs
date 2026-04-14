@@ -4,7 +4,7 @@ use super::shared::{
     FlashAttentionConfig, RopeParams, apply_neox_rope_in_place, apply_optional_per_head_norm,
     run_flash_attention_pipeline,
 };
-use crate::e2e::error::E2eError;
+use crate::e2e::error::{E2eError, GgmlResultExt};
 use crate::e2e::numeric::{checked_mul, dot, softmax_prefix};
 use crate::e2e::plan::StandardAttentionLayerPlan;
 use crate::e2e::state::StandardAttentionState;
@@ -119,26 +119,21 @@ fn standard_attention_graph(
     let overhead = 64 * 1024 * 1024; // 64 MB slack for intermediates
     let total_mem = Bytes::new(weight_bytes + io_bytes + mask_bytes_est + overhead);
 
-    let ctx = Context::new_no_alloc_bytes(total_mem)
-        .map_err(|source| E2eError::ggml("Context::new(std_attn)", source))?;
+    let ctx = Context::new_no_alloc_bytes(total_mem).ggml_ctx("Context::new(std_attn)")?;
 
     // Input tensor (un-normed).
     let x_raw = ctx
         .new_tensor_2d::<f32>(Shape2D::new(hidden, t))
-        .map_err(|source| E2eError::ggml("new<X>", source))?;
+        .ggml_ctx("new<X>")?;
 
     // Layer pre-norm weight: [hidden].
     let attn_norm_w = ctx
         .new_tensor_1d::<f32>(Length::new(hidden))
-        .map_err(|source| E2eError::ggml("new<attn_norm_w>", source))?;
+        .ggml_ctx("new<attn_norm_w>")?;
 
     // In-graph layer pre-norm.
-    let x_normed = ctx
-        .rms_norm(&x_raw, rms_norm_eps)
-        .map_err(|source| E2eError::ggml("rms_norm(X)", source))?;
-    let x = ctx
-        .mul(&x_normed, &attn_norm_w)
-        .map_err(|source| E2eError::ggml("mul(X_norm)", source))?;
+    let x_normed = ctx.rms_norm(&x_raw, rms_norm_eps).ggml_ctx("rms_norm(X)")?;
+    let x = ctx.mul(&x_normed, &attn_norm_w).ggml_ctx("mul(X_norm)")?;
 
     // QKV projections.
     let qkv = build_batch_projections(
@@ -170,15 +165,13 @@ fn standard_attention_graph(
     // Output projection weight.
     let w_out = ctx
         .new_tensor_2d::<f32>(Shape2D::new(qf, hidden))
-        .map_err(|source| E2eError::ggml("new<W_out>", source))?;
+        .ggml_ctx("new<W_out>")?;
 
     // Reshape Q, K to 3D for per-head operations.
-    let q_3d = ctx
-        .reshape_3d(q_proj, d, h, t)
-        .map_err(|source| E2eError::ggml("reshape_3d(Q)", source))?;
+    let q_3d = ctx.reshape_3d(q_proj, d, h, t).ggml_ctx("reshape_3d(Q)")?;
     let k_3d = ctx
         .reshape_3d(k_proj, d, hkv, t)
-        .map_err(|source| E2eError::ggml("reshape_3d(K)", source))?;
+        .ggml_ctx("reshape_3d(K)")?;
 
     // Optional per-head Q/K RMS norm.
     let q_norm_w = attention
@@ -186,7 +179,7 @@ fn standard_attention_graph(
         .q_norm_values()
         .map(|_| {
             ctx.new_tensor_1d::<f32>(Length::new(d))
-                .map_err(|source| E2eError::ggml("new<q_norm>", source))
+                .ggml_ctx("new<q_norm>")
         })
         .transpose()?;
     let k_norm_w = attention
@@ -194,7 +187,7 @@ fn standard_attention_graph(
         .k_norm_values()
         .map(|_| {
             ctx.new_tensor_1d::<f32>(Length::new(d))
-                .map_err(|source| E2eError::ggml("new<k_norm>", source))
+                .ggml_ctx("new<k_norm>")
         })
         .transpose()?;
 
@@ -219,7 +212,7 @@ fn standard_attention_graph(
     let positions = if matches!(config.rotary, RotaryEmbedding::Llama(_)) {
         Some(
             ctx.new_tensor_1d::<i32>(Length::new(t))
-                .map_err(|source| E2eError::ggml("new<positions>", source))?,
+                .ggml_ctx("new<positions>")?,
         )
     } else {
         None
@@ -244,7 +237,7 @@ fn standard_attention_graph(
                 None,
                 rope_params,
             )
-            .map_err(|source| E2eError::ggml("rope_ext(Q)", source))?;
+            .ggml_ctx("rope_ext(Q)")?;
         let k_rope = ctx
             .rope_ext_with_i32_positions(
                 &k_after_norm,
@@ -252,7 +245,7 @@ fn standard_attention_graph(
                 None,
                 rope_params,
             )
-            .map_err(|source| E2eError::ggml("rope_ext(K)", source))?;
+            .ggml_ctx("rope_ext(K)")?;
         (q_rope, k_rope)
     } else {
         (q_after_norm, k_after_norm)
@@ -262,7 +255,7 @@ fn standard_attention_graph(
     let mask = if matches!(config.mask, AttentionMaskPolicy::Causal { .. }) {
         Some(
             ctx.new_tensor(Type::F16, Dims::new([t, t, 1, 1]))
-                .map_err(|source| E2eError::ggml("new<mask>", source))?,
+                .ggml_ctx("new<mask>")?,
         )
     } else {
         None
@@ -287,9 +280,7 @@ fn standard_attention_graph(
     )?;
 
     // Build graph with K/V readback nodes for state capture.
-    let mut graph = ctx
-        .new_graph()
-        .map_err(|source| E2eError::ggml("new_graph(std_attn)", source))?;
+    let mut graph = ctx.new_graph().ggml_ctx("new_graph(std_attn)")?;
     graph.build_forward_expand(&output);
     if state.is_some() {
         graph.build_forward_expand(&k_final);
@@ -298,7 +289,7 @@ fn standard_attention_graph(
 
     let _buffer = ctx
         .allocate_tensors(backend)
-        .map_err(|source| E2eError::ggml("allocate_tensors(std_attn)", source))?;
+        .ggml_ctx("allocate_tensors(std_attn)")?;
 
     // Write data.
     upload_weight(&x_raw, input, "write<X>")?;
@@ -318,32 +309,23 @@ fn standard_attention_graph(
     if let Some(ref pos) = positions {
         let pos_data: Vec<i32> = (0..t as i32).collect();
         pos.write_data_backend(&pos_data)
-            .map_err(|source| E2eError::ggml("write<positions>", source))?;
+            .ggml_ctx("write<positions>")?;
     }
     if let Some(ref m) = mask {
         let mask_bytes = build_causal_mask_f16_bytes(t)?;
-        m.write_bytes_backend(&mask_bytes)
-            .map_err(|source| E2eError::ggml("write<mask>", source))?;
+        m.write_bytes_backend(&mask_bytes).ggml_ctx("write<mask>")?;
     }
 
-    backend
-        .compute(&mut graph)
-        .map_err(|source| E2eError::ggml("compute(std_attn)", source))?;
+    backend.compute(&mut graph).ggml_ctx("compute(std_attn)")?;
 
     // Capture KV state for incremental decode.
     if let Some(state) = state {
-        let k_data: Vec<f32> = k_final
-            .read_data_backend()
-            .map_err(|source| E2eError::ggml("read<K>", source))?;
-        let v_data: Vec<f32> = v_proj
-            .read_data_backend()
-            .map_err(|source| E2eError::ggml("read<V>", source))?;
+        let k_data: Vec<f32> = k_final.read_data_backend().ggml_ctx("read<K>")?;
+        let v_data: Vec<f32> = v_proj.read_data_backend().ggml_ctx("read<V>")?;
         state.append_batch(&k_data, &v_data, t)?;
     }
 
-    output
-        .read_data_backend()
-        .map_err(|source| E2eError::ggml("read<output>", source))
+    output.read_data_backend().ggml_ctx("read<output>")
 }
 
 // ---------------------------------------------------------------------------

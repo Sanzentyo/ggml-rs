@@ -12,7 +12,7 @@ use crate::e2e::attention::{
     PersistentKvCache, PersistentScoringContext, QkvProjections, build_persistent_kv_cache,
     full_attention_decode_core, full_attention_hidden_features, prepare_qkv_from_raw,
 };
-use crate::e2e::error::E2eError;
+use crate::e2e::error::{E2eError, GgmlResultExt};
 use crate::e2e::linear_attention::{
     LinearDecodeScratch, LinearProjections, linear_attention_conv_channels,
     linear_attention_decode_core, linear_attention_hidden_features,
@@ -121,8 +121,7 @@ fn build_one_persistent_full(
         kv_features,
         query_features,
     )?;
-    let ctx = Context::new_no_alloc_bytes(ctx_size)
-        .map_err(|source| E2eError::ggml("Context(pfa)", source))?;
+    let ctx = Context::new_no_alloc_bytes(ctx_size).ggml_ctx("Context(pfa)")?;
 
     let g = build_persistent_full_attention_graphs(
         &ctx,
@@ -132,9 +131,7 @@ fn build_one_persistent_full(
         query_features,
     )?;
 
-    let buffer = ctx
-        .allocate_tensors(backend)
-        .map_err(|source| E2eError::ggml("allocate(pfa)", source))?;
+    let buffer = ctx.allocate_tensors(backend).ggml_ctx("allocate(pfa)")?;
 
     upload_weight(&g.w_q, &attn.q_weight_values, "write<W_Q>(pfa)")?;
     upload_weight(&g.w_k, &attn.k_weight_values, "write<W_K>(pfa)")?;
@@ -173,8 +170,7 @@ fn build_one_persistent_linear(
         inner_size,
         time_step_rank,
     )?;
-    let ctx = Context::new_no_alloc_bytes(ctx_size)
-        .map_err(|source| E2eError::ggml("Context(pla)", source))?;
+    let ctx = Context::new_no_alloc_bytes(ctx_size).ggml_ctx("Context(pla)")?;
 
     let g = build_persistent_linear_attention_graphs(
         &ctx,
@@ -184,9 +180,7 @@ fn build_one_persistent_linear(
         time_step_rank,
     )?;
 
-    let buffer = ctx
-        .allocate_tensors(backend)
-        .map_err(|source| E2eError::ggml("allocate(pla)", source))?;
+    let buffer = ctx.allocate_tensors(backend).ggml_ctx("allocate(pla)")?;
 
     upload_weight(&g.w_qkv, &attn.qkv_weight_values, "write<W_QKV>(pla)")?;
     upload_weight(&g.w_z, &attn.gate_weight_values, "write<W_Z>(pla)")?;

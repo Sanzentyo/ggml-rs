@@ -8,7 +8,7 @@ use super::shared::{
     FlashAttentionConfig, RopeParams, apply_neox_rope_in_place, apply_optional_per_head_norm,
     run_flash_attention_pipeline,
 };
-use crate::e2e::error::E2eError;
+use crate::e2e::error::{E2eError, GgmlResultExt};
 use crate::e2e::numeric::{checked_mul, dot, sigmoid_scalar, softmax_prefix};
 use crate::e2e::plan::Qwen35FullAttentionLayerPlan;
 use crate::e2e::state::Qwen35FullAttentionState;
@@ -129,25 +129,25 @@ fn fully_fused_attention_graph(
     }
 
     let ctx = Context::new_no_alloc_bytes(dims.estimate_memory(t))
-        .map_err(|source| E2eError::ggml("Context::new(fully_fused_attn)", source))?;
+        .ggml_ctx("Context::new(fully_fused_attn)")?;
 
     // --- Input tensors ---
     let x_raw = ctx
         .new_tensor_2d::<f32>(Shape2D::new(hidden, t))
-        .map_err(|source| E2eError::ggml("new<X>", source))?;
+        .ggml_ctx("new<X>")?;
 
     // Layer pre-norm weight: [hidden_features]
     let attn_norm_w = ctx
         .new_tensor_1d::<f32>(Length::new(hidden))
-        .map_err(|source| E2eError::ggml("new<attn_norm_w>", source))?;
+        .ggml_ctx("new<attn_norm_w>")?;
 
     // In-graph layer pre-norm: rms_norm(X, eps) * attn_norm_weight
     let x_normed = ctx
         .rms_norm(&x_raw, rms_norm_eps)
-        .map_err(|source| E2eError::ggml("rms_norm(X_layer)", source))?;
+        .ggml_ctx("rms_norm(X_layer)")?;
     let x = ctx
         .mul(&x_normed, &attn_norm_w)
-        .map_err(|source| E2eError::ggml("mul(X_layer_norm)", source))?;
+        .ggml_ctx("mul(X_layer_norm)")?;
 
     // QKV projections via shared builder (Q carries interleaved gate, hence qf2).
     let qkv = build_batch_projections(
@@ -179,32 +179,32 @@ fn fully_fused_attention_graph(
     // Output projection weight.
     let w_out = ctx
         .new_tensor_2d::<f32>(Shape2D::new(qf, hidden))
-        .map_err(|source| E2eError::ggml("new<W_out>", source))?;
+        .ggml_ctx("new<W_out>")?;
 
     // Norm weight tensors: [D] each, broadcast across H and T.
     let q_norm_w = ctx
         .new_tensor_1d::<f32>(Length::new(d))
-        .map_err(|source| E2eError::ggml("new<q_norm>", source))?;
+        .ggml_ctx("new<q_norm>")?;
     let k_norm_w = ctx
         .new_tensor_1d::<f32>(Length::new(d))
-        .map_err(|source| E2eError::ggml("new<k_norm>", source))?;
+        .ggml_ctx("new<k_norm>")?;
 
     // Position tensor for RoPE: [T] i32
     let positions = ctx
         .new_tensor_1d::<i32>(Length::new(t))
-        .map_err(|source| E2eError::ggml("new<positions>", source))?;
+        .ggml_ctx("new<positions>")?;
 
     // Causal mask as f16: [T, T, 1, 1]
     let mask = ctx
         .new_tensor(Type::F16, Dims::new([t, t, 1, 1]))
-        .map_err(|source| E2eError::ggml("new<mask>", source))?;
+        .ggml_ctx("new<mask>")?;
 
     // --- Deinterleave Q and Gate via strided view ---
     // Q_full layout per token: [Q_h0(D), G_h0(D), Q_h1(D), G_h1(D), ...]
     // Reshape to [D, 2*H, T] then take every-other slice along dim 1.
     let q_full_3d = ctx
         .reshape_3d(q_full, d, 2 * h, t)
-        .map_err(|source| E2eError::ggml("reshape_3d(Q_full)", source))?;
+        .ggml_ctx("reshape_3d(Q_full)")?;
 
     let elem = std::mem::size_of::<f32>();
     let stride_h = 2 * d * elem; // skip one Q + one gate head
@@ -213,23 +213,19 @@ fn fully_fused_attention_graph(
     // Q: even-indexed heads (offset 0)
     let q_view = ctx
         .view_3d(&q_full_3d, d, h, t, stride_h, stride_t, 0)
-        .map_err(|source| E2eError::ggml("view_3d(Q)", source))?;
-    let q_cont = ctx
-        .cont(&q_view)
-        .map_err(|source| E2eError::ggml("cont(Q_deinterleave)", source))?; // [D, H, T]
+        .ggml_ctx("view_3d(Q)")?;
+    let q_cont = ctx.cont(&q_view).ggml_ctx("cont(Q_deinterleave)")?; // [D, H, T]
 
     // Gate: odd-indexed heads (offset D*sizeof(f32))
     let gate_view = ctx
         .view_3d(&q_full_3d, d, h, t, stride_h, stride_t, d * elem)
-        .map_err(|source| E2eError::ggml("view_3d(Gate)", source))?;
-    let gate_cont = ctx
-        .cont(&gate_view)
-        .map_err(|source| E2eError::ggml("cont(Gate_deinterleave)", source))?; // [D, H, T]
+        .ggml_ctx("view_3d(Gate)")?;
+    let gate_cont = ctx.cont(&gate_view).ggml_ctx("cont(Gate_deinterleave)")?; // [D, H, T]
 
     // --- Per-head RMS norm (unconditional for Qwen3.5) ---
     let k_3d = ctx
         .reshape_3d(k_proj, d, hkv, t)
-        .map_err(|source| E2eError::ggml("reshape_3d(K)", source))?;
+        .ggml_ctx("reshape_3d(K)")?;
 
     let q_scaled = apply_optional_per_head_norm(
         &ctx,
@@ -263,10 +259,10 @@ fn fully_fused_attention_graph(
 
     let q_rope = ctx
         .rope_ext_with_i32_positions(&q_scaled, &positions, None, rope_params)
-        .map_err(|source| E2eError::ggml("rope_ext(Q)", source))?; // [D, H, T]
+        .ggml_ctx("rope_ext(Q)")?; // [D, H, T]
     let k_rope = ctx
         .rope_ext_with_i32_positions(&k_scaled, &positions, None, rope_params)
-        .map_err(|source| E2eError::ggml("rope_ext(K)", source))?; // [D, Hkv, T]
+        .ggml_ctx("rope_ext(K)")?; // [D, Hkv, T]
 
     // --- Flash attention pipeline (shared helper) ---
     let flash_cfg = FlashAttentionConfig {
@@ -287,9 +283,7 @@ fn fully_fused_attention_graph(
     )?;
 
     // --- Build, allocate, write, compute ---
-    let mut graph = ctx
-        .new_graph()
-        .map_err(|source| E2eError::ggml("new_graph(fully_fused)", source))?;
+    let mut graph = ctx.new_graph().ggml_ctx("new_graph(fully_fused)")?;
     graph.build_forward_expand(&output);
     // Also include K_rope and V_proj in the graph for intermediate readback.
     graph.build_forward_expand(&k_rope);
@@ -297,7 +291,7 @@ fn fully_fused_attention_graph(
 
     let _buffer = ctx
         .allocate_tensors(backend)
-        .map_err(|source| E2eError::ggml("allocate_tensors(fully_fused)", source))?;
+        .ggml_ctx("allocate_tensors(fully_fused)")?;
 
     // Write input data (un-normed).
     upload_weight(&x_raw, input, "write<X>")?;
@@ -319,31 +313,25 @@ fn fully_fused_attention_graph(
     let pos_data: Vec<i32> = (0..t as i32).collect();
     positions
         .write_data_backend(&pos_data)
-        .map_err(|source| E2eError::ggml("write<positions>", source))?;
+        .ggml_ctx("write<positions>")?;
 
     // Causal mask as f16.
     let mask_bytes = build_causal_mask_f16_bytes(t)?;
     mask.write_bytes_backend(&mask_bytes)
-        .map_err(|source| E2eError::ggml("write<mask>", source))?;
+        .ggml_ctx("write<mask>")?;
 
     backend
         .compute(&mut graph)
-        .map_err(|source| E2eError::ggml("compute(fully_fused)", source))?;
+        .ggml_ctx("compute(fully_fused)")?;
 
     // Read back post-RoPE K and raw V for KV cache state capture.
     if let Some(state) = state {
-        let k_rope_data: Vec<f32> = k_rope
-            .read_data_backend()
-            .map_err(|source| E2eError::ggml("read<K_rope>", source))?;
-        let v_data: Vec<f32> = v_proj
-            .read_data_backend()
-            .map_err(|source| E2eError::ggml("read<V_proj>", source))?;
+        let k_rope_data: Vec<f32> = k_rope.read_data_backend().ggml_ctx("read<K_rope>")?;
+        let v_data: Vec<f32> = v_proj.read_data_backend().ggml_ctx("read<V_proj>")?;
         state.append_batch(&k_rope_data, &v_data, t)?;
     }
 
-    output
-        .read_data_backend()
-        .map_err(|source| E2eError::ggml("read<output>", source))
+    output.read_data_backend().ggml_ctx("read<output>")
 }
 
 // ---------------------------------------------------------------------------
@@ -375,64 +363,49 @@ fn decode_scoring_gpu(
     let t = total_tokens;
 
     // Metadata-only context (backend manages data); 2 MB is generous for ~10 tensors + 1 graph.
-    let ctx = Context::new_no_alloc(2 * 1024 * 1024)
-        .map_err(|source| E2eError::ggml("ctx(scoring_gpu)", source))?;
+    let ctx = Context::new_no_alloc(2 * 1024 * 1024).ggml_ctx("ctx(scoring_gpu)")?;
 
     // Input tensors — shapes follow flash_attn_ext convention.
     // Q: [D, T_q=1, H, 1]
     let q = ctx
         .new_tensor_4d::<f32>(Shape4D::new(d, 1, h, 1))
-        .map_err(|source| E2eError::ggml("q_tensor", source))?;
+        .ggml_ctx("q_tensor")?;
     // K/V in host cache layout [D, Hkv, T, 1]; will be permuted to [D, T, Hkv, 1].
     let k_raw = ctx
         .new_tensor_4d::<f32>(Shape4D::new(d, hkv, t, 1))
-        .map_err(|source| E2eError::ggml("k_tensor", source))?;
+        .ggml_ctx("k_tensor")?;
     let v_raw = ctx
         .new_tensor_4d::<f32>(Shape4D::new(d, hkv, t, 1))
-        .map_err(|source| E2eError::ggml("v_tensor", source))?;
+        .ggml_ctx("v_tensor")?;
     // Gate: [D, H, 1, 1] — matches flash_attn_ext output shape.
     let gate = ctx
         .new_tensor_4d::<f32>(Shape4D::new(d, h, 1, 1))
-        .map_err(|source| E2eError::ggml("gate_tensor", source))?;
+        .ggml_ctx("gate_tensor")?;
 
     // Permute K/V from [D, Hkv, T, 1] → [D, T, Hkv, 1] + make contiguous.
-    let k_perm = ctx
-        .permute(&k_raw, 0, 2, 1, 3)
-        .map_err(|source| E2eError::ggml("permute(K)", source))?;
-    let k = ctx
-        .cont(&k_perm)
-        .map_err(|source| E2eError::ggml("cont(K)", source))?;
-    let v_perm = ctx
-        .permute(&v_raw, 0, 2, 1, 3)
-        .map_err(|source| E2eError::ggml("permute(V)", source))?;
-    let v = ctx
-        .cont(&v_perm)
-        .map_err(|source| E2eError::ggml("cont(V)", source))?;
+    let k_perm = ctx.permute(&k_raw, 0, 2, 1, 3).ggml_ctx("permute(K)")?;
+    let k = ctx.cont(&k_perm).ggml_ctx("cont(K)")?;
+    let v_perm = ctx.permute(&v_raw, 0, 2, 1, 3).ggml_ctx("permute(V)")?;
+    let v = ctx.cont(&v_perm).ggml_ctx("cont(V)")?;
 
     // flash_attn_ext: Q·K scoring + softmax + V aggregation.
     // No causal mask for single-query decode (token attends to itself + all past).
     let attn = ctx
         .flash_attn_ext(&q, &k, &v, None, attention.attention_scale, 0.0, 0.0)
-        .map_err(|source| E2eError::ggml("flash_attn_ext(decode)", source))?;
+        .ggml_ctx("flash_attn_ext(decode)")?;
     // Output: [D, H, 1, 1]
 
     // Gating: sigmoid(gate) ⊙ attn
-    let gate_sig = ctx
-        .sigmoid(&gate)
-        .map_err(|source| E2eError::ggml("sigmoid(gate)", source))?;
-    let gated = ctx
-        .mul(&attn, &gate_sig)
-        .map_err(|source| E2eError::ggml("mul(attn,gate)", source))?;
+    let gate_sig = ctx.sigmoid(&gate).ggml_ctx("sigmoid(gate)")?;
+    let gated = ctx.mul(&attn, &gate_sig).ggml_ctx("mul(attn,gate)")?;
 
     // Build graph → allocate → upload → compute → readback.
-    let mut graph = ctx
-        .new_graph()
-        .map_err(|source| E2eError::ggml("new_graph(scoring)", source))?;
+    let mut graph = ctx.new_graph().ggml_ctx("new_graph(scoring)")?;
     graph.build_forward_expand(&gated);
 
     let _buffer = ctx
         .allocate_tensors(backend)
-        .map_err(|source| E2eError::ggml("allocate(scoring)", source))?;
+        .ggml_ctx("allocate(scoring)")?;
 
     let kv_prefix_len = t * state.kv_features;
     upload_weight(&q, q_values, "write(Q)")?;
@@ -440,13 +413,9 @@ fn decode_scoring_gpu(
     upload_weight(&v_raw, &state.v_cache[..kv_prefix_len], "write(V)")?;
     upload_weight(&gate, q_gate, "write(gate)")?;
 
-    backend
-        .compute(&mut graph)
-        .map_err(|source| E2eError::ggml("compute(scoring)", source))?;
+    backend.compute(&mut graph).ggml_ctx("compute(scoring)")?;
 
-    let outputs = gated
-        .read_data_backend()
-        .map_err(|source| E2eError::ggml("read(gated)", source))?;
+    let outputs = gated.read_data_backend().ggml_ctx("read(gated)")?;
 
     if outputs.len() != query_features {
         return Err(E2eError::BufferLengthMismatch {

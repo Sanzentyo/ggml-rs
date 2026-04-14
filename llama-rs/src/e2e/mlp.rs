@@ -1,4 +1,4 @@
-use super::error::E2eError;
+use super::error::{E2eError, GgmlResultExt};
 use super::numeric::checked_mul;
 use super::tensor_ops::upload_weight;
 use crate::inference::MlpWeights;
@@ -38,46 +38,34 @@ fn build_mlp_graph<'ctx>(
 ) -> Result<MlpGraphParts<'ctx>, E2eError> {
     let w_gate = ctx
         .new_tensor_2d::<f32>(Shape2D::new(hidden_features, ffn_features))
-        .map_err(|source| E2eError::ggml("new<W_GATE>(mlp)", source))?;
+        .ggml_ctx("new<W_GATE>(mlp)")?;
     let w_up = ctx
         .new_tensor_2d::<f32>(Shape2D::new(hidden_features, ffn_features))
-        .map_err(|source| E2eError::ggml("new<W_UP>(mlp)", source))?;
+        .ggml_ctx("new<W_UP>(mlp)")?;
     let w_down = ctx
         .new_tensor_2d::<f32>(Shape2D::new(ffn_features, hidden_features))
-        .map_err(|source| E2eError::ggml("new<W_DOWN>(mlp)", source))?;
+        .ggml_ctx("new<W_DOWN>(mlp)")?;
     let x_in = ctx
         .new_tensor_2d::<f32>(Shape2D::new(hidden_features, sequence_length))
-        .map_err(|source| E2eError::ggml("new<X>(mlp)", source))?;
+        .ggml_ctx("new<X>(mlp)")?;
     let norm_w = ctx
         .new_tensor_1d::<f32>(Length::new(hidden_features))
-        .map_err(|source| E2eError::ggml("new<norm_w>(mlp)", source))?;
+        .ggml_ctx("new<norm_w>(mlp)")?;
 
     let x_normed = ctx
         .rms_norm(&x_in, rms_norm_eps)
-        .map_err(|source| E2eError::ggml("rms_norm(mlp)", source))?;
-    let x = ctx
-        .mul(&x_normed, &norm_w)
-        .map_err(|source| E2eError::ggml("mul(norm)(mlp)", source))?;
+        .ggml_ctx("rms_norm(mlp)")?;
+    let x = ctx.mul(&x_normed, &norm_w).ggml_ctx("mul(norm)(mlp)")?;
 
-    let gate = ctx
-        .mul_mat(&w_gate, &x)
-        .map_err(|source| E2eError::ggml("mul_mat(GATE)(mlp)", source))?;
-    let up = ctx
-        .mul_mat(&w_up, &x)
-        .map_err(|source| E2eError::ggml("mul_mat(UP)(mlp)", source))?;
-    let activated = ctx
-        .silu(&gate)
-        .map_err(|source| E2eError::ggml("silu(mlp)", source))?;
-    let fused = ctx
-        .mul(&activated, &up)
-        .map_err(|source| E2eError::ggml("mul(GATE*UP)(mlp)", source))?;
+    let gate = ctx.mul_mat(&w_gate, &x).ggml_ctx("mul_mat(GATE)(mlp)")?;
+    let up = ctx.mul_mat(&w_up, &x).ggml_ctx("mul_mat(UP)(mlp)")?;
+    let activated = ctx.silu(&gate).ggml_ctx("silu(mlp)")?;
+    let fused = ctx.mul(&activated, &up).ggml_ctx("mul(GATE*UP)(mlp)")?;
     let y_out = ctx
         .mul_mat(&w_down, &fused)
-        .map_err(|source| E2eError::ggml("mul_mat(DOWN)(mlp)", source))?;
+        .ggml_ctx("mul_mat(DOWN)(mlp)")?;
 
-    let mut graph = ctx
-        .new_graph()
-        .map_err(|source| E2eError::ggml("new_graph(mlp)", source))?;
+    let mut graph = ctx.new_graph().ggml_ctx("new_graph(mlp)")?;
     graph.build_forward_expand(&y_out);
 
     Ok(MlpGraphParts {
@@ -122,8 +110,7 @@ pub(super) fn mlp_sequence_inference_with_weights(
 
     let ctx_size =
         recommended_mlp_backend_memory_bytes(hidden_features, ffn_features, sequence_length)?;
-    let ctx = Context::new_no_alloc_bytes(ctx_size)
-        .map_err(|source| E2eError::ggml("Context::new_no_alloc_bytes", source))?;
+    let ctx = Context::new_no_alloc_bytes(ctx_size).ggml_ctx("Context::new_no_alloc_bytes")?;
 
     let MlpGraphParts {
         w_gate,
@@ -143,7 +130,7 @@ pub(super) fn mlp_sequence_inference_with_weights(
 
     let _buffer = ctx
         .allocate_tensors(backend)
-        .map_err(|source| E2eError::ggml("allocate_tensors(mlp)", source))?;
+        .ggml_ctx("allocate_tensors(mlp)")?;
 
     upload_weight(&w_gate, weights.gate_values(), "write<W_GATE>")?;
     upload_weight(&w_up, weights.up_values(), "write<W_UP>")?;
@@ -151,13 +138,9 @@ pub(super) fn mlp_sequence_inference_with_weights(
     upload_weight(&x_in, input, "write<X>")?;
     upload_weight(&norm_w, norm_weight, "write<norm_w>")?;
 
-    backend
-        .compute(&mut graph)
-        .map_err(|source| E2eError::ggml("Backend::compute", source))?;
+    backend.compute(&mut graph).ggml_ctx("Backend::compute")?;
 
-    y_out
-        .read_data_backend()
-        .map_err(|source| E2eError::ggml("read<Y>(mlp)", source))
+    y_out.read_data_backend().ggml_ctx("read<Y>(mlp)")
 }
 
 pub(super) fn recommended_mlp_backend_memory_bytes(
@@ -169,17 +152,17 @@ pub(super) fn recommended_mlp_backend_memory_bytes(
         Shape2D::new(hidden_features, ffn_features),
         Shape2D::new(hidden_features, sequence_length),
     )
-    .map_err(|source| E2eError::ggml("Context::recommended_backend_matmul_memory(gate)", source))?;
+    .ggml_ctx("Context::recommended_backend_matmul_memory(gate)")?;
     let up_projection = Context::recommended_backend_matmul_memory::<f32>(
         Shape2D::new(hidden_features, ffn_features),
         Shape2D::new(hidden_features, sequence_length),
     )
-    .map_err(|source| E2eError::ggml("Context::recommended_backend_matmul_memory(up)", source))?;
+    .ggml_ctx("Context::recommended_backend_matmul_memory(up)")?;
     let down_projection = Context::recommended_backend_matmul_memory::<f32>(
         Shape2D::new(ffn_features, hidden_features),
         Shape2D::new(ffn_features, sequence_length),
     )
-    .map_err(|source| E2eError::ggml("Context::recommended_backend_matmul_memory(down)", source))?;
+    .ggml_ctx("Context::recommended_backend_matmul_memory(down)")?;
 
     let total = gate_projection
         .get()
@@ -219,10 +202,10 @@ impl<'ctx> PersistentMlp<'ctx> {
         upload_weight(&self.x_in, hidden, "PersistentMlp::write(x_in)")?;
         backend
             .compute(&mut self.graph)
-            .map_err(|source| E2eError::ggml("PersistentMlp::compute", source))?;
+            .ggml_ctx("PersistentMlp::compute")?;
         self.y_out
             .read_data_backend()
-            .map_err(|source| E2eError::ggml("PersistentMlp::read(y_out)", source))
+            .ggml_ctx("PersistentMlp::read(y_out)")
     }
 }
 
@@ -250,14 +233,13 @@ pub(super) fn build_persistent_mlp(
     let ffn_features = weights.ffn_features;
 
     let ctx_size = recommended_persistent_mlp_memory(hidden_features, ffn_features)?;
-    let ctx = Context::new_no_alloc_bytes(ctx_size)
-        .map_err(|source| E2eError::ggml("Context(pmlp)", source))?;
+    let ctx = Context::new_no_alloc_bytes(ctx_size).ggml_ctx("Context(pmlp)")?;
 
     let parts = build_mlp_graph(&ctx, hidden_features, ffn_features, 1, rms_norm_eps)?;
 
     let buffer = ctx
         .allocate_tensors(backend)
-        .map_err(|source| E2eError::ggml("allocate_tensors(pmlp)", source))?;
+        .ggml_ctx("allocate_tensors(pmlp)")?;
 
     // Upload weights once.
     upload_weight(&parts.w_gate, weights.gate_values(), "write<W_GATE>(pmlp)")?;

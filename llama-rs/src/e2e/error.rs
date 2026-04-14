@@ -141,3 +141,15 @@ impl E2eError {
         Self::Ggml { context, source }
     }
 }
+
+/// Extension trait to convert `Result<T, ggml_rs::Error>` into `Result<T, E2eError>`
+/// with a static context label.
+pub(super) trait GgmlResultExt<T> {
+    fn ggml_ctx(self, context: &'static str) -> Result<T, E2eError>;
+}
+
+impl<T> GgmlResultExt<T> for Result<T, ggml_rs::Error> {
+    fn ggml_ctx(self, context: &'static str) -> Result<T, E2eError> {
+        self.map_err(|source| E2eError::ggml(context, source))
+    }
+}

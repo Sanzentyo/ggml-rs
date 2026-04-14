@@ -1,6 +1,6 @@
 //! Shared helpers for attention modules: RoPE utilities and flash-attention pipeline.
 
-use crate::e2e::error::E2eError;
+use crate::e2e::error::{E2eError, GgmlResultExt};
 use crate::e2e::numeric::checked_mul;
 use ggml_rs::{Context, DynTensor, Tensor};
 
@@ -124,55 +124,34 @@ pub(super) fn run_flash_attention_pipeline<'ctx>(
     debug_assert_eq!(qf, d * h, "qf must equal d * h");
 
     // Reshape to 4D for flash_attn_ext: [D, H/Hkv, T] → [D, H/Hkv, T, 1].
-    let q_4d = ctx
-        .reshape_4d(q, d, h, t, 1)
-        .map_err(|source| E2eError::ggml("reshape_4d(Q)", source))?;
-    let k_4d = ctx
-        .reshape_4d(k, d, hkv, t, 1)
-        .map_err(|source| E2eError::ggml("reshape_4d(K)", source))?;
-    let v_3d = ctx
-        .reshape_3d(v, d, hkv, t)
-        .map_err(|source| E2eError::ggml("reshape_3d(V)", source))?;
+    let q_4d = ctx.reshape_4d(q, d, h, t, 1).ggml_ctx("reshape_4d(Q)")?;
+    let k_4d = ctx.reshape_4d(k, d, hkv, t, 1).ggml_ctx("reshape_4d(K)")?;
+    let v_3d = ctx.reshape_3d(v, d, hkv, t).ggml_ctx("reshape_3d(V)")?;
     let v_4d = ctx
         .reshape_4d(&v_3d, d, hkv, t, 1)
-        .map_err(|source| E2eError::ggml("reshape_4d(V)", source))?;
+        .ggml_ctx("reshape_4d(V)")?;
 
     // Permute [D, H, T, 1] → [D, T, H, 1] + cont for flash_attn_ext.
-    let q_perm = ctx
-        .permute(&q_4d, 0, 2, 1, 3)
-        .map_err(|source| E2eError::ggml("permute(Q)", source))?;
-    let k_perm = ctx
-        .permute(&k_4d, 0, 2, 1, 3)
-        .map_err(|source| E2eError::ggml("permute(K)", source))?;
-    let v_perm = ctx
-        .permute(&v_4d, 0, 2, 1, 3)
-        .map_err(|source| E2eError::ggml("permute(V)", source))?;
+    let q_perm = ctx.permute(&q_4d, 0, 2, 1, 3).ggml_ctx("permute(Q)")?;
+    let k_perm = ctx.permute(&k_4d, 0, 2, 1, 3).ggml_ctx("permute(K)")?;
+    let v_perm = ctx.permute(&v_4d, 0, 2, 1, 3).ggml_ctx("permute(V)")?;
 
-    let q_c = ctx
-        .cont(&q_perm)
-        .map_err(|source| E2eError::ggml("cont(Q)", source))?;
-    let k_c = ctx
-        .cont(&k_perm)
-        .map_err(|source| E2eError::ggml("cont(K)", source))?;
-    let v_c = ctx
-        .cont(&v_perm)
-        .map_err(|source| E2eError::ggml("cont(V)", source))?;
+    let q_c = ctx.cont(&q_perm).ggml_ctx("cont(Q)")?;
+    let k_c = ctx.cont(&k_perm).ggml_ctx("cont(K)")?;
+    let v_c = ctx.cont(&v_perm).ggml_ctx("cont(V)")?;
 
     // Flash attention.
     let attn = ctx
         .flash_attn_ext(&q_c, &k_c, &v_c, mask, attention_scale, 0.0, 0.0)
-        .map_err(|source| E2eError::ggml("flash_attn_ext", source))?; // [D, H, T, 1]
+        .ggml_ctx("flash_attn_ext")?; // [D, H, T, 1]
 
     // Optional gating: sigmoid(gate) ⊙ attn (Qwen3.5 full attention).
     let scored = if let Some(gate) = gate {
         let gate_4d = ctx
             .reshape_4d(gate, d, h, t, 1)
-            .map_err(|source| E2eError::ggml("reshape_4d(Gate)", source))?;
-        let gate_sig = ctx
-            .sigmoid(&gate_4d)
-            .map_err(|source| E2eError::ggml("sigmoid(Gate)", source))?;
-        ctx.mul(&attn, &gate_sig)
-            .map_err(|source| E2eError::ggml("mul(attn, gate)", source))?
+            .ggml_ctx("reshape_4d(Gate)")?;
+        let gate_sig = ctx.sigmoid(&gate_4d).ggml_ctx("sigmoid(Gate)")?;
+        ctx.mul(&attn, &gate_sig).ggml_ctx("mul(attn, gate)")?
     } else {
         attn
     };
@@ -180,9 +159,8 @@ pub(super) fn run_flash_attention_pipeline<'ctx>(
     // Output projection: [D, H, T, 1] → [H*D, T] → mul_mat(W_out) → [hidden, T].
     let scored_2d = ctx
         .reshape_2d(&scored, qf, t)
-        .map_err(|source| E2eError::ggml("reshape_2d(scored)", source))?;
-    ctx.mul_mat(w_out, &scored_2d)
-        .map_err(|source| E2eError::ggml("mul_mat(output)", source))
+        .ggml_ctx("reshape_2d(scored)")?;
+    ctx.mul_mat(w_out, &scored_2d).ggml_ctx("mul_mat(output)")
 }
 
 /// Optional per-head RMS norm + weight scaling on a 3D tensor `[D, H, T]`.
@@ -199,11 +177,8 @@ pub(super) fn apply_optional_per_head_norm<'ctx>(
 ) -> Result<Tensor<'ctx, f32>, E2eError> {
     match norm_weight {
         Some(nw) => {
-            let normed = ctx
-                .rms_norm(&x, rms_norm_eps)
-                .map_err(|source| E2eError::ggml(label_norm, source))?;
-            ctx.mul(&normed, nw)
-                .map_err(|source| E2eError::ggml(label_mul, source))
+            let normed = ctx.rms_norm(&x, rms_norm_eps).ggml_ctx(label_norm)?;
+            ctx.mul(&normed, nw).ggml_ctx(label_mul)
         }
         None => Ok(x),
     }
