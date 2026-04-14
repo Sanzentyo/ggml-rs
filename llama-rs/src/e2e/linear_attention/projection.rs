@@ -221,12 +221,12 @@ fn project_linear_inputs_graph(
         backend,
     )?;
 
-    let mut iter = results.into_iter();
+    let [qkv, z, alpha, beta]: [Vec<f32>; 4] = results.try_into().expect("4 specs → 4 results");
     Ok(LinearProjections {
-        qkv: iter.next().expect("4 specs → 4 results"),
-        z: iter.next().expect("4 specs → 4 results"),
-        alpha: iter.next().expect("4 specs → 4 results"),
-        beta: iter.next().expect("4 specs → 4 results"),
+        qkv,
+        z,
+        alpha,
+        beta,
         conv_channels,
         hidden_features,
     })
@@ -266,34 +266,27 @@ pub(in crate::e2e) fn project_linear_inputs(
         );
     }
 
-    let qkv = project_sequence(
-        input,
-        sequence_length,
-        hidden_features,
-        conv_channels,
+    let specs = linear_projection_specs(&dims);
+    let weights: [&[f32]; 4] = [
         &attention.qkv_weight_values,
-    )?;
-    let z = project_sequence(
-        input,
-        sequence_length,
-        hidden_features,
-        attention.inner_size,
         &attention.gate_weight_values,
-    )?;
-    let alpha = project_sequence(
-        input,
-        sequence_length,
-        hidden_features,
-        attention.time_step_rank,
         &attention.alpha_weight_values,
-    )?;
-    let beta = project_sequence(
-        input,
-        sequence_length,
-        hidden_features,
-        attention.time_step_rank,
         &attention.beta_weight_values,
-    )?;
+    ];
+    let results: Vec<Vec<f32>> = specs
+        .iter()
+        .zip(weights)
+        .map(|(spec, w)| {
+            project_sequence(
+                input,
+                sequence_length,
+                hidden_features,
+                spec.out_features,
+                w,
+            )
+        })
+        .collect::<Result<_, _>>()?;
+    let [qkv, z, alpha, beta]: [Vec<f32>; 4] = results.try_into().expect("4 specs → 4 results");
 
     Ok(LinearProjections {
         qkv,
