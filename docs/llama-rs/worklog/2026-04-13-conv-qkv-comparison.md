@@ -4091,3 +4091,22 @@ Zero clippy warnings.
 | llama-rs/src/e2e/checkpoint.rs | Module root (~90 lines from 1030) |
 | llama-rs/src/e2e/checkpoint/dto.rs | NEW: Versioned DTO types + validation |
 | llama-rs/src/e2e/checkpoint/runtime.rs | NEW: Runtime conversion + capture/restore |
+
+## Item 69: Split session.rs into init + runtime submodules
+
+**Commit**: `9423bf5`
+**Motivation**: session.rs at 831 lines mixed construction (new/resume), runtime stepping, and tests. The two constructors shared ~80 lines of model resolution logic that was duplicated.
+
+**Approach**:
+- Extracted `ResolvedModel` helper struct in init.rs to deduplicate tensor loading, shape validation, and layer plan building between `new()` and `resume()`.
+- Grouped all runtime stepping (next_token, step_two_phase, step_full_reprocess, ensure_persistent_resources, emit_token, sample_next) into runtime.rs.
+- Root retains struct definition, checkpoint(), accessors, and all tests.
+- `ensure_persistent_resources()` exposed as `pub(super)` so root tests can call it directly.
+
+**Result**: 246 tests pass (net +2 facade tests), zero clippy warnings.
+
+| File | Change |
+|------|--------|
+| llama-rs/src/e2e/session.rs | Module root (~339 lines from 831) |
+| llama-rs/src/e2e/session/init.rs | NEW: Construction paths + ResolvedModel |
+| llama-rs/src/e2e/session/runtime.rs | NEW: Per-token decode + sampling |

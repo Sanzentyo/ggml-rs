@@ -595,6 +595,17 @@ And you should write rusty code(ADT, enum, type state pattern)
   CaptureInput, capture, restore_state + 7 conversion/capture tests.
   Total test count increased from 230 to 244. Zero clippy warnings.
 
+- **Split session.rs into init + runtime submodules** (item 69):
+  Split the 831-line `session.rs` into 3 files:
+  `session.rs` root (~339 lines): struct definition, checkpoint(), accessors,
+  mod declarations, re-exports, 9 tests (including 2 facade tests).
+  `session/init.rs` (~280 lines): new(), resume(), shared ResolvedModel helper
+  that deduplicates ~80 lines of model resolution between constructors.
+  `session/runtime.rs` (~215 lines): next_token(), step_two_phase(),
+  step_full_reprocess(), ensure_persistent_resources() (pub(super) for test
+  access), emit_token(), sample_next().
+  Total test count increased from 244 to 246. Zero clippy warnings.
+
 ## Validation checkpoints completed on this branch
 
 - `cargo fmt --all`
