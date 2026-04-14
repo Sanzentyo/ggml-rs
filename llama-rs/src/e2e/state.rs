@@ -207,11 +207,6 @@ impl LinearAttentionState {
         self.conv_valid = rows_to_copy;
         Ok(())
     }
-
-    /// Capture SSM states from a flat states buffer after prefill.
-    pub(super) fn capture_ssm_states(&mut self, states: &[f32]) {
-        self.ssm_states[..states.len()].copy_from_slice(states);
-    }
 }
 
 impl GenerationState {

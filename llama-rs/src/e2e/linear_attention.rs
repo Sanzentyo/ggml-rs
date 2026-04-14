@@ -71,9 +71,10 @@ pub(super) struct LinearProjections {
 struct FusedLinearOutputs {
     /// Post-conv, post-SiLU activation `[seq_len × conv_channels]`.
     conv: Vec<f32>,
-    /// Pre-conv QKV projection `[seq_len × conv_channels]` — needed by
-    /// `capture_conv_buffer` for decode state continuity.
-    qkv_pre_conv: Vec<f32>,
+    /// Pre-conv QKV tail `[conv_tail_rows × conv_channels]` — only the last
+    /// `kernel_size - 1` rows needed by `capture_conv_buffer` for decode state
+    /// continuity. `None` when no decode state is needed.
+    qkv_pre_conv_tail: Option<Vec<f32>>,
     z: Vec<f32>,
     alpha: Vec<f32>,
     beta: Vec<f32>,
@@ -582,9 +583,15 @@ fn qwen35_linear_attention_core(
     }
 
     // Fused projection + conv: single graph, no host round-trip.
+    // Only read back the tail rows of qkv_pre_conv needed for conv buffer seeding.
+    let conv_tail_rows = if state.is_some() {
+        dims.kernel_size.saturating_sub(1).min(sequence_length)
+    } else {
+        0
+    };
     let FusedLinearOutputs {
         conv,
-        qkv_pre_conv,
+        qkv_pre_conv_tail,
         z,
         alpha,
         beta,
@@ -596,12 +603,18 @@ fn qwen35_linear_attention_core(
         sequence_length,
         attn_norm_weight,
         rms_norm_eps,
+        conv_tail_rows,
         backend,
     )?;
 
-    // Capture pre-conv QKV into conv buffer for future decode steps.
+    // Capture pre-conv QKV tail into conv buffer for future decode steps.
     if let Some(ref mut state) = state {
-        state.capture_conv_buffer(&qkv_pre_conv, sequence_length)?;
+        if let Some(ref tail) = qkv_pre_conv_tail {
+            state.capture_conv_buffer(tail, conv_tail_rows)?;
+        } else {
+            // kernel_size == 1: no conv history needed, but reset valid count.
+            state.conv_valid = 0;
+        }
     }
 
     let qk_features = checked_mul(attention.group_count, attention.state_size)?;
@@ -638,13 +651,29 @@ fn qwen35_linear_attention_core(
         });
     }
     let mut output = vec![0.0_f32; checked_mul(sequence_length, attention.inner_size)?];
-    let mut states = vec![
-        0.0_f32;
-        checked_mul(
-            attention.time_step_rank,
-            checked_mul(attention.state_size, attention.state_size)?
-        )?
-    ];
+    let states_len = checked_mul(
+        attention.time_step_rank,
+        checked_mul(attention.state_size, attention.state_size)?,
+    )?;
+    // When persistent state exists, write recurrence directly into it to avoid
+    // an extra allocation + memcpy. Otherwise use a temporary buffer.
+    let mut owned_states;
+    let states: &mut [f32] = match state {
+        Some(ref mut s) => {
+            debug_assert_eq!(
+                s.ssm_states.len(),
+                states_len,
+                "SSM state size mismatch: expected {states_len}, got {}",
+                s.ssm_states.len()
+            );
+            s.ssm_states[..states_len].fill(0.0);
+            &mut s.ssm_states[..states_len]
+        }
+        None => {
+            owned_states = vec![0.0_f32; states_len];
+            &mut owned_states
+        }
+    };
     let scale = 1.0_f32 / (attention.state_size as f32).sqrt();
     let mut scratch = SsmScratch::new(attention.state_size);
 
@@ -718,10 +747,8 @@ fn qwen35_linear_attention_core(
         }
     }
 
-    // Capture SSM states after processing all tokens.
-    if let Some(state) = state {
-        state.capture_ssm_states(&states);
-    }
+    // SSM states are already in persistent state (written directly) or in a
+    // temporary buffer (discarded). No capture step needed.
 
     project_sequence_graph(
         &output,
@@ -988,8 +1015,10 @@ fn causal_depthwise_conv_graph(
 /// `ggml_ssm_conv`, and SiLU activation into a single compute graph. This
 /// eliminates the host↔device round-trip between projection and convolution.
 ///
-/// Also returns `qkv_pre_conv` (the raw projection output before conv) so that
-/// `capture_conv_buffer` can store the last `kernel_size - 1` rows for decode.
+/// When `conv_tail_rows > 0`, reads back only the last `conv_tail_rows` rows of
+/// the pre-conv QKV tensor (for decode state continuity). When 0, skips the
+/// readback entirely — the allocator can reuse the memory.
+#[allow(clippy::too_many_arguments)] // GPU graph builder — 8 params, all needed
 fn project_and_conv_fused_graph(
     attention: &Qwen35LinearAttentionLayerPlan,
     dims: &LinearAttentionDims,
@@ -997,6 +1026,7 @@ fn project_and_conv_fused_graph(
     sequence_length: usize,
     attn_norm_weight: &[f32],
     rms_norm_eps: f32,
+    conv_tail_rows: usize,
     backend: &Backend,
 ) -> Result<FusedLinearOutputs, E2eError> {
     let LinearAttentionDims {
@@ -1130,7 +1160,10 @@ fn project_and_conv_fused_graph(
         .new_graph()
         .map_err(|source| E2eError::ggml("new_graph(fused)", source))?;
     graph.build_forward_expand(&silu_out);
-    graph.build_forward_expand(&qkv_out); // pre-conv for state capture
+    // Only keep qkv_out alive when we need to read tail rows for conv state.
+    if conv_tail_rows > 0 {
+        graph.build_forward_expand(&qkv_out);
+    }
     graph.build_forward_expand(&z_out);
     graph.build_forward_expand(&alpha_out);
     graph.build_forward_expand(&beta_out);
@@ -1164,9 +1197,21 @@ fn project_and_conv_fused_graph(
     let conv = silu_out
         .read_data_backend()
         .map_err(|source| E2eError::ggml("read<conv_silu>", source))?;
-    let qkv_pre_conv = qkv_out
-        .read_data_backend()
-        .map_err(|source| E2eError::ggml("read<qkv_pre_conv>", source))?;
+    // Read only the tail rows of pre-conv QKV needed for decode state seeding.
+    let qkv_pre_conv_tail = if conv_tail_rows > 0 {
+        let tail_offset = checked_mul(
+            sequence_length.saturating_sub(conv_tail_rows),
+            conv_channels,
+        )?;
+        let tail_len = checked_mul(conv_tail_rows, conv_channels)?;
+        Some(
+            qkv_out
+                .read_data_backend_at(tail_offset, tail_len)
+                .map_err(|source| E2eError::ggml("read<qkv_tail>", source))?,
+        )
+    } else {
+        None
+    };
     let z = z_out
         .read_data_backend()
         .map_err(|source| E2eError::ggml("read<Z>", source))?;
@@ -1179,7 +1224,7 @@ fn project_and_conv_fused_graph(
 
     Ok(FusedLinearOutputs {
         conv,
-        qkv_pre_conv,
+        qkv_pre_conv_tail,
         z,
         alpha,
         beta,
