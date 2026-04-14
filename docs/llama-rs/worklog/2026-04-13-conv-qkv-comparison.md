@@ -4693,3 +4693,54 @@ This was two copies of identical logic.
 - 2 files changed: +8 -28
 - 312 tests pass, zero clippy warnings
 - Commit: eb64be1
+
+---
+
+## Item 89 — Bundle SSM step scalars into SsmStepScalars struct
+
+### Rationale
+ssm_recurrence_step had 9 parameters after item 86 removed _z. Three of them
+(decay, beta_value, scale) are per-step coefficients computed from the same
+gating/softplus/sigmoid pipeline. Bundling them into a small Copy struct
+reduces the param count to 7 (below clippy threshold).
+
+### Design decisions (rubber-duck feedback)
+- Pass by value: 3xf32 = 12 bytes. Reference adds indirection in hot loop.
+- Keep state_size separate: it is a shape invariant, not a step coefficient.
+- derive(Clone, Copy, Debug): value semantics, debuggable.
+
+### Changes
+- ssm.rs: new SsmStepScalars struct + updated function signature
+- decode.rs, sequence.rs, bench.rs: updated call sites
+
+### Result
+- 4 files changed: +32 -19
+- 312 tests pass, zero clippy warnings
+- Commit: b2fbe2d
+
+---
+
+## Item 90 — Remove redundant attn_norm_weight from conv graph chain
+
+### Rationale
+project_and_conv_fused_graph took attn_norm_weight as a parameter,
+but it must always be attention.norm_values (the plan already carries it).
+This creates a footgun — callers could pass mismatched norm weights.
+
+### Design decisions (rubber-duck feedback)
+- Read from plan: attention.norm_values is always the correct source.
+- Cascade removal: the parameter was threaded through qwen35_linear_attention_core,
+  _inference, _prefill, and bench_linear_attention_phases. All removed.
+- No struct needed: removing the param alone drops from 8 to 7, clearing clippy.
+
+### Changes
+- conv.rs: removed attn_norm_weight param, reads attention.norm_values directly
+- sequence.rs, bench.rs: removed param from callers
+- linear_attention.rs: removed param from _inference, _prefill, _core
+- generation/strategy.rs: removed attention.norm_values() from call sites
+- bench_graphs/inference.rs, bench_graphs/micro.rs: removed unused norm_w bindings
+
+### Result
+- 7 files changed: +22 -91
+- 312 tests pass, zero clippy warnings
+- Commit: 2d1d687

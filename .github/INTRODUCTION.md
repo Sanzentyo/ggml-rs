@@ -763,6 +763,20 @@ And you should write rusty code(ADT, enum, type state pattern)
   methods without rewriting trait impls would create recursive calls.
   312 tests pass, zero clippy warnings.
 
+89. **Bundle SSM step scalars into `SsmStepScalars` struct** — DONE (commit `b2fbe2d`)
+  Extracted `decay`, `beta_value`, `scale` into a `#[derive(Clone, Copy, Debug)]`
+  value type passed by value (3×f32, hot loop — no indirection). Reduces
+  `ssm_recurrence_step` from 9→7 params, removing `#[allow(clippy::too_many_arguments)]`.
+  Rubber-duck advised keeping `state_size` separate (shape invariant, not step coefficient).
+  312 tests pass, zero clippy warnings.
+
+90. **Remove redundant `attn_norm_weight` parameter from conv graph chain** — DONE (commit `2d1d687`)
+  `project_and_conv_fused_graph` now reads norm weight from `attention.norm_values`
+  directly, eliminating a parameter that must always match the plan. Change cascades
+  through `qwen35_linear_attention_{inference,prefill,core}` and bench functions
+  (8→7 params, removes `#[allow]`). Rubber-duck recommended this over struct bundling.
+  312 tests pass, zero clippy warnings.
+
 ## Validation checkpoints completed on this branch
 
 - `cargo fmt --all`
