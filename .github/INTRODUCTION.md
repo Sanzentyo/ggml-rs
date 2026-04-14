@@ -824,6 +824,27 @@ And you should write rusty code(ADT, enum, type state pattern)
   and `Display` includes context. config.rs: 6 tests covering valid construction,
   empty prompt rejection, builder chaining, and `avg_generated_token_ms` (empty,
   normal, zero duration). 365 tests pass, zero clippy warnings.
+101. **Extract graph_deinterleave_q_gate helper** — DONE (commit `81c7c02`)
+  Extracted graph-side Q/gate deinterleave from fully_fused_attention_graph
+  into reusable `graph_deinterleave_q_gate()` in attention/projection.rs.
+  Uses strided `view_3d` + `cont` to split interleaved Q+gate layout.
+  Distinct from existing host-side `deinterleave_q_gate()` which operates
+  on `&[f32]` slices. 365 tests pass, zero clippy warnings.
+102. **Memory estimation consolidation** — SKIPPED
+  Already have `sum_matmul_memories()` as shared helper. Further
+  consolidation risks blurring important differences between metadata-only,
+  fused-graph, persistent, and model-specific estimators.
+103. **Decompose fully_fused_attention_graph** — DONE (effective)
+  `FullAttentionDims` (with `new()` + `estimate_memory()`) was already
+  extracted in prior items. `graph_deinterleave_q_gate` extracted in item
+  101. Remaining 199 lines are orchestration that delegates to shared
+  helpers. No further decomposition needed per rubber-duck analysis.
+104. **Extract StandardAttentionDims struct** — DONE (commit `bfb869f`)
+  Created `StandardAttentionDims` with `new()` (validates GQA heads,
+  derives qf/kvf) and `estimate_memory(t)` (fully checked arithmetic).
+  Both `standard_attention_graph` and `standard_attention_decode_step`
+  now share dimension extraction. Mirrors `FullAttentionDims` pattern.
+  365 tests pass, zero clippy warnings.
 
 ## Validation checkpoints completed on this branch
 

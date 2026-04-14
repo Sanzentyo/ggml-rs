@@ -4917,3 +4917,60 @@ Used GgufModel::stub with precise byte sizes for test tensors.
 4. report_avg_generated_token_ms_empty -- no durations -> 0.0
 5. report_avg_generated_token_ms_normal -- valid durations -> correct average
 6. report_avg_generated_token_ms_zero_duration -- zero duration -> 0.0
+
+## Item 101: Extract graph_deinterleave_q_gate helper
+
+Extracted the graph-side Q/gate deinterleave logic from
+fully_fused_attention_graph (qwen35_full.rs:181-202) into a reusable
+function graph_deinterleave_q_gate() in attention/projection.rs.
+
+### Key design decision
+
+The graph-side helper is deliberately separate from the host-side
+deinterleave_q_gate(). They solve different problems:
+- Host-side: operates on &[f32] slices, copies data
+- Graph-side: builds strided view_3d + cont ops in the ggml graph
+
+Both live in attention/projection.rs for discoverability.
+
+### Files changed (2)
+
+- llama-rs/src/e2e/attention/projection.rs -- +graph_deinterleave_q_gate function
+- llama-rs/src/e2e/attention/qwen35_full.rs -- replaced inline code with helper call
+
+## Item 102: Memory estimation consolidation -- SKIPPED
+
+Rubber-duck recommended skipping. Already have sum_matmul_memories() as a
+shared helper. Further consolidation risks blurring important differences
+between metadata-only estimates, fused-graph estimates, persistent decode
+graphs, and model-specific safety slack.
+
+## Item 103: Decompose fully_fused_attention_graph -- DONE (effective)
+
+FullAttentionDims with new() + estimate_memory() was already extracted in
+prior items. graph_deinterleave_q_gate was extracted in item 101. The
+remaining 199 lines are orchestration that delegates to shared helpers
+(graph_norm_input, build_batch_projections, apply_optional_per_head_norm,
+run_flash_attention_pipeline, upload_weight). Further decomposition would
+fragment the pipeline without improving readability.
+
+## Item 104: Extract StandardAttentionDims struct
+
+Created StandardAttentionDims mirroring the existing FullAttentionDims
+pattern for the standard (non-gated) attention path.
+
+### StandardAttentionDims struct
+
+- new(attention) -- validates GQA heads, derives d/h/hkv/hidden/qf/kvf
+- estimate_memory(t) -- fully checked arithmetic, returns Result<Bytes, E2eError>
+
+### Deduplication
+
+Both standard_attention_graph and standard_attention_decode_step previously
+had identical dimension extraction code (layout.head_dimension(), etc. plus
+validate_gqa_heads). Now both use StandardAttentionDims::new(attention).
+
+### Files changed (1)
+
+- llama-rs/src/e2e/attention/standard.rs -- +StandardAttentionDims struct,
+  refactored both graph and decode functions
