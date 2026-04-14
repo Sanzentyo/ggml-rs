@@ -493,6 +493,14 @@ And you should write rusty code(ADT, enum, type state pattern)
   on Metal at seq_len=1024); graph conv wins at seq_len≥256; layout prep
   (transpose+cont+pad) costs as much as conv itself. See comparison doc item 57.
 
+- **MLP graph topology extraction** (item 58):
+  Extracted shared `MlpGraphParts` struct and `build_mlp_graph` builder that
+  encapsulates the 7-op MLP chain (rms_norm → scale → gate matmul → silu →
+  up matmul → mul → down matmul). Both `mlp_sequence_inference_with_weights`
+  (one-shot prefill) and `build_persistent_mlp` (decode) now delegate to
+  `build_mlp_graph`, eliminating ~40 lines of duplicated topology code.
+  See comparison doc item 58.
+
 ## Validation checkpoints completed on this branch
 
 - `cargo fmt --all`

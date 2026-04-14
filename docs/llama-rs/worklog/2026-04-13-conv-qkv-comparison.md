@@ -3642,3 +3642,46 @@ convolution requirement (one conv instead of three), not by matmul efficiency.
 | llama-rs/src/e2e/bench_graphs.rs | Added bench_conv_vs_qkv_comparison, bench_batch_projections, bench_layout_prep |
 | llama-rs/src/e2e/linear_attention.rs | Made causal_depthwise_conv and causal_depthwise_conv_graph pub(super) |
 
+## Item 58: MLP Graph Topology Extraction
+
+### 58.1 Problem
+
+`mlp_sequence_inference_with_weights` (one-shot, variable seq_len) and
+`build_persistent_mlp` (decode, seq_len=1) both inline the identical 7-op
+MLP chain:
+
+1. `new_tensor_2d` x 3 (w_gate, w_up, w_down)
+2. `new_tensor_2d` (x_in) + `new_tensor_1d` (norm_w)
+3. `rms_norm` -> `mul(norm)` -> `mul_mat(gate)` -> `mul_mat(up)` -> `silu` -> `mul` -> `mul_mat(down)`
+4. `new_graph` + `build_forward_expand`
+
+This is ~40 lines of exact duplication. Any topology change (e.g., adding
+bias, changing activation) requires editing two places.
+
+### 58.2 Solution
+
+Extracted `MlpGraphParts` struct and `build_mlp_graph` shared builder.
+
+`MlpGraphParts` holds tensor handles (w_gate, w_up, w_down, x_in, norm_w,
+y_out, graph). `build_mlp_graph(ctx, hidden, ffn, seq_len, eps)` builds the
+complete 7-op chain and returns the parts struct.
+
+Both callers now delegate to `build_mlp_graph` and only handle their own
+concerns:
+- One-shot: allocate + upload all + compute + read
+- Persistent: allocate + upload weights + return struct
+
+### 58.3 Design Decisions
+
+- **Private struct**: `MlpGraphParts` is not `pub(super)` since only the two
+  callers within `mlp.rs` use it.
+- **Error labels**: Use "(mlp)" suffix for shared builder labels.
+- **Destructuring**: One-shot caller destructures into named bindings for
+  `mut graph`; persistent caller accesses via `parts.field`.
+
+### 58.4 Files Modified
+
+| File | Changes |
+|------|---------|
+| llama-rs/src/e2e/mlp.rs | Added `MlpGraphParts` + `build_mlp_graph`; refactored both callers (~40 lines removed) |
+
