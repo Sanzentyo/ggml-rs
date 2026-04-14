@@ -4415,3 +4415,38 @@ pub(super) struct LayerPassConfig<'a> {
 - Updated 7 call sites across 4 files.
 - 305 tests pass, zero clippy warnings.
 - Commit: `5926418`
+
+## Item 79: execute_batch_projections dedup
+
+### Problem
+`project_qkv_graph` (attention/projection.rs) and `project_linear_inputs_graph`
+(linear_attention/projection.rs) shared ~101 lines of identical logic:
+1. Create ggml context with calculated size
+2. Build 1D input tensor, call `build_batch_projections`, create graph, allocate
+3. Upload weight data for each projection
+4. Compute graph, read results into Vec of Vec
+
+The only differences: number of projections (3 vs 4), weight labels, and
+the typed wrapper struct constructed from results.
+
+### Solution
+Extracted `execute_batch_projections()` in `tensor_ops/projection.rs`:
+- Signature takes `ctx_size`, `hidden_features`, `sequence_length`, `specs`,
+  `input`, `weight_data` (paired with labels), and `backend`
+- Returns `Result<Vec<Vec<f32>>, E2eError>`
+
+Both callers now build their specs/weight_data, call the helper, and
+destructure the result into their typed wrapper struct.
+
+### Key decisions
+- Simple helper function, not builder pattern (per rubber-duck advice)
+- `weight_data` pairs each projection weights with upload label
+- `BuiltProjection` and `build_batch_projections` remain as lower-level primitives
+  for persistent_decode.rs and other consumers
+- Removed unused `BuiltProjection` re-export from tensor_ops.rs
+
+### Result
+- ~101 lines of duplication eliminated
+- Updated 3 files (tensor_ops/projection.rs, attention/projection.rs, linear_attention/projection.rs)
+- 325 tests pass, zero clippy warnings
+- Commit: `73d36f9`

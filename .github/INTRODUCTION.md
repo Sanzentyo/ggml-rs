@@ -690,6 +690,13 @@ And you should write rusty code(ADT, enum, type state pattern)
   Updated 7 call sites across loops.rs, resources.rs, runtime.rs.
   305 tests pass, zero clippy warnings.
 
+79. **execute_batch_projections dedup** — DONE (commit `73d36f9`)
+  Extracted `execute_batch_projections()` helper in `tensor_ops/projection.rs` to eliminate
+  ~101 lines of duplication between `project_qkv_graph` and `project_linear_inputs_graph`.
+  Both callers now delegate to the shared helper while preserving typed per-module wrappers.
+  Removed unused `BuiltProjection` re-export from `tensor_ops.rs`.
+  325 tests pass, zero clippy warnings.
+
 ## Validation checkpoints completed on this branch
 
 - `cargo fmt --all`
