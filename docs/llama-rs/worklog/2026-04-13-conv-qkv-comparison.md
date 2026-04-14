@@ -4627,3 +4627,69 @@ the normed input. Only ggml_ctx label strings varied slightly between sites.
 - 5 files changed: +52 -59
 - 305 tests pass, zero clippy warnings
 - Commit: 873bdde
+
+
+## Item 86: Remove unused _z parameter from ssm_recurrence_step
+
+### Problem
+`ssm_recurrence_step()` in ssm.rs took 10 parameters, including `_z: &[f32]`
+which was never used inside the function. The z values are used for SiLU gating
+AFTER the SSM recurrence output is produced, by the caller.
+
+### Solution
+Removed the `_z` parameter from the function signature and updated all 3 call
+sites (decode.rs, sequence.rs, bench.rs). Parameter count drops from 10 to 9
+(still above clippy threshold of 7, so `#[allow]` retained).
+
+### Result
+- 4 files changed, 4 deletions
+- 305 tests pass, zero clippy warnings
+- Commit: c1f2982
+
+## Item 87: Unit tests for validate_gqa_heads
+
+### Problem
+Item 83 added `validate_gqa_heads()` and found bugs (missing zero-head checks).
+Rubber-duck recommended test coverage since it was a bug fix.
+
+### Solution
+Added 7 tests in `attention/shared.rs`:
+- `validate_gqa_heads_standard_gqa` — h=8, kv=2 (standard GQA)
+- `validate_gqa_heads_equal_heads` — h=4, kv=4 (non-GQA)
+- `validate_gqa_heads_mqa_single_kv` — h=8, kv=1 (MQA)
+- `validate_gqa_heads_zero_head_count` — h=0 → InvalidGqaHeadConfig
+- `validate_gqa_heads_zero_kv_head_count` — kv=0 → InvalidGqaHeadConfig
+- `validate_gqa_heads_not_divisible` — h=7, kv=3 → InvalidGqaHeadConfig
+- `validate_gqa_heads_both_zero` — h=0, kv=0 → InvalidGqaHeadConfig
+
+Error tests assert exact variant and field values per rubber-duck advice.
+
+### Result
+- 1 file changed, +71 lines
+- 312 tests pass (7 new), zero clippy warnings
+- Commit: 58f169e
+
+## Item 88: Consolidate k_head_at/v_head_at into KvCacheView trait only
+
+### Problem
+Both StandardAttentionState and Qwen35FullAttentionState had identical inherent
+`k_head_at()` and `v_head_at()` methods. The KvCacheView trait (added in item 82)
+also defined these methods, with the trait impls delegating to the inherent ones.
+This was two copies of identical logic.
+
+### Solution
+1. Rewrote KvCacheView trait impls to inline the slice logic directly
+2. Removed inherent k_head_at/v_head_at from both state types
+3. Kept token_count() as inherent (doesn\'t belong on the narrow KV trait)
+
+### Key decisions
+- Rubber-duck caught a BLOCKING issue: removing inherent methods without rewriting
+  trait impls would create infinite recursion (trait impl calls self.k_head_at()
+  which resolves to itself with no inherent method to fall through to)
+- token_count() kept inherent: broadening KvCacheView beyond read-only head access
+  would couple unrelated decode logic to the trait
+
+### Result
+- 2 files changed: +8 -28
+- 312 tests pass, zero clippy warnings
+- Commit: eb64be1

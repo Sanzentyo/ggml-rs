@@ -742,6 +742,27 @@ And you should write rusty code(ADT, enum, type state pattern)
   `linear_attention` can also use the helper.
   305 tests pass, zero clippy warnings.
 
+86. **Remove unused `_z` parameter from `ssm_recurrence_step`** — DONE (commit `c1f2982`)
+  The `z` values are only used for SiLU gating after SSM output, never
+  inside the recurrence. Removed unused parameter from function signature
+  and updated all 3 call sites (decode.rs, sequence.rs, bench.rs).
+  305 tests pass, zero clippy warnings.
+
+87. **Unit tests for `validate_gqa_heads`** — DONE (commit `58f169e`)
+  7 tests covering the full validation matrix: standard GQA, equal heads,
+  MQA (kv=1), zero head_count, zero kv_head_count, non-divisible, and
+  both-zero. Error tests assert exact `InvalidGqaHeadConfig` variant and
+  field values (bug-fix coverage for item 83).
+  312 tests pass, zero clippy warnings.
+
+88. **Consolidate `k_head_at`/`v_head_at` into KvCacheView trait only** — DONE (commit `eb64be1`)
+  Removed duplicate inherent methods from both `StandardAttentionState`
+  and `Qwen35FullAttentionState`. KvCacheView impls now inline the slice
+  logic directly. Kept `token_count()` as inherent (doesn't belong on the
+  narrow read-only KV trait). Rubber-duck caught that removing inherent
+  methods without rewriting trait impls would create recursive calls.
+  312 tests pass, zero clippy warnings.
+
 ## Validation checkpoints completed on this branch
 
 - `cargo fmt --all`
