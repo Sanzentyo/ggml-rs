@@ -63,6 +63,77 @@ pub(in crate::e2e) fn standard_attention_inference(
 }
 
 // ---------------------------------------------------------------------------
+// Dimension struct
+// ---------------------------------------------------------------------------
+
+/// Validated dimension set for standard (non-gated) attention.
+///
+/// Mirrors [`FullAttentionDims`](super::projection::FullAttentionDims) for the
+/// standard path. Constructed via [`Self::new`], which validates GQA head
+/// divisibility upfront.
+struct StandardAttentionDims {
+    d: usize,
+    h: usize,
+    hkv: usize,
+    hidden: usize,
+    qf: usize,
+    kvf: usize,
+}
+
+impl StandardAttentionDims {
+    fn new(attention: &StandardAttentionLayerPlan) -> Result<Self, E2eError> {
+        let layout = attention.weights.config.layout;
+        let d = layout.head_dimension();
+        let h = layout.query_head_count();
+        let hkv = layout.kv_head_count();
+        let hidden = layout.hidden_features();
+        let qf = checked_mul(h, d)?;
+        let kvf = checked_mul(hkv, d)?;
+        validate_gqa_heads(h, hkv)?;
+        Ok(Self {
+            d,
+            h,
+            hkv,
+            hidden,
+            qf,
+            kvf,
+        })
+    }
+
+    /// Conservative memory estimate for the fully-fused standard attention graph.
+    ///
+    /// Returns `Err` on arithmetic overflow.
+    fn estimate_memory(&self, t: usize) -> Result<Bytes, E2eError> {
+        let Self {
+            d: _,
+            h: _,
+            hkv: _,
+            hidden,
+            qf,
+            kvf,
+        } = *self;
+        let elem = std::mem::size_of::<f32>();
+        let weight_bytes = checked_mul(hidden, qf)?
+            .checked_add(checked_mul(checked_mul(hidden, kvf)?, 2)?)
+            .and_then(|v| v.checked_add(checked_mul(qf, hidden).ok()?))
+            .and_then(|v| v.checked_mul(elem))
+            .ok_or(E2eError::MemorySizeOverflow)?;
+        let io_bytes = checked_mul(hidden, t)?
+            .checked_add(checked_mul(qf, t)?)
+            .and_then(|v| v.checked_add(checked_mul(kvf, checked_mul(t, 2).ok()?).ok()?))
+            .and_then(|v| v.checked_mul(elem))
+            .ok_or(E2eError::MemorySizeOverflow)?;
+        let mask_bytes_est = checked_mul(checked_mul(t, t)?, 2)?;
+        weight_bytes
+            .checked_add(io_bytes)
+            .and_then(|v| v.checked_add(mask_bytes_est))
+            .and_then(|v| v.checked_add(STANDARD_ATTENTION_OVERHEAD_BYTES))
+            .map(Bytes::new)
+            .ok_or(E2eError::MemorySizeOverflow)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Fused graph
 // ---------------------------------------------------------------------------
 
@@ -80,16 +151,17 @@ fn standard_attention_graph(
     use crate::e2e::numeric::build_causal_mask_f16_bytes;
     use ggml_rs::{Dims, RopeExtParams, Type};
 
-    let config = &attention.weights.config;
-    let layout = config.layout;
-    let d = layout.head_dimension();
-    let h = layout.query_head_count();
-    let hkv = layout.kv_head_count();
-    let hidden = layout.hidden_features();
-    let qf = checked_mul(h, d)?;
-    let kvf = checked_mul(hkv, d)?;
+    let dims = StandardAttentionDims::new(attention)?;
+    let StandardAttentionDims {
+        d,
+        h,
+        hkv,
+        hidden,
+        qf,
+        kvf,
+    } = dims;
 
-    validate_gqa_heads(h, hkv)?;
+    let config = &attention.weights.config;
 
     let expected_input = checked_mul(hidden, t)?;
     if input.len() != expected_input {
@@ -99,28 +171,8 @@ fn standard_attention_graph(
         });
     }
 
-    // Memory estimate (conservative): weights + IO + intermediates.
-    let elem = std::mem::size_of::<f32>();
-    let weight_bytes = checked_mul(hidden, qf)?
-        .checked_add(checked_mul(checked_mul(hidden, kvf)?, 2)?)
-        .and_then(|v| v.checked_add(checked_mul(qf, hidden).ok()?))
-        .and_then(|v| v.checked_mul(elem))
-        .ok_or(E2eError::MemorySizeOverflow)?;
-    let io_bytes = checked_mul(hidden, t)?
-        .checked_add(checked_mul(qf, t)?)
-        .and_then(|v| v.checked_add(checked_mul(kvf, checked_mul(t, 2).ok()?).ok()?))
-        .and_then(|v| v.checked_mul(elem))
-        .ok_or(E2eError::MemorySizeOverflow)?;
-    let mask_bytes_est = checked_mul(checked_mul(t, t)?, 2)?; // f16 mask
-    let overhead = STANDARD_ATTENTION_OVERHEAD_BYTES;
-    let total_mem = weight_bytes
-        .checked_add(io_bytes)
-        .and_then(|v| v.checked_add(mask_bytes_est))
-        .and_then(|v| v.checked_add(overhead))
-        .ok_or(E2eError::MemorySizeOverflow)?;
-    let total_mem = Bytes::new(total_mem);
-
-    let ctx = Context::new_no_alloc_bytes(total_mem).ggml_ctx("Context::new(std_attn)")?;
+    let ctx =
+        Context::new_no_alloc_bytes(dims.estimate_memory(t)?).ggml_ctx("Context::new(std_attn)")?;
 
     let ni = graph_norm_input(&ctx, hidden, t, rms_norm_eps)?;
 
@@ -333,16 +385,16 @@ pub(in crate::e2e) fn standard_attention_decode_step(
     state: &mut StandardAttentionState,
     backend: &Backend,
 ) -> Result<Vec<f32>, E2eError> {
+    let dims = StandardAttentionDims::new(attention)?;
+    let StandardAttentionDims {
+        d,
+        h,
+        hkv,
+        hidden,
+        qf,
+        kvf,
+    } = dims;
     let config = &attention.weights.config;
-    let layout = config.layout;
-    let d = layout.head_dimension();
-    let h = layout.query_head_count();
-    let hkv = layout.kv_head_count();
-    let hidden = layout.hidden_features();
-    let qf = checked_mul(h, d)?;
-    let kvf = checked_mul(hkv, d)?;
-
-    validate_gqa_heads(h, hkv)?;
 
     if input.len() != hidden {
         return Err(E2eError::BufferLengthMismatch {
