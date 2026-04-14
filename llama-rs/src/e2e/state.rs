@@ -36,6 +36,9 @@ pub(super) struct Qwen35FullAttentionState {
     pub(super) cached_len: usize,
     /// Features per KV token (`kv_head_count × head_dimension`).
     pub(super) kv_features: usize,
+    /// Set to `true` after the first GPU scoring attempt fails, preventing
+    /// repeated attempts on subsequent decode steps.
+    pub(super) gpu_scoring_failed: bool,
 }
 
 /// Conv buffer + SSM recurrence states for Qwen3.5 linear attention.
@@ -80,6 +83,7 @@ impl Qwen35FullAttentionState {
             v_cache: vec![0.0; cache_size],
             cached_len: 0,
             kv_features,
+            gpu_scoring_failed: false,
         })
     }
 
@@ -202,11 +206,6 @@ impl LinearAttentionState {
             .copy_from_slice(&qkv[src_start..src_start + copy_len]);
         self.conv_valid = rows_to_copy;
         Ok(())
-    }
-
-    /// Capture SSM states from a flat states buffer after prefill.
-    pub(super) fn capture_ssm_states(&mut self, states: &[f32]) {
-        self.ssm_states[..states.len()].copy_from_slice(states);
     }
 }
 

@@ -2,10 +2,15 @@
 
 ## Branch Summary
 
-41 commits implementing a complete Qwen3.5 E2E inference pipeline with
-verified token-ID parity against llama.cpp, plus comprehensive ggml-rs
-API improvements (typed tensors, safe view/reshape wrappers, graph-level
-projections, resumable generation sessions, chat infrastructure).
+71 commits implementing a complete Qwen3.5 E2E inference pipeline with
+verified token-ID parity against llama.cpp (4 prompt lengths tested;
+known precision edge: prompt `[5]` diverges at token 5 due to adjacent
+logits), plus comprehensive ggml-rs API improvements (typed tensors,
+safe view/reshape wrappers, graph-level projections, resumable generation
+sessions, chat infrastructure) and a thorough structural DRY refactoring
+pass (items 34-60).
+
+PR #2 created and reviewed by Copilot — all 6 review comments addressed.
 
 ## Completed Work Items
 
@@ -85,8 +90,8 @@ projections, resumable generation sessions, chat infrastructure).
 
 ## Test Coverage
 
-- **192 tests** pass with `--features link-system` (1 ignored: upstream suite)
-- **0 clippy warnings** (2 expected `too_many_arguments` in llama-rs, not errors)
+- **222 tests** pass with `--features link-system` (7 ignored: benchmark + upstream suite)
+- **0 clippy warnings** across entire workspace (pre-existing warnings resolved: `#[allow]` on C-API-mirroring functions, `identity_op` fix)
 - **0 fmt issues**
 - Key test categories:
   - 18 type system tests
@@ -102,6 +107,28 @@ projections, resumable generation sessions, chat infrastructure).
   - 20+ tokenizer/chat unit tests
   - 15 view/reshape wrapper tests (ggml-rs)
   - 1 graph projection parity test (host vs graph)
+  - 7 bench graph tests (attention, linear attention, MLP, LM head, conv/QKV)
+
+## Copilot PR Review — All 6 Issues Fixed
+
+PR #2 received automated code review (27/71 files reviewed, 6 comments).
+All issues addressed in commit `97faee0`:
+
+1. **Overflow check** (numeric.rs): `build_causal_mask_f16_bytes` returns `Result`
+   with `checked_mul` to prevent `seq_len * seq_len * 2` overflow.
+2. **Tuple drop order** (mlp.rs, attention.rs, generation.rs): All 4 persistent
+   builder functions swap return to `(Handle, Context)` so handle drops first.
+3. **Fallback test** (session.rs): Added `#[cfg(test)] persistent_resources_disabled`
+   latch; test now truly forces the fallback code path.
+4. **Persistent vs fallback** (session.rs): `session_b` uses disabled latch to
+   force fallback; verifies both paths independently produce expected token count.
+5. **flash_attn_ext mask validation** (compute.rs): Validates mask type is f16
+   before FFI call. Added `DynTensor::ggml_type()` accessor.
+6. **write_bytes_backend error** (compute.rs): Uses `UnexpectedTensorByteSize`
+   (byte-level) instead of `LengthMismatch` (element-level).
+
+Additional: gated test-only `causal_depthwise_conv_graph` with `#[cfg(test)]`
+to eliminate dead_code warning in lib target.
 
 ## Known Limitations
 
@@ -116,12 +143,11 @@ projections, resumable generation sessions, chat infrastructure).
 - [x] `cargo fmt --all`
 - [x] `cargo clippy --workspace --all-targets`
 - [x] `cargo test --workspace`
-- [x] `cargo test --workspace --features link-system` (192 pass, 1 ignored)
+- [x] `cargo test --workspace --features link-system` (222 pass, 7 ignored)
 - [x] Zero TODOs/FIXMEs in codebase
 - [x] All docs updated and consistent
 - [x] Module doc comments on all e2e submodules
-- [x] INTRODUCTION.md items 1-8 all marked DONE
+- [x] INTRODUCTION.md items 1-8 all marked DONE, items 34-60 documented
 - [x] CPU runtime smoke test: avg=0.252 ms (no regression from 0.256 ms baseline)
 - [x] Metal runtime smoke test: avg=0.595 ms, checksum matches CPU
 - [x] Self code review: no issues found (5 areas verified)
-- [x] PR #1 created: https://github.com/Sanzentyo/ggml-rs/pull/1

@@ -670,6 +670,36 @@ impl Context {
             .map_err(|error| error.with_context("ggml_silu"))
     }
 
+    /// Element-wise sigmoid: σ(x) = 1 / (1 + exp(-x)).
+    pub fn sigmoid<'ctx, T: GgmlElement>(
+        &'ctx self,
+        a: &Tensor<'ctx, T>,
+    ) -> Result<Tensor<'ctx, T>> {
+        let raw = unsafe { ffi::ggml_sigmoid(self.raw.as_ptr(), a.raw.as_ptr()) };
+        self.wrap_typed_tensor(raw)
+            .map_err(|error| error.with_context("ggml_sigmoid"))
+    }
+
+    /// SSM-style depthwise 1D convolution (causal, stride-1).
+    ///
+    /// - `sx`: pre-padded input `[d_conv - 1 + n_tokens, d_inner]` (3D with
+    ///   batch: `[…, d_inner, n_sequences]`). The first `d_conv - 1` positions
+    ///   along dimension 0 are the left-padding (past context or zeros).
+    /// - `c`: kernel weights `[d_conv, d_inner]`.
+    ///
+    /// Returns `[d_inner, n_tokens]` (or 3D with batch).
+    ///
+    /// Only `f32` tensors are supported by the ggml backend kernels.
+    pub fn ssm_conv<'ctx>(
+        &'ctx self,
+        sx: &Tensor<'ctx, f32>,
+        c: &Tensor<'ctx, f32>,
+    ) -> Result<Tensor<'ctx, f32>> {
+        let raw = unsafe { ffi::ggml_ssm_conv(self.raw.as_ptr(), sx.raw.as_ptr(), c.raw.as_ptr()) };
+        self.wrap_typed_tensor(raw)
+            .map_err(|error| error.with_context("ggml_ssm_conv"))
+    }
+
     pub fn rms_norm<'ctx, T: GgmlElement>(
         &'ctx self,
         a: &Tensor<'ctx, T>,
@@ -972,6 +1002,151 @@ impl Context {
             .map_err(|error| error.with_context("ggml_view_4d"))
     }
 
+    // ------------------------------------------------------------------
+    // Cross-context view variants
+    //
+    // These mirror view_1d..view_4d but accept a source tensor from a
+    // longer-lived context.  The `'src: 'ctx` bound ensures the source
+    // data outlives the view: the borrow checker ties `'src` to the
+    // source context (via `Tensor<'src, T>` PhantomData) and `'ctx` to
+    // the creating context.  Dropping the source context while the view
+    // is live is a compile error.
+    // ------------------------------------------------------------------
+
+    /// 1-D view into a tensor from a (possibly different) longer-lived context.
+    pub fn view_1d_of<'ctx, 'src: 'ctx, T: GgmlElement>(
+        &'ctx self,
+        a: &Tensor<'src, T>,
+        ne0: usize,
+        offset: usize,
+    ) -> Result<Tensor<'ctx, T>> {
+        let elem_size = std::mem::size_of::<T>();
+        let inner_bytes = ne0.checked_mul(elem_size).ok_or(Error::Overflow)?;
+        validate_view_extent(a, offset, &[], inner_bytes)?;
+        let ne0 = (ne0)
+            .try_into_checked()
+            .map_err(|source| Error::int_conversion("tensor dimension", source))?;
+        let raw = unsafe { ffi::ggml_view_1d(self.raw.as_ptr(), a.raw.as_ptr(), ne0, offset) };
+        self.wrap_typed_tensor(raw)
+            .map_err(|error| error.with_context("ggml_view_1d_of"))
+    }
+
+    /// 2-D view into a tensor from a (possibly different) longer-lived context.
+    pub fn view_2d_of<'ctx, 'src: 'ctx, T: GgmlElement>(
+        &'ctx self,
+        a: &Tensor<'src, T>,
+        ne0: usize,
+        ne1: usize,
+        nb1: usize,
+        offset: usize,
+    ) -> Result<Tensor<'ctx, T>> {
+        let elem_size = std::mem::size_of::<T>();
+        let inner_bytes = ne0.checked_mul(elem_size).ok_or(Error::Overflow)?;
+        validate_view_extent(a, offset, &[(ne1, nb1)], inner_bytes)?;
+        let ne0 = (ne0)
+            .try_into_checked()
+            .map_err(|source| Error::int_conversion("tensor dimension", source))?;
+        let ne1 = (ne1)
+            .try_into_checked()
+            .map_err(|source| Error::int_conversion("tensor dimension", source))?;
+        let raw =
+            unsafe { ffi::ggml_view_2d(self.raw.as_ptr(), a.raw.as_ptr(), ne0, ne1, nb1, offset) };
+        self.wrap_typed_tensor(raw)
+            .map_err(|error| error.with_context("ggml_view_2d_of"))
+    }
+
+    /// 3-D view into a tensor from a (possibly different) longer-lived context.
+    #[allow(clippy::too_many_arguments)]
+    pub fn view_3d_of<'ctx, 'src: 'ctx, T: GgmlElement>(
+        &'ctx self,
+        a: &Tensor<'src, T>,
+        ne0: usize,
+        ne1: usize,
+        ne2: usize,
+        nb1: usize,
+        nb2: usize,
+        offset: usize,
+    ) -> Result<Tensor<'ctx, T>> {
+        let elem_size = std::mem::size_of::<T>();
+        let inner_bytes = ne0.checked_mul(elem_size).ok_or(Error::Overflow)?;
+        validate_view_extent(a, offset, &[(ne2, nb2), (ne1, nb1)], inner_bytes)?;
+        let ne0 = (ne0)
+            .try_into_checked()
+            .map_err(|source| Error::int_conversion("tensor dimension", source))?;
+        let ne1 = (ne1)
+            .try_into_checked()
+            .map_err(|source| Error::int_conversion("tensor dimension", source))?;
+        let ne2 = (ne2)
+            .try_into_checked()
+            .map_err(|source| Error::int_conversion("tensor dimension", source))?;
+        let raw = unsafe {
+            ffi::ggml_view_3d(
+                self.raw.as_ptr(),
+                a.raw.as_ptr(),
+                ne0,
+                ne1,
+                ne2,
+                nb1,
+                nb2,
+                offset,
+            )
+        };
+        self.wrap_typed_tensor(raw)
+            .map_err(|error| error.with_context("ggml_view_3d_of"))
+    }
+
+    /// 4-D view into a tensor from a (possibly different) longer-lived context.
+    #[allow(clippy::too_many_arguments)]
+    pub fn view_4d_of<'ctx, 'src: 'ctx, T: GgmlElement>(
+        &'ctx self,
+        a: &Tensor<'src, T>,
+        ne0: usize,
+        ne1: usize,
+        ne2: usize,
+        ne3: usize,
+        nb1: usize,
+        nb2: usize,
+        nb3: usize,
+        offset: usize,
+    ) -> Result<Tensor<'ctx, T>> {
+        let elem_size = std::mem::size_of::<T>();
+        let inner_bytes = ne0.checked_mul(elem_size).ok_or(Error::Overflow)?;
+        validate_view_extent(
+            a,
+            offset,
+            &[(ne3, nb3), (ne2, nb2), (ne1, nb1)],
+            inner_bytes,
+        )?;
+        let ne0 = (ne0)
+            .try_into_checked()
+            .map_err(|source| Error::int_conversion("tensor dimension", source))?;
+        let ne1 = (ne1)
+            .try_into_checked()
+            .map_err(|source| Error::int_conversion("tensor dimension", source))?;
+        let ne2 = (ne2)
+            .try_into_checked()
+            .map_err(|source| Error::int_conversion("tensor dimension", source))?;
+        let ne3 = (ne3)
+            .try_into_checked()
+            .map_err(|source| Error::int_conversion("tensor dimension", source))?;
+        let raw = unsafe {
+            ffi::ggml_view_4d(
+                self.raw.as_ptr(),
+                a.raw.as_ptr(),
+                ne0,
+                ne1,
+                ne2,
+                ne3,
+                nb1,
+                nb2,
+                nb3,
+                offset,
+            )
+        };
+        self.wrap_typed_tensor(raw)
+            .map_err(|error| error.with_context("ggml_view_4d_of"))
+    }
+
     pub fn permute<'ctx, T: GgmlElement>(
         &'ctx self,
         a: &Tensor<'ctx, T>,
@@ -1090,6 +1265,64 @@ impl Context {
             .map_err(|error| error.with_context("ggml_rope_ext"))
     }
 
+    /// Flash attention with optional causal mask, ALiBi bias, and logit softcap.
+    ///
+    /// # Tensor shapes
+    ///
+    /// - `q`: `[D, T, H, 1]` — query (head dim, tokens, heads, batch=1)
+    /// - `k`: `[D, Tkv, Hkv, 1]` — key (GQA: `Hkv ≤ H`)
+    /// - `v`: `[D, Tkv, Hkv, 1]` — value
+    /// - `mask`: optional `[Tkv, T, Hmask, 1]` (broadcastable over heads)
+    ///   **Must be f16** — the ggml CPU kernel reads mask values as `ggml_fp16_t`.
+    ///
+    /// # Output
+    ///
+    /// Returns **f32** tensor `[D, H, T, 1]` (note: **permuted** relative to Q).
+    /// Use `permute(result, 0, 2, 1, 3)` then `cont` to restore `[D, T, H, 1]`.
+    ///
+    /// # Parameters
+    ///
+    /// - `scale`: attention scale (typically `1/√D`)
+    /// - `max_bias`: ALiBi positional bias maximum; `0.0` for no bias
+    /// - `logit_softcap`: soft-cap on logits before softmax; `0.0` for no cap
+    #[allow(clippy::too_many_arguments)] // mirrors ggml_flash_attn_ext C API
+    pub fn flash_attn_ext<'ctx>(
+        &'ctx self,
+        q: &Tensor<'ctx, f32>,
+        k: &Tensor<'ctx, f32>,
+        v: &Tensor<'ctx, f32>,
+        mask: Option<&DynTensor<'ctx>>,
+        scale: f32,
+        max_bias: f32,
+        logit_softcap: f32,
+    ) -> Result<Tensor<'ctx, f32>> {
+        if let Some(m) = mask {
+            let actual = m.ggml_type();
+            if actual != Type::F16 {
+                return Err(Error::TypeMismatch {
+                    expected: Type::F16.as_raw(),
+                    actual: actual.as_raw(),
+                });
+            }
+        }
+        let mask_raw = mask.map_or(ptr::null_mut(), |t| t.raw.as_ptr());
+        let raw = unsafe {
+            ffi::ggml_flash_attn_ext(
+                self.raw.as_ptr(),
+                q.raw.as_ptr(),
+                k.raw.as_ptr(),
+                v.raw.as_ptr(),
+                mask_raw,
+                scale,
+                max_bias,
+                logit_softcap,
+            )
+        };
+        self.wrap_typed_tensor(raw)
+            .map_err(|error| error.with_context("ggml_flash_attn_ext"))
+    }
+
+    /// Creates a new computation graph.
     pub fn new_graph(&self) -> Result<Graph<'_>> {
         let raw = unsafe { ffi::ggml_new_graph(self.raw.as_ptr()) };
         self.wrap_graph(raw)
@@ -1245,6 +1478,11 @@ impl<'ctx> DynTensor<'ctx> {
         unsafe { ffi::ggml_nbytes(self.raw.as_ptr()) }
     }
 
+    /// Returns the ggml element type of this tensor.
+    pub fn ggml_type(&self) -> Type {
+        Type::from_raw(unsafe { self.raw.as_ref().type_ } as c_int)
+    }
+
     pub fn set_name(&self, name: &str) -> Result<()> {
         let name = CString::new(name)?;
         let raw = unsafe { ffi::ggml_set_name(self.raw.as_ptr(), name.as_ptr()) };
@@ -1275,6 +1513,24 @@ impl<'ctx> DynTensor<'ctx> {
             _ctx: PhantomData,
             _type: PhantomData,
         })
+    }
+
+    /// Writes raw bytes to the tensor through the backend API.
+    ///
+    /// The caller must ensure that `data` matches the tensor's byte size
+    /// (i.e., `data.len() == self.nbytes()`).
+    pub fn write_bytes_backend(&self, data: &[u8]) -> Result<()> {
+        let expected = self.nbytes();
+        if data.len() != expected {
+            return Err(Error::UnexpectedTensorByteSize {
+                expected,
+                actual: data.len(),
+            });
+        }
+        unsafe {
+            ffi::ggml_backend_tensor_set(self.raw.as_ptr(), data.as_ptr().cast(), 0, expected);
+        }
+        Ok(())
     }
 }
 
@@ -1887,5 +2143,96 @@ fn ensure_matmul_compatible(lhs_cols: usize, rhs_cols: usize) -> Result<()> {
         Ok(())
     } else {
         Err(Error::IncompatibleMatmulShapes { lhs_cols, rhs_cols })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// GraphAllocator — pre-reserved graph-level memory allocator
+// ---------------------------------------------------------------------------
+
+/// Graph-level memory allocator that pre-reserves device buffers.
+///
+/// Unlike [`Context::allocate_tensors`] which allocates a new backend buffer
+/// per call, `GraphAllocator` reserves a buffer once for the maximum expected
+/// graph size, then reuses that buffer across multiple graph computations.
+///
+/// Tensors that already have a backend buffer assigned (e.g., persistent KV
+/// cache tensors accessed via `view_Nd_of`) are automatically skipped during
+/// allocation.
+///
+/// # Usage pattern
+///
+/// ```ignore
+/// let mut gallocr = GraphAllocator::new(&backend)?;
+///
+/// // Reserve for the maximum graph size (e.g., at max sequence length).
+/// gallocr.reserve(&max_graph)?;
+///
+/// // Per-step: build a graph and allocate from the pre-reserved buffer.
+/// gallocr.alloc_graph(&mut step_graph)?;
+/// // ... write inputs, compute, read outputs ...
+/// // step graph/context can be dropped; buffer persists for the next step.
+/// ```
+///
+/// # Safety invariant
+///
+/// The `GraphAllocator` must outlive any [`Context`] whose graph tensors it
+/// has allocated. In practice, create the allocator at an outer scope and
+/// build ephemeral contexts within inner scopes.
+pub struct GraphAllocator {
+    raw: NonNull<ffi::ggml_gallocr>,
+    _not_send_sync: PhantomData<*mut ()>,
+}
+
+impl GraphAllocator {
+    /// Creates a new graph allocator for the given backend's default buffer type.
+    pub fn new(backend: &Backend) -> Result<Self> {
+        let buft = unsafe { ffi::ggml_backend_get_default_buffer_type(backend.raw.as_ptr()) };
+        let raw = unsafe { ffi::ggml_gallocr_new(buft) };
+        let raw = NonNull::new(raw).ok_or_else(|| Error::null_pointer("ggml_gallocr_new"))?;
+        Ok(Self {
+            raw,
+            _not_send_sync: PhantomData,
+        })
+    }
+
+    /// Reserves memory for the maximum expected graph size.
+    ///
+    /// Call this once with the largest graph you expect to use. Subsequent
+    /// calls to [`alloc_graph`](Self::alloc_graph) reuse this buffer as long
+    /// as the graph fits. If a later graph exceeds the reservation, the
+    /// underlying ggml allocator will re-reserve automatically.
+    pub fn reserve(&mut self, graph: &Graph<'_>) -> Result<()> {
+        let ok = unsafe { ffi::ggml_gallocr_reserve(self.raw.as_ptr(), graph.raw.as_ptr()) };
+        if ok {
+            Ok(())
+        } else {
+            Err(Error::allocation_failed("ggml_gallocr_reserve"))
+        }
+    }
+
+    /// Allocates tensor memory from the pre-reserved buffer for this graph.
+    ///
+    /// Tensors with existing backend buffers are skipped automatically. The
+    /// allocated tensor data remains valid until the next `alloc_graph` call
+    /// or until this `GraphAllocator` is dropped.
+    pub fn alloc_graph(&mut self, graph: &mut Graph<'_>) -> Result<()> {
+        let ok = unsafe { ffi::ggml_gallocr_alloc_graph(self.raw.as_ptr(), graph.raw.as_ptr()) };
+        if ok {
+            Ok(())
+        } else {
+            Err(Error::allocation_failed("ggml_gallocr_alloc_graph"))
+        }
+    }
+
+    /// Returns the size of the reserved buffer in bytes for buffer index 0.
+    pub fn buffer_size(&self) -> usize {
+        unsafe { ffi::ggml_gallocr_get_buffer_size(self.raw.as_ptr(), 0) }
+    }
+}
+
+impl Drop for GraphAllocator {
+    fn drop(&mut self) {
+        unsafe { ffi::ggml_gallocr_free(self.raw.as_ptr()) }
     }
 }

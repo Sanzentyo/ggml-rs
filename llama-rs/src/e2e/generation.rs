@@ -11,6 +11,8 @@
 //! [`PrefillStrategy`] (captures state), and [`DecodeStrategy`] (uses state).
 
 use super::attention::{
+    PersistentKvCache, PersistentScoringContext, QkvProjections, build_persistent_kv_cache,
+    full_attention_decode_core, full_attention_hidden_features, prepare_qkv_from_raw,
     qwen35_full_attention_decode_step, qwen35_full_attention_inference,
     qwen35_full_attention_prefill,
 };
@@ -18,22 +20,32 @@ use super::config::{E2eGenerationConfig, E2eGenerationReport};
 use super::decode::decode_norm_tensor;
 use super::error::E2eError;
 use super::linear_attention::{
+    LinearDecodeScratch, LinearProjections, linear_attention_conv_channels,
+    linear_attention_decode_core, linear_attention_hidden_features,
     qwen35_linear_attention_decode_step, qwen35_linear_attention_inference,
     qwen35_linear_attention_prefill,
 };
-use super::mlp::mlp_sequence_inference_with_weights;
+use super::mlp::{PersistentMlp, build_persistent_mlp, mlp_sequence_inference_with_weights};
 use super::numeric::{checked_mul, validate_token_id, value_to_i32};
-use super::plan::{AttentionLayerPlan, LayerPlan};
+use super::plan::{
+    AttentionLayerPlan, LayerPlan, Qwen35FullAttentionLayerPlan, Qwen35LinearAttentionLayerPlan,
+};
 use super::planner::build_layer_plans;
 use super::resolve::resolve_global_tensor_names;
 use super::state::{GenerationState, LayerAttentionState};
-use super::tensor_ops::{add_in_place, gather_embeddings, rms_norm_with_weight};
+use super::tensor_ops::{
+    PersistentDecodeProjection, add_in_place, build_lm_head_graph,
+    build_persistent_full_attention_graphs, build_persistent_linear_attention_graphs,
+    gather_embeddings, lm_head_sample_step, recommended_lm_head_memory,
+    recommended_persistent_full_attention_memory, recommended_persistent_linear_attention_memory,
+    rms_norm_with_weight, upload_weight,
+};
 use crate::backend::ensure_backends_loaded;
 use crate::inference::attention_inference_with_weights_on_backend_repeats_with_length;
 use crate::metadata::resolve_transformer_metadata;
 use crate::model::GgufModel;
 use crate::tokenizer::tokenize_text_prompt;
-use ggml_rs::Backend;
+use ggml_rs::{Backend, Context};
 use std::path::Path;
 use std::time::Instant;
 
@@ -84,12 +96,16 @@ pub(super) struct GenerationOutput {
 /// - [`InferenceStrategy`]: stateless, full-reprocess (supports all layer types)
 /// - [`PrefillStrategy`]: captures per-layer state during prompt processing
 /// - [`DecodeStrategy`]: uses cached state for single-token decode
+///
+/// For Qwen3.5 layers, `input` is un-normed; the norm is done in-graph.
+/// For `Standard` attention and decode paths, the strategy applies host-side
+/// norm internally before dispatching.
 pub(super) trait AttentionStrategy {
     fn process_attention(
         &mut self,
         layer_idx: usize,
         attention: &AttentionLayerPlan,
-        normalized_input: &[f32],
+        input: &[f32],
         seq_len: usize,
         rms_norm_eps: f32,
         backend: &Backend,
@@ -104,16 +120,25 @@ impl AttentionStrategy for InferenceStrategy {
         &mut self,
         _layer_idx: usize,
         attention: &AttentionLayerPlan,
-        normalized_input: &[f32],
+        input: &[f32],
         seq_len: usize,
         rms_norm_eps: f32,
         backend: &Backend,
     ) -> Result<Vec<f32>, E2eError> {
         match attention {
             AttentionLayerPlan::Standard(attn) => {
+                // Standard attention expects pre-normed input (host-side).
+                let hidden_features = attn.norm_values.len();
+                let normalized = rms_norm_with_weight(
+                    input,
+                    hidden_features,
+                    seq_len,
+                    &attn.norm_values,
+                    rms_norm_eps,
+                )?;
                 attention_inference_with_weights_on_backend_repeats_with_length(
                     &attn.weights,
-                    normalized_input,
+                    &normalized,
                     seq_len,
                     backend,
                     1,
@@ -127,16 +152,18 @@ impl AttentionStrategy for InferenceStrategy {
             }
             AttentionLayerPlan::Qwen35Full(attn) => qwen35_full_attention_inference(
                 attn,
-                normalized_input,
+                input,
                 seq_len,
                 rms_norm_eps,
+                attention.norm_values(),
                 backend,
             ),
             AttentionLayerPlan::Qwen35Linear(attn) => qwen35_linear_attention_inference(
                 attn,
-                normalized_input,
+                input,
                 seq_len,
                 rms_norm_eps,
+                attention.norm_values(),
                 backend,
             ),
         }
@@ -153,7 +180,7 @@ impl AttentionStrategy for PrefillStrategy<'_> {
         &mut self,
         layer_idx: usize,
         attention: &AttentionLayerPlan,
-        normalized_input: &[f32],
+        input: &[f32],
         seq_len: usize,
         rms_norm_eps: f32,
         backend: &Backend,
@@ -162,9 +189,10 @@ impl AttentionStrategy for PrefillStrategy<'_> {
             (AttentionLayerPlan::Qwen35Full(attn), LayerAttentionState::Qwen35Full(s)) => {
                 qwen35_full_attention_prefill(
                     attn,
-                    normalized_input,
+                    input,
                     seq_len,
                     rms_norm_eps,
+                    attention.norm_values(),
                     s,
                     backend,
                 )
@@ -172,9 +200,10 @@ impl AttentionStrategy for PrefillStrategy<'_> {
             (AttentionLayerPlan::Qwen35Linear(attn), LayerAttentionState::Qwen35Linear(s)) => {
                 qwen35_linear_attention_prefill(
                     attn,
-                    normalized_input,
+                    input,
                     seq_len,
                     rms_norm_eps,
+                    attention.norm_values(),
                     s,
                     backend,
                 )
@@ -194,19 +223,27 @@ impl AttentionStrategy for DecodeStrategy<'_> {
         &mut self,
         layer_idx: usize,
         attention: &AttentionLayerPlan,
-        normalized_input: &[f32],
+        input: &[f32],
         seq_len: usize,
         rms_norm_eps: f32,
-        _backend: &Backend,
+        backend: &Backend,
     ) -> Result<Vec<f32>, E2eError> {
         debug_assert_eq!(seq_len, 1, "DecodeStrategy expects single-token input");
         let _ = seq_len;
+
+        // Decode path: host-side norm before dispatch.
+        // The hidden_features dimension is inferred from the norm weight vector.
+        let norm_weight = attention.norm_values();
+        let hidden_features = norm_weight.len();
+        let normalized =
+            rms_norm_with_weight(input, hidden_features, 1, norm_weight, rms_norm_eps)?;
+
         match (attention, &mut self.state.layers[layer_idx]) {
             (AttentionLayerPlan::Qwen35Full(attn), LayerAttentionState::Qwen35Full(s)) => {
-                qwen35_full_attention_decode_step(attn, normalized_input, rms_norm_eps, s)
+                qwen35_full_attention_decode_step(attn, &normalized, rms_norm_eps, s, backend)
             }
             (AttentionLayerPlan::Qwen35Linear(attn), LayerAttentionState::Qwen35Linear(s)) => {
-                qwen35_linear_attention_decode_step(attn, normalized_input, rms_norm_eps, s)
+                qwen35_linear_attention_decode_step(attn, &normalized, rms_norm_eps, s, backend)
             }
             _ => Err(E2eError::UnsupportedTwoPhase),
         }
@@ -218,28 +255,30 @@ impl AttentionStrategy for DecodeStrategy<'_> {
 // ---------------------------------------------------------------------------
 
 /// Process all layers using the given attention strategy.
+///
+/// Attention norm is now done in-graph by each strategy (or host-side for
+/// decode/Standard). MLP norm is done in-graph by the MLP function. The
+/// generation loop passes un-normed `hidden` throughout.
 pub(super) fn process_all_layers(
     hidden: &mut [f32],
     layer_plans: &[LayerPlan],
     strategy: &mut impl AttentionStrategy,
-    hidden_features: usize,
     seq_len: usize,
     rms_norm_eps: f32,
     backend: &Backend,
+    persistent_mlps: &mut [Option<PersistentMlp<'static>>],
 ) -> Result<(), E2eError> {
+    debug_assert!(
+        persistent_mlps.is_empty() || persistent_mlps.len() == layer_plans.len(),
+        "persistent_mlps must be empty (disabled) or aligned to layer_plans"
+    );
+
     for (layer_idx, layer_plan) in layer_plans.iter().enumerate() {
         if let Some(attention) = &layer_plan.attention {
-            let normalized_attn = rms_norm_with_weight(
-                hidden,
-                hidden_features,
-                seq_len,
-                attention.norm_values(),
-                rms_norm_eps,
-            )?;
             let attention_output = strategy.process_attention(
                 layer_idx,
                 attention,
-                &normalized_attn,
+                hidden,
                 seq_len,
                 rms_norm_eps,
                 backend,
@@ -247,41 +286,678 @@ pub(super) fn process_all_layers(
             add_in_place(hidden, &attention_output)?;
         }
 
-        let normalized_ffn = rms_norm_with_weight(
-            hidden,
-            hidden_features,
-            seq_len,
-            &layer_plan.mlp.norm_values,
-            rms_norm_eps,
-        )?;
-        let mlp_output = mlp_sequence_inference_with_weights(
-            &layer_plan.mlp.weights,
-            &normalized_ffn,
-            seq_len,
-            backend,
-        )?;
+        let mlp_output = if let Some(Some(mlp)) = persistent_mlps.get_mut(layer_idx) {
+            mlp.step(hidden, backend)?
+        } else {
+            mlp_sequence_inference_with_weights(
+                &layer_plan.mlp.weights,
+                hidden,
+                seq_len,
+                &layer_plan.mlp.norm_values,
+                rms_norm_eps,
+                backend,
+            )?
+        };
         add_in_place(hidden, &mlp_output)?;
     }
     Ok(())
 }
 
-/// Normalize the final hidden state and greedily sample the next token.
-fn sample_next_token(
+// ---------------------------------------------------------------------------
+// Persistent decode projections: build once, step per-token
+// ---------------------------------------------------------------------------
+
+type PersistentProjectionSets = (
+    Vec<Option<Context>>,
+    Vec<Option<PersistentDecodeProjection<'static>>>,
+);
+
+/// Attempt to build persistent projection contexts and graphs for all layers.
+///
+/// Returns `None` on any failure (opportunistic — caller falls back to
+/// `DecodeStrategy`). On success returns `(contexts, projections)` where both
+/// vecs are aligned to `layer_plans` and each slot is `Some` for attention
+/// layers, `None` otherwise.
+fn try_build_persistent_projections(
+    layer_plans: &[LayerPlan],
+    backend: &Backend,
+) -> Option<PersistentProjectionSets> {
+    // SAFETY reasoning for the 'static transmute below:
+    //
+    // `Tensor<'ctx, T>`, `Graph<'ctx>`, and `BackendBuffer<'ctx>` all carry
+    // `PhantomData<&'ctx Context>` — they contain raw pointers, not actual
+    // Rust references.  The lifetime exists solely so the borrow-checker can
+    // enforce "Context outlives its derived handles" at the API boundary.
+    //
+    // Inside `two_phase_loop` we store `proj_ctxs` (the owning `Vec<Option<Context>>`)
+    // and `decode_projs` (the derived handles) as sibling locals declared in
+    // strict order so that `decode_projs` drops *before* `proj_ctxs`.
+    // This maintains the real invariant: handles never outlive their context.
+    //
+    // The transmute erases the unnameable local borrow `'ctx` that would
+    // otherwise require GATs or self-referential structs.  Because both
+    // containers live for the same scope and drop in the correct order, this
+    // is sound.
+
+    let mut contexts: Vec<Option<Context>> = Vec::with_capacity(layer_plans.len());
+    let mut projections: Vec<Option<PersistentDecodeProjection<'static>>> =
+        Vec::with_capacity(layer_plans.len());
+
+    for layer_plan in layer_plans {
+        let attention = match &layer_plan.attention {
+            Some(a) => a,
+            None => {
+                contexts.push(None);
+                projections.push(None);
+                continue;
+            }
+        };
+
+        let result: Result<(PersistentDecodeProjection<'static>, Context), E2eError> =
+            match attention {
+                AttentionLayerPlan::Qwen35Full(attn) => build_one_persistent_full(attn, backend),
+                AttentionLayerPlan::Qwen35Linear(attn) => {
+                    build_one_persistent_linear(attn, backend)
+                }
+                AttentionLayerPlan::Standard(_) => {
+                    // Standard attention doesn't support persistent projections.
+                    return None;
+                }
+            };
+
+        match result {
+            Ok((proj, ctx)) => {
+                contexts.push(Some(ctx));
+                projections.push(Some(proj));
+            }
+            Err(_) => return None, // Any failure → give up on persistent path
+        }
+    }
+
+    debug_assert_eq!(contexts.len(), layer_plans.len());
+    debug_assert_eq!(projections.len(), layer_plans.len());
+    Some((contexts, projections))
+}
+
+fn build_one_persistent_full(
+    attn: &Qwen35FullAttentionLayerPlan,
+    backend: &Backend,
+) -> Result<(PersistentDecodeProjection<'static>, Context), E2eError> {
+    let hidden_features = full_attention_hidden_features(attn)?;
+    let query_features = checked_mul(attn.head_count, attn.head_dimension)?;
+    let kv_features = checked_mul(attn.kv_head_count, attn.head_dimension)?;
+    let query_features_x2 = checked_mul(query_features, 2)?;
+
+    let ctx_size = recommended_persistent_full_attention_memory(
+        hidden_features,
+        query_features_x2,
+        kv_features,
+        query_features,
+    )?;
+    let ctx = Context::new_no_alloc_bytes(ctx_size)
+        .map_err(|source| E2eError::ggml("Context(pfa)", source))?;
+
+    let g = build_persistent_full_attention_graphs(
+        &ctx,
+        hidden_features,
+        query_features_x2,
+        kv_features,
+        query_features,
+    )?;
+
+    let buffer = ctx
+        .allocate_tensors(backend)
+        .map_err(|source| E2eError::ggml("allocate(pfa)", source))?;
+
+    upload_weight(&g.w_q, &attn.q_weight_values, "write<W_Q>(pfa)")?;
+    upload_weight(&g.w_k, &attn.k_weight_values, "write<W_K>(pfa)")?;
+    upload_weight(&g.w_v, &attn.v_weight_values, "write<W_V>(pfa)")?;
+    upload_weight(&g.output.w, &attn.output_weight_values, "write<W_OUT>(pfa)")?;
+
+    // SAFETY: see the comment block in `try_build_persistent_projections`.
+    let proj = unsafe {
+        std::mem::transmute::<PersistentDecodeProjection<'_>, PersistentDecodeProjection<'static>>(
+            PersistentDecodeProjection::FullAttention {
+                x_in: g.x_in,
+                q_out: g.q_out,
+                k_out: g.k_out,
+                v_out: g.v_out,
+                input_graph: g.input_graph,
+                output: g.output,
+                _buffer: buffer,
+            },
+        )
+    };
+    Ok((proj, ctx))
+}
+
+fn build_one_persistent_linear(
+    attn: &Qwen35LinearAttentionLayerPlan,
+    backend: &Backend,
+) -> Result<(PersistentDecodeProjection<'static>, Context), E2eError> {
+    let hidden_features = linear_attention_hidden_features(attn)?;
+    let conv_channels = linear_attention_conv_channels(attn)?;
+    let inner_size = attn.inner_size;
+    let time_step_rank = attn.time_step_rank;
+
+    let ctx_size = recommended_persistent_linear_attention_memory(
+        hidden_features,
+        conv_channels,
+        inner_size,
+        time_step_rank,
+    )?;
+    let ctx = Context::new_no_alloc_bytes(ctx_size)
+        .map_err(|source| E2eError::ggml("Context(pla)", source))?;
+
+    let g = build_persistent_linear_attention_graphs(
+        &ctx,
+        hidden_features,
+        conv_channels,
+        inner_size,
+        time_step_rank,
+    )?;
+
+    let buffer = ctx
+        .allocate_tensors(backend)
+        .map_err(|source| E2eError::ggml("allocate(pla)", source))?;
+
+    upload_weight(&g.w_qkv, &attn.qkv_weight_values, "write<W_QKV>(pla)")?;
+    upload_weight(&g.w_z, &attn.gate_weight_values, "write<W_Z>(pla)")?;
+    upload_weight(&g.w_alpha, &attn.alpha_weight_values, "write<W_ALPHA>(pla)")?;
+    upload_weight(&g.w_beta, &attn.beta_weight_values, "write<W_BETA>(pla)")?;
+    upload_weight(
+        &g.output.w,
+        &attn.ssm_out_weight_values,
+        "write<W_OUT>(pla)",
+    )?;
+
+    let proj = unsafe {
+        std::mem::transmute::<PersistentDecodeProjection<'_>, PersistentDecodeProjection<'static>>(
+            PersistentDecodeProjection::LinearAttention {
+                x_in: g.x_in,
+                qkv_out: g.qkv_out,
+                z_out: g.z_out,
+                alpha_out: g.alpha_out,
+                beta_out: g.beta_out,
+                input_graph: g.input_graph,
+                output: g.output,
+                _buffer: buffer,
+            },
+        )
+    };
+    Ok((proj, ctx))
+}
+
+type PersistentKvCacheSets = (
+    Vec<Option<Context>>,
+    Vec<Option<PersistentKvCache<'static>>>,
+);
+
+/// Attempt to build persistent backend-resident KV caches for all full
+/// attention layers.
+///
+/// Returns `None` on any failure. Linear attention layers get `None` slots
+/// (they have no quadratic KV cache). The `max_tokens` budget is shared
+/// across all layers.
+fn try_build_persistent_kv_caches(
+    layer_plans: &[LayerPlan],
+    max_tokens: usize,
+    backend: &Backend,
+) -> Option<PersistentKvCacheSets> {
+    let mut contexts: Vec<Option<Context>> = Vec::with_capacity(layer_plans.len());
+    let mut caches: Vec<Option<PersistentKvCache<'static>>> = Vec::with_capacity(layer_plans.len());
+
+    for layer_plan in layer_plans {
+        match &layer_plan.attention {
+            Some(AttentionLayerPlan::Qwen35Full(attn)) => {
+                match build_persistent_kv_cache(attn, max_tokens, backend) {
+                    Ok((cache, ctx)) => {
+                        contexts.push(Some(ctx));
+                        caches.push(Some(cache));
+                    }
+                    Err(_) => return None,
+                }
+            }
+            _ => {
+                // Linear or missing — no persistent KV cache.
+                contexts.push(None);
+                caches.push(None);
+            }
+        }
+    }
+
+    debug_assert_eq!(contexts.len(), layer_plans.len());
+    debug_assert_eq!(caches.len(), layer_plans.len());
+    Some((contexts, caches))
+}
+
+type PersistentMlpSets = (Vec<Option<Context>>, Vec<Option<PersistentMlp<'static>>>);
+
+/// Attempt to build persistent MLP graphs for all layers (per-layer opportunistic).
+///
+/// Each layer is built independently — if one fails, it gets `None` and falls
+/// back to the ephemeral `mlp_sequence_inference_with_weights` path. Returns
+/// aligned vecs (one slot per layer plan).
+fn try_build_persistent_mlps(
+    layer_plans: &[LayerPlan],
+    rms_norm_eps: f32,
+    backend: &Backend,
+) -> PersistentMlpSets {
+    // Transmute is handled inside `build_persistent_mlp` (same pattern as
+    // `build_one_persistent_full`). Callers maintain LIFO drop order.
+
+    let mut contexts: Vec<Option<Context>> = Vec::with_capacity(layer_plans.len());
+    let mut mlps: Vec<Option<PersistentMlp<'static>>> = Vec::with_capacity(layer_plans.len());
+
+    for layer_plan in layer_plans {
+        let mlp_plan = &layer_plan.mlp;
+        match build_persistent_mlp(
+            &mlp_plan.weights,
+            &mlp_plan.norm_values,
+            rms_norm_eps,
+            backend,
+        ) {
+            Ok((mlp, ctx)) => {
+                contexts.push(Some(ctx));
+                mlps.push(Some(mlp));
+            }
+            Err(_) => {
+                contexts.push(None);
+                mlps.push(None);
+            }
+        }
+    }
+
+    debug_assert_eq!(contexts.len(), layer_plans.len());
+    debug_assert_eq!(mlps.len(), layer_plans.len());
+    (contexts, mlps)
+}
+
+// ---------------------------------------------------------------------------
+// LmHeadResources: persistent LM head graph — build once, sample per token
+// ---------------------------------------------------------------------------
+
+/// Persistent LM head graph resources for GPU-accelerated greedy sampling.
+///
+/// Built once from model weights; reused every decode step. Encapsulates the
+/// ggml context, buffer, graph tensors, and graph in a self-contained struct
+/// with correct drop ordering (tensors/graph before context/buffer).
+pub(super) struct LmHeadResources {
+    // Graph tensors referencing _ctx (dropped first)
+    x_in: ggml_rs::Tensor<'static, f32>,
+    logits_t: ggml_rs::Tensor<'static, f32>,
+    graph: ggml_rs::Graph<'static>,
+    // Context + buffer (dropped last — keep tensor memory alive)
+    _buffer: ggml_rs::BackendBuffer<'static>,
+    _ctx: Context,
+}
+
+impl LmHeadResources {
+    /// Build persistent LM head graph and upload weights.
+    ///
+    /// Returns `None` if any step fails (context allocation, graph build,
+    /// weight upload). Callers fall back to host-side greedy sampling.
+    pub(super) fn try_build(
+        hidden_features: usize,
+        vocab_size: usize,
+        rms_norm_eps: f32,
+        output_weight_values: &[f32],
+        output_norm_values: &[f32],
+        backend: &Backend,
+    ) -> Option<Self> {
+        let ctx_size = recommended_lm_head_memory(hidden_features, vocab_size).ok()?;
+        let ctx = Context::new_no_alloc_bytes(ctx_size).ok()?;
+        let parts = build_lm_head_graph(&ctx, hidden_features, vocab_size, rms_norm_eps).ok()?;
+        let buffer = ctx.allocate_tensors(backend).ok()?;
+        parts.w_out.write_data_backend(output_weight_values).ok()?;
+        parts.norm_w.write_data_backend(output_norm_values).ok()?;
+
+        // SAFETY: ctx and buffer kept alive as struct fields; drop order
+        // (declaration order, top→bottom) ensures tensors/graph drop before ctx/buffer.
+        let x_in = unsafe {
+            std::mem::transmute::<ggml_rs::Tensor<'_, f32>, ggml_rs::Tensor<'static, f32>>(
+                parts.x_in,
+            )
+        };
+        let logits_t = unsafe {
+            std::mem::transmute::<ggml_rs::Tensor<'_, f32>, ggml_rs::Tensor<'static, f32>>(
+                parts.logits,
+            )
+        };
+        let graph = unsafe {
+            std::mem::transmute::<ggml_rs::Graph<'_>, ggml_rs::Graph<'static>>(parts.graph)
+        };
+        let _buffer = unsafe {
+            std::mem::transmute::<ggml_rs::BackendBuffer<'_>, ggml_rs::BackendBuffer<'static>>(
+                buffer,
+            )
+        };
+
+        Some(Self {
+            x_in,
+            logits_t,
+            graph,
+            _buffer,
+            _ctx: ctx,
+        })
+    }
+
+    /// Sample one token from a single hidden state vector via the GPU graph.
+    pub(super) fn sample_hidden(
+        &mut self,
+        hidden_state: &[f32],
+        backend: &Backend,
+    ) -> Result<i32, E2eError> {
+        lm_head_sample_step(
+            hidden_state,
+            &self.x_in,
+            &self.logits_t,
+            &mut self.graph,
+            backend,
+        )
+    }
+}
+
+// ---------------------------------------------------------------------------
+// PersistentDecodeResources: unified persistent resource bundle
+// ---------------------------------------------------------------------------
+
+/// All GPU-resident persistent resources needed for optimized decode.
+///
+/// Field ordering is **safety-critical**: resources that reference contexts must
+/// be declared (and thus dropped) *before* the contexts that own the underlying
+/// ggml memory.  Rust drops struct fields in declaration order (top to bottom).
+///
+/// The struct is built once after prefill and reused for every decode step.
+/// Individual resource groups are independently optional — a failure in one
+/// (e.g., KV cache) does not prevent others (e.g., MLPs) from being used.
+pub(super) struct PersistentDecodeResources {
+    // --- Resources referencing contexts (dropped first) ---
+    pub scoring_ctx: Option<PersistentScoringContext>,
+    pub linear_scratch: Option<LinearDecodeScratch>,
+    pub persistent_mlps: Vec<Option<PersistentMlp<'static>>>,
+    pub decode_projs: Option<Vec<Option<PersistentDecodeProjection<'static>>>>,
+    pub kv_caches: Vec<Option<PersistentKvCache<'static>>>,
+
+    // LM head (self-contained: owns its own context + buffer)
+    lm_head: LmHeadResources,
+
+    // --- Contexts (dropped last — keeps tensor memory alive) ---
+    _mlp_ctxs: Vec<Option<Context>>,
+    _proj_ctxs: Vec<Option<Context>>,
+    _kv_ctxs: Vec<Option<Context>>,
+}
+
+impl PersistentDecodeResources {
+    /// Build persistent decode resources from layer plans and model weights.
+    ///
+    /// The LM head must be pre-built by the caller. Projections, KV caches,
+    /// scoring context, linear scratch, and MLPs are each independently
+    /// optional — a failure in one category does not affect others.
+    pub(super) fn try_build(
+        layer_plans: &[LayerPlan],
+        lm_head: LmHeadResources,
+        rms_norm_eps: f32,
+        total_sequence_length: usize,
+        backend: &Backend,
+    ) -> Self {
+        // 1. Persistent MLPs (per-layer opportunistic)
+        let (_mlp_ctxs, persistent_mlps) =
+            try_build_persistent_mlps(layer_plans, rms_norm_eps, backend);
+
+        // 3. Persistent projections (all-or-nothing per attention type)
+        let persistent = try_build_persistent_projections(layer_plans, backend);
+        let (_proj_ctxs, decode_projs) = match persistent {
+            Some((ctxs, projs)) => (ctxs, Some(projs)),
+            None => (Vec::new(), None),
+        };
+
+        // 4. Persistent KV caches (requires projections to be useful)
+        let kv_persistent =
+            try_build_persistent_kv_caches(layer_plans, total_sequence_length, backend);
+        let (_kv_ctxs, kv_caches) = match kv_persistent {
+            Some((ctxs, caches)) => (ctxs, caches),
+            None => {
+                let empty: Vec<Option<PersistentKvCache<'static>>> =
+                    (0..layer_plans.len()).map(|_| None).collect();
+                (Vec::new(), empty)
+            }
+        };
+
+        // 5. Persistent scoring context (requires KV caches)
+        let scoring_ctx = kv_caches
+            .iter()
+            .zip(layer_plans.iter())
+            .find_map(|(kv, lp)| {
+                if let (Some(kv), Some(AttentionLayerPlan::Qwen35Full(attn))) =
+                    (kv, lp.attention.as_ref())
+                {
+                    Some((attn, kv))
+                } else {
+                    None
+                }
+            })
+            .and_then(|(attn, kv)| {
+                PersistentScoringContext::new(attn, total_sequence_length, kv, backend).ok()
+            });
+
+        // 6. Linear attention scratch buffers
+        let linear_scratch = layer_plans.iter().find_map(|lp| {
+            if let Some(AttentionLayerPlan::Qwen35Linear(attn)) = lp.attention.as_ref() {
+                Some(LinearDecodeScratch::new(attn.state_size, attn.inner_size))
+            } else {
+                None
+            }
+        });
+
+        Self {
+            scoring_ctx,
+            linear_scratch,
+            persistent_mlps,
+            decode_projs,
+            kv_caches,
+            lm_head,
+            _mlp_ctxs,
+            _proj_ctxs,
+            _kv_ctxs,
+        }
+    }
+
+    /// Seed persistent KV caches from host-side prefill state.
+    pub(super) fn seed_kv_caches(&self, state: &GenerationState) {
+        for (layer_idx, cache) in self.kv_caches.iter().enumerate() {
+            if let (Some(cache), Some(LayerAttentionState::Qwen35Full(s))) =
+                (cache, state.layers.get(layer_idx))
+            {
+                let _ = cache.seed_from_host(&s.k_cache, &s.v_cache, s.token_count());
+            }
+        }
+    }
+
+    /// Run one LM head sampling step on a single-token hidden state.
+    pub(super) fn sample_token(
+        &mut self,
+        hidden: &[f32],
+        token_index: usize,
+        hidden_features: usize,
+        backend: &Backend,
+    ) -> Result<i32, E2eError> {
+        let offset = checked_mul(token_index, hidden_features)?;
+        let last_hidden = &hidden[offset..offset + hidden_features];
+        self.lm_head.sample_hidden(last_hidden, backend)
+    }
+
+    /// Run one decode step through all layers using persistent resources.
+    ///
+    /// If persistent projections are available, uses the fast path
+    /// (inline persistent decode). Otherwise falls back to
+    /// `DecodeStrategy` with `process_all_layers`.
+    pub(super) fn decode_step(
+        &mut self,
+        hidden: &mut [f32],
+        layer_plans: &[LayerPlan],
+        state: &mut GenerationState,
+        hidden_features: usize,
+        rms_norm_eps: f32,
+        backend: &Backend,
+    ) -> Result<(), E2eError> {
+        if self.decode_projs.is_some() {
+            self.persistent_decode_all_layers(
+                hidden,
+                layer_plans,
+                state,
+                hidden_features,
+                rms_norm_eps,
+                backend,
+            )
+        } else {
+            // Fallback: per-token weight upload for attention, but persistent MLPs
+            let mut strategy = DecodeStrategy { state };
+            process_all_layers(
+                hidden,
+                layer_plans,
+                &mut strategy,
+                1,
+                rms_norm_eps,
+                backend,
+                &mut self.persistent_mlps,
+            )
+        }
+    }
+
+    /// Process all layers in decode mode using persistent projections.
+    ///
+    /// For each layer: host norm → persistent input proj → core logic → persistent
+    /// output proj → residual add → persistent or ephemeral MLP.
+    ///
+    /// Caller must ensure `self.decode_projs.is_some()`.
+    fn persistent_decode_all_layers(
+        &mut self,
+        hidden: &mut [f32],
+        layer_plans: &[LayerPlan],
+        state: &mut GenerationState,
+        hidden_features: usize,
+        rms_norm_eps: f32,
+        backend: &Backend,
+    ) -> Result<(), E2eError> {
+        let projections = self
+            .decode_projs
+            .as_mut()
+            .ok_or(E2eError::UnsupportedTwoPhase)?;
+
+        debug_assert_eq!(layer_plans.len(), projections.len());
+        debug_assert_eq!(layer_plans.len(), self.kv_caches.len());
+        debug_assert!(
+            self.persistent_mlps.is_empty() || self.persistent_mlps.len() == layer_plans.len(),
+            "persistent_mlps must be empty (disabled) or aligned to layer_plans"
+        );
+
+        for (layer_idx, layer_plan) in layer_plans.iter().enumerate() {
+            if let (Some(attention), Some(proj)) =
+                (&layer_plan.attention, projections[layer_idx].as_mut())
+            {
+                let norm_weight = attention.norm_values();
+                let normalized =
+                    rms_norm_with_weight(hidden, hidden_features, 1, norm_weight, rms_norm_eps)?;
+
+                proj.project_input(&normalized, backend)?;
+
+                let attention_output = match (attention, &mut state.layers[layer_idx]) {
+                    (AttentionLayerPlan::Qwen35Full(attn), LayerAttentionState::Qwen35Full(s)) => {
+                        let QkvProjections {
+                            q_full,
+                            k_proj,
+                            v_proj,
+                        } = proj.read_full_attention_projections()?;
+                        let hf = full_attention_hidden_features(attn)?;
+                        let prepared = prepare_qkv_from_raw(
+                            attn,
+                            q_full,
+                            k_proj,
+                            v_proj,
+                            1,
+                            hf,
+                            rms_norm_eps,
+                        )?;
+                        let sc = self.scoring_ctx.as_mut();
+                        let head_outputs = full_attention_decode_core(
+                            prepared,
+                            attn,
+                            s,
+                            Some(backend),
+                            self.kv_caches[layer_idx].as_ref(),
+                            sc,
+                        )?;
+                        proj.project_output(&head_outputs, backend)?
+                    }
+                    (
+                        AttentionLayerPlan::Qwen35Linear(attn),
+                        LayerAttentionState::Qwen35Linear(s),
+                    ) => {
+                        let raw = proj.read_linear_attention_projections()?;
+                        let conv_channels = linear_attention_conv_channels(attn)?;
+                        let hf = linear_attention_hidden_features(attn)?;
+                        let projections = LinearProjections {
+                            qkv: raw.qkv,
+                            z: raw.z,
+                            alpha: raw.alpha,
+                            beta: raw.beta,
+                            conv_channels,
+                            hidden_features: hf,
+                        };
+                        let output = linear_attention_decode_core(
+                            projections,
+                            attn,
+                            rms_norm_eps,
+                            s,
+                            self.linear_scratch.as_mut(),
+                        )?;
+                        proj.project_output(&output, backend)?
+                    }
+                    _ => return Err(E2eError::UnsupportedTwoPhase),
+                };
+                add_in_place(hidden, &attention_output)?;
+            }
+
+            let mlp_output = if let Some(Some(mlp)) = self.persistent_mlps.get_mut(layer_idx) {
+                mlp.step(hidden, backend)?
+            } else {
+                mlp_sequence_inference_with_weights(
+                    &layer_plan.mlp.weights,
+                    hidden,
+                    1,
+                    &layer_plan.mlp.norm_values,
+                    rms_norm_eps,
+                    backend,
+                )?
+            };
+            add_in_place(hidden, &mlp_output)?;
+        }
+        Ok(())
+    }
+}
+
+/// Greedy sampling fallback when the persistent LM head graph is unavailable.
+///
+/// Performs host-side norm + matmul + argmax instead of GPU graph execution.
+/// Used in both `two_phase_loop` and `single_phase_loop` fallback paths.
+fn graph_sample_fallback(
     hidden: &[f32],
     token_index: usize,
     inputs: &GenerationInputs<'_>,
 ) -> Result<i32, E2eError> {
-    let seq_len = token_index + 1;
-    let normalized_output = rms_norm_with_weight(
-        hidden,
+    let offset = checked_mul(token_index, inputs.hidden_features)?;
+    let last_hidden = &hidden[offset..offset + inputs.hidden_features];
+    let normalized = rms_norm_with_weight(
+        last_hidden,
         inputs.hidden_features,
-        seq_len,
+        1,
         inputs.output_norm_values,
         inputs.rms_norm_eps,
     )?;
     greedy_next_token_id(
-        &normalized_output,
-        token_index,
+        &normalized,
+        0,
         inputs.hidden_features,
         inputs.output_weight_values,
         inputs.vocab_size,
@@ -457,7 +1133,7 @@ pub(super) fn generate_from_plans(
             let has_standard = inputs
                 .layer_plans
                 .iter()
-                .any(|p| matches!(p.attention, Some(AttentionLayerPlan::Standard(_))));
+                .any(|p| p.attention.as_ref().is_some_and(|a| a.is_standard()));
             if has_standard || inputs.max_new_tokens == 0 {
                 GenerationMode::FullReprocess
             } else {
@@ -471,7 +1147,7 @@ pub(super) fn generate_from_plans(
         let has_unsupported = inputs
             .layer_plans
             .iter()
-            .any(|p| matches!(p.attention, Some(AttentionLayerPlan::Standard(_))));
+            .any(|p| p.attention.as_ref().is_some_and(|a| a.is_standard()));
         if has_unsupported {
             return Err(E2eError::UnsupportedTwoPhase);
         }
@@ -510,6 +1186,16 @@ fn full_reprocess_loop(
 ) -> Result<(), E2eError> {
     let mut strategy = InferenceStrategy;
 
+    // Persistent LM head: build graph and upload weights once.
+    let mut lm_head = LmHeadResources::try_build(
+        inputs.hidden_features,
+        inputs.vocab_size,
+        inputs.rms_norm_eps,
+        inputs.output_weight_values,
+        inputs.output_norm_values,
+        inputs.backend,
+    );
+
     for _step in 0..inputs.max_new_tokens {
         let active_token_ids = &all_token_ids[..*current_token_count];
         let mut hidden = gather_embeddings(
@@ -523,16 +1209,23 @@ fn full_reprocess_loop(
             &mut hidden,
             inputs.layer_plans,
             &mut strategy,
-            inputs.hidden_features,
             *current_token_count,
             inputs.rms_norm_eps,
             inputs.backend,
+            &mut [],
         )?;
 
         let last_index = current_token_count
             .checked_sub(1)
             .ok_or(E2eError::EmptyPrompt)?;
-        let next_token_id = sample_next_token(&hidden, last_index, inputs)?;
+
+        let next_token_id = if let Some(ref mut lm) = lm_head {
+            let offset = checked_mul(last_index, inputs.hidden_features)?;
+            let last_hidden = &hidden[offset..offset + inputs.hidden_features];
+            lm.sample_hidden(last_hidden, inputs.backend)?
+        } else {
+            graph_sample_fallback(&hidden, last_index, inputs)?
+        };
 
         generated_token_ids.push(next_token_id);
         if *current_token_count < inputs.total_sequence_length {
@@ -561,6 +1254,27 @@ fn two_phase_loop(
 
     let mut state = GenerationState::new(inputs.layer_plans, inputs.total_sequence_length)?;
 
+    // Build all persistent resources upfront (LM head, projections, KV caches,
+    // scoring ctx, linear scratch, MLPs). LM head is reused for both prefill
+    // sampling and decode loop — no duplicate graph build.
+    let mut resources = LmHeadResources::try_build(
+        inputs.hidden_features,
+        inputs.vocab_size,
+        inputs.rms_norm_eps,
+        inputs.output_weight_values,
+        inputs.output_norm_values,
+        inputs.backend,
+    )
+    .map(|lm_head| {
+        PersistentDecodeResources::try_build(
+            inputs.layer_plans,
+            lm_head,
+            inputs.rms_norm_eps,
+            inputs.total_sequence_length,
+            inputs.backend,
+        )
+    });
+
     // Phase 1: Prefill — process all prompt tokens at once, capturing state.
     let prompt_ids = &all_token_ids[..prompt_token_count];
     let mut hidden = gather_embeddings(
@@ -576,17 +1290,23 @@ fn two_phase_loop(
             &mut hidden,
             inputs.layer_plans,
             &mut strategy,
-            inputs.hidden_features,
             prompt_token_count,
             inputs.rms_norm_eps,
             inputs.backend,
+            &mut [],
         )?;
     }
 
     let last_index = prompt_token_count
         .checked_sub(1)
         .ok_or(E2eError::EmptyPrompt)?;
-    let first_token_id = sample_next_token(&hidden, last_index, inputs)?;
+
+    // Sample first token using persistent LM head if available.
+    let first_token_id = if let Some(ref mut res) = resources {
+        res.sample_token(&hidden, last_index, inputs.hidden_features, inputs.backend)?
+    } else {
+        graph_sample_fallback(&hidden, last_index, inputs)?
+    };
 
     generated_token_ids.push(first_token_id);
     all_token_ids[prompt_token_count] = first_token_id;
@@ -596,8 +1316,16 @@ fn two_phase_loop(
         return Ok(());
     }
 
+    if inputs.max_new_tokens <= 1 {
+        return Ok(());
+    }
+
+    // Seed persistent KV caches from host prefill state.
+    if let Some(ref res) = resources {
+        res.seed_kv_caches(&state);
+    }
+
     // Phase 2: Decode — one token at a time using cached state.
-    let mut strategy = DecodeStrategy { state: &mut state };
     for _step in 1..inputs.max_new_tokens {
         let new_token_id = all_token_ids[*current_token_count - 1];
         let mut hidden = gather_embeddings(
@@ -607,17 +1335,29 @@ fn two_phase_loop(
             &[new_token_id],
         )?;
 
-        process_all_layers(
-            &mut hidden,
-            inputs.layer_plans,
-            &mut strategy,
-            inputs.hidden_features,
-            1,
-            inputs.rms_norm_eps,
-            inputs.backend,
-        )?;
-
-        let next_token_id = sample_next_token(&hidden, 0, inputs)?;
+        let next_token_id = if let Some(ref mut res) = resources {
+            res.decode_step(
+                &mut hidden,
+                inputs.layer_plans,
+                &mut state,
+                inputs.hidden_features,
+                inputs.rms_norm_eps,
+                inputs.backend,
+            )?;
+            res.sample_token(&hidden, 0, inputs.hidden_features, inputs.backend)?
+        } else {
+            let mut strategy = DecodeStrategy { state: &mut state };
+            process_all_layers(
+                &mut hidden,
+                inputs.layer_plans,
+                &mut strategy,
+                1,
+                inputs.rms_norm_eps,
+                inputs.backend,
+                &mut [],
+            )?;
+            graph_sample_fallback(&hidden, 0, inputs)?
+        };
 
         generated_token_ids.push(next_token_id);
         if *current_token_count < inputs.total_sequence_length {

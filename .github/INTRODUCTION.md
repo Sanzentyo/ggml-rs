@@ -22,7 +22,7 @@ And you should write rusty code(ADT, enum, type state pattern)
 6. ~~Autoregressive decode state management (prefill/decode split).~~ **DONE** — KV cache for full attention, conv buffer + SSM states for linear attention, decode equivalence tests pass.
 7. ~~Two-phase generation loop (prefill + incremental decode).~~ **DONE** — generation.rs branches on layer types: all-Qwen3.5 → two-phase (prefill all prompt tokens, then decode one-at-a-time), otherwise → full-reprocess fallback.
 8. ~~Backend example enhancement (review_3 item 11) + README (item 12).~~ **DONE** — `backend_ops.rs` example, fixed stale README snippets, multi-op + Metal parity tests added.
-9. Merge back to `main` only after validation and runtime checks pass. **READY** — PR #1 created, all validation passed. See `docs/llama-rs/worklog/2026-04-14-merge-prep.md`.
+9. Merge back to `master` only after validation and runtime checks pass. **READY** — PR #2 created, Copilot review 6/6 comments addressed (commit `97faee0`). See `docs/llama-rs/worklog/2026-04-14-merge-prep.md`.
 
 ## Completed refactor items
 
@@ -118,6 +118,401 @@ And you should write rusty code(ADT, enum, type state pattern)
   Shared `project_sequence_graph` and `recommended_single_projection_memory`
   extracted to `tensor_ops.rs`. Backend threaded through all attention functions.
   Parity test confirms host vs graph output matches within 1e-5. 192 tests pass.
+
+- **Example directory reorganization**: All examples reorganized from flat layouts
+  into categorized subdirectories (basics/, backends/, benchmarks/, models/ for root
+  crate; basics/, benchmarks/, gguf/, inference/, models/, applications/ for llama-rs).
+  Added missing `save_load_state` and `simple_chat` Cargo.toml entries. All 192 tests
+  pass. File history preserved via `git mv`.
+
+- **Graph-level causal depthwise conv** (`ggml_ssm_conv`):
+  Added `ssm_conv` safe wrapper to `ggml-rs` (f32-only). `causal_depthwise_conv_graph`
+  in `linear_attention.rs` performs host-side transpose + left-padding then runs
+  `ggml_ssm_conv` + `ggml_silu` on the backend (CPU/Metal/CUDA). Prefill path now
+  uses graph-level conv; decode stays host-side (single token). 4 parity tests verify
+  graph vs host-only numerical match. Original host function kept as `#[cfg(test)]`
+  reference. 196 tests pass.
+
+- **Fused projection + conv graph** (single-graph linear attention prefill):
+  Merged the 4 linear projections (QKV, Z, alpha, beta) and causal depthwise
+  convolution + SiLU into a single ggml compute graph: `project_and_conv_fused_graph`.
+  Eliminates the host↔device round-trip between projection and conv stages.
+  In-graph chain: `mul_mat → transpose → cont → concat(zeros, ...) → reshape_3d
+  → ssm_conv → silu`. Pre-conv QKV still read back for `capture_conv_buffer`
+  (decode state continuity). Backend buffer lifetime correctly scoped to span all
+  reads. Standalone `causal_depthwise_conv_graph` demoted to `#[cfg(test)]`.
+  196 tests pass.
+
+- **Sigmoid + flash_attn_ext safe wrappers** (`ggml-rs`):
+  Added `sigmoid` (elementwise σ(x)) and `flash_attn_ext` (fused multi-head
+  scaled dot-product attention with optional f16 causal mask) to the safe API.
+  `DynTensor::write_bytes_backend` enables raw byte writes for non-f32/i32 types
+  (needed for f16 mask). 5 new integration tests: sigmoid CPU/Metal parity,
+  flash_attn MHA/GQA reference match, output shape validation.
+
+- **Fused attention scoring graph** (full attention prefill):
+  Replaced the host-side O(T²·H·D) scoring loop in `qwen35_full_attention_core`
+  with a single ggml compute graph: `permute → cont → flash_attn_ext → sigmoid(gate)
+  → mul → reshape_2d → mul_mat(W_out)`. Flash output `[D, H, T, 1]` matches gate
+  layout directly (no extra permute for gating). Causal mask built as f16 per ggml
+  CPU kernel requirements. Decode path (seq_len=1) unchanged. `f32_to_f16_bits` and
+  `build_causal_mask_f16_bytes` added to `numeric.rs`. 182 tests pass.
+
+- **Fully fused single-graph full attention** (prefill):
+  Merged the previous two-graph pipeline (QKV projection → host deinterleave/norm/RoPE
+  → scoring) into a single ggml compute graph: `mul_mat(W_q/W_k/W_v, X) → strided
+  view_3d Q/gate deinterleave → rms_norm + weight broadcast → rope_ext (NeoX mode=2)
+  → permute → cont → flash_attn_ext → sigmoid(gate) → mul → reshape_2d → mul_mat(W_out)`.
+  Eliminates 10 host↔device transfers and 2 graph round-trips → single transfer of
+  weights/input + single compute + single readback. Post-RoPE K and raw V read back
+  conditionally for KV cache capture via `build_forward_expand`. Decode path (seq_len=1)
+  unchanged. 202 tests pass.
+
+- **Layer pre-norm fusion** (attention + MLP):
+  Moved `rms_norm + weight` from host-side (`process_all_layers`) into each ggml
+  compute graph. Full attention (`fully_fused_attention_graph`), linear attention
+  (`project_and_conv_fused_graph`), and MLP (`mlp_sequence_inference_with_weights`)
+  all accept un-normed input + norm weight, applying in-graph `rms_norm(X, eps) * w`
+  as the first operation. Eliminates 2× host↔device round-trips per layer (attention
+  norm + MLP norm). Decode path keeps host-side norm (`DecodeStrategy` calls
+  `rms_norm_with_weight` before dispatch) — single-token graph overhead not worthwhile.
+  Standard attention path also keeps host-side norm. Parity tests updated: decode
+  applies host-side norm to match in-graph norm, tolerance still within 1e-5
+  (ggml f32 vs host f64 accumulation). 201 tests pass.
+
+- **CPU vs Metal microbenchmarks** (`bench_graphs.rs`):
+  Synthetic benchmarks at Qwen3.5 0.6B dimensions (hidden=1536, ffn=8960).
+  Metal provides 2.4–3.1× speedup at seq_len=64 (MLP: 45.6→14.9ms, full attn:
+  7.0→2.9ms). CPU is faster for short sequences (seq_len ≤ 4) due to Metal
+  dispatch overhead — validates keeping decode path host-side. MLP is the
+  throughput bottleneck (3× 1536×8960 matmuls). Linear attention Metal gain
+  limited by host-side SSM recurrence. See `docs/llama-rs/worklog/2026-04-13-conv-qkv-comparison.md`
+  item 12 for full table.
+
+- **Graph-level LM head (output projection)**:
+  Replaced host-side naive matmul (151936 dot products × 1536) and wasteful
+  full-sequence normalization with a persistent ggml graph: `rms_norm → mul →
+  reshape → mul_mat`. Weights (~935MB for Qwen3.5) uploaded once; per-step cost
+  drops to ~614KB I/O (6KB hidden input + 608KB logits readback). Both
+  `two_phase_loop` and `full_reprocess_loop` use the persistent graph.
+  `build_lm_head_graph` + `lm_head_sample_step` in `tensor_ops.rs`;
+  `graph_sample_at` convenience wrapper in `generation.rs`. No unsafe code
+  (function-scoped ggml context avoids self-referential struct). Parity tests
+  verify graph argmax matches host-side sampling. LM head benchmark added to
+  `bench_graphs.rs`. See comparison doc item 13.
+
+- **Decode-path QKV backend offload**:
+  Both `qwen35_full_attention_decode_step` and `qwen35_linear_attention_decode_step`
+  now accept `backend: &Backend` and pass `Some(backend)` to their projection helpers.
+  QKV projections (3 matmuls for full, 4 for linear) and output projections are
+  offloaded from host-side scalar dot products to ggml compute graphs. The
+  `DecodeStrategy` in `generation.rs` forwards `backend` (was `_backend`) to both
+  callsites. All 205 tests pass. See comparison doc item 14.
+
+- **Persistent decode projections** (eliminate per-token weight upload):
+  Build ggml projection graphs once per layer at decode-phase start, upload weights
+  once, then reuse for every token — only ~6 KB hidden vector I/O per layer per token
+  vs ~756 MB weight upload before. `PersistentDecodeProjection` enum (FullAttention /
+  LinearAttention) in `tensor_ops.rs` holds persistent tensor handles, graphs, and
+  backend buffers. Core decode logic extracted into `full_attention_decode_core` and
+  `linear_attention_decode_core` (pure refactoring, all tests pass). `two_phase_loop`
+  tries persistent path first, falls back to `DecodeStrategy` on failure (runtime
+  robustness). See comparison doc item 15.
+- **Decode attention scoring offload** (`flash_attn_ext`):
+  Offloads the Q·K scoring + softmax + V aggregation + sigmoid gating loop to GPU
+  via `flash_attn_ext` graph. `decode_scoring_gpu` in `attention.rs` builds a
+  per-step temporary graph, uploads the live KV cache prefix with permutation
+  `[D, Hkv, T] → [D, T, Hkv]`, runs fused attention, and reads back gated outputs.
+  `full_attention_decode_core` now accepts `backend: Option<&Backend>` — GPU-first
+  with silent fallback to host loop. GQA-aware parity test passes within 1e-4.
+  See comparison doc item 16.
+- **Decode conv/QKV/SSM analysis** (items 17–19):
+  Analyzed remaining host-side decode bottlenecks. Causal depthwise conv decode
+  (~5.6K FLOPs) stays on host — GPU dispatch overhead (~0.8 ms) vastly exceeds
+  scalar loop cost (<1 µs). QKV routing is logically contiguous split with small
+  Q/K copies for per-group normalization — already optimal. SSM recurrence
+  (Delta-Net) is **incompatible** with `ggml_ssm_scan` — the delta rule feedback
+  `sk = k^T·(decayed state)` creates state-dependent updates that linear selective
+  scan cannot express. SIMD vectorization of inner loops identified as most
+  promising near-term optimization. See comparison doc items 17–19.
+- **RoPE decode + probe-once GPU failure** (items 20–21):
+  RoPE decode (~6K FLOPs/layer at D=1536) stays on host — smallest per-layer
+  operation, sub-microsecond scalar cost vs ~0.8 ms Metal dispatch overhead.
+  Implemented probe-once GPU scoring optimization: `gpu_scoring_failed` flag in
+  `Qwen35FullAttentionState` prevents repeated GPU scoring attempts after the
+  first failure per sequence. Eliminates wasted dispatch overhead on CPU-only
+  backends (~0.8 ms/layer/token savings). See comparison doc items 20–21.
+- **Persistent KV cache design + SIMD analysis + cost model** (items 22–24):
+  Designed persistent backend-resident KV cache to eliminate O(T) per-step
+  upload (4 MB→4 KB at T=1000). Identified that on-device `permute+cont` O(T)
+  remains even with persistent KV. Analyzed SSM recurrence SIMD vectorization:
+  phases 1/3 are contiguous-access SIMD candidates; phase 4 had strided access
+  pattern — **reordered** to row-major for auto-vectorization (all tests pass).
+  End-to-end cost model shows KV transfer (~64 MB across 8 FA layers at T=1000)
+  as dominant bottleneck, not compute. See comparison doc items 22–24.
+- **Cross-context view API** (`view_Nd_of`) in `ggml-rs`:
+  Added `view_1d_of` through `view_4d_of` to `Context`, enabling zero-copy
+  views from tensors in a different (longer-lived) context. Safe `'src: 'ctx`
+  lifetime bound replaces `'static` transmute. Unblocks persistent KV cache
+  (item 22). 5 integration tests including compute graph scenario. 213 tests pass.
+  See comparison doc item 25.
+- **Persistent backend-resident KV cache** (`PersistentKvCache`):
+  Pre-allocated K/V tensors on device with incremental O(1) per-step append
+  via `write_data_backend_at`. Eliminates O(T) per-step KV upload (~64 MB/step
+  at T=4000 across 8 FA layers). Uses `view_4d_of` cross-context views for
+  ephemeral scoring graphs. Three-level fallback: persistent GPU → ephemeral
+  GPU → host scoring. See comparison doc item 26.
+- **Causal depthwise conv vs QKV packing comparison** (item 27):
+  Detailed architectural analysis of how Qwen3.5's two attention types
+  (full + linear) differ in projection storage, convolution handling,
+  state management, and GPU offloading. Covers separate vs unified QKV,
+  Q+gate interleaving, sliding window buffer, fused projection+conv graph,
+  and `ggml_ssm_conv` primitive usage. See comparison doc item 27.
+- **Persistent MLP graphs** (item 28):
+  Pre-built MLP compute graphs with weights resident on device. Eliminates
+  ~165 MB weight upload per layer per token (~5.3 GB across 32 layers).
+  `PersistentMlp` struct holds fixed `seq_len=1` graph (`rms_norm → mul →
+  silu(gate) × up → down`). Per-step cost: ~12 KB I/O vs ~165 MB ephemeral.
+  Per-layer opportunistic (failed layers fall back to ephemeral). Integrated
+  into `two_phase_loop` with early-return when `remaining_decode_steps == 0`.
+  See comparison doc item 28.
+
+- **GraphAllocator safe wrapper** (item 29):
+  Safe Rust wrapper for `ggml_gallocr` C API. Pre-reserves a buffer for the
+  maximum graph size, then reuses it via `alloc_graph()` on each step —
+  eliminating per-step Metal buffer allocation. `!Send + !Sync`, skips
+  tensors with existing backend buffers. 5 integration tests.
+  See comparison doc item 29.
+
+- **PersistentScoringContext** (item 30):
+  Uses GraphAllocator to eliminate per-step Metal buffer allocation in
+  FA decode scoring. Extracts graph construction into `build_scoring_graph()`,
+  reserves at max_tokens, reuses buffer each step. One shared context across
+  all FA layers (serial execution, same dimensions). Eliminates ~800µs/step
+  (8 layers × ~100µs). See comparison doc item 30.
+
+- **Flash-friendly KV layout** (item 31):
+  Changed `PersistentKvCache` from `[D, Hkv, MaxT, 1]` (head-major) to
+  `[D, MaxT, Hkv, 1]` (time-major, flash-friendly). Eliminates per-step
+  `permute(0,2,1,3) + cont` O(T) device copy (~136µs at T=1000). Direct
+  `view_4d_of` with strided nb2 feeds flash_attn_ext; Hkv small writes
+  per append (D=64, Hkv=4: negligible). See comparison doc item 31.
+
+- **Auto-vectorization verification + decode allocation elimination** (item 32):
+  Verified LLVM auto-vectorizes `ssm_recurrence_step` with NEON (129 NEON insns,
+  `fmul.4s`+`fadd.4s` pairs, 8 floats/iter via `ldp`/`stp` register pairs).
+  FMA rejected: changes rounding semantics, breaks decode parity.
+  Added `LinearDecodeScratch` bundling `SsmScratch` + output + norm_buf, reused
+  across all 24 linear layers. Eliminates 384 heap allocations per decode step
+  (16/layer × 24 layers). Added `rms_norm_single_into()` and
+  `rms_norm_single_in_place()` for allocation-free normalization.
+  See comparison doc item 32.
+
+- **Resumable GenerationSession + binary checkpoint** (item 33):
+  `GenerationSession` wraps inference as an iterator-like API (`next_token()`)
+  with mid-generation checkpointing. `GenerationCheckpoint` uses postcard
+  binary format with magic bytes + version envelope. `ModelFingerprint`
+  validates layer count, hidden dims, vocab, eps, and per-layer type tags
+  on resume. `CheckpointV1` DTO decoupled from runtime types for format
+  stability. Supports TwoPhase (Qwen3.5, performance-preserving) and
+  FullReprocess (standard attention) modes. 18 tests covering roundtrip,
+  validation, invariant checking, and fingerprint mismatch.
+  See comparison doc item 33.
+
+- **PersistentDecodeResources — unified session decode optimization** (item 34):
+  `PersistentDecodeResources` encapsulates all GPU-resident persistent state
+  (LM head, projections, KV caches, scoring context, linear scratch, MLPs)
+  in a single struct with safety-critical drop ordering. Granular optionality:
+  LM head always present, all other resources independently optional.
+  Refactored `two_phase_loop` from ~170 lines of inline resource management
+  to ~50 lines. Integrated into `GenerationSession` with lazy init after
+  prefill + fallback to slow path. Eliminated duplicate LM head builds.
+  See comparison doc item 34.
+
+- **LmHeadResources extraction** (item 35):
+  Extracted self-contained `LmHeadResources` struct from inline LM head fields
+  in `PersistentDecodeResources`. Owns its own ggml context, buffer, tensors,
+  and graph with correct drop ordering. `try_build()` + `sample_hidden()` API.
+  Embedded in `PersistentDecodeResources`, also used by `full_reprocess_loop`
+  (eliminates duplicate LM head construction). Removed `graph_sample_at()`
+  helper. Added graceful fallback in `full_reprocess_loop` when build fails.
+  See comparison doc item 35.
+
+- **Attention dispatch helpers** (item 36):
+  Added `is_standard()` predicate method to `AttentionLayerPlan` for
+  boolean-query use sites. Applied in `generate_from_plans()` mode
+  selection (2 sites). Dispatch match arms keep explicit variant
+  patterns to preserve exhaustiveness checking.
+  See comparison doc item 36.
+
+- **Dead code cleanup** (item 37):
+  Removed unused `_hidden_features` parameter from `process_all_layers`
+  (8→7 args, 7 call sites). Demoted one-shot `lm_head_graph` function
+  to `#[cfg(test)]` (replaced by `LmHeadResources` in production).
+  See comparison doc item 37.
+
+- **Tuple-to-struct for persistent graph builders** (item 38):
+  Replaced fragile 5/12/14-element tuple returns with named structs:
+  `LmHeadGraphParts`, `FullAttentionGraphParts`, `LinearAttentionGraphParts`.
+  Eliminated `#[allow(clippy::type_complexity)]` on two builder functions.
+  All call sites updated to use field access (e.g. `g.w_q`) instead of
+  positional destructuring.
+  See comparison doc item 38.
+
+- **Inline `persistent_decode_all_layers` as method** (item 39):
+  Converted 11-parameter free function into `impl PersistentDecodeResources`
+  method. 5 params (`projections`, `kv_caches`, `persistent_mlps`,
+  `scoring_ctx`, `linear_scratch`) now accessed via `self`, leaving 6
+  explicit params. Eliminates `clippy::too_many_arguments(11/7)`.
+  See comparison doc item 39.
+
+- **`RopeParams` struct extraction** (item 40):
+  Grouped 4 RoPE configuration values (`n_rot`, `freq_base`, `freq_scale`,
+  `position_offset`) into `RopeParams`. `apply_neox_rope_in_place` reduced
+  from 8→5 params. Eliminates `clippy::too_many_arguments(8/7)`.
+  See comparison doc item 40.
+
+- **Further clippy `too_many_arguments` reduction** (item 41):
+  `project_qkv_graph` accepts `&Qwen35FullAttentionLayerPlan` instead of
+  3 individual weight slices (9→8 params). `PersistentDecodeResources::try_build`
+  accepts pre-built `LmHeadResources` instead of raw weight slices (8→5 params),
+  returns `Self` instead of `Option<Self>`. LM head construction moved to
+  callers with `Option::map` pattern. All `too_many_arguments` warnings
+  eliminated from `llama-rs` crate.
+  See comparison doc item 41.
+
+- **`QkvProjections` struct** (item 42):
+  Replaced `(Vec<f32>, Vec<f32>, Vec<f32>)` return type from `project_qkv_graph`
+  with named struct (`q_full`, `k_proj`, `v_proj`). Eliminates
+  `clippy::type_complexity` warning. Self-documenting field access at call sites.
+  See comparison doc item 42.
+
+- **`FullAttentionDims` struct** (item 43):
+  Consolidated dimension validation + memory estimation from
+  `fully_fused_attention_graph` into a reusable struct. `new()` validates GQA
+  divisibility and derives hidden size from output weight matrix. `estimate_memory(t)`
+  replaces inline calculation. Reduces function preamble from ~30 lines to 2.
+  See comparison doc item 43.
+
+- **`LinearAttentionDims` struct** (item 44):
+  Consolidated dimension derivation + memory estimation for linear attention.
+  `new()` reuses existing helper functions; `estimate_fused_memory(seq_len)` replaces
+  ~40 lines of inline memory calculation. Three callers now use the struct instead
+  of duplicated inline derivation. `project_and_conv_fused_graph` drops from 8→7
+  params, removing `#[allow(clippy::too_many_arguments)]`. Spurious `#[allow]` on
+  `project_linear_inputs_graph` (6 params) also removed.
+  See comparison doc item 44.
+
+- **Stale `#[allow(clippy)]` removal** (item 45):
+  Removed 3 now-unnecessary `#[allow]` annotations:
+  - `build_lm_head_graph`: `type_complexity` stale (returns `LmHeadGraphParts` struct)
+  - `fully_fused_attention_graph`: `too_many_arguments` stale (7 params after item 43)
+  - `qwen35_linear_attention_core`: `too_many_arguments` stale (7 params after item 44)
+  Also fixed `build_lm_head_graph` doc comment (still said "returns tuple").
+
+- **Projection result struct extraction** (item 46):
+  Made `QkvProjections` `pub(super)` and reused it from `tensor_ops.rs` for
+  `read_full_attention_projections` (was `(Vec<f32>, Vec<f32>, Vec<f32>)`).
+  Added `RawLinearProjections { qkv, z, alpha, beta }` in `tensor_ops.rs` for
+  `read_linear_attention_projections` (was `(Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>)`).
+  All `#[allow(clippy::type_complexity)]` eliminated from llama-rs.
+  Only remaining `#[allow]` is `ssm_recurrence_step` (10-param math kernel, deliberate).
+  See comparison doc items 45-46.
+
+- **`sum_matmul_memories` DRY helper** (item 47):
+  Extracted common memory estimation pattern from `recommended_persistent_full_attention_memory`
+  and `recommended_persistent_linear_attention_memory`. Takes a declarative slice of
+  `(weight_shape, input_shape, label)` tuples, uses `try_fold` + `checked_add`.
+  Both callers reduced from ~35 lines to ~10 lines.
+  See comparison doc item 47.
+
+- **`upload_weight` DRY helper** (item 48):
+  Extracted `write_data_backend` + `map_err` pattern from `build_one_persistent_full`
+  and `build_one_persistent_linear`. Each weight upload reduced from 3 lines to 1 line,
+  preserving per-weight error labels for debuggability.
+  See comparison doc item 48.
+
+- **`OutputProjectionGraph` sub-struct extraction** (item 49):
+  Extracted shared output projection fields (`w`, `x`, `y`, `graph`) from
+  `FullAttentionGraphParts` and `LinearAttentionGraphParts` into `OutputProjectionGraph`.
+  Both graph builder functions now call `build_output_projection_graph` instead of
+  duplicating ~15 lines of tensor creation + graph wiring. `PersistentDecodeProjection`
+  enum variants also compose with the sub-struct, simplifying `project_output`.
+  See comparison doc item 49.
+
+- **Hoist `upload_weight` to `tensor_ops` + apply across all modules** (item 50):
+  Moved `upload_weight` from `generation.rs` to `tensor_ops.rs` as `pub(super)`.
+  Applied across `attention.rs` (23→4 occurrences), `linear_attention.rs` (15→0),
+  `mlp.rs` (10→0), eliminating 66 lines of `write_data_backend` + `map_err`
+  boilerplate while preserving per-weight error labels.
+  See comparison doc item 50.
+
+- **Tail-only `qkv_pre_conv` readback** (item 51):
+  `project_and_conv_fused_graph` previously read back the FULL pre-conv QKV tensor
+  from GPU. Now reads only the last `kernel_size - 1` rows via `read_data_backend_at`
+  (~680x reduction for 2048-token prompts). When no decode state is needed, skips
+  the readback entirely.
+  See comparison doc item 51.
+
+- **Direct SSM recurrence into persistent state** (item 52):
+  `qwen35_linear_attention_core` now writes SSM recurrence directly into
+  `state.ssm_states` instead of allocating a temporary buffer + memcpy.
+  Removed dead `capture_ssm_states` method. Added `debug_assert_eq` for size invariant.
+  See comparison doc item 52.
+
+- **Linear attention prefill benchmark** (item 53):
+  Added `bench_e2e_graphs_linear_attention_prefill` to `bench_graphs.rs`.
+  Prefill-with-state is comparable or faster than stateless inference,
+  confirming items 51-52 eliminated state capture overhead. Metal achieves
+  2.86x speedup at seq_len=256. CPU faster below seq_len~16 (dispatch overhead).
+  See comparison doc item 53.
+
+- **Phase-breakdown comparison benchmark** (item 54):
+  Added `bench_linear_attention_phases()` decomposing linear attention into
+  4 timed phases. At seq_len=256 on Metal: SSM recurrence 45.7% (4.8ms),
+  Proj+Conv 35.9%, OutProj 17.9%, QK split 0.5%. SSM runs at identical
+  speed on CPU and Metal (pure scalar work). See comparison doc item 54.
+
+- **SSM loop optimization** (item 55):
+  Hoisted `state_size`/`time_step_rank`/`group_count`/`state_size_sq` out of
+  inner loop. Replaced `checked_mul` offset with `chunks_exact_mut().enumerate()`.
+  Hoisted `token_rank_base`. Result: ~6% SSM recurrence improvement across all
+  backends (4.794→4.491ms Metal seq=256). See comparison doc item 55.
+
+- **Batch projection helper** (item 56):
+  Added `ProjectionSpec` / `BuiltProjection` / `build_batch_projections()` to
+  `tensor_ops.rs`. Refactored 3 sites (persistent full attention, persistent
+  linear attention, one-shot QKV) to use the shared helper. Eliminates ~50
+  lines of repeated `new_tensor_2d` + `mul_mat` boilerplate. Named struct
+  preserves diagnostic labels. See comparison doc item 56.
+
+- **Conv vs QKV packing micro-benchmark** (item 57):
+  Quantitative comparison of packed QKV (single matmul) vs separate Q/K/V
+  (3 matmuls), host conv vs graph conv (ssm_conv), and layout prep overhead.
+  Key findings: packed QKV is NOT faster than separate (separate is 15% faster
+  on Metal at seq_len=1024); graph conv wins at seq_len≥256; layout prep
+  (transpose+cont+pad) costs as much as conv itself. See comparison doc item 57.
+
+- **MLP graph topology extraction** (item 58):
+  Extracted shared `MlpGraphParts` struct and `build_mlp_graph` builder that
+  encapsulates the 7-op MLP chain (rms_norm → scale → gate matmul → silu →
+  up matmul → mul → down matmul). Both `mlp_sequence_inference_with_weights`
+  (one-shot prefill) and `build_persistent_mlp` (decode) now delegate to
+  `build_mlp_graph`, eliminating ~40 lines of duplicated topology code.
+  See comparison doc item 58.
+
+- **Fully-fused attention QKV via batch projections** (item 59):
+  Refactored `fully_fused_attention_graph` QKV creation (3 separate
+  `new_tensor_2d` + `mul_mat` blocks) to use `build_batch_projections`.
+  Reduces ~15 lines of boilerplate while preserving all error labels.
+  See comparison doc item 59.
+
+- **Linear attention projections via batch helper** (item 60):
+  Extracted `linear_projection_specs` returning the 4-projection spec array
+  (QKV, Z, alpha, beta). Both `project_linear_inputs_graph` and
+  `project_and_conv_fused_graph` now delegate to `build_batch_projections`
+  via this shared spec, eliminating ~30 lines of duplicated tensor creation
+  and matmul boilerplate. See comparison doc item 60.
 
 ## Validation checkpoints completed on this branch
 

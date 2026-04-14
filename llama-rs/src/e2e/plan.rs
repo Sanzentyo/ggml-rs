@@ -69,6 +69,11 @@ impl AttentionLayerPlan {
             Self::Qwen35Linear(a) => &a.norm_values,
         }
     }
+
+    /// Returns `true` if this layer uses standard (non-Qwen3.5) attention.
+    pub(super) fn is_standard(&self) -> bool {
+        matches!(self, Self::Standard(_))
+    }
 }
 
 #[derive(Debug, Clone)]

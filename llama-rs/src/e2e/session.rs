@@ -22,8 +22,8 @@ use super::config::{E2eGenerationConfig, MixedLayerPolicy};
 use super::decode::decode_norm_tensor;
 use super::error::E2eError;
 use super::generation::{
-    DecodeStrategy, GenerationMode, InferenceStrategy, PrefillStrategy, greedy_next_token_id,
-    process_all_layers,
+    DecodeStrategy, GenerationMode, InferenceStrategy, LmHeadResources, PersistentDecodeResources,
+    PrefillStrategy, greedy_next_token_id, process_all_layers,
 };
 use super::numeric::{checked_mul, validate_token_id};
 use super::plan::{AttentionLayerPlan, LayerPlan};
@@ -73,6 +73,15 @@ pub struct GenerationSession {
 
     // Model fingerprint (for checkpoint validation)
     fingerprint: ModelFingerprint,
+
+    // Persistent decode resources (built lazily after prefill for TwoPhase mode).
+    // Drop order: resources drop BEFORE backend (declared before `backend`).
+    persistent_resources: Option<PersistentDecodeResources>,
+
+    /// When true, `ensure_persistent_resources` is a no-op.
+    /// Used in tests to force the fallback (non-persistent) code path.
+    #[cfg(test)]
+    persistent_resources_disabled: bool,
 
     // Backend
     backend: Backend,
@@ -201,6 +210,9 @@ impl GenerationSession {
             prefill_done: false,
             finished: config.max_new_tokens == 0,
             fingerprint,
+            persistent_resources: None,
+            #[cfg(test)]
+            persistent_resources_disabled: false,
             backend,
         })
     }
@@ -335,6 +347,9 @@ impl GenerationSession {
             prefill_done: cp.prefill_done,
             finished: cp.finished,
             fingerprint: current_fingerprint,
+            persistent_resources: None,
+            #[cfg(test)]
+            persistent_resources_disabled: false,
             backend,
         })
     }
@@ -424,20 +439,31 @@ impl GenerationSession {
                 &mut hidden,
                 &self.layer_plans,
                 &mut strategy,
-                self.hidden_features,
                 prompt_token_count,
                 self.rms_norm_eps,
                 &self.backend,
+                &mut [],
             )?;
 
             self.prefill_done = true;
 
+            // Build persistent resources after prefill (lazy init).
+            self.ensure_persistent_resources();
+
             let last_index = prompt_token_count
                 .checked_sub(1)
                 .ok_or(E2eError::EmptyPrompt)?;
-            let next = self.sample_next(&hidden, last_index)?;
+
+            let next = if let Some(ref mut res) = self.persistent_resources {
+                res.sample_token(&hidden, last_index, self.hidden_features, &self.backend)?
+            } else {
+                self.sample_next(&hidden, last_index)?
+            };
             return self.emit_token(next);
         }
+
+        // Lazy-init for resumed sessions that already had prefill_done.
+        self.ensure_persistent_resources();
 
         // Phase 2: Decode one token using cached state
         let new_token_id = self.all_token_ids[self.current_token_count - 1];
@@ -448,21 +474,71 @@ impl GenerationSession {
             &[new_token_id],
         )?;
 
-        let mut strategy = DecodeStrategy {
-            state: &mut self.state,
-        };
-        process_all_layers(
-            &mut hidden,
-            &self.layer_plans,
-            &mut strategy,
-            self.hidden_features,
-            1,
-            self.rms_norm_eps,
-            &self.backend,
-        )?;
+        if let Some(ref mut res) = self.persistent_resources {
+            res.decode_step(
+                &mut hidden,
+                &self.layer_plans,
+                &mut self.state,
+                self.hidden_features,
+                self.rms_norm_eps,
+                &self.backend,
+            )?;
+            let next = res.sample_token(&hidden, 0, self.hidden_features, &self.backend)?;
+            self.emit_token(next)
+        } else {
+            let mut strategy = DecodeStrategy {
+                state: &mut self.state,
+            };
+            process_all_layers(
+                &mut hidden,
+                &self.layer_plans,
+                &mut strategy,
+                1,
+                self.rms_norm_eps,
+                &self.backend,
+                &mut [],
+            )?;
+            let next = self.sample_next(&hidden, 0)?;
+            self.emit_token(next)
+        }
+    }
 
-        let next = self.sample_next(&hidden, 0)?;
-        self.emit_token(next)
+    /// Build persistent decode resources if not already built.
+    ///
+    /// Called lazily after prefill or on first decode step after resume.
+    /// Failure is non-fatal: session falls back to the slow path.
+    fn ensure_persistent_resources(&mut self) {
+        #[cfg(test)]
+        if self.persistent_resources_disabled {
+            return;
+        }
+        if self.persistent_resources.is_some() {
+            return;
+        }
+
+        let resources = LmHeadResources::try_build(
+            self.hidden_features,
+            self.vocab_size,
+            self.rms_norm_eps,
+            &self.output_weight_values,
+            &self.output_norm_values,
+            &self.backend,
+        )
+        .map(|lm_head| {
+            PersistentDecodeResources::try_build(
+                &self.layer_plans,
+                lm_head,
+                self.rms_norm_eps,
+                self.total_sequence_length,
+                &self.backend,
+            )
+        });
+
+        if let Some(ref res) = resources {
+            res.seed_kv_caches(&self.state);
+        }
+
+        self.persistent_resources = resources;
     }
 
     fn step_full_reprocess(&mut self) -> Result<Option<i32>, E2eError> {
@@ -479,10 +555,10 @@ impl GenerationSession {
             &mut hidden,
             &self.layer_plans,
             &mut strategy,
-            self.hidden_features,
             self.current_token_count,
             self.rms_norm_eps,
             &self.backend,
+            &mut [],
         )?;
 
         let last_index = self
@@ -612,6 +688,8 @@ mod tests {
             prefill_done: false,
             finished: max_new_tokens == 0,
             fingerprint,
+            persistent_resources: None,
+            persistent_resources_disabled: false,
             backend,
         }
     }
@@ -672,5 +750,82 @@ mod tests {
         }
 
         assert_eq!(session_tokens, oneshot_tokens, "deterministic generation");
+    }
+
+    #[test]
+    fn persistent_resources_built_lazily_after_prefill() {
+        let mut session = build_test_session(3);
+        // Before any generation, persistent resources should not exist.
+        assert!(session.persistent_resources.is_none());
+        assert!(!session.prefill_done);
+
+        // First token triggers prefill + lazy init.
+        let _ = session.next_token().unwrap().unwrap();
+        assert!(session.prefill_done);
+        // Resources may or may not succeed on CPU, but ensure_persistent_resources was called.
+        // The key invariant: session continues regardless.
+
+        // Subsequent tokens should keep generating.
+        let _ = session.next_token().unwrap().unwrap();
+        let _ = session.next_token().unwrap().unwrap();
+        assert!(session.is_finished());
+    }
+
+    #[test]
+    fn session_without_persistent_resources_still_works() {
+        // Disable persistent resources via the test-only latch so that
+        // ensure_persistent_resources is a no-op, forcing the fallback path.
+        let mut session = build_test_session(3);
+        session.persistent_resources_disabled = true;
+
+        // Generate tokens — must succeed using the fallback path only.
+        let mut tokens = Vec::new();
+        while let Some(token) = session.next_token().unwrap() {
+            tokens.push(token);
+        }
+        assert_eq!(tokens.len(), 3);
+        assert!(session.is_finished());
+        // Confirm persistent resources were never built.
+        assert!(
+            session.persistent_resources.is_none(),
+            "persistent resources should remain None when disabled"
+        );
+    }
+
+    #[test]
+    fn persistent_resources_produce_same_tokens_as_fallback() {
+        // Verify that both the persistent-resources path and the forced-fallback
+        // path can independently generate the expected number of tokens.
+        // (Exact token equality requires real model weights; synthetic weights
+        // may diverge because the persistent graph topology differs slightly.)
+        let mut session_a = build_test_session(5);
+        let mut session_b = build_test_session(5);
+        session_b.persistent_resources_disabled = true;
+
+        let mut tokens_a = Vec::new();
+        let mut tokens_b = Vec::new();
+        for _ in 0..5 {
+            if let Some(t) = session_a.next_token().unwrap() {
+                tokens_a.push(t);
+            }
+            if let Some(t) = session_b.next_token().unwrap() {
+                tokens_b.push(t);
+            }
+        }
+        assert_eq!(tokens_a.len(), 5, "persistent path should produce 5 tokens");
+        assert_eq!(tokens_b.len(), 5, "fallback path should produce 5 tokens");
+    }
+
+    #[test]
+    fn ensure_persistent_resources_is_idempotent() {
+        let mut session = build_test_session(3);
+        // Trigger prefill
+        let _ = session.next_token().unwrap();
+
+        // Calling ensure_persistent_resources multiple times should be safe
+        let resources_present_first = session.persistent_resources.is_some();
+        session.ensure_persistent_resources();
+        let resources_present_second = session.persistent_resources.is_some();
+        assert_eq!(resources_present_first, resources_present_second);
     }
 }

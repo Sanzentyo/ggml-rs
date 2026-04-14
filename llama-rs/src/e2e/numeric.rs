@@ -79,6 +79,62 @@ pub(super) fn softplus_scalar(value: f32) -> f32 {
     }
 }
 
+/// Convert a single f32 to IEEE 754 half-precision (f16) bits.
+pub(super) fn f32_to_f16_bits(value: f32) -> u16 {
+    let bits = value.to_bits();
+    let sign = ((bits >> 16) & 0x8000) as u16;
+    let exponent = ((bits >> 23) & 0xFF) as i32;
+    let mantissa = bits & 0x7F_FFFF;
+
+    if exponent == 0xFF {
+        return if mantissa == 0 {
+            sign | 0x7C00 // Inf
+        } else {
+            sign | 0x7E00 // NaN (quiet)
+        };
+    }
+
+    let unbiased = exponent - 127;
+    if unbiased > 15 {
+        return sign | 0x7C00; // overflow → Inf
+    }
+    if unbiased < -24 {
+        return sign; // too small → zero
+    }
+    if unbiased < -14 {
+        let shift = (-14 - unbiased) as u32;
+        let m = (mantissa | 0x80_0000) >> (shift + 13);
+        return sign | m as u16;
+    }
+    let exp16 = ((unbiased + 15) as u16) << 10;
+    let man16 = (mantissa >> 13) as u16;
+    sign | exp16 | man16
+}
+
+/// Build a causal attention mask as f16 little-endian bytes.
+///
+/// Layout: `[Tkv, T]` (row = query token, col = key token).
+/// Allowed positions → 0.0 (f16), blocked positions → -Inf (f16 0xFC00).
+///
+/// Returns an error if `seq_len² × 2` overflows `usize`.
+pub(super) fn build_causal_mask_f16_bytes(seq_len: usize) -> Result<Vec<u8>, super::E2eError> {
+    let zero_f16 = f32_to_f16_bits(0.0_f32).to_le_bytes();
+    let neg_inf_f16 = f32_to_f16_bits(f32::NEG_INFINITY).to_le_bytes();
+    let total_bytes = seq_len
+        .checked_mul(seq_len)
+        .and_then(|n| n.checked_mul(2))
+        .ok_or(super::E2eError::MemorySizeOverflow)?;
+    let mut buf = vec![0u8; total_bytes];
+    for row in 0..seq_len {
+        for col in 0..seq_len {
+            let bytes = if col > row { &neg_inf_f16 } else { &zero_f16 };
+            let offset = (col + row * seq_len) * 2;
+            buf[offset..offset + 2].copy_from_slice(bytes);
+        }
+    }
+    Ok(buf)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

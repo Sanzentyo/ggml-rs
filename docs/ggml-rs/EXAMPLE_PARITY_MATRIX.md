@@ -10,32 +10,32 @@ Status legend:
 
 | Upstream target | Rust counterpart | Status | Result parity | Perf snapshot (Rust/C++) | Real upstream blocker |
 | --- | --- | --- | --- | --- | --- |
-| `simple-ctx` | `examples/simple_ctx.rs` | Done (direct) | checksum delta `0.0` | N/A | none |
-| `simple-backend` | `examples/backend_matmul.rs` | Done (direct) | checksum delta `0.0` (CPU/Metal) | N/A | none |
-| `perf-metal` | `examples/perf_metal.rs` | Done (direct) | checksum delta `0.0` | `~0.98x` (`n_op=512`, `n_iter=64`) | none |
-| `gpt-2-ctx` | `llama-rs/examples/gpt2_ctx.rs` | Done (synthetic) | checksum delta `~2.18e-5` | `~9.60x` | `models/gpt-2-117M/ggml-model.bin` missing |
-| `gpt-2-alloc` | `llama-rs/examples/gpt2_alloc.rs` | Done (synthetic) | checksum delta `~2.18e-5` | `~14.81x` | same |
-| `gpt-2-backend` | `llama-rs/examples/gpt2_backend.rs` | Done (synthetic) | checksum delta `~2.18e-5` | `~12.21x` | same |
-| `gpt-2-sched` | `llama-rs/examples/gpt2_sched.rs` | Done (synthetic) | checksum delta `~2.18e-5` | `~11.92x` | same |
-| `gpt-2-batched` | `llama-rs/examples/gpt2_batched.rs` | Done (synthetic) | checksum delta `~2.18e-5` | `~15.84x` | same |
-| `gpt-2-quantize` | `llama-rs/examples/gpt2_quantize.rs` | Done (synthetic) | checksum delta `~4.8e-7`, RMSE delta `~9e-11` | `~32.57x` | same |
-| `gpt-j` | `examples/gptj_main_synth.rs` | Done (synthetic) | PASS | `~1.39x` | GPT-J model asset missing |
-| `gpt-j-quantize` | `examples/gptj_quantize_synth.rs` | Done (synthetic) | PASS | `~12.11x` | GPT-J model asset missing |
-| `magika` | `examples/magika_main_synth.rs` | Done (synthetic) | PASS | `~1.44x` | Magika model asset missing |
-| `mnist-eval` | `examples/mnist_eval.rs` | Done (synthetic) | PASS | `~7.91x` | MNIST model/dataset missing |
-| `mnist-train` | `examples/mnist_train.rs` | Done (synthetic) | PASS | `~56.55x` | MNIST model/dataset missing |
-| `sam` | `examples/sam.rs` | Done (synthetic) | PASS | `~16.70x` | SAM model missing (example image present) |
-| `yolov3-tiny` | `examples/yolov3_tiny.rs` | Done (synthetic) | PASS | `~36.21x` | YOLO model/input/labels missing |
-| `backend-ops` | `examples/backend_ops.rs` | Done (direct) | checksum delta `0.0` (CPU/Metal) | N/A | none |
+| `simple-ctx` | `examples/basics/simple_ctx.rs` | Done (direct) | checksum delta `0.0` | N/A | none |
+| `simple-backend` | `examples/backends/backend_matmul.rs` | Done (direct) | checksum delta `0.0` (CPU/Metal) | N/A | none |
+| `perf-metal` | `examples/backends/perf_metal.rs` | Done (direct) | checksum delta `0.0` | `~0.98x` (`n_op=512`, `n_iter=64`) | none |
+| `gpt-2-ctx` | `llama-rs/examples/models/gpt2_ctx.rs` | Done (synthetic) | checksum delta `~2.18e-5` | `~9.60x` | `models/gpt-2-117M/ggml-model.bin` missing |
+| `gpt-2-alloc` | `llama-rs/examples/models/gpt2_alloc.rs` | Done (synthetic) | checksum delta `~2.18e-5` | `~14.81x` | same |
+| `gpt-2-backend` | `llama-rs/examples/models/gpt2_backend.rs` | Done (synthetic) | checksum delta `~2.18e-5` | `~12.21x` | same |
+| `gpt-2-sched` | `llama-rs/examples/models/gpt2_sched.rs` | Done (synthetic) | checksum delta `~2.18e-5` | `~11.92x` | same |
+| `gpt-2-batched` | `llama-rs/examples/models/gpt2_batched.rs` | Done (synthetic) | checksum delta `~2.18e-5` | `~15.84x` | same |
+| `gpt-2-quantize` | `llama-rs/examples/models/gpt2_quantize.rs` | Done (synthetic) | checksum delta `~4.8e-7`, RMSE delta `~9e-11` | `~32.57x` | same |
+| `gpt-j` | `examples/models/gptj_main_synth.rs` | Done (synthetic) | PASS | `~1.39x` | GPT-J model asset missing |
+| `gpt-j-quantize` | `examples/models/gptj_quantize_synth.rs` | Done (synthetic) | PASS | `~12.11x` | GPT-J model asset missing |
+| `magika` | `examples/models/magika_main_synth.rs` | Done (synthetic) | PASS | `~1.44x` | Magika model asset missing |
+| `mnist-eval` | `examples/models/mnist_eval.rs` | Done (synthetic) | PASS | `~7.91x` | MNIST model/dataset missing |
+| `mnist-train` | `examples/models/mnist_train.rs` | Done (synthetic) | PASS | `~56.55x` | MNIST model/dataset missing |
+| `sam` | `examples/models/sam.rs` | Done (synthetic) | PASS | `~16.70x` | SAM model missing (example image present) |
+| `yolov3-tiny` | `examples/models/yolov3_tiny.rs` | Done (synthetic) | PASS | `~36.21x` | YOLO model/input/labels missing |
+| `backend-ops` | `examples/backends/backend_ops.rs` | Done (direct) | checksum delta `0.0` (CPU/Metal) | N/A | none |
 
 ## Additional examples (no upstream counterpart)
 
 | Example | Purpose |
 | --- | --- |
-| `examples/backend_ops.rs` | Multi-op backend graph (matmul + bias add) on CPU/Metal |
-| `examples/arithmetic_expr.rs` | Expression-style arithmetic API demo |
-| `examples/bench_matmul.rs` | Context-path matmul benchmarking |
-| `examples/bench_upstream_suite.rs` | Upstream benchmark suite runner |
+| `examples/backends/backend_ops.rs` | Multi-op backend graph (matmul + bias add) on CPU/Metal |
+| `examples/basics/arithmetic_expr.rs` | Expression-style arithmetic API demo |
+| `examples/benchmarks/bench_matmul.rs` | Context-path matmul benchmarking |
+| `examples/benchmarks/bench_upstream_suite.rs` | Upstream benchmark suite runner |
 
 ## Artifacts
 

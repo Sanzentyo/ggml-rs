@@ -32,9 +32,9 @@ mod typed_tensor;
 mod types;
 
 pub use compute::{
-    Backend, BackendBuffer, Context, DynTensor, Graph, Tensor, decode_tensor_data_to,
-    graph_overhead_bytes, graph_overhead_custom, init_timing, tensor_element_count,
-    tensor_overhead_bytes, type_size, with_context, with_no_alloc_context,
+    Backend, BackendBuffer, Context, DynTensor, Graph, GraphAllocator, Tensor,
+    decode_tensor_data_to, graph_overhead_bytes, graph_overhead_custom, init_timing,
+    tensor_element_count, tensor_overhead_bytes, type_size, with_context, with_no_alloc_context,
 };
 pub use error::{Error, Result};
 pub use gguf::{
@@ -56,10 +56,10 @@ pub mod prelude {
     pub use crate::{
         Backend, BackendBuffer, BackendDeviceType, BackendElement, BackendKind, Bytes, Cols,
         ComputeStatus, Context, Dims, DynTensor, GgmlElement, GgmlType, GgufArrayValue, GgufFile,
-        GgufValue, GgufWriter, Graph, Length, LengthSpec, RopeExtParams, Rows, Shape2D,
-        Shape2DSpec, Shape3D, Shape3DSpec, Shape4D, Shape4DSpec, StaticLength, StaticShape2D,
-        StaticShape3D, StaticShape4D, Tensor, Tensor1D, Tensor1DConst, Tensor2D, Tensor2DConst,
-        Tensor3D, Tensor3DConst, Tensor4D, Tensor4DConst, TensorExpr, TensorIndex, ThreadCount,
-        TryFromGgufValue, Type, with_context, with_no_alloc_context,
+        GgufValue, GgufWriter, Graph, GraphAllocator, Length, LengthSpec, RopeExtParams, Rows,
+        Shape2D, Shape2DSpec, Shape3D, Shape3DSpec, Shape4D, Shape4DSpec, StaticLength,
+        StaticShape2D, StaticShape3D, StaticShape4D, Tensor, Tensor1D, Tensor1DConst, Tensor2D,
+        Tensor2DConst, Tensor3D, Tensor3DConst, Tensor4D, Tensor4DConst, TensorExpr, TensorIndex,
+        ThreadCount, TryFromGgufValue, Type, with_context, with_no_alloc_context,
     };
 }
