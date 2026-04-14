@@ -2,11 +2,13 @@
 
 ## Branch Summary
 
-68 commits implementing a complete Qwen3.5 E2E inference pipeline with
+71 commits implementing a complete Qwen3.5 E2E inference pipeline with
 verified token-ID parity against llama.cpp, plus comprehensive ggml-rs
 API improvements (typed tensors, safe view/reshape wrappers, graph-level
 projections, resumable generation sessions, chat infrastructure) and a
 thorough structural DRY refactoring pass (items 34-60).
+
+PR #2 created and reviewed by Copilot — all 6 review comments addressed.
 
 ## Completed Work Items
 
@@ -87,7 +89,7 @@ thorough structural DRY refactoring pass (items 34-60).
 ## Test Coverage
 
 - **222 tests** pass with `--features link-system` (7 ignored: benchmark + upstream suite)
-- **0 new clippy warnings** (pre-existing: 2 `too_many_arguments` in llama-rs, 1 in ggml-rs tests)
+- **0 new clippy warnings** (pre-existing: 1 `too_many_arguments` in ggml-rs `flash_attn_ext`, 2 in test files)
 - **0 fmt issues**
 - Key test categories:
   - 18 type system tests
@@ -104,6 +106,27 @@ thorough structural DRY refactoring pass (items 34-60).
   - 15 view/reshape wrapper tests (ggml-rs)
   - 1 graph projection parity test (host vs graph)
   - 7 bench graph tests (attention, linear attention, MLP, LM head, conv/QKV)
+
+## Copilot PR Review — All 6 Issues Fixed
+
+PR #2 received automated code review (27/71 files reviewed, 6 comments).
+All issues addressed in commit `97faee0`:
+
+1. **Overflow check** (numeric.rs): `build_causal_mask_f16_bytes` returns `Result`
+   with `checked_mul` to prevent `seq_len * seq_len * 2` overflow.
+2. **Tuple drop order** (mlp.rs, attention.rs, generation.rs): All 4 persistent
+   builder functions swap return to `(Handle, Context)` so handle drops first.
+3. **Fallback test** (session.rs): Added `#[cfg(test)] persistent_resources_disabled`
+   latch; test now truly forces the fallback code path.
+4. **Persistent vs fallback** (session.rs): `session_b` uses disabled latch to
+   force fallback; verifies both paths independently produce expected token count.
+5. **flash_attn_ext mask validation** (compute.rs): Validates mask type is f16
+   before FFI call. Added `DynTensor::ggml_type()` accessor.
+6. **write_bytes_backend error** (compute.rs): Uses `UnexpectedTensorByteSize`
+   (byte-level) instead of `LengthMismatch` (element-level).
+
+Additional: gated test-only `causal_depthwise_conv_graph` with `#[cfg(test)]`
+to eliminate dead_code warning in lib target.
 
 ## Known Limitations
 
