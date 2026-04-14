@@ -11,7 +11,7 @@
 //! [`PrefillStrategy`] (captures state), and [`DecodeStrategy`] (uses state).
 
 use super::attention::{
-    PersistentKvCache, PersistentScoringContext, build_persistent_kv_cache,
+    PersistentKvCache, PersistentScoringContext, QkvProjections, build_persistent_kv_cache,
     full_attention_decode_core, full_attention_hidden_features, prepare_qkv_from_raw,
     qwen35_full_attention_decode_step, qwen35_full_attention_inference,
     qwen35_full_attention_prefill,
@@ -883,7 +883,11 @@ impl PersistentDecodeResources {
 
                 let attention_output = match (attention, &mut state.layers[layer_idx]) {
                     (AttentionLayerPlan::Qwen35Full(attn), LayerAttentionState::Qwen35Full(s)) => {
-                        let (q_full, k_proj, v_proj) = proj.read_full_attention_projections()?;
+                        let QkvProjections {
+                            q_full,
+                            k_proj,
+                            v_proj,
+                        } = proj.read_full_attention_projections()?;
                         let hf = full_attention_hidden_features(attn)?;
                         let prepared = prepare_qkv_from_raw(
                             attn,
@@ -909,14 +913,14 @@ impl PersistentDecodeResources {
                         AttentionLayerPlan::Qwen35Linear(attn),
                         LayerAttentionState::Qwen35Linear(s),
                     ) => {
-                        let (qkv, z, alpha, beta) = proj.read_linear_attention_projections()?;
+                        let raw = proj.read_linear_attention_projections()?;
                         let conv_channels = linear_attention_conv_channels(attn)?;
                         let hf = linear_attention_hidden_features(attn)?;
                         let projections = LinearProjections {
-                            qkv,
-                            z,
-                            alpha,
-                            beta,
+                            qkv: raw.qkv,
+                            z: raw.z,
+                            alpha: raw.alpha,
+                            beta: raw.beta,
                             conv_channels,
                             hidden_features: hf,
                         };

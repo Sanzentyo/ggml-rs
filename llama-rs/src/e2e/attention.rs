@@ -416,11 +416,15 @@ fn recommended_qkv_projection_memory(
     Ok(Bytes::new(total))
 }
 
-/// Host-side QKV projection outputs.
-struct QkvProjections {
-    q_full: Vec<f32>,
-    k_proj: Vec<f32>,
-    v_proj: Vec<f32>,
+/// Host-side QKV projection outputs for full attention.
+///
+/// Used by both the fused graph builder (`project_qkv_graph`) and the
+/// persistent projection reader (`read_full_attention_projections`).
+#[derive(Debug)]
+pub(super) struct QkvProjections {
+    pub(super) q_full: Vec<f32>,
+    pub(super) k_proj: Vec<f32>,
+    pub(super) v_proj: Vec<f32>,
 }
 
 /// Validated derived dimensions for full (gated) attention.
@@ -884,7 +888,6 @@ pub(super) fn apply_neox_rope_in_place(
 ///   → reshape_2d → mul_mat(W_out)
 ///
 /// When `state` is Some, reads back post-RoPE K and raw V for KV cache capture.
-#[allow(clippy::too_many_arguments)]
 fn fully_fused_attention_graph(
     attention: &Qwen35FullAttentionLayerPlan,
     input: &[f32],

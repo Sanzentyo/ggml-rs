@@ -568,7 +568,6 @@ fn split_and_norm_qk(
     Ok((q_heads, k_heads))
 }
 
-#[allow(clippy::too_many_arguments)]
 fn qwen35_linear_attention_core(
     attention: &Qwen35LinearAttentionLayerPlan,
     input: &[f32],

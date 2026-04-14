@@ -1,9 +1,25 @@
+use super::attention::QkvProjections;
 use super::error::E2eError;
 use super::numeric::checked_mul;
 use ggml_rs::{Backend, Bytes, Context, Graph, Length, Shape2D, Tensor};
 
 /// Slack constant added to memory estimates for ggml graph/tensor overhead.
 pub(super) const PROJECTION_SLACK_BYTES: usize = 4 * 1024 * 1024;
+
+/// Raw linear-attention projection outputs read back from the persistent
+/// projection graph.
+///
+/// Unlike [`super::linear_attention::LinearProjections`], this carries only
+/// the four GPU-readback buffers and omits derived dimension fields
+/// (`conv_channels`, `hidden_features`), which the caller must supply
+/// from the layer plan.
+#[derive(Debug)]
+pub(super) struct RawLinearProjections {
+    pub(super) qkv: Vec<f32>,
+    pub(super) z: Vec<f32>,
+    pub(super) alpha: Vec<f32>,
+    pub(super) beta: Vec<f32>,
+}
 
 pub(super) fn rms_norm_with_weight(
     input: &[f32],
@@ -453,13 +469,13 @@ pub(super) struct LmHeadGraphParts<'ctx> {
 
 /// Build an LM head ggml graph (rms_norm → weight → matmul) in the given context.
 ///
-/// Returns `(x_input_tensor, logits_tensor, graph)`. The caller must:
+/// Returns [`LmHeadGraphParts`] containing the weight, input, output tensors
+/// and compute graph. The caller must:
 /// 1. Call `ctx.allocate_tensors(backend)` and keep the buffer alive.
 /// 2. Upload weights once via `w_out.write_data_backend` and `norm_w.write_data_backend`.
 /// 3. Per step: upload hidden state to the returned x_input, compute, read logits.
 ///
 /// This is the building block for persistent LM head contexts in generation loops.
-#[allow(clippy::type_complexity)]
 pub(super) fn build_lm_head_graph<'ctx>(
     ctx: &'ctx Context,
     hidden_features: usize,
@@ -900,12 +916,7 @@ impl<'ctx> PersistentDecodeProjection<'ctx> {
     }
 
     /// Read raw QKV projection outputs for full attention.
-    ///
-    /// Returns `(q_full, k_proj, v_proj)`.
-    #[allow(clippy::type_complexity)]
-    pub(super) fn read_full_attention_projections(
-        &self,
-    ) -> Result<(Vec<f32>, Vec<f32>, Vec<f32>), E2eError> {
+    pub(super) fn read_full_attention_projections(&self) -> Result<QkvProjections, E2eError> {
         match self {
             Self::FullAttention {
                 q_out,
@@ -913,16 +924,20 @@ impl<'ctx> PersistentDecodeProjection<'ctx> {
                 v_out,
                 ..
             } => {
-                let q: Vec<f32> = q_out
+                let q_full: Vec<f32> = q_out
                     .read_data_backend()
                     .map_err(|source| E2eError::ggml("read<Q>(pfa_step)", source))?;
-                let k: Vec<f32> = k_out
+                let k_proj: Vec<f32> = k_out
                     .read_data_backend()
                     .map_err(|source| E2eError::ggml("read<K>(pfa_step)", source))?;
-                let v: Vec<f32> = v_out
+                let v_proj: Vec<f32> = v_out
                     .read_data_backend()
                     .map_err(|source| E2eError::ggml("read<V>(pfa_step)", source))?;
-                Ok((q, k, v))
+                Ok(QkvProjections {
+                    q_full,
+                    k_proj,
+                    v_proj,
+                })
             }
             Self::LinearAttention { .. } => Err(E2eError::BufferLengthMismatch {
                 expected: 0,
@@ -932,10 +947,9 @@ impl<'ctx> PersistentDecodeProjection<'ctx> {
     }
 
     /// Read raw linear attention projection outputs.
-    #[allow(clippy::type_complexity)]
     pub(super) fn read_linear_attention_projections(
         &self,
-    ) -> Result<(Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>), E2eError> {
+    ) -> Result<RawLinearProjections, E2eError> {
         match self {
             Self::LinearAttention {
                 qkv_out,
@@ -956,7 +970,12 @@ impl<'ctx> PersistentDecodeProjection<'ctx> {
                 let beta: Vec<f32> = beta_out
                     .read_data_backend()
                     .map_err(|source| E2eError::ggml("read<BETA>(pla_step)", source))?;
-                Ok((qkv, z, alpha, beta))
+                Ok(RawLinearProjections {
+                    qkv,
+                    z,
+                    alpha,
+                    beta,
+                })
             }
             Self::FullAttention { .. } => Err(E2eError::BufferLengthMismatch {
                 expected: 0,
@@ -1255,23 +1274,23 @@ mod tests {
             _buffer: _buf,
         };
         proj.project_input(&input, &backend).expect("project_input");
-        let (q_pers, k_pers, v_pers) = proj.read_full_attention_projections().expect("read QKV");
+        let qkv = proj.read_full_attention_projections().expect("read QKV");
 
-        for (i, (h, p)) in q_host.iter().zip(q_pers.iter()).enumerate() {
+        for (i, (h, p)) in q_host.iter().zip(qkv.q_full.iter()).enumerate() {
             assert!(
                 (h - p).abs() < 1e-5,
                 "Q[{i}]: host={h} vs persistent={p}, diff={}",
                 (h - p).abs()
             );
         }
-        for (i, (h, p)) in k_host.iter().zip(k_pers.iter()).enumerate() {
+        for (i, (h, p)) in k_host.iter().zip(qkv.k_proj.iter()).enumerate() {
             assert!(
                 (h - p).abs() < 1e-5,
                 "K[{i}]: host={h} vs persistent={p}, diff={}",
                 (h - p).abs()
             );
         }
-        for (i, (h, p)) in v_host.iter().zip(v_pers.iter()).enumerate() {
+        for (i, (h, p)) in v_host.iter().zip(qkv.v_proj.iter()).enumerate() {
             assert!(
                 (h - p).abs() < 1e-5,
                 "V[{i}]: host={h} vs persistent={p}, diff={}",
@@ -1360,15 +1379,15 @@ mod tests {
             _buffer: _buf,
         };
         proj.project_input(&input, &backend).expect("project_input");
-        let (qkv_pers, z_pers, alpha_pers, beta_pers) = proj
+        let raw = proj
             .read_linear_attention_projections()
             .expect("read linear");
 
         for (name, host, pers) in [
-            ("QKV", &qkv_host, &qkv_pers),
-            ("Z", &z_host, &z_pers),
-            ("alpha", &alpha_host, &alpha_pers),
-            ("beta", &beta_host, &beta_pers),
+            ("QKV", &qkv_host, &raw.qkv),
+            ("Z", &z_host, &raw.z),
+            ("alpha", &alpha_host, &raw.alpha),
+            ("beta", &beta_host, &raw.beta),
         ] {
             assert_eq!(host.len(), pers.len(), "{name} length mismatch");
             for (i, (h, p)) in host.iter().zip(pers.iter()).enumerate() {
