@@ -51,22 +51,12 @@ impl AttentionStrategy for InferenceStrategy {
         backend: &Backend,
     ) -> Result<Vec<f32>, E2eError> {
         match attention {
-            AttentionLayerPlan::Standard(attn) => standard_attention_inference(
-                attn,
-                input,
-                seq_len,
-                rms_norm_eps,
-                &attn.norm_values,
-                backend,
-            ),
-            AttentionLayerPlan::Qwen35Full(attn) => qwen35_full_attention_inference(
-                attn,
-                input,
-                seq_len,
-                rms_norm_eps,
-                attention.norm_values(),
-                backend,
-            ),
+            AttentionLayerPlan::Standard(attn) => {
+                standard_attention_inference(attn, input, seq_len, rms_norm_eps, backend)
+            }
+            AttentionLayerPlan::Qwen35Full(attn) => {
+                qwen35_full_attention_inference(attn, input, seq_len, rms_norm_eps, backend)
+            }
             AttentionLayerPlan::Qwen35Linear(attn) => {
                 qwen35_linear_attention_inference(attn, input, seq_len, rms_norm_eps, backend)
             }
@@ -91,26 +81,10 @@ impl AttentionStrategy for PrefillStrategy<'_> {
     ) -> Result<Vec<f32>, E2eError> {
         match (attention, &mut self.state.layers[layer_idx]) {
             (AttentionLayerPlan::Standard(attn), LayerAttentionState::Standard(s)) => {
-                standard_attention_prefill(
-                    attn,
-                    input,
-                    seq_len,
-                    rms_norm_eps,
-                    &attn.norm_values,
-                    s,
-                    backend,
-                )
+                standard_attention_prefill(attn, input, seq_len, rms_norm_eps, s, backend)
             }
             (AttentionLayerPlan::Qwen35Full(attn), LayerAttentionState::Qwen35Full(s)) => {
-                qwen35_full_attention_prefill(
-                    attn,
-                    input,
-                    seq_len,
-                    rms_norm_eps,
-                    attention.norm_values(),
-                    s,
-                    backend,
-                )
+                qwen35_full_attention_prefill(attn, input, seq_len, rms_norm_eps, s, backend)
             }
             (AttentionLayerPlan::Qwen35Linear(attn), LayerAttentionState::Qwen35Linear(s)) => {
                 qwen35_linear_attention_prefill(attn, input, seq_len, rms_norm_eps, s, backend)

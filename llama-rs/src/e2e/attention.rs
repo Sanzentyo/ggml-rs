@@ -262,22 +262,13 @@ mod tests {
         let full_input: Vec<f32> = prompt.iter().chain(new_token.iter()).copied().collect();
         let norm_weight = &plan.norm_values;
         let full_output =
-            qwen35_full_attention_inference(&plan, &full_input, 4, 1e-5, norm_weight, &backend)
-                .unwrap();
+            qwen35_full_attention_inference(&plan, &full_input, 4, 1e-5, &backend).unwrap();
         let expected = &full_output[3 * hidden..4 * hidden];
 
         // Prefill 3 tokens, then decode 1.
         let mut state = Qwen35FullAttentionState::new(4, kv_head_count, hd).unwrap();
-        let _prefill_out = qwen35_full_attention_prefill(
-            &plan,
-            &prompt,
-            3,
-            1e-5,
-            norm_weight,
-            &mut state,
-            &backend,
-        )
-        .unwrap();
+        let _prefill_out =
+            qwen35_full_attention_prefill(&plan, &prompt, 3, 1e-5, &mut state, &backend).unwrap();
 
         // Decode path: apply host-side rms_norm + weight to match the in-graph
         // norm that inference/prefill now perform.
@@ -361,16 +352,9 @@ mod tests {
         // Prefill to populate KV cache with 5 tokens.
         let norm_weight = &plan.norm_values;
         let mut state_host = Qwen35FullAttentionState::new(6, kv_head_count, hd).unwrap();
-        let _prefill = qwen35_full_attention_prefill(
-            &plan,
-            &prompt,
-            5,
-            1e-5,
-            norm_weight,
-            &mut state_host,
-            &backend,
-        )
-        .unwrap();
+        let _prefill =
+            qwen35_full_attention_prefill(&plan, &prompt, 5, 1e-5, &mut state_host, &backend)
+                .unwrap();
 
         // Clone state so both paths start from the same KV cache snapshot.
         let mut state_gpu = state_host.clone();
@@ -475,16 +459,9 @@ mod tests {
         let mut state =
             super::super::state::StandardAttentionState::new(max_tokens, hkv, hd).unwrap();
 
-        let _output = standard_attention_prefill(
-            &plan,
-            &input,
-            prompt_len,
-            1e-5,
-            &plan.norm_values,
-            &mut state,
-            &backend,
-        )
-        .unwrap();
+        let _output =
+            standard_attention_prefill(&plan, &input, prompt_len, 1e-5, &mut state, &backend)
+                .unwrap();
 
         // token_count matches prompt length
         assert_eq!(state.token_count(), prompt_len);
@@ -541,31 +518,18 @@ mod tests {
 
         // Path A: Full reprocess of [prompt + new_token] — extract last-token slice.
         let full_input: Vec<f32> = prompt.iter().chain(new_token.iter()).copied().collect();
-        let full_output = standard_attention_inference(
-            &plan,
-            &full_input,
-            prompt_len + 1,
-            1e-5,
-            &plan.norm_values,
-            &backend,
-        )
-        .unwrap();
+        let full_output =
+            standard_attention_inference(&plan, &full_input, prompt_len + 1, 1e-5, &backend)
+                .unwrap();
         let expected = &full_output[prompt_len * hidden..(prompt_len + 1) * hidden];
 
         // Path B: Prefill prompt, then decode new_token.
         let mut state =
             super::super::state::StandardAttentionState::new(max_tokens, hkv, hd).unwrap();
 
-        let _prefill_out = standard_attention_prefill(
-            &plan,
-            &prompt,
-            prompt_len,
-            1e-5,
-            &plan.norm_values,
-            &mut state,
-            &backend,
-        )
-        .unwrap();
+        let _prefill_out =
+            standard_attention_prefill(&plan, &prompt, prompt_len, 1e-5, &mut state, &backend)
+                .unwrap();
 
         // Decode path receives pre-normed input (matching DecodeStrategy behavior).
         let normalized_token = super::super::tensor_ops::rms_norm_with_weight(
@@ -611,16 +575,9 @@ mod tests {
         let mut state =
             super::super::state::StandardAttentionState::new(max_tokens, hkv, hd).unwrap();
 
-        let _out = standard_attention_prefill(
-            &plan,
-            &input,
-            max_tokens,
-            1e-5,
-            &plan.norm_values,
-            &mut state,
-            &backend,
-        )
-        .unwrap();
+        let _out =
+            standard_attention_prefill(&plan, &input, max_tokens, 1e-5, &mut state, &backend)
+                .unwrap();
 
         assert_eq!(state.token_count(), max_tokens);
 

@@ -23,10 +23,9 @@ fn bench_e2e_graphs_full_attention() {
     let plan_small = build_full_attention_plan(hidden, heads, kv_heads, hd);
     for seq_len in [4, 16] {
         let input = synthetic_input(hidden, seq_len);
-        let norm_w = &plan_small.norm_values;
         for &(bname, ref backend) in &backends {
             let avg = bench_fn(warmup, iters, || {
-                qwen35_full_attention_inference(&plan_small, &input, seq_len, 1e-5, norm_w, backend)
+                qwen35_full_attention_inference(&plan_small, &input, seq_len, 1e-5, backend)
             });
             results.push(BenchResult {
                 label: "full_attention_fused",
@@ -43,10 +42,9 @@ fn bench_e2e_graphs_full_attention() {
     let plan_large = build_full_attention_plan(hidden, heads, kv_heads, hd);
     for seq_len in [1, 4, 16, 64] {
         let input = synthetic_input(hidden, seq_len);
-        let norm_w = &plan_large.norm_values;
         for &(bname, ref backend) in &backends {
             let avg = bench_fn(warmup, iters, || {
-                qwen35_full_attention_inference(&plan_large, &input, seq_len, 1e-5, norm_w, backend)
+                qwen35_full_attention_inference(&plan_large, &input, seq_len, 1e-5, backend)
             });
             results.push(BenchResult {
                 label: "full_attention_fused",
@@ -311,14 +309,7 @@ fn bench_e2e_graphs_combined() {
         for &(bname, ref backend) in &backends {
             // Full attention.
             let avg = bench_fn(warmup, iters, || {
-                qwen35_full_attention_inference(
-                    &full_plan,
-                    &input,
-                    seq_len,
-                    1e-5,
-                    &full_plan.norm_values,
-                    backend,
-                )
+                qwen35_full_attention_inference(&full_plan, &input, seq_len, 1e-5, backend)
             });
             results.push(BenchResult {
                 label: "full_attention_fused",

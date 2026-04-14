@@ -26,7 +26,6 @@ pub(in crate::e2e) fn qwen35_full_attention_inference(
     input: &[f32],
     sequence_length: usize,
     rms_norm_eps: f32,
-    attn_norm_weight: &[f32],
     backend: &Backend,
 ) -> Result<Vec<f32>, E2eError> {
     qwen35_full_attention_core(
@@ -34,7 +33,6 @@ pub(in crate::e2e) fn qwen35_full_attention_inference(
         input,
         sequence_length,
         rms_norm_eps,
-        attn_norm_weight,
         None,
         backend,
     )
@@ -46,7 +44,6 @@ pub(in crate::e2e) fn qwen35_full_attention_prefill(
     input: &[f32],
     sequence_length: usize,
     rms_norm_eps: f32,
-    attn_norm_weight: &[f32],
     state: &mut Qwen35FullAttentionState,
     backend: &Backend,
 ) -> Result<Vec<f32>, E2eError> {
@@ -55,7 +52,6 @@ pub(in crate::e2e) fn qwen35_full_attention_prefill(
         input,
         sequence_length,
         rms_norm_eps,
-        attn_norm_weight,
         Some(state),
         backend,
     )
@@ -66,7 +62,6 @@ fn qwen35_full_attention_core(
     input: &[f32],
     sequence_length: usize,
     rms_norm_eps: f32,
-    attn_norm_weight: &[f32],
     state: Option<&mut Qwen35FullAttentionState>,
     backend: &Backend,
 ) -> Result<Vec<f32>, E2eError> {
@@ -75,7 +70,6 @@ fn qwen35_full_attention_core(
         input,
         sequence_length,
         rms_norm_eps,
-        attn_norm_weight,
         state,
         backend,
     )
@@ -96,13 +90,14 @@ fn qwen35_full_attention_core(
 ///   → permute → cont → flash_attn_ext → sigmoid(gate) → mul
 ///   → reshape_2d → mul_mat(W_out)
 ///
+/// Reads the RMS norm weight from `attention.norm_values` directly.
+///
 /// When `state` is Some, reads back post-RoPE K and raw V for KV cache capture.
 fn fully_fused_attention_graph(
     attention: &Qwen35FullAttentionLayerPlan,
     input: &[f32],
     t: usize,
     rms_norm_eps: f32,
-    attn_norm_weight: &[f32],
     state: Option<&mut Qwen35FullAttentionState>,
     backend: &Backend,
 ) -> Result<Vec<f32>, E2eError> {
@@ -281,7 +276,7 @@ fn fully_fused_attention_graph(
     upload_weight(&ni.x_raw, input, "write<X>")?;
 
     // Layer pre-norm weight.
-    upload_weight(&ni.norm_w, attn_norm_weight, "write<attn_norm_w>")?;
+    upload_weight(&ni.norm_w, &attention.norm_values, "write<attn_norm_w>")?;
 
     // Write weight data.
     upload_weight(w_q, &attention.q_weight_values, "write<W_q>")?;

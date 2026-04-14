@@ -32,7 +32,6 @@ pub(in crate::e2e) fn standard_attention_prefill(
     input: &[f32],
     seq_len: usize,
     rms_norm_eps: f32,
-    attn_norm_weight: &[f32],
     state: &mut StandardAttentionState,
     backend: &Backend,
 ) -> Result<Vec<f32>, E2eError> {
@@ -41,7 +40,6 @@ pub(in crate::e2e) fn standard_attention_prefill(
         input,
         seq_len,
         rms_norm_eps,
-        attn_norm_weight,
         Some(state),
         backend,
     )
@@ -53,18 +51,9 @@ pub(in crate::e2e) fn standard_attention_inference(
     input: &[f32],
     seq_len: usize,
     rms_norm_eps: f32,
-    attn_norm_weight: &[f32],
     backend: &Backend,
 ) -> Result<Vec<f32>, E2eError> {
-    standard_attention_graph(
-        attention,
-        input,
-        seq_len,
-        rms_norm_eps,
-        attn_norm_weight,
-        None,
-        backend,
-    )
+    standard_attention_graph(attention, input, seq_len, rms_norm_eps, None, backend)
 }
 
 // ---------------------------------------------------------------------------
@@ -72,12 +61,13 @@ pub(in crate::e2e) fn standard_attention_inference(
 // ---------------------------------------------------------------------------
 
 /// Fused graph implementation shared by inference and prefill paths.
+///
+/// Reads the RMS norm weight from `attention.norm_values` directly.
 fn standard_attention_graph(
     attention: &StandardAttentionLayerPlan,
     input: &[f32],
     t: usize,
     rms_norm_eps: f32,
-    attn_norm_weight: &[f32],
     state: Option<&mut StandardAttentionState>,
     backend: &Backend,
 ) -> Result<Vec<f32>, E2eError> {
@@ -276,7 +266,7 @@ fn standard_attention_graph(
 
     // Write data.
     upload_weight(&ni.x_raw, input, "write<X>")?;
-    upload_weight(&ni.norm_w, attn_norm_weight, "write<attn_norm_w>")?;
+    upload_weight(&ni.norm_w, &attention.norm_values, "write<attn_norm_w>")?;
     upload_weight(&qkv[0].w, attention.weights.q_values(), "write<W_q>")?;
     upload_weight(&qkv[1].w, attention.weights.k_values(), "write<W_k>")?;
     upload_weight(&qkv[2].w, attention.weights.v_values(), "write<W_v>")?;
