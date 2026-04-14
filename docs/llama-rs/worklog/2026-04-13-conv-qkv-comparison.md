@@ -3850,3 +3850,53 @@ Extracted two helpers plus one config struct:
 |------|---------|
 | llama-rs/src/e2e/attention.rs | Added `FlashAttentionConfig`, `run_flash_attention_pipeline`, `apply_optional_per_head_norm`; refactored both graph functions |
 
+## Item 63 — Split attention.rs into coherent submodules
+
+### 63.1 Motivation
+
+The monolithic `attention.rs` (2576 lines) mixed five distinct concerns:
+RoPE/flash helpers, KV cache persistence, QKV projection math, gated
+attention (Qwen3.5), and standard attention. Navigation and local reasoning
+required scrolling through unrelated code. Splitting into focused submodules
+improves maintainability without changing any behavior.
+
+### 63.2 Module Structure
+
+| Submodule | Responsibility | Approx LOC |
+|-----------|---------------|------------|
+| `shared.rs` | RoPE utilities (`RopeParams`, `apply_neox_rope_in_place`) + flash-attention pipeline helpers (`FlashAttentionConfig`, `run_flash_attention_pipeline`, `apply_optional_per_head_norm`) | ~200 |
+| `persistent.rs` | `PersistentKvCache`, `build_persistent_kv_cache`, `PersistentScoringContext`, `ScoringGraph`, `build_scoring_graph`, `decode_scoring_gpu_persistent` | ~290 |
+| `projection.rs` | `PreparedAttention`, `QkvProjections`, `FullAttentionDims`, `deinterleave_q_gate`, QKV projection/preparation functions | ~340 |
+| `qwen35_full.rs` | Qwen3.5 gated attention: fused graph, GPU scoring, decode step, inference/prefill entry points | ~520 |
+| `standard.rs` | Standard (non-gated) attention: fused graph, decode step, inference/prefill entry points | ~380 |
+
+### 63.3 Visibility Strategy
+
+- Submodules are **private** (`mod shared;` not `pub mod shared;`)
+- Consumer-facing items get `pub(in crate::e2e)` in submodule → re-exported as `pub(super)` from attention root
+- Cross-submodule items use `pub(super)` within the attention module only
+- Intra-submodule items stay private
+- Tests import directly from submodules via `use super::projection::...`
+
+### 63.4 Metrics
+
+| Metric | Before | After |
+|--------|--------|-------|
+| attention.rs LOC | 2576 | ~645 (root + tests) |
+| Submodule files | 0 | 5 |
+| Total attention LOC | 2576 | ~2035 + 645 root = ~2680 (slight increase from doc comments + imports) |
+| External import breakage | — | 0 (re-exports preserve paths) |
+| Clippy warnings | 0 | 0 |
+| Tests | 229 pass | 229 pass |
+
+### 63.5 Files Modified
+
+| File | Changes |
+|------|---------|
+| llama-rs/src/e2e/attention.rs | Replaced 2576-line monolith with module root: mod declarations, pub(super) re-exports, tests |
+| llama-rs/src/e2e/attention/shared.rs | NEW — RoPE + flash-attention pipeline helpers |
+| llama-rs/src/e2e/attention/persistent.rs | NEW — KV cache + GPU scoring |
+| llama-rs/src/e2e/attention/projection.rs | NEW — QKV projection/deinterleaving |
+| llama-rs/src/e2e/attention/qwen35_full.rs | NEW — Qwen3.5 gated attention |
+| llama-rs/src/e2e/attention/standard.rs | NEW — Standard attention |
+

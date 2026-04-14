@@ -539,6 +539,14 @@ And you should write rusty code(ADT, enum, type state pattern)
   tensor) and `apply_optional_per_head_norm` (conditional rms_norm + weight
   scaling). `FlashAttentionConfig` struct carries dimensional/scalar params.
   Net ~75 line reduction, zero clippy warnings, 229 tests pass.
+- **Split attention.rs into coherent submodules** (item 63):
+  Split the 2576-line monolithic `attention.rs` into 5 focused submodules:
+  `shared.rs` (RoPE + flash-attention helpers), `persistent.rs` (KV cache +
+  GPU scoring), `projection.rs` (QKV projection/deinterleaving),
+  `qwen35_full.rs` (gated attention fused graph + decode), `standard.rs`
+  (standard attention fused graph + decode). Module root retains `pub(super)`
+  re-exports for stable consumer import paths. Tests stay in root module.
+  Zero clippy warnings, 229 tests pass.
 
 ## Validation checkpoints completed on this branch
 
