@@ -684,6 +684,12 @@ And you should write rusty code(ADT, enum, type state pattern)
   dto.rs, state.rs, session/init.rs. Net -7 lines across 4 files.
   305 tests pass, zero clippy warnings.
 
+78. **LayerPassConfig parameter bundling** — DONE (commit `5926418`)
+  Introduced `LayerPassConfig` struct bundling `layer_plans`, `rms_norm_eps`, `backend`.
+  `process_all_layers` reduced from 7 params to 5. `decode_step` also simplified.
+  Updated 7 call sites across loops.rs, resources.rs, runtime.rs.
+  305 tests pass, zero clippy warnings.
+
 ## Validation checkpoints completed on this branch
 
 - `cargo fmt --all`

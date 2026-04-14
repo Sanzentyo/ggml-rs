@@ -4383,3 +4383,35 @@ Updated callers:
 - Net -7 lines across 4 files.
 - 305 tests pass, zero clippy warnings.
 - Commit: `9853c0a`
+
+---
+
+## Item 78: LayerPassConfig parameter bundling
+
+### Problem
+`process_all_layers` takes 7 parameters, with 3 immutable config values (`layer_plans`,
+`rms_norm_eps`, `backend`) repeated at every call site. `PersistentDecodeResources::decode_step`
+similarly threads these three through.
+
+### Solution
+Introduced `LayerPassConfig<'a>` struct in `generation.rs`:
+```rust
+pub(super) struct LayerPassConfig<'a> {
+    pub layer_plans: &'a [LayerPlan],
+    pub rms_norm_eps: f32,
+    pub backend: &'a Backend,
+}
+```
+- `process_all_layers`: 7 params → 5 (hidden, config, strategy, seq_len, persistent_mlps)
+- `decode_step`: 7 params → 4 (hidden, config, state, hidden_features)
+- Added `GenerationInputs::layer_pass_config()` convenience method for loops.rs
+
+### Key decisions
+- In `session/runtime.rs`, construct `LayerPassConfig` inline via field splitting to avoid
+  whole-`self` borrow conflict when `&mut self.state` is also needed.
+- Kept `hidden`, `strategy`, `seq_len`, `persistent_mlps` as separate params per rubber-duck advice.
+
+### Result
+- Updated 7 call sites across 4 files.
+- 305 tests pass, zero clippy warnings.
+- Commit: `5926418`
