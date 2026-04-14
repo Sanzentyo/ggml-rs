@@ -73,3 +73,85 @@ impl E2eGenerationReport {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::backend::LlamaBackend;
+
+    // ── E2eGenerationConfig ─────────────────────────────────────
+    #[test]
+    fn config_new_valid() {
+        let cfg = E2eGenerationConfig::new(LlamaBackend::Cpu, vec![1, 2, 3], 10).unwrap();
+        assert_eq!(cfg.prompt_token_ids, &[1, 2, 3]);
+        assert_eq!(cfg.max_new_tokens, 10);
+        assert_eq!(cfg.pad_token_id, 0);
+        assert_eq!(cfg.eos_token_id, None);
+        assert_eq!(cfg.mixed_layer_policy, MixedLayerPolicy::Strict);
+    }
+
+    #[test]
+    fn config_empty_prompt_rejected() {
+        let err = E2eGenerationConfig::new(LlamaBackend::Cpu, vec![], 10).unwrap_err();
+        assert!(matches!(err, E2eError::EmptyPrompt));
+    }
+
+    #[test]
+    fn config_builder_chaining() {
+        let cfg = E2eGenerationConfig::new(LlamaBackend::Cpu, vec![1], 5)
+            .unwrap()
+            .with_pad_token_id(42)
+            .with_eos_token_id(Some(99))
+            .with_mixed_layer_policy(MixedLayerPolicy::SkipUnsupportedAttention);
+        assert_eq!(cfg.pad_token_id, 42);
+        assert_eq!(cfg.eos_token_id, Some(99));
+        assert_eq!(
+            cfg.mixed_layer_policy,
+            MixedLayerPolicy::SkipUnsupportedAttention
+        );
+    }
+
+    // ── E2eGenerationReport ─────────────────────────────────────
+    #[test]
+    fn avg_token_ms_empty_is_zero() {
+        let report = E2eGenerationReport {
+            backend_name: "test".into(),
+            prompt_token_count: 0,
+            generated_token_ids: vec![],
+            all_token_ids: vec![],
+            attention_layer_count: 0,
+            mlp_only_layer_count: 0,
+            elapsed: Duration::from_millis(100),
+        };
+        assert_eq!(report.avg_generated_token_ms(), 0.0);
+    }
+
+    #[test]
+    fn avg_token_ms_normal() {
+        let report = E2eGenerationReport {
+            backend_name: "test".into(),
+            prompt_token_count: 5,
+            generated_token_ids: vec![1, 2, 3, 4],
+            all_token_ids: vec![0; 9],
+            attention_layer_count: 1,
+            mlp_only_layer_count: 0,
+            elapsed: Duration::from_millis(400),
+        };
+        // 400ms / 4 tokens = 100ms per token
+        assert!((report.avg_generated_token_ms() - 100.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn avg_token_ms_zero_duration() {
+        let report = E2eGenerationReport {
+            backend_name: "test".into(),
+            prompt_token_count: 0,
+            generated_token_ids: vec![1],
+            all_token_ids: vec![1],
+            attention_layer_count: 0,
+            mlp_only_layer_count: 0,
+            elapsed: Duration::ZERO,
+        };
+        assert_eq!(report.avg_generated_token_ms(), 0.0);
+    }
+}

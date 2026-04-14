@@ -160,3 +160,87 @@ impl<T> GgmlResultExt<T> for Result<T, ggml_rs::Error> {
         self.map_err(|source| E2eError::ggml(context, source))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── Constructor helpers ─────────────────────────────────────
+    #[test]
+    fn model_helper_builds_variant() {
+        let source = ModelError::MissingTensor { name: "x".into() };
+        let err = E2eError::model("ctx", source);
+        assert!(matches!(err, E2eError::Model { context: "ctx", .. }));
+    }
+
+    #[test]
+    fn metadata_helper_builds_variant() {
+        let source = MetadataError::MissingRequiredKey { key: "k".into() };
+        let err = E2eError::metadata("ctx", source);
+        assert!(matches!(err, E2eError::Metadata { context: "ctx", .. }));
+    }
+
+    #[test]
+    fn naming_helper_builds_variant() {
+        let source = NamingError::NoLayersDetected;
+        let err = E2eError::naming("ctx", source);
+        assert!(matches!(err, E2eError::Naming { context: "ctx", .. }));
+    }
+
+    #[test]
+    fn inference_helper_builds_variant() {
+        let source = InferenceError::InvalidAttentionLayout {
+            hidden_features: 0,
+            query_head_count: 0,
+            kv_head_count: 0,
+        };
+        let err = E2eError::inference("ctx", source);
+        assert!(matches!(err, E2eError::Inference { context: "ctx", .. }));
+    }
+
+    #[test]
+    fn tokenizer_helper_builds_variant() {
+        let source = TokenizerError::MissingMetadata { key: "model" };
+        let err = E2eError::tokenizer("ctx", source);
+        assert!(matches!(err, E2eError::Tokenizer { context: "ctx", .. }));
+    }
+
+    #[test]
+    fn ggml_helper_builds_variant() {
+        let source = ggml_rs::Error::ZeroMemorySize;
+        let err = E2eError::ggml("ctx", source);
+        assert!(matches!(err, E2eError::Ggml { context: "ctx", .. }));
+    }
+
+    // ── GgmlResultExt ───────────────────────────────────────────
+    #[test]
+    fn ggml_result_ext_ok_passes_through() {
+        let r: Result<i32, ggml_rs::Error> = Ok(42);
+        assert_eq!(r.ggml_ctx("ctx").unwrap(), 42);
+    }
+
+    #[test]
+    fn ggml_result_ext_err_wraps() {
+        let r: Result<i32, ggml_rs::Error> = Err(ggml_rs::Error::ZeroMemorySize);
+        let err = r.ggml_ctx("conv").unwrap_err();
+        assert!(matches!(
+            err,
+            E2eError::Ggml {
+                context: "conv",
+                ..
+            }
+        ));
+    }
+
+    // ── Display ─────────────────────────────────────────────────
+    #[test]
+    fn display_includes_context() {
+        let source = ModelError::MissingTensor { name: "foo".into() };
+        let err = E2eError::model("loading weights", source);
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("loading weights"),
+            "display should include context: {msg}"
+        );
+    }
+}
