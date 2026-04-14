@@ -9,6 +9,7 @@ use super::plan::Qwen35FullAttentionLayerPlan;
 use super::state::Qwen35FullAttentionState;
 use super::tensor_ops::{
     PROJECTION_SLACK_BYTES, per_head_rms_norm, project_sequence, project_sequence_graph,
+    upload_weight,
 };
 use ggml_rs::{Backend, BackendBuffer, Bytes, Context, GraphAllocator, Shape2D, Shape4D, Tensor};
 
@@ -307,11 +308,8 @@ fn decode_scoring_gpu_persistent(
     };
 
     // Upload only Q and gate — K/V are already on device.
-    sg.q.write_data_backend(q_values)
-        .map_err(|source| E2eError::ggml("write(Q)", source))?;
-    sg.gate
-        .write_data_backend(q_gate)
-        .map_err(|source| E2eError::ggml("write(gate)", source))?;
+    upload_weight(&sg.q, q_values, "write(Q)")?;
+    upload_weight(&sg.gate, q_gate, "write(gate)")?;
 
     backend
         .compute(&mut sg.graph)
@@ -569,14 +567,10 @@ fn project_qkv_graph(
         .allocate_tensors(backend)
         .map_err(|source| E2eError::ggml("allocate_tensors(QKV)", source))?;
 
-    w_q.write_data_backend(&attention.q_weight_values)
-        .map_err(|source| E2eError::ggml("write_data_backend<W_Q>", source))?;
-    w_k.write_data_backend(&attention.k_weight_values)
-        .map_err(|source| E2eError::ggml("write_data_backend<W_K>", source))?;
-    w_v.write_data_backend(&attention.v_weight_values)
-        .map_err(|source| E2eError::ggml("write_data_backend<W_V>", source))?;
-    x.write_data_backend(input)
-        .map_err(|source| E2eError::ggml("write_data_backend<X>", source))?;
+    upload_weight(&w_q, &attention.q_weight_values, "write<W_Q>")?;
+    upload_weight(&w_k, &attention.k_weight_values, "write<W_K>")?;
+    upload_weight(&w_v, &attention.v_weight_values, "write<W_V>")?;
+    upload_weight(&x, input, "write<X>")?;
 
     backend
         .compute(&mut graph)
@@ -1131,33 +1125,20 @@ fn fully_fused_attention_graph(
         .map_err(|source| E2eError::ggml("allocate_tensors(fully_fused)", source))?;
 
     // Write input data (un-normed).
-    x_raw
-        .write_data_backend(input)
-        .map_err(|source| E2eError::ggml("write<X>", source))?;
+    upload_weight(&x_raw, input, "write<X>")?;
 
     // Layer pre-norm weight.
-    attn_norm_w
-        .write_data_backend(attn_norm_weight)
-        .map_err(|source| E2eError::ggml("write<attn_norm_w>", source))?;
+    upload_weight(&attn_norm_w, attn_norm_weight, "write<attn_norm_w>")?;
 
     // Write weight data.
-    w_q.write_data_backend(&attention.q_weight_values)
-        .map_err(|source| E2eError::ggml("write<W_q>", source))?;
-    w_k.write_data_backend(&attention.k_weight_values)
-        .map_err(|source| E2eError::ggml("write<W_k>", source))?;
-    w_v.write_data_backend(&attention.v_weight_values)
-        .map_err(|source| E2eError::ggml("write<W_v>", source))?;
-    w_out
-        .write_data_backend(&attention.output_weight_values)
-        .map_err(|source| E2eError::ggml("write<W_out>", source))?;
+    upload_weight(&w_q, &attention.q_weight_values, "write<W_q>")?;
+    upload_weight(&w_k, &attention.k_weight_values, "write<W_k>")?;
+    upload_weight(&w_v, &attention.v_weight_values, "write<W_v>")?;
+    upload_weight(&w_out, &attention.output_weight_values, "write<W_out>")?;
 
     // Norm weights.
-    q_norm_w
-        .write_data_backend(&attention.q_norm_values)
-        .map_err(|source| E2eError::ggml("write<q_norm>", source))?;
-    k_norm_w
-        .write_data_backend(&attention.k_norm_values)
-        .map_err(|source| E2eError::ggml("write<k_norm>", source))?;
+    upload_weight(&q_norm_w, &attention.q_norm_values, "write<q_norm>")?;
+    upload_weight(&k_norm_w, &attention.k_norm_values, "write<k_norm>")?;
 
     // Position indices: [0, 1, 2, ..., T-1]
     let pos_data: Vec<i32> = (0..t as i32).collect();
@@ -1274,16 +1255,10 @@ fn decode_scoring_gpu(
         .map_err(|source| E2eError::ggml("allocate(scoring)", source))?;
 
     let kv_prefix_len = t * state.kv_features;
-    q.write_data_backend(q_values)
-        .map_err(|source| E2eError::ggml("write(Q)", source))?;
-    k_raw
-        .write_data_backend(&state.k_cache[..kv_prefix_len])
-        .map_err(|source| E2eError::ggml("write(K)", source))?;
-    v_raw
-        .write_data_backend(&state.v_cache[..kv_prefix_len])
-        .map_err(|source| E2eError::ggml("write(V)", source))?;
-    gate.write_data_backend(q_gate)
-        .map_err(|source| E2eError::ggml("write(gate)", source))?;
+    upload_weight(&q, q_values, "write(Q)")?;
+    upload_weight(&k_raw, &state.k_cache[..kv_prefix_len], "write(K)")?;
+    upload_weight(&v_raw, &state.v_cache[..kv_prefix_len], "write(V)")?;
+    upload_weight(&gate, q_gate, "write(gate)")?;
 
     backend
         .compute(&mut graph)

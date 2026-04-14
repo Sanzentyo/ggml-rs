@@ -38,7 +38,7 @@ use super::tensor_ops::{
     build_persistent_full_attention_graphs, build_persistent_linear_attention_graphs,
     gather_embeddings, lm_head_sample_step, recommended_lm_head_memory,
     recommended_persistent_full_attention_memory, recommended_persistent_linear_attention_memory,
-    rms_norm_with_weight,
+    rms_norm_with_weight, upload_weight,
 };
 use crate::backend::ensure_backends_loaded;
 use crate::inference::attention_inference_with_weights_on_backend_repeats_with_length;
@@ -377,17 +377,6 @@ fn try_build_persistent_projections(
     debug_assert_eq!(contexts.len(), layer_plans.len());
     debug_assert_eq!(projections.len(), layer_plans.len());
     Some((contexts, projections))
-}
-
-/// Upload a weight buffer to a backend tensor with a descriptive error label.
-fn upload_weight(
-    tensor: &ggml_rs::Tensor<'_, f32>,
-    data: &[f32],
-    label: &'static str,
-) -> Result<(), E2eError> {
-    tensor
-        .write_data_backend(data)
-        .map_err(|source| E2eError::ggml(label, source))
 }
 
 fn build_one_persistent_full(

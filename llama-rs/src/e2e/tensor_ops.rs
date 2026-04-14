@@ -613,6 +613,17 @@ fn sum_matmul_memories(
     Ok(Bytes::new(total))
 }
 
+/// Upload a weight buffer to a backend tensor with a descriptive error label.
+pub(super) fn upload_weight(
+    tensor: &Tensor<'_, f32>,
+    data: &[f32],
+    label: &'static str,
+) -> Result<(), E2eError> {
+    tensor
+        .write_data_backend(data)
+        .map_err(|source| E2eError::ggml(label, source))
+}
+
 /// Estimate ggml context metadata bytes for a full attention persistent
 /// projection (both input and output graphs in a single context).
 pub(super) fn recommended_persistent_full_attention_memory(

@@ -8,6 +8,7 @@ use super::error::E2eError;
 use super::numeric::{checked_mul, sigmoid_scalar, silu_scalar, softplus_scalar};
 use super::plan::Qwen35LinearAttentionLayerPlan;
 use super::state::LinearAttentionState;
+use super::tensor_ops::upload_weight;
 use super::tensor_ops::{
     PROJECTION_SLACK_BYTES, head_slice, head_slice_mut, per_head_l2_norm, project_sequence,
     project_sequence_graph, rms_norm_single, rms_norm_single_into,
@@ -266,19 +267,11 @@ fn project_linear_inputs_graph(
         .allocate_tensors(backend)
         .map_err(|source| E2eError::ggml("allocate_tensors(linear_proj)", source))?;
 
-    w_qkv
-        .write_data_backend(&attention.qkv_weight_values)
-        .map_err(|source| E2eError::ggml("write_data_backend<W_QKV>", source))?;
-    w_z.write_data_backend(&attention.gate_weight_values)
-        .map_err(|source| E2eError::ggml("write_data_backend<W_Z>", source))?;
-    w_alpha
-        .write_data_backend(&attention.alpha_weight_values)
-        .map_err(|source| E2eError::ggml("write_data_backend<W_alpha>", source))?;
-    w_beta
-        .write_data_backend(&attention.beta_weight_values)
-        .map_err(|source| E2eError::ggml("write_data_backend<W_beta>", source))?;
-    x.write_data_backend(input)
-        .map_err(|source| E2eError::ggml("write_data_backend<X>", source))?;
+    upload_weight(&w_qkv, &attention.qkv_weight_values, "write<W_QKV>")?;
+    upload_weight(&w_z, &attention.gate_weight_values, "write<W_Z>")?;
+    upload_weight(&w_alpha, &attention.alpha_weight_values, "write<W_alpha>")?;
+    upload_weight(&w_beta, &attention.beta_weight_values, "write<W_beta>")?;
+    upload_weight(&x, input, "write<X>")?;
 
     backend
         .compute(&mut graph)
@@ -977,10 +970,8 @@ fn causal_depthwise_conv_graph(
         .allocate_tensors(backend)
         .map_err(|source| E2eError::ggml("allocate_tensors(conv)", source))?;
 
-    sx.write_data_backend(&sx_data)
-        .map_err(|source| E2eError::ggml("write_data_backend<sx>", source))?;
-    c.write_data_backend(weight)
-        .map_err(|source| E2eError::ggml("write_data_backend<c>", source))?;
+    upload_weight(&sx, &sx_data, "write<sx>")?;
+    upload_weight(&c, weight, "write<c>")?;
 
     backend
         .compute(&mut graph)
@@ -1149,36 +1140,21 @@ fn project_and_conv_fused_graph(
         .map_err(|source| E2eError::ggml("allocate_tensors(fused)", source))?;
 
     // Upload projection weights and input.
-    w_qkv
-        .write_data_backend(&attention.qkv_weight_values)
-        .map_err(|source| E2eError::ggml("write<W_QKV>", source))?;
-    w_z.write_data_backend(&attention.gate_weight_values)
-        .map_err(|source| E2eError::ggml("write<W_Z>", source))?;
-    w_alpha
-        .write_data_backend(&attention.alpha_weight_values)
-        .map_err(|source| E2eError::ggml("write<W_alpha>", source))?;
-    w_beta
-        .write_data_backend(&attention.beta_weight_values)
-        .map_err(|source| E2eError::ggml("write<W_beta>", source))?;
-    x_raw
-        .write_data_backend(input)
-        .map_err(|source| E2eError::ggml("write<X>", source))?;
-    norm_w
-        .write_data_backend(attn_norm_weight)
-        .map_err(|source| E2eError::ggml("write<norm_w>", source))?;
+    upload_weight(&w_qkv, &attention.qkv_weight_values, "write<W_QKV>")?;
+    upload_weight(&w_z, &attention.gate_weight_values, "write<W_Z>")?;
+    upload_weight(&w_alpha, &attention.alpha_weight_values, "write<W_alpha>")?;
+    upload_weight(&w_beta, &attention.beta_weight_values, "write<W_beta>")?;
+    upload_weight(&x_raw, input, "write<X>")?;
+    upload_weight(&norm_w, attn_norm_weight, "write<norm_w>")?;
 
     // Upload zero padding (only when kernel_size > 1).
     if let Some(ref zeros) = zeros_tensor {
         let zero_data = vec![0.0_f32; pad * conv_channels];
-        zeros
-            .write_data_backend(&zero_data)
-            .map_err(|source| E2eError::ggml("write<zeros>", source))?;
+        upload_weight(zeros, &zero_data, "write<zeros>")?;
     }
 
     // Upload conv kernel weights.
-    c_tensor
-        .write_data_backend(&attention.conv_weight_values)
-        .map_err(|source| E2eError::ggml("write<c>", source))?;
+    upload_weight(&c_tensor, &attention.conv_weight_values, "write<c>")?;
 
     backend
         .compute(&mut graph)

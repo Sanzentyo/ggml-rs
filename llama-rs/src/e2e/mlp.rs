@@ -1,5 +1,6 @@
 use super::error::E2eError;
 use super::numeric::checked_mul;
+use super::tensor_ops::upload_weight;
 use crate::inference::MlpWeights;
 use ggml_rs::{Backend, BackendBuffer, Bytes, Context, Graph, Length, Shape2D, Tensor};
 
@@ -87,20 +88,11 @@ pub(super) fn mlp_sequence_inference_with_weights(
         .allocate_tensors(backend)
         .map_err(|source| E2eError::ggml("Context::allocate_tensors", source))?;
 
-    w_gate
-        .write_data_backend(weights.gate_values())
-        .map_err(|source| E2eError::ggml("Tensor::write_data_backend<W_GATE>", source))?;
-    w_up.write_data_backend(weights.up_values())
-        .map_err(|source| E2eError::ggml("Tensor::write_data_backend<W_UP>", source))?;
-    w_down
-        .write_data_backend(weights.down_values())
-        .map_err(|source| E2eError::ggml("Tensor::write_data_backend<W_DOWN>", source))?;
-    x_raw
-        .write_data_backend(input)
-        .map_err(|source| E2eError::ggml("Tensor::write_data_backend<X>", source))?;
-    norm_w
-        .write_data_backend(norm_weight)
-        .map_err(|source| E2eError::ggml("write<norm_w>", source))?;
+    upload_weight(&w_gate, weights.gate_values(), "write<W_GATE>")?;
+    upload_weight(&w_up, weights.up_values(), "write<W_UP>")?;
+    upload_weight(&w_down, weights.down_values(), "write<W_DOWN>")?;
+    upload_weight(&x_raw, input, "write<X>")?;
+    upload_weight(&norm_w, norm_weight, "write<norm_w>")?;
 
     backend
         .compute(&mut graph)
@@ -166,9 +158,7 @@ impl<'ctx> PersistentMlp<'ctx> {
                 actual: hidden.len(),
             });
         }
-        self.x_in
-            .write_data_backend(hidden)
-            .map_err(|source| E2eError::ggml("PersistentMlp::write(x_in)", source))?;
+        upload_weight(&self.x_in, hidden, "PersistentMlp::write(x_in)")?;
         backend
             .compute(&mut self.graph)
             .map_err(|source| E2eError::ggml("PersistentMlp::compute", source))?;
@@ -253,17 +243,10 @@ pub(super) fn build_persistent_mlp(
         .map_err(|source| E2eError::ggml("allocate_tensors(pmlp)", source))?;
 
     // Upload weights once.
-    w_gate
-        .write_data_backend(weights.gate_values())
-        .map_err(|source| E2eError::ggml("write<W_GATE>(pmlp)", source))?;
-    w_up.write_data_backend(weights.up_values())
-        .map_err(|source| E2eError::ggml("write<W_UP>(pmlp)", source))?;
-    w_down
-        .write_data_backend(weights.down_values())
-        .map_err(|source| E2eError::ggml("write<W_DOWN>(pmlp)", source))?;
-    norm_w
-        .write_data_backend(norm_weight)
-        .map_err(|source| E2eError::ggml("write<NORM_W>(pmlp)", source))?;
+    upload_weight(&w_gate, weights.gate_values(), "write<W_GATE>(pmlp)")?;
+    upload_weight(&w_up, weights.up_values(), "write<W_UP>(pmlp)")?;
+    upload_weight(&w_down, weights.down_values(), "write<W_DOWN>(pmlp)")?;
+    upload_weight(&norm_w, norm_weight, "write<NORM_W>(pmlp)")?;
 
     // SAFETY: see doc comment above.
     let mlp = unsafe {
