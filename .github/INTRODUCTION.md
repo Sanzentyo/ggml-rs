@@ -547,6 +547,15 @@ And you should write rusty code(ADT, enum, type state pattern)
   (standard attention fused graph + decode). Module root retains `pub(super)`
   re-exports for stable consumer import paths. Tests stay in root module.
   Zero clippy warnings, 229 tests pass.
+- **Split linear_attention.rs into coherent submodules** (item 64):
+  Split the 1767-line monolithic `linear_attention.rs` into 3 focused
+  submodules: `projection.rs` (LinearProjections, FusedLinearOutputs,
+  LinearAttentionDims, graph + host fallback projections), `conv.rs`
+  (causal depthwise convolution: host reference, graph-accelerated, fused
+  projection+conv, decode step), `ssm.rs` (SsmScratch, LinearDecodeScratch,
+  ssm_recurrence_step, split_and_norm_qk). Root retains entry points
+  (inference/prefill/decode), core logic, bench utilities, tests.
+  Zero clippy warnings, 229 tests pass.
 
 ## Validation checkpoints completed on this branch
 

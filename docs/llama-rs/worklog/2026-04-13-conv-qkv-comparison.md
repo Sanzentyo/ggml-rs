@@ -3900,3 +3900,48 @@ improves maintainability without changing any behavior.
 | llama-rs/src/e2e/attention/qwen35_full.rs | NEW — Qwen3.5 gated attention |
 | llama-rs/src/e2e/attention/standard.rs | NEW — Standard attention |
 
+---
+
+## Item 64 — Split linear_attention.rs into coherent submodules
+
+### 64.1 Goal
+
+Split the 1767-line monolithic `linear_attention.rs` into 3 focused submodules
+to improve navigability and separation of concerns, following the same pattern
+established in item 63 (attention.rs split).
+
+### 64.2 Submodule Design
+
+| Submodule | Responsibility | ~LOC |
+|-----------|---------------|------|
+| `projection.rs` | LinearProjections struct, FusedLinearOutputs, LinearAttentionDims, graph + host fallback projection functions | ~290 |
+| `conv.rs` | Causal depthwise convolution: host reference (#[cfg(test)]), graph-accelerated (#[cfg(test)]), fused projection+conv, decode step | ~350 |
+| `ssm.rs` | SsmScratch, LinearDecodeScratch, ssm_recurrence_step, split_and_norm_qk | ~165 |
+| Root | Entry points (inference/prefill/decode), qwen35_linear_attention_core, bench utilities, tests | ~910 |
+
+### 64.3 Visibility Strategy
+
+- Items consumed by `e2e` siblings (generation.rs, etc.): `pub(in crate::e2e)` in submodule, re-exported as `pub(super)` from root
+- Cross-submodule items: `pub(super)` within the module
+- Test-only items (`causal_depthwise_conv`, `causal_depthwise_conv_graph`): `#[cfg(test)] pub(in crate::e2e)` for bench_graphs access
+- Struct fields on `LinearProjections`: `pub(in crate::e2e)` since generation.rs constructs them directly
+
+### 64.4 Metrics
+
+| Metric | Before | After |
+|--------|--------|-------|
+| linear_attention.rs LOC | 1767 | ~910 (root + tests) |
+| Submodule files | 0 | 3 |
+| External import breakage | — | 0 (re-exports preserve paths) |
+| Clippy warnings | 0 | 0 |
+| Tests | 229 pass | 229 pass |
+
+### 64.5 Files Modified
+
+| File | Changes |
+|------|---------|
+| llama-rs/src/e2e/linear_attention.rs | Replaced 1767-line monolith with module root: mod declarations, re-exports, entry points, core logic, bench utilities, tests |
+| llama-rs/src/e2e/linear_attention/projection.rs | NEW — LinearProjections, FusedLinearOutputs, LinearAttentionDims, projection functions |
+| llama-rs/src/e2e/linear_attention/conv.rs | NEW — Causal depthwise convolution (host, graph, fused, decode step) |
+| llama-rs/src/e2e/linear_attention/ssm.rs | NEW — SSM recurrence logic and scratch buffers |
+
