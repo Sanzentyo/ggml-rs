@@ -3753,3 +3753,100 @@ projection tensors (QKV, Z, alpha, beta) with individual `new_tensor_2d` +
 |------|---------|
 | llama-rs/src/e2e/linear_attention.rs | Added `linear_projection_specs`; refactored both projection functions |
 
+---
+
+## Item 61 — Standard attention incremental decode
+
+### 61.1 Background
+
+Standard attention (non-Qwen3.5 full-attention layers) previously forced
+FullReprocess mode, recomputing the entire sequence per new token. This made
+it the only layer type without incremental decode support.
+
+### 61.2 Solution
+
+- `StandardAttentionState` in `state.rs`: KV cache storing post-RoPE K and
+  raw V per head, with `append_batch` and per-head accessors.
+- `standard_attention_prefill()`: fused ggml graph with KV readback via
+  `build_forward_expand` for intermediate tensors.
+- `standard_attention_decode_step()`: host-side dot-product scoring with
+  cached KV (matching Qwen35Full decode pattern).
+- `standard_attention_inference()`: stateless wrapper for single-call use.
+- All three strategies (Inference/Prefill/Decode) wired in `generation.rs`.
+- Removed `has_standard -> FullReprocess` guard.
+- Checkpoint format bumped V1->V2 with KV cache fields.
+- 7 new tests (3 attention + 4 checkpoint). 229 tests pass.
+
+### 61.3 Files Modified
+
+| File | Changes |
+|------|---------|
+| llama-rs/src/e2e/state.rs | Added `StandardAttentionState` with KV cache |
+| llama-rs/src/e2e/attention.rs | `standard_attention_prefill`, `decode_step`, `inference` |
+| llama-rs/src/e2e/generation.rs | Wired all three strategies |
+| llama-rs/src/e2e/checkpoint.rs | V2 format with KV cache fields |
+
+---
+
+## Item 62 — Extract shared flash-attention pipeline
+
+### 62.1 Background
+
+`fully_fused_attention_graph` (~295 lines) and `standard_attention_graph`
+(~315 lines) shared ~70% of their code for the flash-attention pipeline:
+reshape_4d, permute, cont, flash_attn_ext, optional gating, output
+projection. The remaining ~30% differs: Q+gate interleaving and gating
+(Qwen3.5 only), optional norm/RoPE/mask (standard), weight access patterns.
+
+### 62.2 Solution
+
+Extracted two helpers plus one config struct:
+
+1. **`FlashAttentionConfig`** — carries dimensional/scalar params: `d`, `h`,
+   `hkv`, `t`, `qf`, `attention_scale`. No tensor references (those are
+   passed as arguments).
+
+2. **`run_flash_attention_pipeline`** — accepts QKV as a tuple
+   `(&Tensor, &Tensor, &Tensor)`, optional mask (`DynTensor`), optional gate
+   (`Tensor`), and output weight. Performs the full pipeline: reshape_4d ->
+   permute(0,2,1,3) -> cont -> flash_attn_ext -> optional sigmoid(gate)*attn ->
+   reshape_2d -> mul_mat(w_out). Returns `[hidden, T]` output.
+
+3. **`apply_optional_per_head_norm`** — conditional per-head RMS norm + weight
+   scaling. If `norm_weight` is `Some`, applies rms_norm then mul; otherwise
+   returns input unchanged. Uses static string labels for error messages.
+
+### 62.3 Design Decisions
+
+- **Thin config struct**: `FlashAttentionConfig` has no `hidden` field since
+  `w_out` already encodes output dimensionality. `debug_assert_eq!(qf, d*h)`
+  validates consistency.
+- **QKV tuple**: Bundles Q/K/V into a single tuple parameter to stay within
+  clippy's 7-argument limit (6 params total).
+- **No lifecycle extraction**: Graph creation, build_forward_expand, allocator
+  setup, and state capture differ too much between callers — kept in callers.
+- **Static labels**: `apply_optional_per_head_norm` takes `&'static str`
+  labels instead of `format!()` to satisfy `E2eError::ggml`'s `'static`
+  requirement.
+- **DynTensor for mask**: Flash attention mask is `DynTensor` (F16 tensor
+  created dynamically), not `Tensor<f32>`.
+- Per rubber-duck critique: input norm extraction deferred (too little
+  payoff); `StandardAttentionDims` helper noted for future work.
+
+### 62.4 Metrics
+
+| Metric | Before | After |
+|--------|--------|-------|
+| fully_fused_attention_graph LOC | ~295 | ~230 |
+| standard_attention_graph LOC | ~315 | ~255 |
+| Shared helper LOC | 0 | ~105 |
+| Net LOC delta | — | -75 |
+| Clippy warnings | 0 | 0 |
+| Tests | 229 pass | 229 pass |
+
+### 62.5 Files Modified
+
+| File | Changes |
+|------|---------|
+| llama-rs/src/e2e/attention.rs | Added `FlashAttentionConfig`, `run_flash_attention_pipeline`, `apply_optional_per_head_norm`; refactored both graph functions |
+

@@ -12,7 +12,9 @@ use super::tensor_ops::{
     per_head_rms_norm, project_sequence, project_sequence_graph, upload_weight,
 };
 use crate::inference::{AttentionMaskPolicy, RotaryEmbedding};
-use ggml_rs::{Backend, BackendBuffer, Bytes, Context, GraphAllocator, Shape2D, Shape4D, Tensor};
+use ggml_rs::{
+    Backend, BackendBuffer, Bytes, Context, DynTensor, GraphAllocator, Shape2D, Shape4D, Tensor,
+};
 
 /// Backend-resident KV cache for GPU-accelerated attention scoring.
 ///
@@ -880,6 +882,134 @@ pub(super) fn apply_neox_rope_in_place(
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// Shared flash-attention pipeline helpers
+// ---------------------------------------------------------------------------
+
+/// Configuration for the shared flash-attention pipeline.
+///
+/// Carries only the dimensional and scalar parameters; the heavy tensors
+/// (Q, K, V, mask, gate, output weight) are passed as arguments.
+struct FlashAttentionConfig {
+    d: usize,
+    h: usize,
+    hkv: usize,
+    t: usize,
+    qf: usize,
+    attention_scale: f32,
+}
+
+/// Shared flash-attention pipeline: reshape → permute → cont → flash_attn_ext
+/// → optional gating → output projection.
+///
+/// Accepts Q `[D, H, T]`, K `[D, Hkv, T]`, V `[D, Hkv, T]` (already after
+/// any per-head norm and RoPE), plus optional gate `[D, H, T]` and causal
+/// mask `[T, T, 1, 1]`.  Returns the output tensor `[hidden, T]`.
+fn run_flash_attention_pipeline<'ctx>(
+    ctx: &'ctx Context,
+    cfg: &FlashAttentionConfig,
+    qkv: (&Tensor<'ctx, f32>, &Tensor<'ctx, f32>, &Tensor<'ctx, f32>),
+    mask: Option<&DynTensor<'ctx>>,
+    gate: Option<&Tensor<'ctx, f32>>,
+    w_out: &Tensor<'ctx, f32>,
+) -> Result<Tensor<'ctx, f32>, E2eError> {
+    let (q, k, v) = qkv;
+    let FlashAttentionConfig {
+        d,
+        h,
+        hkv,
+        t,
+        qf,
+        attention_scale,
+    } = *cfg;
+    debug_assert_eq!(qf, d * h, "qf must equal d * h");
+
+    // Reshape to 4D for flash_attn_ext: [D, H/Hkv, T] → [D, H/Hkv, T, 1].
+    let q_4d = ctx
+        .reshape_4d(q, d, h, t, 1)
+        .map_err(|source| E2eError::ggml("reshape_4d(Q)", source))?;
+    let k_4d = ctx
+        .reshape_4d(k, d, hkv, t, 1)
+        .map_err(|source| E2eError::ggml("reshape_4d(K)", source))?;
+    let v_3d = ctx
+        .reshape_3d(v, d, hkv, t)
+        .map_err(|source| E2eError::ggml("reshape_3d(V)", source))?;
+    let v_4d = ctx
+        .reshape_4d(&v_3d, d, hkv, t, 1)
+        .map_err(|source| E2eError::ggml("reshape_4d(V)", source))?;
+
+    // Permute [D, H, T, 1] → [D, T, H, 1] + cont for flash_attn_ext.
+    let q_perm = ctx
+        .permute(&q_4d, 0, 2, 1, 3)
+        .map_err(|source| E2eError::ggml("permute(Q)", source))?;
+    let k_perm = ctx
+        .permute(&k_4d, 0, 2, 1, 3)
+        .map_err(|source| E2eError::ggml("permute(K)", source))?;
+    let v_perm = ctx
+        .permute(&v_4d, 0, 2, 1, 3)
+        .map_err(|source| E2eError::ggml("permute(V)", source))?;
+
+    let q_c = ctx
+        .cont(&q_perm)
+        .map_err(|source| E2eError::ggml("cont(Q)", source))?;
+    let k_c = ctx
+        .cont(&k_perm)
+        .map_err(|source| E2eError::ggml("cont(K)", source))?;
+    let v_c = ctx
+        .cont(&v_perm)
+        .map_err(|source| E2eError::ggml("cont(V)", source))?;
+
+    // Flash attention.
+    let attn = ctx
+        .flash_attn_ext(&q_c, &k_c, &v_c, mask, attention_scale, 0.0, 0.0)
+        .map_err(|source| E2eError::ggml("flash_attn_ext", source))?; // [D, H, T, 1]
+
+    // Optional gating: sigmoid(gate) ⊙ attn (Qwen3.5 full attention).
+    let scored = if let Some(gate) = gate {
+        let gate_4d = ctx
+            .reshape_4d(gate, d, h, t, 1)
+            .map_err(|source| E2eError::ggml("reshape_4d(Gate)", source))?;
+        let gate_sig = ctx
+            .sigmoid(&gate_4d)
+            .map_err(|source| E2eError::ggml("sigmoid(Gate)", source))?;
+        ctx.mul(&attn, &gate_sig)
+            .map_err(|source| E2eError::ggml("mul(attn, gate)", source))?
+    } else {
+        attn
+    };
+
+    // Output projection: [D, H, T, 1] → [H*D, T] → mul_mat(W_out) → [hidden, T].
+    let scored_2d = ctx
+        .reshape_2d(&scored, qf, t)
+        .map_err(|source| E2eError::ggml("reshape_2d(scored)", source))?;
+    ctx.mul_mat(w_out, &scored_2d)
+        .map_err(|source| E2eError::ggml("mul_mat(output)", source))
+}
+
+/// Optional per-head RMS norm + weight scaling on a 3D tensor `[D, H, T]`.
+///
+/// If `norm_weight` is Some, applies `rms_norm(x, eps) * weight` per head.
+/// Otherwise returns the input tensor unchanged.
+fn apply_optional_per_head_norm<'ctx>(
+    ctx: &'ctx Context,
+    x: Tensor<'ctx, f32>,
+    norm_weight: Option<&Tensor<'ctx, f32>>,
+    rms_norm_eps: f32,
+    label_norm: &'static str,
+    label_mul: &'static str,
+) -> Result<Tensor<'ctx, f32>, E2eError> {
+    match norm_weight {
+        Some(nw) => {
+            let normed = ctx
+                .rms_norm(&x, rms_norm_eps)
+                .map_err(|source| E2eError::ggml(label_norm, source))?;
+            ctx.mul(&normed, nw)
+                .map_err(|source| E2eError::ggml(label_mul, source))
+        }
+        None => Ok(x),
+    }
+}
+
 /// Fully fused attention graph: layer norm + projection + deinterleave + norm + RoPE + scoring.
 ///
 /// Accepts **un-normed** hidden state and applies layer pre-norm as the first
@@ -1021,25 +1151,27 @@ fn fully_fused_attention_graph(
         .cont(&gate_view)
         .map_err(|source| E2eError::ggml("cont(Gate_deinterleave)", source))?; // [D, H, T]
 
-    // --- Per-head RMS norm ---
-    // rms_norm normalizes along ne[0]=D for each (h, t) pair.
+    // --- Per-head RMS norm (unconditional for Qwen3.5) ---
     let k_3d = ctx
         .reshape_3d(k_proj, d, hkv, t)
         .map_err(|source| E2eError::ggml("reshape_3d(K)", source))?;
 
-    let q_normed = ctx
-        .rms_norm(&q_cont, rms_norm_eps)
-        .map_err(|source| E2eError::ggml("rms_norm(Q)", source))?;
-    let q_scaled = ctx
-        .mul(&q_normed, &q_norm_w)
-        .map_err(|source| E2eError::ggml("mul(Q_norm, weight)", source))?; // [D, H, T]
-
-    let k_normed = ctx
-        .rms_norm(&k_3d, rms_norm_eps)
-        .map_err(|source| E2eError::ggml("rms_norm(K)", source))?;
-    let k_scaled = ctx
-        .mul(&k_normed, &k_norm_w)
-        .map_err(|source| E2eError::ggml("mul(K_norm, weight)", source))?; // [D, Hkv, T]
+    let q_scaled = apply_optional_per_head_norm(
+        &ctx,
+        q_cont,
+        Some(&q_norm_w),
+        rms_norm_eps,
+        "rms_norm(Q)",
+        "mul(Q_norm)",
+    )?;
+    let k_scaled = apply_optional_per_head_norm(
+        &ctx,
+        k_3d,
+        Some(&k_norm_w),
+        rms_norm_eps,
+        "rms_norm(K)",
+        "mul(K_norm)",
+    )?;
 
     // --- NeoX RoPE (mode=2) ---
     let rope_params = RopeExtParams {
@@ -1061,72 +1193,23 @@ fn fully_fused_attention_graph(
         .rope_ext_with_i32_positions(&k_scaled, &positions, None, rope_params)
         .map_err(|source| E2eError::ggml("rope_ext(K)", source))?; // [D, Hkv, T]
 
-    // --- Prepare for flash_attn_ext: [D, T, H, 1] ---
-    let q_4d = ctx
-        .reshape_4d(&q_rope, d, h, t, 1)
-        .map_err(|source| E2eError::ggml("reshape_4d(Q)", source))?;
-    let k_4d = ctx
-        .reshape_4d(&k_rope, d, hkv, t, 1)
-        .map_err(|source| E2eError::ggml("reshape_4d(K)", source))?;
-    let v_3d = ctx
-        .reshape_3d(v_proj, d, hkv, t)
-        .map_err(|source| E2eError::ggml("reshape_3d(V)", source))?;
-    let v_4d = ctx
-        .reshape_4d(&v_3d, d, hkv, t, 1)
-        .map_err(|source| E2eError::ggml("reshape_4d(V)", source))?;
-
-    // Permute [D, H, T, 1] → [D, T, H, 1] + cont for flash_attn_ext.
-    let q_perm = ctx
-        .permute(&q_4d, 0, 2, 1, 3)
-        .map_err(|source| E2eError::ggml("permute(Q)", source))?;
-    let k_perm = ctx
-        .permute(&k_4d, 0, 2, 1, 3)
-        .map_err(|source| E2eError::ggml("permute(K)", source))?;
-    let v_perm = ctx
-        .permute(&v_4d, 0, 2, 1, 3)
-        .map_err(|source| E2eError::ggml("permute(V)", source))?;
-
-    let q_c = ctx
-        .cont(&q_perm)
-        .map_err(|source| E2eError::ggml("cont(Q_perm)", source))?;
-    let k_c = ctx
-        .cont(&k_perm)
-        .map_err(|source| E2eError::ggml("cont(K_perm)", source))?;
-    let v_c = ctx
-        .cont(&v_perm)
-        .map_err(|source| E2eError::ggml("cont(V_perm)", source))?;
-
-    // --- Flash attention + gating + output projection ---
-    let attn = ctx
-        .flash_attn_ext(
-            &q_c,
-            &k_c,
-            &v_c,
-            Some(&mask),
-            attention.attention_scale,
-            0.0,
-            0.0,
-        )
-        .map_err(|source| E2eError::ggml("flash_attn_ext", source))?; // [D, H, T, 1]
-
-    // Gate: reshape to 4D for sigmoid + element-wise mul with flash output.
-    let gate_4d = ctx
-        .reshape_4d(&gate_cont, d, h, t, 1)
-        .map_err(|source| E2eError::ggml("reshape_4d(Gate)", source))?;
-    let gate_sig = ctx
-        .sigmoid(&gate_4d)
-        .map_err(|source| E2eError::ggml("sigmoid(Gate)", source))?;
-    let gated = ctx
-        .mul(&attn, &gate_sig)
-        .map_err(|source| E2eError::ggml("mul(attn, gate)", source))?; // [D, H, T, 1]
-
-    // Output projection: [D, H, T, 1] → [H*D, T] → mul_mat(W_out) → [hidden, T]
-    let gated_2d = ctx
-        .reshape_2d(&gated, qf, t)
-        .map_err(|source| E2eError::ggml("reshape_2d(gated)", source))?;
-    let output = ctx
-        .mul_mat(&w_out, &gated_2d)
-        .map_err(|source| E2eError::ggml("mul_mat(output)", source))?; // [hidden, T]
+    // --- Flash attention pipeline (shared helper) ---
+    let flash_cfg = FlashAttentionConfig {
+        d,
+        h,
+        hkv,
+        t,
+        qf,
+        attention_scale: attention.attention_scale,
+    };
+    let output = run_flash_attention_pipeline(
+        &ctx,
+        &flash_cfg,
+        (&q_rope, &k_rope, v_proj),
+        Some(&mask),
+        Some(&gate_cont),
+        &w_out,
+    )?;
 
     // --- Build, allocate, write, compute ---
     let mut graph = ctx
@@ -1618,45 +1701,39 @@ fn standard_attention_graph(
         .map_err(|source| E2eError::ggml("reshape_3d(K)", source))?;
 
     // Optional per-head Q/K RMS norm.
-    let has_q_norm = attention.weights.q_norm_values().is_some();
-    let has_k_norm = attention.weights.k_norm_values().is_some();
-
-    let q_norm_w = if has_q_norm {
-        Some(
+    let q_norm_w = attention
+        .weights
+        .q_norm_values()
+        .map(|_| {
             ctx.new_tensor_1d::<f32>(Length::new(d))
-                .map_err(|source| E2eError::ggml("new<q_norm>", source))?,
-        )
-    } else {
-        None
-    };
-    let k_norm_w = if has_k_norm {
-        Some(
+                .map_err(|source| E2eError::ggml("new<q_norm>", source))
+        })
+        .transpose()?;
+    let k_norm_w = attention
+        .weights
+        .k_norm_values()
+        .map(|_| {
             ctx.new_tensor_1d::<f32>(Length::new(d))
-                .map_err(|source| E2eError::ggml("new<k_norm>", source))?,
-        )
-    } else {
-        None
-    };
+                .map_err(|source| E2eError::ggml("new<k_norm>", source))
+        })
+        .transpose()?;
 
-    let q_after_norm = if let Some(ref nw) = q_norm_w {
-        let normed = ctx
-            .rms_norm(&q_3d, rms_norm_eps)
-            .map_err(|source| E2eError::ggml("rms_norm(Q)", source))?;
-        ctx.mul(&normed, nw)
-            .map_err(|source| E2eError::ggml("mul(Q_norm)", source))?
-    } else {
-        q_3d
-    };
-
-    let k_after_norm = if let Some(ref nw) = k_norm_w {
-        let normed = ctx
-            .rms_norm(&k_3d, rms_norm_eps)
-            .map_err(|source| E2eError::ggml("rms_norm(K)", source))?;
-        ctx.mul(&normed, nw)
-            .map_err(|source| E2eError::ggml("mul(K_norm)", source))?
-    } else {
-        k_3d
-    };
+    let q_after_norm = apply_optional_per_head_norm(
+        &ctx,
+        q_3d,
+        q_norm_w.as_ref(),
+        rms_norm_eps,
+        "rms_norm(Q)",
+        "mul(Q_norm)",
+    )?;
+    let k_after_norm = apply_optional_per_head_norm(
+        &ctx,
+        k_3d,
+        k_norm_w.as_ref(),
+        rms_norm_eps,
+        "rms_norm(K)",
+        "mul(K_norm)",
+    )?;
 
     // RoPE (if configured).
     let positions = if matches!(config.rotary, RotaryEmbedding::Llama(_)) {
@@ -1711,60 +1788,23 @@ fn standard_attention_graph(
         None
     };
 
-    // Prepare for flash_attn_ext: [D, H/Hkv, T] → [D, T, H/Hkv, 1].
-    let q_4d = ctx
-        .reshape_4d(&q_final, d, h, t, 1)
-        .map_err(|source| E2eError::ggml("reshape_4d(Q)", source))?;
-    let k_4d = ctx
-        .reshape_4d(&k_final, d, hkv, t, 1)
-        .map_err(|source| E2eError::ggml("reshape_4d(K)", source))?;
-    let v_3d = ctx
-        .reshape_3d(v_proj, d, hkv, t)
-        .map_err(|source| E2eError::ggml("reshape_3d(V)", source))?;
-    let v_4d = ctx
-        .reshape_4d(&v_3d, d, hkv, t, 1)
-        .map_err(|source| E2eError::ggml("reshape_4d(V)", source))?;
-
-    let q_perm = ctx
-        .permute(&q_4d, 0, 2, 1, 3)
-        .map_err(|source| E2eError::ggml("permute(Q)", source))?;
-    let k_perm = ctx
-        .permute(&k_4d, 0, 2, 1, 3)
-        .map_err(|source| E2eError::ggml("permute(K)", source))?;
-    let v_perm = ctx
-        .permute(&v_4d, 0, 2, 1, 3)
-        .map_err(|source| E2eError::ggml("permute(V)", source))?;
-
-    let q_c = ctx
-        .cont(&q_perm)
-        .map_err(|source| E2eError::ggml("cont(Q)", source))?;
-    let k_c = ctx
-        .cont(&k_perm)
-        .map_err(|source| E2eError::ggml("cont(K)", source))?;
-    let v_c = ctx
-        .cont(&v_perm)
-        .map_err(|source| E2eError::ggml("cont(V)", source))?;
-
-    // Flash attention (no gating for standard attention).
-    let attn = ctx
-        .flash_attn_ext(
-            &q_c,
-            &k_c,
-            &v_c,
-            mask.as_ref(),
-            config.attention_scale,
-            0.0,
-            0.0,
-        )
-        .map_err(|source| E2eError::ggml("flash_attn_ext", source))?; // [D, H, T, 1]
-
-    // Output projection: [D, H, T, 1] → [H*D, T] → mul_mat(W_out) → [hidden, T].
-    let attn_2d = ctx
-        .reshape_2d(&attn, qf, t)
-        .map_err(|source| E2eError::ggml("reshape_2d(attn)", source))?;
-    let output = ctx
-        .mul_mat(&w_out, &attn_2d)
-        .map_err(|source| E2eError::ggml("mul_mat(output)", source))?;
+    // --- Flash attention pipeline (shared helper, no gating for standard) ---
+    let flash_cfg = FlashAttentionConfig {
+        d,
+        h,
+        hkv,
+        t,
+        qf,
+        attention_scale: config.attention_scale,
+    };
+    let output = run_flash_attention_pipeline(
+        &ctx,
+        &flash_cfg,
+        (&q_final, &k_final, v_proj),
+        mask.as_ref(),
+        None, // no gating
+        &w_out,
+    )?;
 
     // Build graph with K/V readback nodes for state capture.
     let mut graph = ctx

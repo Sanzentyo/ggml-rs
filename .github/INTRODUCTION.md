@@ -531,6 +531,15 @@ And you should write rusty code(ADT, enum, type state pattern)
   `attention_inference_with_weights_on_backend_repeats_with_length`. 123 tests
   pass, zero clippy warnings. Commit `e0e3675`.
 
+- **Extract shared flash-attention pipeline** (item 62):
+  `fully_fused_attention_graph` and `standard_attention_graph` shared ~70%
+  code for the flash-attention pipeline (reshape_4d → permute → cont →
+  flash_attn_ext → optional gating → output projection). Extracted two helpers:
+  `run_flash_attention_pipeline` (QKV tuple + optional mask/gate → output
+  tensor) and `apply_optional_per_head_norm` (conditional rms_norm + weight
+  scaling). `FlashAttentionConfig` struct carries dimensional/scalar params.
+  Net ~75 line reduction, zero clippy warnings, 229 tests pass.
+
 ## Validation checkpoints completed on this branch
 
 - `cargo fmt --all`
