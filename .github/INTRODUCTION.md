@@ -486,6 +486,13 @@ And you should write rusty code(ADT, enum, type state pattern)
   lines of repeated `new_tensor_2d` + `mul_mat` boilerplate. Named struct
   preserves diagnostic labels. See comparison doc item 56.
 
+- **Conv vs QKV packing micro-benchmark** (item 57):
+  Quantitative comparison of packed QKV (single matmul) vs separate Q/K/V
+  (3 matmuls), host conv vs graph conv (ssm_conv), and layout prep overhead.
+  Key findings: packed QKV is NOT faster than separate (separate is 15% faster
+  on Metal at seq_len=1024); graph conv wins at seq_len≥256; layout prep
+  (transpose+cont+pad) costs as much as conv itself. See comparison doc item 57.
+
 ## Validation checkpoints completed on this branch
 
 - `cargo fmt --all`

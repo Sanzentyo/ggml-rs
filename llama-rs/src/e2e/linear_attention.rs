@@ -838,7 +838,7 @@ fn ssm_recurrence_step(
 }
 
 #[cfg(test)]
-fn causal_depthwise_conv(
+pub(super) fn causal_depthwise_conv(
     input: &[f32],
     sequence_length: usize,
     channels: usize,
@@ -877,10 +877,10 @@ fn causal_depthwise_conv(
 
 /// Graph-accelerated causal depthwise convolution via `ggml_ssm_conv` + SiLU.
 ///
-/// Standalone version used by tests for parity checking. Production code uses
-/// the fused `project_and_conv_fused_graph` which combines projection + conv.
-#[cfg(test)]
-fn causal_depthwise_conv_graph(
+/// Standalone version used by tests and benchmarks for parity checking.
+/// Production code uses the fused `project_and_conv_fused_graph` which
+/// combines projection + conv.
+pub(super) fn causal_depthwise_conv_graph(
     input: &[f32],
     sequence_length: usize,
     channels: usize,
