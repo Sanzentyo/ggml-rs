@@ -574,19 +574,18 @@ impl CheckpointV1 {
                         )));
                     }
                     if *kv_features > 0 {
-                        let expected_cache = self
-                            .total_sequence_length
+                        let expected_data = cached_len
                             .checked_mul(*kv_features)
                             .ok_or(E2eError::MemorySizeOverflow)?;
-                        if k_cache.len() != expected_cache {
+                        if k_cache.len() != expected_data {
                             return Err(E2eError::CheckpointDeserialize(format!(
-                                "layer {i}: Standard k_cache length mismatch: expected {expected_cache}, got {}",
+                                "layer {i}: Standard k_cache length mismatch: expected {expected_data}, got {}",
                                 k_cache.len()
                             )));
                         }
-                        if v_cache.len() != expected_cache {
+                        if v_cache.len() != expected_data {
                             return Err(E2eError::CheckpointDeserialize(format!(
-                                "layer {i}: Standard v_cache length mismatch: expected {expected_cache}, got {}",
+                                "layer {i}: Standard v_cache length mismatch: expected {expected_data}, got {}",
                                 v_cache.len()
                             )));
                         }
@@ -832,10 +831,10 @@ mod tests {
         let kv_features = kv_head_count * head_dimension;
         let total_sequence_length = 13;
         let cached_len = 3;
-        let cache_size = total_sequence_length * kv_features;
+        let data_len = cached_len * kv_features;
         let std_state = LayerStateDto::Standard {
-            k_cache: (0..cache_size).map(|i| i as f32 * 0.1).collect(),
-            v_cache: (0..cache_size).map(|i| i as f32 * 0.2).collect(),
+            k_cache: (0..data_len).map(|i| i as f32 * 0.1).collect(),
+            v_cache: (0..data_len).map(|i| i as f32 * 0.2).collect(),
             cached_len,
             kv_features,
         };
@@ -949,5 +948,83 @@ mod tests {
             err.contains("kv_features must be > 0"),
             "expected kv_features error, got: {err}"
         );
+    }
+
+    #[test]
+    fn standard_capture_roundtrip_via_from_impl() {
+        let kv_features = 8;
+        let cached_len = 3;
+        let total_seq = 13;
+        let runtime = LayerAttentionState::Standard(StandardAttentionState {
+            k_cache: (0..total_seq * kv_features)
+                .map(|i| i as f32 * 0.1)
+                .collect(),
+            v_cache: (0..total_seq * kv_features)
+                .map(|i| i as f32 * 0.2)
+                .collect(),
+            cached_len,
+            kv_features,
+        });
+
+        // From impl trims to cached_len * kv_features
+        let dto = LayerStateDto::from(&runtime);
+        match &dto {
+            LayerStateDto::Standard { k_cache, .. } => {
+                assert_eq!(k_cache.len(), cached_len * kv_features);
+            }
+            _ => panic!("expected Standard"),
+        }
+
+        // Build a checkpoint with the trimmed DTO
+        let cp = GenerationCheckpoint {
+            inner: CheckpointV1 {
+                version: CHECKPOINT_VERSION,
+                fingerprint: ModelFingerprint {
+                    layer_count: 1,
+                    hidden_features: 64,
+                    vocab_size: 1000,
+                    rms_norm_eps_bits: 1e-5_f32.to_bits(),
+                    layer_types: vec![LayerTypeTag::Standard {
+                        kv_head_count: 1,
+                        head_dimension: kv_features,
+                    }],
+                },
+                prompt_token_ids: vec![1, 2, 3],
+                generated_token_ids: vec![42],
+                current_token_count: 4,
+                prompt_token_count: 3,
+                max_new_tokens: 10,
+                total_sequence_length: total_seq,
+                pad_token_id: 0,
+                eos_token_id: None,
+                prefill_done: true,
+                finished: false,
+                layer_states: vec![dto],
+            },
+        };
+
+        // Round-trip through save/load
+        let mut buf = Vec::new();
+        cp.save_to(&mut buf).unwrap();
+        let restored = GenerationCheckpoint::load_from(buf.as_slice()).unwrap();
+
+        // Validate that restore reconstructs full-size caches
+        let state = restored.inner.restore_state().unwrap();
+        match &state.layers[0] {
+            LayerAttentionState::Standard(kv) => {
+                assert_eq!(kv.k_cache.len(), total_seq * kv_features);
+                assert_eq!(kv.cached_len, cached_len);
+                // First cached_len * kv_features elements match original
+                let data_len = cached_len * kv_features;
+                for i in 0..data_len {
+                    assert_eq!(kv.k_cache[i], i as f32 * 0.1, "k_cache[{i}] mismatch");
+                }
+                // Remaining are zeroed
+                for i in data_len..kv.k_cache.len() {
+                    assert_eq!(kv.k_cache[i], 0.0, "k_cache[{i}] should be zero");
+                }
+            }
+            _ => panic!("expected Standard"),
+        }
     }
 }
