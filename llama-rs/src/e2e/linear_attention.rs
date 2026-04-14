@@ -36,7 +36,6 @@ pub(super) use conv::{
 };
 
 use super::error::E2eError;
-use super::numeric::checked_mul;
 use super::plan::Qwen35LinearAttentionLayerPlan;
 use super::state::LinearAttentionState;
 use ggml_rs::Backend;
@@ -104,8 +103,7 @@ pub(super) fn linear_attention_hidden_features(
 pub(super) fn linear_attention_conv_channels(
     attention: &Qwen35LinearAttentionLayerPlan,
 ) -> Result<usize, E2eError> {
-    Ok(attention.inner_size
-        + checked_mul(checked_mul(attention.group_count, attention.state_size)?, 2)?)
+    attention.conv_channels()
 }
 
 #[cfg(test)]

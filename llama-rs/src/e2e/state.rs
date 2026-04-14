@@ -304,7 +304,7 @@ impl GenerationState {
                 Some(AttentionLayerPlan::Qwen35Linear(lin)) => {
                     LayerAttentionState::Qwen35Linear(LinearAttentionState::new(
                         lin.conv_kernel,
-                        lin.conv_channels(),
+                        lin.conv_channels()?,
                         lin.time_step_rank,
                         lin.state_size,
                     )?)
@@ -461,5 +461,99 @@ mod tests {
             // ssm_size = time_step_rank * state_size^2 = 4 * 4 = 16
             assert_eq!(lin.ssm_states.len(), 16);
         }
+    }
+
+    // ── kv_cache_append_batch boundary tests ────────────────────
+    #[test]
+    fn kv_append_exact_fill_then_overflow() {
+        // 4 tokens max, kv_features = 2×3 = 6
+        let mut state = StandardAttentionState::new(4, 2, 3).unwrap();
+
+        // Fill all 4 slots in two batches
+        let k = vec![1.0; 12]; // 2 tokens × 6
+        let v = vec![2.0; 12];
+        state.append_batch(&k, &v, 2).unwrap();
+        assert_eq!(state.token_count(), 2);
+
+        let k2 = vec![3.0; 12];
+        let v2 = vec![4.0; 12];
+        state.append_batch(&k2, &v2, 2).unwrap();
+        assert_eq!(state.token_count(), 4);
+
+        // Next append should fail with SequenceTooLong
+        let k3 = vec![5.0; 6];
+        let v3 = vec![6.0; 6];
+        let err = state.append_batch(&k3, &v3, 1).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                E2eError::SequenceTooLong {
+                    requested: 5,
+                    context_length: 4
+                }
+            ),
+            "expected SequenceTooLong, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn kv_append_buffer_length_mismatch() {
+        let mut state = StandardAttentionState::new(4, 2, 3).unwrap();
+
+        // k_values too short for count=2 (expect 12, provide 6)
+        let k = vec![1.0; 6];
+        let v = vec![2.0; 12];
+        let err = state.append_batch(&k, &v, 2).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                E2eError::BufferLengthMismatch {
+                    expected: 12,
+                    actual: 6
+                }
+            ),
+            "expected BufferLengthMismatch, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn kv_append_zero_count_is_noop() {
+        let mut state = StandardAttentionState::new(4, 2, 3).unwrap();
+        state.append_batch(&[], &[], 0).unwrap();
+        assert_eq!(state.token_count(), 0);
+    }
+
+    #[test]
+    fn kv_append_multi_batch_placement() {
+        // Verify data lands at correct offsets
+        let mut state = Qwen35FullAttentionState::new(4, 1, 2).unwrap();
+        // kv_features = 1×2 = 2
+
+        let k1 = vec![1.0, 2.0];
+        let v1 = vec![10.0, 20.0];
+        state.append_batch(&k1, &v1, 1).unwrap();
+
+        let k2 = vec![3.0, 4.0, 5.0, 6.0]; // 2 tokens
+        let v2 = vec![30.0, 40.0, 50.0, 60.0];
+        state.append_batch(&k2, &v2, 2).unwrap();
+
+        assert_eq!(state.token_count(), 3);
+        assert_eq!(state.k_at(0), &[1.0, 2.0]);
+        assert_eq!(state.k_at(1), &[3.0, 4.0]);
+        assert_eq!(state.k_at(2), &[5.0, 6.0]);
+        assert_eq!(state.v_at(0), &[10.0, 20.0]);
+        assert_eq!(state.v_at(1), &[30.0, 40.0]);
+        assert_eq!(state.v_at(2), &[50.0, 60.0]);
+    }
+
+    #[test]
+    fn kv_append_via_standard_delegates_correctly() {
+        let mut state = StandardAttentionState::new(2, 1, 2).unwrap();
+        let k = vec![1.0, 2.0];
+        let v = vec![3.0, 4.0];
+        state.append_batch(&k, &v, 1).unwrap();
+        assert_eq!(state.token_count(), 1);
+        assert_eq!(&state.k_cache[0..2], &[1.0, 2.0]);
+        assert_eq!(&state.v_cache[0..2], &[3.0, 4.0]);
     }
 }

@@ -112,7 +112,7 @@ impl ModelFingerprint {
                 },
                 Some(AttentionLayerPlan::Qwen35Linear(lin)) => LayerTypeTag::Qwen35Linear {
                     conv_kernel: lin.conv_kernel,
-                    conv_channels: lin.conv_channels(),
+                    conv_channels: lin.conv_channels().unwrap_or(0),
                     time_step_rank: lin.time_step_rank,
                     state_size: lin.state_size,
                 },
