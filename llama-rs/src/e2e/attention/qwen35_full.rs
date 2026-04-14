@@ -6,10 +6,10 @@ use super::persistent::{
 use super::projection::{FullAttentionDims, PreparedAttention, project_and_prepare_qkv};
 use super::shared::{
     FlashAttentionConfig, RopeParams, apply_neox_rope_in_place, apply_optional_per_head_norm,
-    run_flash_attention_pipeline,
+    host_attention_scoring, run_flash_attention_pipeline,
 };
 use crate::e2e::error::{E2eError, GgmlResultExt};
-use crate::e2e::numeric::{checked_mul, dot, sigmoid_scalar, softmax_prefix};
+use crate::e2e::numeric::{checked_mul, sigmoid_scalar};
 use crate::e2e::plan::Qwen35FullAttentionLayerPlan;
 use crate::e2e::state::Qwen35FullAttentionState;
 use crate::e2e::tensor_ops::{
@@ -535,30 +535,23 @@ pub(in crate::e2e) fn full_attention_decode_core(
         state.gpu_scoring_failed = true;
     }
 
-    let groups = attention.head_count / attention.kv_head_count;
-    let mut head_outputs = vec![0.0_f32; query_features];
+    // Host-side attention scoring (shared with standard attention fallback).
+    let mut head_outputs = host_attention_scoring(
+        &q_values,
+        attention.head_count,
+        attention.kv_head_count,
+        hd,
+        attention.attention_scale,
+        total_tokens,
+        state,
+    );
+
+    // Per-head sigmoid gating (Qwen3.5-specific).
     for head in 0..attention.head_count {
-        let kv_head = head / groups;
-        let q = &q_values[head * hd..(head + 1) * hd];
-
-        let mut scores = vec![f32::NEG_INFINITY; total_tokens];
-        for (source, score) in scores.iter_mut().enumerate().take(total_tokens) {
-            let k = state.k_head_at(source, kv_head, hd);
-            *score = dot(q, k) * attention.attention_scale;
-        }
-        let weights = softmax_prefix(&scores, total_tokens);
-
-        let dst = &mut head_outputs[head * hd..(head + 1) * hd];
-        for (source, weight) in weights.iter().copied().enumerate() {
-            let v = state.v_head_at(source, kv_head, hd);
-            for index in 0..hd {
-                dst[index] += v[index] * weight;
-            }
-        }
-
         let gate = &q_gate[head * hd..(head + 1) * hd];
-        for index in 0..hd {
-            dst[index] *= sigmoid_scalar(gate[index]);
+        let dst = &mut head_outputs[head * hd..(head + 1) * hd];
+        for (d, g) in dst.iter_mut().zip(gate.iter()) {
+            *d *= sigmoid_scalar(*g);
         }
     }
 

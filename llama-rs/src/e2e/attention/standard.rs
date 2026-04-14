@@ -2,10 +2,10 @@
 
 use super::shared::{
     FlashAttentionConfig, RopeParams, apply_neox_rope_in_place, apply_optional_per_head_norm,
-    run_flash_attention_pipeline,
+    host_attention_scoring, run_flash_attention_pipeline,
 };
 use crate::e2e::error::{E2eError, GgmlResultExt};
-use crate::e2e::numeric::{checked_mul, dot, softmax_prefix};
+use crate::e2e::numeric::checked_mul;
 use crate::e2e::plan::StandardAttentionLayerPlan;
 use crate::e2e::state::StandardAttentionState;
 use crate::e2e::tensor_ops::{
@@ -401,28 +401,16 @@ pub(in crate::e2e) fn standard_attention_decode_step(
     state.append_batch(&k_values, &v_values, 1)?;
     let total_tokens = state.token_count();
 
-    // Host-side attention scoring.
-    let groups = h / hkv;
-    let mut head_outputs = vec![0.0_f32; qf];
-    for head in 0..h {
-        let kv_head = head / groups;
-        let q = &q_values[head * d..(head + 1) * d];
-
-        let mut scores = vec![f32::NEG_INFINITY; total_tokens];
-        for (source, score) in scores.iter_mut().enumerate().take(total_tokens) {
-            let k = state.k_head_at(source, kv_head, d);
-            *score = dot(q, k) * config.attention_scale;
-        }
-        let weights = softmax_prefix(&scores, total_tokens);
-
-        let dst = &mut head_outputs[head * d..(head + 1) * d];
-        for (source, weight) in weights.iter().copied().enumerate() {
-            let v = state.v_head_at(source, kv_head, d);
-            for index in 0..d {
-                dst[index] += v[index] * weight;
-            }
-        }
-    }
+    // Host-side attention scoring (shared with Qwen3.5 full attention fallback).
+    let head_outputs = host_attention_scoring(
+        &q_values,
+        h,
+        hkv,
+        d,
+        config.attention_scale,
+        total_tokens,
+        state,
+    );
 
     // Output projection.
     project_sequence_graph(

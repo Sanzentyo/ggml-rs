@@ -1,8 +1,101 @@
-//! Shared helpers for attention modules: RoPE utilities and flash-attention pipeline.
+//! Shared helpers for attention modules: KV cache access, RoPE utilities,
+//! host-side attention scoring, and flash-attention pipeline.
 
 use crate::e2e::error::{E2eError, GgmlResultExt};
-use crate::e2e::numeric::checked_mul;
+use crate::e2e::numeric::{checked_mul, dot, softmax_prefix};
+use crate::e2e::state::{Qwen35FullAttentionState, StandardAttentionState};
 use ggml_rs::{Context, DynTensor, Tensor};
+
+// ---------------------------------------------------------------------------
+// KV cache read-only access (for host-side attention scoring)
+// ---------------------------------------------------------------------------
+
+/// Read-only view into a KV cache for host-side attention scoring.
+///
+/// Implemented by both `StandardAttentionState` and `Qwen35FullAttentionState`,
+/// allowing the scoring loop to be shared across attention variants.
+pub(in crate::e2e) trait KvCacheView {
+    /// Get a K slice for a specific token and KV head.
+    fn k_head_at(&self, token: usize, kv_head: usize, head_dim: usize) -> &[f32];
+    /// Get a V slice for a specific token and KV head.
+    fn v_head_at(&self, token: usize, kv_head: usize, head_dim: usize) -> &[f32];
+}
+
+impl KvCacheView for StandardAttentionState {
+    fn k_head_at(&self, token: usize, kv_head: usize, head_dim: usize) -> &[f32] {
+        self.k_head_at(token, kv_head, head_dim)
+    }
+    fn v_head_at(&self, token: usize, kv_head: usize, head_dim: usize) -> &[f32] {
+        self.v_head_at(token, kv_head, head_dim)
+    }
+}
+
+impl KvCacheView for Qwen35FullAttentionState {
+    fn k_head_at(&self, token: usize, kv_head: usize, head_dim: usize) -> &[f32] {
+        self.k_head_at(token, kv_head, head_dim)
+    }
+    fn v_head_at(&self, token: usize, kv_head: usize, head_dim: usize) -> &[f32] {
+        self.v_head_at(token, kv_head, head_dim)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Host-side attention scoring
+// ---------------------------------------------------------------------------
+
+/// Host-side multi-head attention scoring against a KV cache.
+///
+/// For each query head, scores all cached keys via dot-product, applies
+/// softmax, and produces a weighted sum of values (grouped query attention).
+/// Returns `head_outputs` of length `head_count * head_dimension`.
+///
+/// This is the fallback scoring path used by both standard and Qwen3.5 full
+/// attention decode steps when GPU scoring is unavailable. Qwen3.5 applies
+/// additional per-head sigmoid gating on the returned outputs.
+pub(super) fn host_attention_scoring(
+    q_values: &[f32],
+    head_count: usize,
+    kv_head_count: usize,
+    head_dimension: usize,
+    attention_scale: f32,
+    total_tokens: usize,
+    cache: &impl KvCacheView,
+) -> Vec<f32> {
+    debug_assert_eq!(
+        q_values.len(),
+        head_count * head_dimension,
+        "q_values length must equal head_count * head_dimension"
+    );
+    debug_assert!(
+        kv_head_count > 0 && head_count.is_multiple_of(kv_head_count),
+        "head_count must be a positive multiple of kv_head_count"
+    );
+
+    let groups = head_count / kv_head_count;
+    let query_features = head_count * head_dimension;
+    let mut head_outputs = vec![0.0_f32; query_features];
+
+    for head in 0..head_count {
+        let kv_head = head / groups;
+        let q = &q_values[head * head_dimension..(head + 1) * head_dimension];
+
+        let mut scores = vec![f32::NEG_INFINITY; total_tokens];
+        for (source, score) in scores.iter_mut().enumerate().take(total_tokens) {
+            let k = cache.k_head_at(source, kv_head, head_dimension);
+            *score = dot(q, k) * attention_scale;
+        }
+        let weights = softmax_prefix(&scores, total_tokens);
+
+        let dst = &mut head_outputs[head * head_dimension..(head + 1) * head_dimension];
+        for (source, weight) in weights.iter().copied().enumerate() {
+            let v = cache.v_head_at(source, kv_head, head_dimension);
+            for (index, d) in dst.iter_mut().enumerate().take(head_dimension) {
+                *d += v[index] * weight;
+            }
+        }
+    }
+    head_outputs
+}
 
 // ---------------------------------------------------------------------------
 // NeoX-style RoPE
