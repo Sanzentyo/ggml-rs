@@ -460,6 +460,25 @@ And you should write rusty code(ADT, enum, type state pattern)
   Removed dead `capture_ssm_states` method. Added `debug_assert_eq` for size invariant.
   See comparison doc item 52.
 
+- **Linear attention prefill benchmark** (item 53):
+  Added `bench_e2e_graphs_linear_attention_prefill` to `bench_graphs.rs`.
+  Prefill-with-state is comparable or faster than stateless inference,
+  confirming items 51-52 eliminated state capture overhead. Metal achieves
+  2.86x speedup at seq_len=256. CPU faster below seq_len~16 (dispatch overhead).
+  See comparison doc item 53.
+
+- **Phase-breakdown comparison benchmark** (item 54):
+  Added `bench_linear_attention_phases()` decomposing linear attention into
+  4 timed phases. At seq_len=256 on Metal: SSM recurrence 45.7% (4.8ms),
+  Proj+Conv 35.9%, OutProj 17.9%, QK split 0.5%. SSM runs at identical
+  speed on CPU and Metal (pure scalar work). See comparison doc item 54.
+
+- **SSM loop optimization** (item 55):
+  Hoisted `state_size`/`time_step_rank`/`group_count`/`state_size_sq` out of
+  inner loop. Replaced `checked_mul` offset with `chunks_exact_mut().enumerate()`.
+  Hoisted `token_rank_base`. Result: ~6% SSM recurrence improvement across all
+  backends (4.794→4.491ms Metal seq=256). See comparison doc item 55.
+
 ## Validation checkpoints completed on this branch
 
 - `cargo fmt --all`

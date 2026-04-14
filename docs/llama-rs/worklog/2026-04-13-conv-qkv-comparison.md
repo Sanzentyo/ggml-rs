@@ -3280,3 +3280,204 @@ unnecessary when the persistent state buffer was already the right size.
 |------|---------|
 | `llama-rs/src/e2e/linear_attention.rs` | Direct-write SSM state, removed `capture_ssm_states` call |
 | `llama-rs/src/e2e/state.rs` | Removed dead `capture_ssm_states` method |
+
+---
+
+## Item 53 — Linear Attention Prefill Benchmark
+
+### 53.1 Motivation
+
+Items 51-52 introduced performance optimizations (tail-only readback, direct SSM
+write). A dedicated prefill-with-state benchmark is needed to validate these
+optimizations and establish a baseline for future work.
+
+### 53.2 Benchmark Infrastructure
+
+Added `bench_e2e_graphs_linear_attention_prefill` to `bench_graphs.rs`. Unlike
+the existing `bench_e2e_graphs_linear_attention` (which uses the stateless
+`qwen35_linear_attention_inference`), this new benchmark uses
+`qwen35_linear_attention_prefill` with fresh `LinearAttentionState` — exercising
+the tail-only readback and direct SSM state write paths.
+
+Run command:
+```
+cargo test --workspace --features link-system --release -- bench_e2e_graphs_linear_attention --nocapture --ignored
+```
+
+### 53.3 Results (Qwen3.5 0.6B dimensions, M-series Mac, release mode)
+
+**Inference (no state):**
+
+| SeqLen | CPU (ms) | Metal (ms) | Metal speedup |
+|--------|----------|------------|---------------|
+| 1      | 3.119    | 3.761      | 0.83x         |
+| 4      | 3.370    | 4.029      | 0.84x         |
+| 16     | 4.841    | 4.696      | 1.03x         |
+| 64     | 11.203   | 7.087      | 1.58x         |
+
+**Prefill (with state capture):**
+
+| SeqLen | CPU (ms) | Metal (ms) | Metal speedup |
+|--------|----------|------------|---------------|
+| 1      | 2.353    | 3.711      | 0.63x         |
+| 4      | 3.425    | 3.781      | 0.91x         |
+| 16     | 4.661    | 4.603      | 1.01x         |
+| 64     | 11.434   | 6.459      | 1.77x         |
+| 256    | 30.906   | 10.817     | 2.86x         |
+
+**Key observations:**
+- Prefill-with-state is **comparable or faster** than inference-without-state,
+  confirming items 51-52 successfully eliminated the state capture overhead.
+- At `seq_len=1`, prefill is actually ~0.8ms faster on CPU (2.35 vs 3.12ms) --
+  the tail readback skip saves graph output marking overhead.
+- Metal crossover point is around `seq_len~16` -- below that, Metal dispatch
+  overhead dominates. This validates the existing decode-path decision to stay
+  on host-side for `seq_len=1`.
+- At `seq_len=256`, Metal achieves 2.86x speedup. The SSM host-side recurrence
+  remains the limiting factor (O(T x time_step_rank x state_size^2) scalar work).
+
+### 53.4 Files Modified
+
+| File | Changes |
+|------|---------|
+| `llama-rs/src/e2e/bench_graphs.rs` | Added `bench_e2e_graphs_linear_attention_prefill` |
+
+---
+
+## Item 54 — Linear Attention Phase-Breakdown Comparison
+
+### 54.1 Motivation
+
+With items 51-52 validating that state capture overhead is eliminated, the next
+question is: where does wall-clock time actually go in linear attention prefill?
+Isolating the four major phases allows targeted optimization.
+
+### 54.2 Implementation
+
+Added `bench_linear_attention_phases()` to `linear_attention.rs` (behind `#[cfg(test)]`)
+which decomposes `qwen35_linear_attention_core` into four explicitly-timed phases:
+1. Fused projection + causal depthwise conv (GPU graph)
+2. QK split + per-head L2 norm + V extraction (CPU)
+3. SSM recurrence loop (CPU)
+4. Output projection (GPU graph)
+
+Added `bench_e2e_linear_attention_phase_breakdown` to `bench_graphs.rs`.
+
+### 54.3 Results (Qwen3.5 0.6B dimensions, M-series Mac, release mode)
+
+| Backend | SeqLen | Total(ms) | Proj+Conv | QK Split | SSM Recur | OutProj |
+|---------|--------|-----------|-----------|----------|-----------|---------|
+| CPU     | 1      | 2.345     | 1.583     | 0.001    | 0.023     | 0.738   |
+| Metal   | 1      | 3.092     | 2.072     | 0.001    | 0.020     | 1.000   |
+| CPU     | 4      | 2.390     | 1.584     | 0.002    | 0.077     | 0.727   |
+| Metal   | 4      | 3.183     | 2.112     | 0.001    | 0.074     | 0.996   |
+| CPU     | 16     | 3.781     | 2.418     | 0.005    | 0.304     | 1.054   |
+| Metal   | 16     | 3.613     | 2.185     | 0.004    | 0.298     | 1.126   |
+| CPU     | 64     | 9.281     | 5.626     | 0.019    | 1.210     | 2.426   |
+| Metal   | 64     | 4.854     | 2.523     | 0.014    | 1.205     | 1.111   |
+| CPU     | 256    | 31.159    | 18.460    | 0.068    | 4.808     | 7.824   |
+| Metal   | 256    | 10.484    | 3.763     | 0.053    | 4.794     | 1.873   |
+
+### 54.4 Analysis
+
+**Phase dominance at seq_len=256 on Metal:**
+- SSM recurrence: **45.7%** (4.794 ms) -- CPU-only, scalar
+- Proj+Conv: **35.9%** (3.763 ms) -- GPU
+- Output proj: **17.9%** (1.873 ms) -- GPU
+- QK split+norm: **0.5%** (0.053 ms) -- negligible
+
+**Key observations:**
+- SSM recurrence runs at **identical speed on both backends** (~4.8 ms for seq=256)
+  because it is purely CPU scalar work regardless of backend choice.
+- Metal provides ~4.9x speedup on Proj+Conv and ~4.2x on OutProj at seq=256.
+- QK split + per-head L2 norm is <1% of total at all sequence lengths.
+- At short sequences (seq<=4), Metal dispatch overhead dominates -- GPU
+  projection is slower than CPU for single-token decode.
+- SSM recurrence scales linearly with sequence length (O(T * R * S^2)):
+  4 tokens = 0.077ms, 64 tokens = 1.21ms, 256 tokens = 4.8ms.
+
+**Optimization target:** SSM recurrence loop is the clear bottleneck on Metal.
+The checked arithmetic in the inner loop (`checked_mul` per head per token)
+and head-offset recomputation are candidates for hoisting.
+
+### 54.5 Files Modified
+
+| File | Changes |
+|------|---------|
+| `llama-rs/src/e2e/linear_attention.rs` | Added `#[cfg(test)]` `bench_linear_attention_phases()` + `LinearAttentionPhaseTimings` |
+| `llama-rs/src/e2e/bench_graphs.rs` | Added `bench_e2e_linear_attention_phase_breakdown` |
+| `llama-rs/src/e2e/state.rs` | Removed dead `capture_ssm_states` method |
+
+---
+
+## Item 55 — SSM Loop Optimization (Hoist Constants + chunks_exact_mut)
+
+### 55.1 Motivation
+
+Item 54 identified the SSM recurrence loop as the #1 bottleneck on Metal (45.7%
+of total at seq_len=256). The inner loop contained:
+- Per-iteration checked_mul for head state offset computation
+- Repeated field access for state_size, time_step_rank, group_count
+- Manual offset arithmetic for alpha/beta indexing
+
+### 55.2 Implementation
+
+Applied loop-shape cleanup per rubber-duck recommendation (no new data structures):
+
+1. **Hoisted constants**: state_size, time_step_rank, group_count, state_size_sq
+   extracted once before the loop instead of accessed via struct fields per iteration.
+2. **chunks_exact_mut(state_size_sq).enumerate()**: Replaces manual
+   checked_mul(head, state_size_sq) offset calculation — the enumerate() index
+   provides the head index, and the chunk provides a correctly-sized slice.
+3. **token_rank_base**: Hoisted token * time_step_rank per token to avoid
+   repeated multiplication in alpha/beta indexing.
+4. Applied identically to both qwen35_linear_attention_core and
+   bench_linear_attention_phases (test-only benchmarking copy).
+
+### 55.3 Results (Qwen3.5 0.6B dimensions, Apple M5, release mode)
+
+**Before (item 54 baseline):**
+
+| Backend | SeqLen | Total(ms) | SSM Recur |
+|---------|--------|-----------|-----------|
+| CPU     | 64     | 9.281     | 1.210     |
+| Metal   | 64     | 4.854     | 1.205     |
+| CPU     | 256    | 31.159    | 4.808     |
+| Metal   | 256    | 10.484    | 4.794     |
+
+**After (item 55):**
+
+| Backend | SeqLen | Total(ms) | SSM Recur |
+|---------|--------|-----------|-----------|
+| CPU     | 64     | 9.258     | 1.132     |
+| Metal   | 64     | 4.961     | 1.132     |
+| CPU     | 256    | 30.756    | 4.547     |
+| Metal   | 256    | 10.180    | 4.491     |
+
+**SSM Recurrence improvement:**
+
+| Backend | SeqLen | Before(ms) | After(ms) | Delta |
+|---------|--------|------------|-----------|-------|
+| CPU     | 64     | 1.210      | 1.132     | -6.4% |
+| Metal   | 64     | 1.205      | 1.132     | -6.1% |
+| CPU     | 256    | 4.808      | 4.547     | -5.4% |
+| Metal   | 256    | 4.794      | 4.491     | -6.3% |
+
+### 55.4 Analysis
+
+- Consistent ~6% improvement in SSM recurrence across all backends and sequence
+  lengths. This confirms the overhead came from repeated checked_mul and field
+  access, not from memory access patterns.
+- Total wall-clock improvement is modest (Metal 256: -2.9%, CPU 256: -1.3%)
+  because SSM is only ~45% of total time on Metal.
+- The SSM loop remains CPU-bound scalar work — further gains would require
+  algorithmic changes (e.g., SIMD, GPU-offloaded recurrence, or chunked parallel
+  scan) rather than loop-shape cleanup.
+- Zero test regressions. Zero clippy warnings.
+
+### 55.5 Files Modified
+
+| File | Changes |
+|------|---------|
+| llama-rs/src/e2e/linear_attention.rs | Hoisted constants, chunks_exact_mut, token_rank_base in both production and bench paths |
+
