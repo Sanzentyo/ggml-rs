@@ -17,7 +17,7 @@ pub(super) use host_ops::{
 
 // Re-exports: projection utilities
 pub(super) use projection::{
-    BuiltProjection, PROJECTION_SLACK_BYTES, ProjectionSpec, build_batch_projections,
+    PROJECTION_SLACK_BYTES, ProjectionSpec, build_batch_projections, execute_batch_projections,
     project_sequence_graph, upload_weight,
 };
 

@@ -167,3 +167,60 @@ pub(super) fn sum_matmul_memories(
         .ok_or(E2eError::MemorySizeOverflow)?;
     Ok(Bytes::new(total))
 }
+
+/// Build and execute a batch projection compute graph.
+///
+/// Encapsulates the common pattern shared by QKV and linear-attention input
+/// projections:
+/// 1. Create context from pre-estimated memory budget
+/// 2. Create shared input tensor and batch projections
+/// 3. Build graph, allocate tensors, upload weights and input
+/// 4. Compute and read all projection outputs
+///
+/// `weight_data` must have the same length as `specs` — each entry is
+/// `(data, upload_label)` for the corresponding projection.
+pub(in crate::e2e) fn execute_batch_projections(
+    ctx_size: Bytes,
+    hidden_features: usize,
+    sequence_length: usize,
+    specs: &[ProjectionSpec],
+    input: &[f32],
+    weight_data: &[(&[f32], &'static str)],
+    backend: &Backend,
+) -> Result<Vec<Vec<f32>>, E2eError> {
+    debug_assert_eq!(
+        specs.len(),
+        weight_data.len(),
+        "specs and weight_data must have the same length"
+    );
+
+    let ctx =
+        Context::new_no_alloc_bytes(ctx_size).ggml_ctx("Context::new_no_alloc_bytes(batch)")?;
+
+    let x = ctx
+        .new_tensor_2d::<f32>(Shape2D::new(hidden_features, sequence_length))
+        .ggml_ctx("new_tensor_2d<X>")?;
+
+    let projs = build_batch_projections(&ctx, &x, hidden_features, specs)?;
+
+    let mut graph = ctx.new_graph().ggml_ctx("new_graph(batch)")?;
+    for p in &projs {
+        graph.build_forward_expand(&p.y);
+    }
+
+    let _buffer = ctx
+        .allocate_tensors(backend)
+        .ggml_ctx("allocate_tensors(batch)")?;
+
+    for (proj, &(data, label)) in projs.iter().zip(weight_data) {
+        upload_weight(&proj.w, data, label)?;
+    }
+    upload_weight(&x, input, "write<X>")?;
+
+    backend.compute(&mut graph).ggml_ctx("compute(batch)")?;
+
+    projs
+        .iter()
+        .map(|p| p.y.read_data_backend().ggml_ctx("read_data_backend"))
+        .collect()
+}

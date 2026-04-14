@@ -4,8 +4,8 @@ use crate::e2e::error::{E2eError, GgmlResultExt};
 use crate::e2e::numeric::checked_mul;
 use crate::e2e::plan::Qwen35FullAttentionLayerPlan;
 use crate::e2e::tensor_ops::{
-    BuiltProjection, PROJECTION_SLACK_BYTES, ProjectionSpec, build_batch_projections,
-    per_head_rms_norm, project_sequence, upload_weight,
+    PROJECTION_SLACK_BYTES, ProjectionSpec, execute_batch_projections, per_head_rms_norm,
+    project_sequence,
 };
 use ggml_rs::{Backend, Bytes, Context, Shape2D};
 
@@ -223,62 +223,44 @@ fn project_qkv_graph(
         kv_features,
         sequence_length,
     )?;
-    let ctx = Context::new_no_alloc_bytes(ctx_size).ggml_ctx("Context::new_no_alloc_bytes(QKV)")?;
 
-    let x = ctx
-        .new_tensor_2d::<f32>(Shape2D::new(hidden_features, sequence_length))
-        .ggml_ctx("new_tensor_2d<X>")?;
+    let specs = [
+        ProjectionSpec {
+            weight_label: "new_tensor_2d<W_Q>",
+            matmul_label: "mul_mat(Q)",
+            out_features: query_features_x2,
+        },
+        ProjectionSpec {
+            weight_label: "new_tensor_2d<W_K>",
+            matmul_label: "mul_mat(K)",
+            out_features: kv_features,
+        },
+        ProjectionSpec {
+            weight_label: "new_tensor_2d<W_V>",
+            matmul_label: "mul_mat(V)",
+            out_features: kv_features,
+        },
+    ];
 
-    let projs = build_batch_projections(
-        &ctx,
-        &x,
+    let results = execute_batch_projections(
+        ctx_size,
         hidden_features,
+        sequence_length,
+        &specs,
+        input,
         &[
-            ProjectionSpec {
-                weight_label: "new_tensor_2d<W_Q>",
-                matmul_label: "mul_mat(Q)",
-                out_features: query_features_x2,
-            },
-            ProjectionSpec {
-                weight_label: "new_tensor_2d<W_K>",
-                matmul_label: "mul_mat(K)",
-                out_features: kv_features,
-            },
-            ProjectionSpec {
-                weight_label: "new_tensor_2d<W_V>",
-                matmul_label: "mul_mat(V)",
-                out_features: kv_features,
-            },
+            (&attention.q_weight_values, "write<W_Q>"),
+            (&attention.k_weight_values, "write<W_K>"),
+            (&attention.v_weight_values, "write<W_V>"),
         ],
+        backend,
     )?;
-    let [q, k, v]: [BuiltProjection<'_>; 3] = projs
-        .try_into()
-        .ok()
-        .expect("internal spec mismatch: expected 3 projections");
 
-    let mut graph = ctx.new_graph().ggml_ctx("new_graph(QKV)")?;
-    graph.build_forward_expand(&q.y);
-    graph.build_forward_expand(&k.y);
-    graph.build_forward_expand(&v.y);
-
-    let _buffer = ctx
-        .allocate_tensors(backend)
-        .ggml_ctx("allocate_tensors(QKV)")?;
-
-    upload_weight(&q.w, &attention.q_weight_values, "write<W_Q>")?;
-    upload_weight(&k.w, &attention.k_weight_values, "write<W_K>")?;
-    upload_weight(&v.w, &attention.v_weight_values, "write<W_V>")?;
-    upload_weight(&x, input, "write<X>")?;
-
-    backend.compute(&mut graph).ggml_ctx("compute(QKV)")?;
-
-    let q_full = q.y.read_data_backend().ggml_ctx("read_data_backend<Q>")?;
-    let k_proj = k.y.read_data_backend().ggml_ctx("read_data_backend<K>")?;
-    let v_proj = v.y.read_data_backend().ggml_ctx("read_data_backend<V>")?;
+    let mut iter = results.into_iter();
     Ok(QkvProjections {
-        q_full,
-        k_proj,
-        v_proj,
+        q_full: iter.next().expect("3 specs → 3 results"),
+        k_proj: iter.next().expect("3 specs → 3 results"),
+        v_proj: iter.next().expect("3 specs → 3 results"),
     })
 }
 

@@ -7,8 +7,7 @@ use crate::e2e::error::{E2eError, GgmlResultExt};
 use crate::e2e::numeric::checked_mul;
 use crate::e2e::plan::Qwen35LinearAttentionLayerPlan;
 use crate::e2e::tensor_ops::{
-    PROJECTION_SLACK_BYTES, ProjectionSpec, build_batch_projections, project_sequence,
-    upload_weight,
+    PROJECTION_SLACK_BYTES, ProjectionSpec, execute_batch_projections, project_sequence,
 };
 use ggml_rs::{Backend, Bytes, Context, Shape2D};
 
@@ -206,49 +205,28 @@ fn project_linear_inputs_graph(
         dims.time_step_rank,
         sequence_length,
     )?;
-    let ctx = Context::new_no_alloc_bytes(ctx_size)
-        .ggml_ctx("Context::new_no_alloc_bytes(linear_proj)")?;
 
-    let x = ctx
-        .new_tensor_2d::<f32>(Shape2D::new(hidden_features, sequence_length))
-        .ggml_ctx("new<X>")?;
-
-    let projs =
-        build_batch_projections(&ctx, &x, hidden_features, &linear_projection_specs(&dims))?;
-
-    let mut graph = ctx.new_graph().ggml_ctx("new_graph(linear_proj)")?;
-    for p in &projs {
-        graph.build_forward_expand(&p.y);
-    }
-
-    let _buffer = ctx
-        .allocate_tensors(backend)
-        .ggml_ctx("allocate_tensors(linear_proj)")?;
-
-    upload_weight(&projs[0].w, &attention.qkv_weight_values, "write<W_QKV>")?;
-    upload_weight(&projs[1].w, &attention.gate_weight_values, "write<W_Z>")?;
-    upload_weight(
-        &projs[2].w,
-        &attention.alpha_weight_values,
-        "write<W_alpha>",
+    let results = execute_batch_projections(
+        ctx_size,
+        hidden_features,
+        sequence_length,
+        &linear_projection_specs(&dims),
+        input,
+        &[
+            (&attention.qkv_weight_values, "write<W_QKV>"),
+            (&attention.gate_weight_values, "write<W_Z>"),
+            (&attention.alpha_weight_values, "write<W_alpha>"),
+            (&attention.beta_weight_values, "write<W_beta>"),
+        ],
+        backend,
     )?;
-    upload_weight(&projs[3].w, &attention.beta_weight_values, "write<W_beta>")?;
-    upload_weight(&x, input, "write<X>")?;
 
-    backend
-        .compute(&mut graph)
-        .ggml_ctx("compute(linear_proj)")?;
-
-    let qkv = projs[0].y.read_data_backend().ggml_ctx("read<QKV>")?;
-    let z = projs[1].y.read_data_backend().ggml_ctx("read<Z>")?;
-    let alpha = projs[2].y.read_data_backend().ggml_ctx("read<alpha>")?;
-    let beta = projs[3].y.read_data_backend().ggml_ctx("read<beta>")?;
-
+    let mut iter = results.into_iter();
     Ok(LinearProjections {
-        qkv,
-        z,
-        alpha,
-        beta,
+        qkv: iter.next().expect("4 specs → 4 results"),
+        z: iter.next().expect("4 specs → 4 results"),
+        alpha: iter.next().expect("4 specs → 4 results"),
+        beta: iter.next().expect("4 specs → 4 results"),
         conv_channels,
         hidden_features,
     })
