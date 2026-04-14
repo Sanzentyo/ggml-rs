@@ -67,14 +67,9 @@ impl AttentionStrategy for InferenceStrategy {
                 attention.norm_values(),
                 backend,
             ),
-            AttentionLayerPlan::Qwen35Linear(attn) => qwen35_linear_attention_inference(
-                attn,
-                input,
-                seq_len,
-                rms_norm_eps,
-                attention.norm_values(),
-                backend,
-            ),
+            AttentionLayerPlan::Qwen35Linear(attn) => {
+                qwen35_linear_attention_inference(attn, input, seq_len, rms_norm_eps, backend)
+            }
         }
     }
 }
@@ -118,15 +113,7 @@ impl AttentionStrategy for PrefillStrategy<'_> {
                 )
             }
             (AttentionLayerPlan::Qwen35Linear(attn), LayerAttentionState::Qwen35Linear(s)) => {
-                qwen35_linear_attention_prefill(
-                    attn,
-                    input,
-                    seq_len,
-                    rms_norm_eps,
-                    attention.norm_values(),
-                    s,
-                    backend,
-                )
+                qwen35_linear_attention_prefill(attn, input, seq_len, rms_norm_eps, s, backend)
             }
             _ => Err(E2eError::UnsupportedTwoPhase),
         }

@@ -46,7 +46,6 @@ pub(super) fn qwen35_linear_attention_inference(
     input: &[f32],
     sequence_length: usize,
     rms_norm_eps: f32,
-    attn_norm_weight: &[f32],
     backend: &Backend,
 ) -> Result<Vec<f32>, E2eError> {
     qwen35_linear_attention_core(
@@ -54,7 +53,6 @@ pub(super) fn qwen35_linear_attention_inference(
         input,
         sequence_length,
         rms_norm_eps,
-        attn_norm_weight,
         None,
         backend,
     )
@@ -66,7 +64,6 @@ pub(super) fn qwen35_linear_attention_prefill(
     input: &[f32],
     sequence_length: usize,
     rms_norm_eps: f32,
-    attn_norm_weight: &[f32],
     state: &mut LinearAttentionState,
     backend: &Backend,
 ) -> Result<Vec<f32>, E2eError> {
@@ -75,7 +72,6 @@ pub(super) fn qwen35_linear_attention_prefill(
         input,
         sequence_length,
         rms_norm_eps,
-        attn_norm_weight,
         Some(state),
         backend,
     )
@@ -172,14 +168,8 @@ mod tests {
         let backend =
             Backend::new(ggml_rs::BackendKind::Cpu).expect("CPU backend should be available");
 
-        let result = qwen35_linear_attention_inference(
-            &plan,
-            &input,
-            sequence_length,
-            1e-5,
-            &plan.norm_values,
-            &backend,
-        );
+        let result =
+            qwen35_linear_attention_inference(&plan, &input, sequence_length, 1e-5, &backend);
         assert!(
             result.is_ok(),
             "inference should succeed: {:?}",
@@ -197,14 +187,8 @@ mod tests {
             group_count: 3,
             ..plan.clone()
         };
-        let bad_result = qwen35_linear_attention_inference(
-            &plan_bad,
-            &input,
-            sequence_length,
-            1e-5,
-            &plan_bad.norm_values,
-            &backend,
-        );
+        let bad_result =
+            qwen35_linear_attention_inference(&plan_bad, &input, sequence_length, 1e-5, &backend);
         assert!(
             bad_result.is_err(),
             "should fail with indivisible group_count"
@@ -303,8 +287,7 @@ mod tests {
         let full_input: Vec<f32> = prompt.iter().chain(new_token.iter()).copied().collect();
         let norm_weight = &plan.norm_values;
         let full_output =
-            qwen35_linear_attention_inference(&plan, &full_input, 4, 1e-5, norm_weight, &backend)
-                .unwrap();
+            qwen35_linear_attention_inference(&plan, &full_input, 4, 1e-5, &backend).unwrap();
         let expected = &full_output[3 * hidden..4 * hidden];
 
         // Prefill 3 tokens, then decode 1 token.
@@ -315,16 +298,8 @@ mod tests {
             state_size,
         )
         .unwrap();
-        let _prefill_output = qwen35_linear_attention_prefill(
-            &plan,
-            &prompt,
-            3,
-            1e-5,
-            norm_weight,
-            &mut state,
-            &backend,
-        )
-        .unwrap();
+        let _prefill_output =
+            qwen35_linear_attention_prefill(&plan, &prompt, 3, 1e-5, &mut state, &backend).unwrap();
 
         // Decode path: apply host-side rms_norm + weight to match the in-graph
         // norm that inference/prefill now perform.

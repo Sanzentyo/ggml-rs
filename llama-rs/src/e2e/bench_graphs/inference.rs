@@ -76,17 +76,9 @@ fn bench_e2e_graphs_linear_attention() {
     let plan_small = build_linear_attention_plan(hidden, inner, gc, tsr, ss, ck);
     for seq_len in [4, 16] {
         let input = synthetic_input(hidden, seq_len);
-        let norm_w = &plan_small.norm_values;
         for &(bname, ref backend) in &backends {
             let avg = bench_fn(warmup, iters, || {
-                qwen35_linear_attention_inference(
-                    &plan_small,
-                    &input,
-                    seq_len,
-                    1e-5,
-                    norm_w,
-                    backend,
-                )
+                qwen35_linear_attention_inference(&plan_small, &input, seq_len, 1e-5, backend)
             });
             results.push(BenchResult {
                 label: "linear_attention_fused",
@@ -104,17 +96,9 @@ fn bench_e2e_graphs_linear_attention() {
     let plan_large = build_linear_attention_plan(hidden, inner, gc, tsr, ss, ck);
     for seq_len in [1, 4, 16, 64] {
         let input = synthetic_input(hidden, seq_len);
-        let norm_w = &plan_large.norm_values;
         for &(bname, ref backend) in &backends {
             let avg = bench_fn(warmup, iters, || {
-                qwen35_linear_attention_inference(
-                    &plan_large,
-                    &input,
-                    seq_len,
-                    1e-5,
-                    norm_w,
-                    backend,
-                )
+                qwen35_linear_attention_inference(&plan_large, &input, seq_len, 1e-5, backend)
             });
             results.push(BenchResult {
                 label: "linear_attention_fused",
@@ -154,14 +138,11 @@ fn bench_e2e_graphs_linear_attention_prefill() {
 
     for seq_len in [1, 4, 16, 64, 256] {
         let input = synthetic_input(hidden, seq_len);
-        let norm_w = &plan.norm_values;
         for &(bname, ref backend) in &backends {
             let avg = bench_fn(warmup, iters, || {
                 let mut state = LinearAttentionState::new(ck, conv_channels, tsr, ss)
                     .expect("state creation should succeed");
-                qwen35_linear_attention_prefill(
-                    &plan, &input, seq_len, 1e-5, norm_w, &mut state, backend,
-                )
+                qwen35_linear_attention_prefill(&plan, &input, seq_len, 1e-5, &mut state, backend)
             });
             results.push(BenchResult {
                 label: "linear_attn_prefill",
@@ -208,14 +189,13 @@ fn bench_e2e_linear_attention_phase_breakdown() {
 
     for seq_len in [1, 4, 16, 64, 256] {
         let input = synthetic_input(hidden, seq_len);
-        let norm_w = &plan.norm_values;
         for &(bname, ref backend) in &backends {
             // Warmup.
             for _ in 0..warmup {
                 let mut state =
                     LinearAttentionState::new(ck, conv_channels, tsr, ss).expect("state creation");
                 let _ = bench_linear_attention_phases(
-                    &plan, &input, seq_len, 1e-5, norm_w, &mut state, backend,
+                    &plan, &input, seq_len, 1e-5, &mut state, backend,
                 );
             }
             // Measure.
@@ -224,7 +204,7 @@ fn bench_e2e_linear_attention_phase_breakdown() {
                 let mut state =
                     LinearAttentionState::new(ck, conv_channels, tsr, ss).expect("state creation");
                 let t = bench_linear_attention_phases(
-                    &plan, &input, seq_len, 1e-5, norm_w, &mut state, backend,
+                    &plan, &input, seq_len, 1e-5, &mut state, backend,
                 )
                 .expect("phase bench should succeed");
                 totals[0] += t.proj_conv_ms;
@@ -350,14 +330,7 @@ fn bench_e2e_graphs_combined() {
 
             // Linear attention.
             let avg = bench_fn(warmup, iters, || {
-                qwen35_linear_attention_inference(
-                    &linear_plan,
-                    &input,
-                    seq_len,
-                    1e-5,
-                    &linear_plan.norm_values,
-                    backend,
-                )
+                qwen35_linear_attention_inference(&linear_plan, &input, seq_len, 1e-5, backend)
             });
             results.push(BenchResult {
                 label: "linear_attention_fused",

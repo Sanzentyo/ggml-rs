@@ -42,7 +42,6 @@ pub(in crate::e2e) fn bench_linear_attention_phases(
     input: &[f32],
     sequence_length: usize,
     rms_norm_eps: f32,
-    attn_norm_weight: &[f32],
     state: &mut LinearAttentionState,
     backend: &Backend,
 ) -> Result<LinearAttentionPhaseTimings, E2eError> {
@@ -65,7 +64,6 @@ pub(in crate::e2e) fn bench_linear_attention_phases(
         &dims,
         input,
         sequence_length,
-        attn_norm_weight,
         rms_norm_eps,
         conv_tail_rows,
         backend,

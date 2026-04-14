@@ -314,10 +314,9 @@ fn bench_conv_vs_qkv_comparison() {
                 state_size,
                 conv_kernel,
             );
-            let norm_w = &plan.norm_values;
             for &(bname, ref backend) in &backends {
                 let avg = bench_fn(warmup, iters, || {
-                    qwen35_linear_attention_inference(&plan, &input, seq_len, 1e-5, norm_w, backend)
+                    qwen35_linear_attention_inference(&plan, &input, seq_len, 1e-5, backend)
                 });
                 results.push(BenchResult {
                     label: "full_fused",

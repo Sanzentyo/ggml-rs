@@ -20,7 +20,6 @@ pub(super) fn qwen35_linear_attention_core(
     input: &[f32],
     sequence_length: usize,
     rms_norm_eps: f32,
-    attn_norm_weight: &[f32],
     mut state: Option<&mut LinearAttentionState>,
     backend: &Backend,
 ) -> Result<Vec<f32>, E2eError> {
@@ -54,7 +53,6 @@ pub(super) fn qwen35_linear_attention_core(
         &dims,
         input,
         sequence_length,
-        attn_norm_weight,
         rms_norm_eps,
         conv_tail_rows,
         backend,

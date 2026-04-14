@@ -150,16 +150,17 @@ pub(in crate::e2e) fn causal_depthwise_conv_graph(
 /// `ggml_ssm_conv`, and SiLU activation into a single compute graph. This
 /// eliminates the host↔device round-trip between projection and convolution.
 ///
+/// Reads the RMS norm weight from `attention.norm_values` directly, avoiding
+/// a redundant parameter that must always match the plan.
+///
 /// When `conv_tail_rows > 0`, reads back only the last `conv_tail_rows` rows of
 /// the pre-conv QKV tensor (for decode state continuity). When 0, skips the
 /// readback entirely — the allocator can reuse the memory.
-#[allow(clippy::too_many_arguments)] // GPU graph builder — 8 params, all needed
 pub(super) fn project_and_conv_fused_graph(
     attention: &Qwen35LinearAttentionLayerPlan,
     dims: &LinearAttentionDims,
     input: &[f32],
     sequence_length: usize,
-    attn_norm_weight: &[f32],
     rms_norm_eps: f32,
     conv_tail_rows: usize,
     backend: &Backend,
@@ -261,7 +262,7 @@ pub(super) fn project_and_conv_fused_graph(
     upload_weight(w_alpha, &attention.alpha_weight_values, "write<W_alpha>")?;
     upload_weight(w_beta, &attention.beta_weight_values, "write<W_beta>")?;
     upload_weight(&ni.x_raw, input, "write<X>")?;
-    upload_weight(&ni.norm_w, attn_norm_weight, "write<norm_w>")?;
+    upload_weight(&ni.norm_w, &attention.norm_values, "write<norm_w>")?;
 
     // Upload zero padding (only when kernel_size > 1).
     if let Some(ref zeros) = zeros_tensor {
