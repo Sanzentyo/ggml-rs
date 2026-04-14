@@ -329,3 +329,74 @@ pub(super) fn apply_optional_per_head_norm<'ctx>(
         None => Ok(x),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::e2e::error::E2eError;
+
+    #[test]
+    fn validate_gqa_heads_standard_gqa() {
+        assert!(validate_gqa_heads(8, 2).is_ok());
+    }
+
+    #[test]
+    fn validate_gqa_heads_equal_heads() {
+        assert!(validate_gqa_heads(4, 4).is_ok());
+    }
+
+    #[test]
+    fn validate_gqa_heads_mqa_single_kv() {
+        assert!(validate_gqa_heads(8, 1).is_ok());
+    }
+
+    #[test]
+    fn validate_gqa_heads_zero_head_count() {
+        match validate_gqa_heads(0, 4) {
+            Err(E2eError::InvalidGqaHeadConfig {
+                head_count,
+                kv_head_count,
+            }) => {
+                assert_eq!(head_count, 0);
+                assert_eq!(kv_head_count, 4);
+            }
+            other => panic!("expected InvalidGqaHeadConfig, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validate_gqa_heads_zero_kv_head_count() {
+        match validate_gqa_heads(8, 0) {
+            Err(E2eError::InvalidGqaHeadConfig {
+                head_count,
+                kv_head_count,
+            }) => {
+                assert_eq!(head_count, 8);
+                assert_eq!(kv_head_count, 0);
+            }
+            other => panic!("expected InvalidGqaHeadConfig, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validate_gqa_heads_not_divisible() {
+        match validate_gqa_heads(7, 3) {
+            Err(E2eError::InvalidGqaHeadConfig {
+                head_count,
+                kv_head_count,
+            }) => {
+                assert_eq!(head_count, 7);
+                assert_eq!(kv_head_count, 3);
+            }
+            other => panic!("expected InvalidGqaHeadConfig, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validate_gqa_heads_both_zero() {
+        assert!(matches!(
+            validate_gqa_heads(0, 0),
+            Err(E2eError::InvalidGqaHeadConfig { .. })
+        ));
+    }
+}
