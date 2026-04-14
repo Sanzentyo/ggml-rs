@@ -8,7 +8,7 @@ use crate::e2e::numeric::checked_mul;
 use crate::e2e::plan::Qwen35LinearAttentionLayerPlan;
 use crate::e2e::state::LinearAttentionState;
 #[cfg(test)]
-use crate::e2e::tensor_ops::PROJECTION_SLACK_BYTES;
+use crate::e2e::tensor_ops::MATMUL_GRAPH_SLACK_BYTES;
 use crate::e2e::tensor_ops::{build_batch_projections, upload_weight};
 use ggml_rs::{Backend, Bytes, Context, Shape2D};
 
@@ -106,7 +106,7 @@ pub(in crate::e2e) fn causal_depthwise_conv_graph(
     let tensor_overhead = 3
         * std::mem::size_of::<f32>()
         * (padded_len * channels + kernel_size * channels + sequence_length * channels);
-    let ctx_size = Bytes::new(tensor_overhead + PROJECTION_SLACK_BYTES);
+    let ctx_size = Bytes::new(tensor_overhead + MATMUL_GRAPH_SLACK_BYTES);
 
     let ctx =
         Context::new_no_alloc_bytes(ctx_size).ggml_ctx("Context::new_no_alloc_bytes(conv)")?;

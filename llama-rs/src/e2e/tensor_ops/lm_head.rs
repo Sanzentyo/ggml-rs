@@ -1,7 +1,7 @@
 use super::super::error::{E2eError, GgmlResultExt};
 #[cfg(test)]
 use super::super::numeric::checked_mul;
-use super::projection::PROJECTION_SLACK_BYTES;
+use super::projection::MATMUL_GRAPH_SLACK_BYTES;
 use ggml_rs::{Backend, Bytes, Context, Graph, Length, Shape2D, Tensor};
 
 /// Estimate backend memory for the LM head graph.
@@ -19,7 +19,7 @@ pub(in crate::e2e) fn recommended_lm_head_memory(
     let slack = hidden_features
         .checked_mul(std::mem::size_of::<f32>())
         .and_then(|v| v.checked_mul(4))
-        .and_then(|v| v.checked_add(PROJECTION_SLACK_BYTES))
+        .and_then(|v| v.checked_add(MATMUL_GRAPH_SLACK_BYTES))
         .ok_or(E2eError::MemorySizeOverflow)?;
 
     let total = matmul_mem

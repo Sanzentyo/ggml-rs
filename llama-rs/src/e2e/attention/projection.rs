@@ -5,10 +5,16 @@ use crate::e2e::error::{E2eError, GgmlResultExt};
 use crate::e2e::numeric::checked_mul;
 use crate::e2e::plan::Qwen35FullAttentionLayerPlan;
 use crate::e2e::tensor_ops::{
-    PROJECTION_SLACK_BYTES, ProjectionSpec, execute_batch_projections, per_head_rms_norm,
+    MATMUL_GRAPH_SLACK_BYTES, ProjectionSpec, execute_batch_projections, per_head_rms_norm,
     project_sequence,
 };
 use ggml_rs::{Backend, Bytes, Context, Shape2D};
+
+/// Base slack for the full-attention (Qwen3.5) memory estimate.
+///
+/// This accounts for ggml context overhead, intermediate tensor descriptors,
+/// and alignment padding in the fused QKV + deinterleave + scoring graph.
+const FULL_ATTENTION_BASE_SLACK_BYTES: usize = 1_048_576;
 
 // ---------------------------------------------------------------------------
 // Structs
@@ -84,7 +90,9 @@ impl FullAttentionDims {
     }
 
     /// Conservative memory estimate for the fully-fused attention graph.
-    pub(super) fn estimate_memory(&self, t: usize) -> Bytes {
+    ///
+    /// Returns `Err` if the estimate overflows `usize`.
+    pub(super) fn estimate_memory(&self, t: usize) -> Result<Bytes, E2eError> {
         let Self {
             d,
             h: _,
@@ -94,18 +102,36 @@ impl FullAttentionDims {
             qf2,
             kvf,
         } = *self;
-        let weight_bytes = (hidden * qf2 + hidden * kvf * 2 + qf * hidden + d * 2 + hidden) * 4;
-        let data_bytes = (hidden * t * 2
-            + qf2 * t
-            + kvf * t * 2
-            + qf * t * 4
-            + kvf * t * 2
-            + qf * t * 3
-            + t * t
-            + hidden * t)
-            * 4;
-        let mask_bytes_estimate = t * t * 2; // f16
-        Bytes::new((weight_bytes + data_bytes + mask_bytes_estimate) * 2 + 1_048_576)
+
+        let weight_bytes = checked_mul(hidden, qf2)?
+            .checked_add(checked_mul(hidden, checked_mul(kvf, 2)?)?)
+            .and_then(|v| v.checked_add(checked_mul(qf, hidden).ok()?))
+            .and_then(|v| v.checked_add(checked_mul(d, 2).ok()?))
+            .and_then(|v| v.checked_add(hidden))
+            .and_then(|v| v.checked_mul(4))
+            .ok_or(E2eError::MemorySizeOverflow)?;
+
+        let data_bytes = checked_mul(hidden, checked_mul(t, 2)?)?
+            .checked_add(checked_mul(qf2, t)?)
+            .and_then(|v| v.checked_add(checked_mul(kvf, checked_mul(t, 2).ok()?).ok()?))
+            .and_then(|v| v.checked_add(checked_mul(qf, checked_mul(t, 4).ok()?).ok()?))
+            .and_then(|v| v.checked_add(checked_mul(kvf, checked_mul(t, 2).ok()?).ok()?))
+            .and_then(|v| v.checked_add(checked_mul(qf, checked_mul(t, 3).ok()?).ok()?))
+            .and_then(|v| v.checked_add(checked_mul(t, t).ok()?))
+            .and_then(|v| v.checked_add(checked_mul(hidden, t).ok()?))
+            .and_then(|v| v.checked_mul(4))
+            .ok_or(E2eError::MemorySizeOverflow)?;
+
+        let mask_bytes_estimate = checked_mul(checked_mul(t, t)?, 2)?; // f16
+
+        let total = weight_bytes
+            .checked_add(data_bytes)
+            .and_then(|v| v.checked_add(mask_bytes_estimate))
+            .and_then(|v| v.checked_mul(2))
+            .and_then(|v| v.checked_add(FULL_ATTENTION_BASE_SLACK_BYTES))
+            .ok_or(E2eError::MemorySizeOverflow)?;
+
+        Ok(Bytes::new(total))
     }
 }
 
@@ -188,7 +214,7 @@ fn recommended_qkv_projection_memory(
         .get()
         .checked_add(k_mem.get())
         .and_then(|v| v.checked_add(v_mem.get()))
-        .and_then(|v| v.checked_add(PROJECTION_SLACK_BYTES))
+        .and_then(|v| v.checked_add(MATMUL_GRAPH_SLACK_BYTES))
         .ok_or(E2eError::MemorySizeOverflow)?;
     Ok(Bytes::new(total))
 }

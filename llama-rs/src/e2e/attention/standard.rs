@@ -1,5 +1,11 @@
 //! Standard (non-gated) attention: prefill, inference, and decode step.
 
+/// Slack for the fully-fused standard attention graph.
+///
+/// Larger than the per-projection slack because this graph builds QKV projections,
+/// per-head norms, RoPE, flash attention, and output projection in a single context.
+const STANDARD_ATTENTION_OVERHEAD_BYTES: usize = 64 * 1024 * 1024;
+
 use super::shared::{
     FlashAttentionConfig, RopeParams, apply_neox_rope_in_place, apply_optional_per_head_norm,
     graph_norm_input, host_attention_scoring, run_flash_attention_pipeline, validate_gqa_heads,
@@ -95,14 +101,24 @@ fn standard_attention_graph(
 
     // Memory estimate (conservative): weights + IO + intermediates.
     let elem = std::mem::size_of::<f32>();
-    let weight_bytes =
-        (checked_mul(hidden, qf)? + 2 * checked_mul(hidden, kvf)? + checked_mul(qf, hidden)?)
-            * elem;
-    let io_bytes =
-        (checked_mul(hidden, t)? + checked_mul(qf, t)? + 2 * checked_mul(kvf, t)?) * elem;
-    let mask_bytes_est = t * t * 2; // f16 mask
-    let overhead = 64 * 1024 * 1024; // 64 MB slack for intermediates
-    let total_mem = Bytes::new(weight_bytes + io_bytes + mask_bytes_est + overhead);
+    let weight_bytes = checked_mul(hidden, qf)?
+        .checked_add(checked_mul(checked_mul(hidden, kvf)?, 2)?)
+        .and_then(|v| v.checked_add(checked_mul(qf, hidden).ok()?))
+        .and_then(|v| v.checked_mul(elem))
+        .ok_or(E2eError::MemorySizeOverflow)?;
+    let io_bytes = checked_mul(hidden, t)?
+        .checked_add(checked_mul(qf, t)?)
+        .and_then(|v| v.checked_add(checked_mul(kvf, checked_mul(t, 2).ok()?).ok()?))
+        .and_then(|v| v.checked_mul(elem))
+        .ok_or(E2eError::MemorySizeOverflow)?;
+    let mask_bytes_est = checked_mul(checked_mul(t, t)?, 2)?; // f16 mask
+    let overhead = STANDARD_ATTENTION_OVERHEAD_BYTES;
+    let total_mem = weight_bytes
+        .checked_add(io_bytes)
+        .and_then(|v| v.checked_add(mask_bytes_est))
+        .and_then(|v| v.checked_add(overhead))
+        .ok_or(E2eError::MemorySizeOverflow)?;
+    let total_mem = Bytes::new(total_mem);
 
     let ctx = Context::new_no_alloc_bytes(total_mem).ggml_ctx("Context::new(std_attn)")?;
 

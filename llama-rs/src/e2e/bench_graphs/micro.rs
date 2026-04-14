@@ -27,7 +27,9 @@ fn bench_batch_projections(
     iters: usize,
     backend: &Backend,
 ) -> f64 {
-    use super::super::tensor_ops::{ProjectionSpec, build_batch_projections, upload_weight};
+    use super::super::tensor_ops::{
+        MATMUL_GRAPH_SLACK_BYTES, ProjectionSpec, build_batch_projections, upload_weight,
+    };
     use ggml_rs::{Bytes, Context, Shape2D};
 
     // Pre-generate deterministic weight data for each projection.
@@ -72,7 +74,7 @@ fn bench_batch_projections(
             .expect("mem estimate");
             total_bytes += mem.get();
         }
-        total_bytes += 4 * 1024 * 1024; // slack
+        total_bytes += MATMUL_GRAPH_SLACK_BYTES;
 
         let ctx = Context::new_no_alloc_bytes(Bytes::new(total_bytes)).expect("ctx");
         let x_in = ctx

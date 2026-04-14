@@ -123,7 +123,7 @@ fn fully_fused_attention_graph(
         });
     }
 
-    let ctx = Context::new_no_alloc_bytes(dims.estimate_memory(t))
+    let ctx = Context::new_no_alloc_bytes(dims.estimate_memory(t)?)
         .ggml_ctx("Context::new(fully_fused_attn)")?;
 
     let ni = graph_norm_input(&ctx, hidden, t, rms_norm_eps)?;

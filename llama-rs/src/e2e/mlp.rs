@@ -1,10 +1,8 @@
 use super::error::{E2eError, GgmlResultExt};
 use super::numeric::checked_mul;
-use super::tensor_ops::upload_weight;
+use super::tensor_ops::{MATMUL_GRAPH_SLACK_BYTES, upload_weight};
 use crate::inference::MlpWeights;
 use ggml_rs::{Backend, BackendBuffer, Bytes, Context, Graph, Length, Shape2D, Tensor};
-
-const MLP_BACKEND_SLACK_BYTES: usize = 4 * 1024 * 1024;
 
 // ---------------------------------------------------------------------------
 // Shared MLP graph topology builder
@@ -168,7 +166,7 @@ pub(super) fn recommended_mlp_backend_memory_bytes(
         .get()
         .checked_add(up_projection.get())
         .and_then(|value| value.checked_add(down_projection.get()))
-        .and_then(|value| value.checked_add(MLP_BACKEND_SLACK_BYTES))
+        .and_then(|value| value.checked_add(MATMUL_GRAPH_SLACK_BYTES))
         .ok_or(E2eError::MemorySizeOverflow)?;
     Ok(Bytes::new(total))
 }

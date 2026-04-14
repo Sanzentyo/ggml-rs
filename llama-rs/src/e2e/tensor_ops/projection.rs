@@ -2,7 +2,7 @@ use super::super::error::{E2eError, GgmlResultExt};
 use ggml_rs::{Backend, Bytes, Context, Graph, Shape2D, Tensor};
 
 /// Slack constant added to memory estimates for ggml graph/tensor overhead.
-pub(in crate::e2e) const PROJECTION_SLACK_BYTES: usize = 4 * 1024 * 1024;
+pub(in crate::e2e) const MATMUL_GRAPH_SLACK_BYTES: usize = 4 * 1024 * 1024;
 
 /// Estimate the backend memory needed for a single matmul projection.
 fn recommended_single_projection_memory(
@@ -17,7 +17,7 @@ fn recommended_single_projection_memory(
     .ggml_ctx("recommended_backend_matmul_memory(single)")?;
     let total = mem
         .get()
-        .checked_add(PROJECTION_SLACK_BYTES)
+        .checked_add(MATMUL_GRAPH_SLACK_BYTES)
         .ok_or(E2eError::MemorySizeOverflow)?;
     Ok(Bytes::new(total))
 }
@@ -151,7 +151,7 @@ pub(super) fn build_output_projection_graph<'ctx>(
 ///
 /// Each entry is `(weight_shape, input_shape, label)`.  The label is used
 /// in the error message if the memory query fails.  Returns the total plus
-/// `2 × PROJECTION_SLACK_BYTES` for ggml graph/tensor overhead.
+/// `2 × MATMUL_GRAPH_SLACK_BYTES` for ggml graph/tensor overhead.
 pub(super) fn sum_matmul_memories(
     projections: &[(Shape2D, Shape2D, &'static str)],
 ) -> Result<Bytes, E2eError> {
@@ -163,7 +163,7 @@ pub(super) fn sum_matmul_memories(
             acc.checked_add(mem.get())
                 .ok_or(E2eError::MemorySizeOverflow)
         })?
-        .checked_add(PROJECTION_SLACK_BYTES * 2)
+        .checked_add(MATMUL_GRAPH_SLACK_BYTES * 2)
         .ok_or(E2eError::MemorySizeOverflow)?;
     Ok(Bytes::new(total))
 }

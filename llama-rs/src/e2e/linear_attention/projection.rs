@@ -7,7 +7,7 @@ use crate::e2e::error::{E2eError, GgmlResultExt};
 use crate::e2e::numeric::checked_mul;
 use crate::e2e::plan::Qwen35LinearAttentionLayerPlan;
 use crate::e2e::tensor_ops::{
-    PROJECTION_SLACK_BYTES, ProjectionSpec, execute_batch_projections, project_sequence,
+    MATMUL_GRAPH_SLACK_BYTES, ProjectionSpec, execute_batch_projections, project_sequence,
 };
 use ggml_rs::{Backend, Bytes, Context, Shape2D};
 
@@ -112,7 +112,7 @@ impl LinearAttentionDims {
 
         proj_total
             .checked_add(conv_tensor_bytes)
-            .and_then(|v| v.checked_add(PROJECTION_SLACK_BYTES * 2))
+            .and_then(|v| v.checked_add(MATMUL_GRAPH_SLACK_BYTES * 2))
             .ok_or(E2eError::MemorySizeOverflow)
     }
 }
@@ -154,7 +154,7 @@ fn recommended_linear_projection_memory(
         .checked_add(z_mem.get())
         .and_then(|v| v.checked_add(alpha_mem.get()))
         .and_then(|v| v.checked_add(beta_mem.get()))
-        .and_then(|v| v.checked_add(PROJECTION_SLACK_BYTES))
+        .and_then(|v| v.checked_add(MATMUL_GRAPH_SLACK_BYTES))
         .ok_or(E2eError::MemorySizeOverflow)?;
     Ok(Bytes::new(total))
 }
