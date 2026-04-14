@@ -649,6 +649,17 @@ And you should write rusty code(ADT, enum, type state pattern)
   - Alternative naming conventions (HuggingFace-style)
   263 tests pass, zero clippy warnings.
 
+74. **Unit tests for planner.rs** — DONE (commit `8da9ba8`)
+  10 tests covering layer plan construction:
+  - `required_transformer_usize`: Some→Ok, None→error
+  - `build_layer_mlp_plan`: success, invalid gate shape, hidden_features=0
+  - Policy tests: Strict errors on missing attention (qwen35 arch), propagates
+    malformed attention (llama arch); SkipUnsupportedAttention builds MLP-only
+  - Standard attention end-to-end smoke test with minimal llama model
+  Test helpers: stub_model (element-count sizing), MLP/attention tensor builders,
+  llama/qwen35 KV metadata builders.
+  273 tests pass, zero clippy warnings.
+
 ## Validation checkpoints completed on this branch
 
 - `cargo fmt --all`

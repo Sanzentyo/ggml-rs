@@ -4232,3 +4232,59 @@ Both populate only `tensor_index` and `kv_index` (the fields `find_tensor()` che
 ### Result
 - 263 tests pass (up from 246), zero clippy warnings.
 - Commit: `fae4281`
+
+---
+
+## Item 74: Unit tests for planner.rs
+
+### Problem
+`planner.rs` (430 lines) had zero test coverage. It contains the core layer plan construction
+logic (`build_layer_plans`, `build_layer_mlp_plan`, `try_build_attention_layer_plan`) with
+complex branching: architecture dispatch, mixed-layer policy handling, dimension validation.
+
+### Complexity barrier
+Planner functions decode actual tensor data via `model.tensor_values::<f32>()`. Testing required
+building stub models with correctly-sized F32 byte payloads, not just tensor names. Additionally,
+`TransformerMetadata` must be constructed via `resolve_transformer_metadata_from_kv` with appropriate
+KV entries.
+
+### Solution
+
+**Test helpers** (reusable within module):
+- `stub_model(tensors, kv)` — builds GgufModel with element-count-based sizing (avoids byte miscalc)
+- `mlp_tensors(hidden, ffn)` — MLP tensor set for layer 0
+- `attention_tensors(hidden, heads, kv_heads, head_dim)` — standard attention tensor set
+- `llama_kv_1block` / `qwen35_kv_1block` — minimal metadata KV for 1-block models
+- `build_metadata(kv)` — constructs TransformerMetadata from KV pairs
+
+**Tests** (10):
+
+`required_transformer_usize` (2):
+- Some(42) returns Ok(42)
+- None returns error mentioning the key
+
+`build_layer_mlp_plan` (3):
+- Success with correctly-sized tensors (hidden=8, ffn=16)
+- Invalid gate shape (not divisible by hidden_features) → `InvalidMlpGateShape`
+- hidden_features = 0 → error
+
+`build_layer_plans` policy (4):
+- Strict + qwen35 arch + no attention → error mentioning "attention"
+- Skip + qwen35 arch + no attention → MLP-only plan (attention: None)
+- Strict + llama arch + partial attention (attn_q present, attn_k missing) → propagates error
+- Skip + llama arch + partial attention → recovers, builds MLP-only
+
+Standard attention (1):
+- Minimal llama model (hidden=4, heads=1, kv_heads=1, head_dim=4, ffn=8) → successful
+  Standard attention plan end-to-end
+
+### Key decisions
+- Rubber-duck critique pointed out `Ok(None)` only occurs for qwen35 arch; llama arch gets `Err`.
+  Both paths now tested with appropriate architecture metadata.
+- Element-count-based stub helper avoids the pitfall of raw byte sizing (must be multiples of 4).
+- Standard attention smoke test is cheap (tiny dimensions) but covers full path: naming resolution,
+  dimension inference, config construction, weight decode, plan assembly.
+
+### Result
+- 273 tests pass (up from 263), zero clippy warnings.
+- Commit: `8da9ba8`
