@@ -2,7 +2,7 @@
 
 use super::shared::{
     FlashAttentionConfig, RopeParams, apply_neox_rope_in_place, apply_optional_per_head_norm,
-    host_attention_scoring, run_flash_attention_pipeline, validate_gqa_heads,
+    graph_norm_input, host_attention_scoring, run_flash_attention_pipeline, validate_gqa_heads,
 };
 use crate::e2e::error::{E2eError, GgmlResultExt};
 use crate::e2e::numeric::checked_mul;
@@ -116,24 +116,12 @@ fn standard_attention_graph(
 
     let ctx = Context::new_no_alloc_bytes(total_mem).ggml_ctx("Context::new(std_attn)")?;
 
-    // Input tensor (un-normed).
-    let x_raw = ctx
-        .new_tensor_2d::<f32>(Shape2D::new(hidden, t))
-        .ggml_ctx("new<X>")?;
-
-    // Layer pre-norm weight: [hidden].
-    let attn_norm_w = ctx
-        .new_tensor_1d::<f32>(Length::new(hidden))
-        .ggml_ctx("new<attn_norm_w>")?;
-
-    // In-graph layer pre-norm.
-    let x_normed = ctx.rms_norm(&x_raw, rms_norm_eps).ggml_ctx("rms_norm(X)")?;
-    let x = ctx.mul(&x_normed, &attn_norm_w).ggml_ctx("mul(X_norm)")?;
+    let ni = graph_norm_input(&ctx, hidden, t, rms_norm_eps)?;
 
     // QKV projections.
     let qkv = build_batch_projections(
         &ctx,
-        &x,
+        &ni.x,
         hidden,
         &[
             ProjectionSpec {
@@ -287,8 +275,8 @@ fn standard_attention_graph(
         .ggml_ctx("allocate_tensors(std_attn)")?;
 
     // Write data.
-    upload_weight(&x_raw, input, "write<X>")?;
-    upload_weight(&attn_norm_w, attn_norm_weight, "write<attn_norm_w>")?;
+    upload_weight(&ni.x_raw, input, "write<X>")?;
+    upload_weight(&ni.norm_w, attn_norm_weight, "write<attn_norm_w>")?;
     upload_weight(&qkv[0].w, attention.weights.q_values(), "write<W_q>")?;
     upload_weight(&qkv[1].w, attention.weights.k_values(), "write<W_k>")?;
     upload_weight(&qkv[2].w, attention.weights.v_values(), "write<W_v>")?;

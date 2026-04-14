@@ -13,7 +13,7 @@
 mod persistent;
 mod projection;
 mod qwen35_full;
-mod shared;
+pub(in crate::e2e) mod shared;
 mod standard;
 
 // Re-exports: keep existing import paths stable for e2e consumers

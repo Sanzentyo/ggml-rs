@@ -2,6 +2,7 @@
 //! conv graph, and single-token decode step.
 
 use super::projection::{FusedLinearOutputs, LinearAttentionDims, linear_projection_specs};
+use crate::e2e::attention::shared::graph_norm_input;
 use crate::e2e::error::{E2eError, GgmlResultExt};
 use crate::e2e::numeric::checked_mul;
 use crate::e2e::plan::Qwen35LinearAttentionLayerPlan;
@@ -9,7 +10,7 @@ use crate::e2e::state::LinearAttentionState;
 #[cfg(test)]
 use crate::e2e::tensor_ops::PROJECTION_SLACK_BYTES;
 use crate::e2e::tensor_ops::{build_batch_projections, upload_weight};
-use ggml_rs::{Backend, Bytes, Context, Length, Shape2D};
+use ggml_rs::{Backend, Bytes, Context, Shape2D};
 
 /// Host-side causal depthwise convolution (test/reference implementation).
 #[cfg(test)]
@@ -190,24 +191,10 @@ pub(super) fn project_and_conv_fused_graph(
     let ctx = Context::new_no_alloc_bytes(Bytes::new(total_bytes))
         .ggml_ctx("Context::new_no_alloc_bytes(fused)")?;
 
-    // --- Projection tensors via shared builder ---
-    let x_raw = ctx
-        .new_tensor_2d::<f32>(Shape2D::new(hidden, sequence_length))
-        .ggml_ctx("new<X>")?;
-
-    // Layer pre-norm weight: [hidden]
-    let norm_w = ctx
-        .new_tensor_1d::<f32>(Length::new(hidden))
-        .ggml_ctx("new<norm_w>")?;
-
-    // In-graph layer pre-norm: rms_norm(X, eps) * norm_weight
-    let x_normed = ctx
-        .rms_norm(&x_raw, rms_norm_eps)
-        .ggml_ctx("rms_norm(X_layer)")?;
-    let x = ctx.mul(&x_normed, &norm_w).ggml_ctx("mul(X_layer_norm)")?;
+    let ni = graph_norm_input(&ctx, hidden, sequence_length, rms_norm_eps)?;
 
     // --- Projection: 4 matmuls sharing normed input X ---
-    let projs = build_batch_projections(&ctx, &x, hidden, &linear_projection_specs(dims))?;
+    let projs = build_batch_projections(&ctx, &ni.x, hidden, &linear_projection_specs(dims))?;
     let (w_qkv, qkv_out) = (&projs[0].w, &projs[0].y);
     let (w_z, z_out) = (&projs[1].w, &projs[1].y);
     let (w_alpha, alpha_out) = (&projs[2].w, &projs[2].y);
@@ -273,8 +260,8 @@ pub(super) fn project_and_conv_fused_graph(
     upload_weight(w_z, &attention.gate_weight_values, "write<W_Z>")?;
     upload_weight(w_alpha, &attention.alpha_weight_values, "write<W_alpha>")?;
     upload_weight(w_beta, &attention.beta_weight_values, "write<W_beta>")?;
-    upload_weight(&x_raw, input, "write<X>")?;
-    upload_weight(&norm_w, attn_norm_weight, "write<norm_w>")?;
+    upload_weight(&ni.x_raw, input, "write<X>")?;
+    upload_weight(&ni.norm_w, attn_norm_weight, "write<norm_w>")?;
 
     // Upload zero padding (only when kernel_size > 1).
     if let Some(ref zeros) = zeros_tensor {

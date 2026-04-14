@@ -4,7 +4,7 @@
 use crate::e2e::error::{E2eError, GgmlResultExt};
 use crate::e2e::numeric::{checked_mul, dot, softmax_prefix};
 use crate::e2e::state::{Qwen35FullAttentionState, StandardAttentionState};
-use ggml_rs::{Context, DynTensor, Tensor};
+use ggml_rs::{Context, DynTensor, Length, Shape2D, Tensor};
 
 // ---------------------------------------------------------------------------
 // GQA head validation
@@ -23,6 +23,40 @@ pub(in crate::e2e) fn validate_gqa_heads(
         });
     }
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Graph norm input (shared context + RMS-norm boilerplate)
+// ---------------------------------------------------------------------------
+
+/// Tensors produced by [`graph_norm_input`]: the raw input, norm weight,
+/// and the pre-normed result that downstream projections consume.
+pub(in crate::e2e) struct NormInput<'ctx> {
+    /// Un-normed input `[hidden × seq_len]` — caller uploads data here.
+    pub(in crate::e2e) x_raw: Tensor<'ctx, f32>,
+    /// RMS-norm weight `[hidden]` — caller uploads the layer norm weight.
+    pub(in crate::e2e) norm_w: Tensor<'ctx, f32>,
+    /// Normed result: `rms_norm(x_raw, eps) * norm_w`.
+    pub(in crate::e2e) x: Tensor<'ctx, f32>,
+}
+
+/// Create the raw input tensor, norm weight tensor, and pre-normed input
+/// within an already-allocated ggml `Context`.
+pub(in crate::e2e) fn graph_norm_input<'ctx>(
+    ctx: &'ctx Context,
+    hidden: usize,
+    seq_len: usize,
+    rms_norm_eps: f32,
+) -> Result<NormInput<'ctx>, E2eError> {
+    let x_raw = ctx
+        .new_tensor_2d::<f32>(Shape2D::new(hidden, seq_len))
+        .ggml_ctx("new<X>")?;
+    let norm_w = ctx
+        .new_tensor_1d::<f32>(Length::new(hidden))
+        .ggml_ctx("new<attn_norm_w>")?;
+    let x_normed = ctx.rms_norm(&x_raw, rms_norm_eps).ggml_ctx("rms_norm(X)")?;
+    let x = ctx.mul(&x_normed, &norm_w).ggml_ctx("mul(X_norm)")?;
+    Ok(NormInput { x_raw, norm_w, x })
 }
 
 // ---------------------------------------------------------------------------

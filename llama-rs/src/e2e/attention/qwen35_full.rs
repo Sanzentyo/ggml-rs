@@ -6,7 +6,7 @@ use super::persistent::{
 use super::projection::{FullAttentionDims, PreparedAttention, project_and_prepare_qkv};
 use super::shared::{
     FlashAttentionConfig, RopeParams, apply_neox_rope_in_place, apply_optional_per_head_norm,
-    host_attention_scoring, run_flash_attention_pipeline, validate_gqa_heads,
+    graph_norm_input, host_attention_scoring, run_flash_attention_pipeline, validate_gqa_heads,
 };
 use crate::e2e::error::{E2eError, GgmlResultExt};
 use crate::e2e::numeric::{checked_mul, sigmoid_scalar};
@@ -131,28 +131,12 @@ fn fully_fused_attention_graph(
     let ctx = Context::new_no_alloc_bytes(dims.estimate_memory(t))
         .ggml_ctx("Context::new(fully_fused_attn)")?;
 
-    // --- Input tensors ---
-    let x_raw = ctx
-        .new_tensor_2d::<f32>(Shape2D::new(hidden, t))
-        .ggml_ctx("new<X>")?;
-
-    // Layer pre-norm weight: [hidden_features]
-    let attn_norm_w = ctx
-        .new_tensor_1d::<f32>(Length::new(hidden))
-        .ggml_ctx("new<attn_norm_w>")?;
-
-    // In-graph layer pre-norm: rms_norm(X, eps) * attn_norm_weight
-    let x_normed = ctx
-        .rms_norm(&x_raw, rms_norm_eps)
-        .ggml_ctx("rms_norm(X_layer)")?;
-    let x = ctx
-        .mul(&x_normed, &attn_norm_w)
-        .ggml_ctx("mul(X_layer_norm)")?;
+    let ni = graph_norm_input(&ctx, hidden, t, rms_norm_eps)?;
 
     // QKV projections via shared builder (Q carries interleaved gate, hence qf2).
     let qkv = build_batch_projections(
         &ctx,
-        &x,
+        &ni.x,
         hidden,
         &[
             ProjectionSpec {
@@ -294,10 +278,10 @@ fn fully_fused_attention_graph(
         .ggml_ctx("allocate_tensors(fully_fused)")?;
 
     // Write input data (un-normed).
-    upload_weight(&x_raw, input, "write<X>")?;
+    upload_weight(&ni.x_raw, input, "write<X>")?;
 
     // Layer pre-norm weight.
-    upload_weight(&attn_norm_w, attn_norm_weight, "write<attn_norm_w>")?;
+    upload_weight(&ni.norm_w, attn_norm_weight, "write<attn_norm_w>")?;
 
     // Write weight data.
     upload_weight(w_q, &attention.q_weight_values, "write<W_q>")?;
