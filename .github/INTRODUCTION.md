@@ -727,6 +727,21 @@ And you should write rusty code(ADT, enum, type state pattern)
   misleading `BufferLengthMismatch`. Fixed missing `head_count==0` check in projection.rs.
   305 tests pass, zero clippy warnings.
 
+84. **kv_cache_append_batch shared function** — DONE (commit `e88ced5`)
+  Extracted the identical 25-line `append_batch` logic from both
+  `StandardAttentionState` and `Qwen35FullAttentionState` into a private
+  `kv_cache_append_batch()` helper in state.rs. Both methods delegate to it.
+  Added `debug_assert` for K/V cache size alignment.
+  305 tests pass, zero clippy warnings.
+
+85. **graph_norm_input + NormInput struct** — DONE (commit `873bdde`)
+  Extracted the duplicated context+tensor+rms_norm+mul boilerplate from 3
+  graph builders (standard.rs, qwen35_full.rs, linear_attention/conv.rs)
+  into `graph_norm_input()` returning `NormInput<'ctx>` struct. Widened
+  `attention/shared` module visibility to `pub(in crate::e2e)` so
+  `linear_attention` can also use the helper.
+  305 tests pass, zero clippy warnings.
+
 ## Validation checkpoints completed on this branch
 
 - `cargo fmt --all`

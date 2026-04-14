@@ -4572,3 +4572,58 @@ for a head configuration problem.
 - Added InvalidGqaHeadConfig error variant with proper error message
 - 305 tests pass, zero clippy warnings
 - Commit: d14aba2
+
+
+## Item 84: kv_cache_append_batch shared function
+
+### Problem
+StandardAttentionState and Qwen35FullAttentionState in state.rs had byte-for-byte
+identical append_batch implementations (25 lines each). Both check batch_size,
+validate capacity, copy K and V slices, and increment cached_len.
+
+### Solution
+Extracted a private kv_cache_append_batch() function taking raw references to
+the cache slices and cached_len counter. Both append_batch methods delegate to it.
+Added debug_assert for K/V cache size alignment (catches construction bugs).
+
+### Key decisions
+- Free function approach over inner struct: avoids 10+ field access changes across
+  checkpoint, attention, and test files
+- Private function (not pub): only called from the two append_batch methods
+- debug_assert for v_cache.len() == k_cache.len() per rubber-duck advice
+
+### Result
+- 25 lines of duplication eliminated
+- 1 file changed (state.rs): +51 -36
+- 305 tests pass, zero clippy warnings
+- Commit: e88ced5
+
+## Item 85: graph_norm_input + NormInput struct
+
+### Problem
+Three graph builders had identical 5-6 line boilerplate:
+1. standard_attention_graph (standard.rs)
+2. fully_fused_attention_graph (qwen35_full.rs)
+3. project_and_conv_fused_graph (linear_attention/conv.rs)
+
+Each created: x_raw tensor, norm_w tensor, then rms_norm + mul to produce
+the normed input. Only ggml_ctx label strings varied slightly between sites.
+
+### Solution
+1. Created NormInput struct with x_raw, norm_w, x fields
+2. Extracted graph_norm_input() in attention/shared.rs
+3. Widened attention/shared module to pub(in crate::e2e) for cross-module access
+4. All 3 callers now use a single-line call
+
+### Key decisions
+- NormInput struct instead of tuple: resolves clippy type_complexity warning
+- Caller owns Context, helper borrows it: avoids lifetime/self-reference issues
+  (rubber-duck identified this as a blocking concern)
+- Standardized ggml_ctx labels across all sites
+- pub(in crate::e2e) visibility to serve both attention and linear_attention modules
+
+### Result
+- ~15 lines of boilerplate eliminated per call site (3 sites = ~45 lines)
+- 5 files changed: +52 -59
+- 305 tests pass, zero clippy warnings
+- Commit: 873bdde
