@@ -6,9 +6,9 @@
 use super::super::error::E2eError;
 use super::super::generation::{
     DecodeStrategy, GenerationMode, InferenceStrategy, LayerPassConfig, LmHeadResources,
-    PersistentDecodeResources, PrefillStrategy, greedy_next_token_id, process_all_layers,
+    PersistentDecodeResources, PrefillStrategy, greedy_sample_at_index, process_all_layers,
 };
-use super::super::tensor_ops::{gather_embeddings, rms_norm_with_weight};
+use super::super::tensor_ops::gather_embeddings;
 use super::GenerationSession;
 
 impl GenerationSession {
@@ -85,12 +85,12 @@ impl GenerationSession {
             &[new_token_id],
         )?;
 
+        let layer_config = LayerPassConfig {
+            layer_plans: &self.layer_plans,
+            rms_norm_eps: self.rms_norm_eps,
+            backend: &self.backend,
+        };
         if let Some(ref mut res) = self.persistent_resources {
-            let layer_config = LayerPassConfig {
-                layer_plans: &self.layer_plans,
-                rms_norm_eps: self.rms_norm_eps,
-                backend: &self.backend,
-            };
             res.decode_step(
                 &mut hidden,
                 &layer_config,
@@ -100,11 +100,6 @@ impl GenerationSession {
             let next = res.sample_token(&hidden, 0, self.hidden_features, &self.backend)?;
             self.emit_token(next)
         } else {
-            let layer_config = LayerPassConfig {
-                layer_plans: &self.layer_plans,
-                rms_norm_eps: self.rms_norm_eps,
-                backend: &self.backend,
-            };
             let mut strategy = DecodeStrategy {
                 state: &mut self.state,
             };
@@ -202,18 +197,12 @@ impl GenerationSession {
     }
 
     fn sample_next(&self, hidden: &[f32], token_index: usize) -> Result<i32, E2eError> {
-        let seq_len = token_index + 1;
-        let normalized_output = rms_norm_with_weight(
+        greedy_sample_at_index(
             hidden,
-            self.hidden_features,
-            seq_len,
-            &self.output_norm_values,
-            self.rms_norm_eps,
-        )?;
-        greedy_next_token_id(
-            &normalized_output,
             token_index,
             self.hidden_features,
+            &self.output_norm_values,
+            self.rms_norm_eps,
             &self.output_weight_values,
             self.vocab_size,
         )

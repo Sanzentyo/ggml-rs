@@ -28,7 +28,7 @@ use super::error::E2eError;
 use super::mlp::{PersistentMlp, mlp_sequence_inference_with_weights};
 use super::numeric::checked_mul;
 use super::plan::LayerPlan;
-use super::tensor_ops::{add_in_place, rms_norm_with_weight};
+use super::tensor_ops::{add_in_place, rms_norm_single};
 use ggml_rs::Backend;
 
 /// Controls which execution strategy the generation loop uses.
@@ -131,24 +131,55 @@ pub(super) fn process_all_layers(
     Ok(())
 }
 
+/// Greedy-sample a single token from the hidden state at `token_index`.
+///
+/// Slices the hidden buffer to the target token, applies RMS normalization,
+/// and returns the argmax token ID. Used by both the batch generation loop
+/// (`graph_sample_fallback`) and the session runtime (`sample_next`).
+pub(super) fn greedy_sample_at_index(
+    hidden: &[f32],
+    token_index: usize,
+    hidden_features: usize,
+    output_norm_values: &[f32],
+    rms_norm_eps: f32,
+    output_weight_values: &[f32],
+    vocab_size: usize,
+) -> Result<i32, E2eError> {
+    let offset = checked_mul(token_index, hidden_features)?;
+    let end = offset
+        .checked_add(hidden_features)
+        .ok_or(E2eError::BufferLengthMismatch {
+            expected: offset.saturating_add(hidden_features),
+            actual: hidden.len(),
+        })?;
+    if end > hidden.len() {
+        return Err(E2eError::BufferLengthMismatch {
+            expected: end,
+            actual: hidden.len(),
+        });
+    }
+    let token_hidden = &hidden[offset..end];
+    let normalized = rms_norm_single(token_hidden, output_norm_values, rms_norm_eps)?;
+    greedy_next_token_id(
+        &normalized,
+        0,
+        hidden_features,
+        output_weight_values,
+        vocab_size,
+    )
+}
+
 fn graph_sample_fallback(
     hidden: &[f32],
     token_index: usize,
     inputs: &GenerationInputs<'_>,
 ) -> Result<i32, E2eError> {
-    let offset = checked_mul(token_index, inputs.hidden_features)?;
-    let last_hidden = &hidden[offset..offset + inputs.hidden_features];
-    let normalized = rms_norm_with_weight(
-        last_hidden,
+    greedy_sample_at_index(
+        hidden,
+        token_index,
         inputs.hidden_features,
-        1,
         inputs.output_norm_values,
         inputs.rms_norm_eps,
-    )?;
-    greedy_next_token_id(
-        &normalized,
-        0,
-        inputs.hidden_features,
         inputs.output_weight_values,
         inputs.vocab_size,
     )
