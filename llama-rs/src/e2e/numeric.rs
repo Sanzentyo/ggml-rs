@@ -115,11 +115,16 @@ pub(super) fn f32_to_f16_bits(value: f32) -> u16 {
 ///
 /// Layout: `[Tkv, T]` (row = query token, col = key token).
 /// Allowed positions → 0.0 (f16), blocked positions → -Inf (f16 0xFC00).
-pub(super) fn build_causal_mask_f16_bytes(seq_len: usize) -> Vec<u8> {
+///
+/// Returns an error if `seq_len² × 2` overflows `usize`.
+pub(super) fn build_causal_mask_f16_bytes(seq_len: usize) -> Result<Vec<u8>, super::E2eError> {
     let zero_f16 = f32_to_f16_bits(0.0_f32).to_le_bytes();
     let neg_inf_f16 = f32_to_f16_bits(f32::NEG_INFINITY).to_le_bytes();
-    let total = seq_len * seq_len;
-    let mut buf = vec![0u8; total * 2];
+    let total_bytes = seq_len
+        .checked_mul(seq_len)
+        .and_then(|n| n.checked_mul(2))
+        .ok_or(super::E2eError::MemorySizeOverflow)?;
+    let mut buf = vec![0u8; total_bytes];
     for row in 0..seq_len {
         for col in 0..seq_len {
             let bytes = if col > row { &neg_inf_f16 } else { &zero_f16 };
@@ -127,7 +132,7 @@ pub(super) fn build_causal_mask_f16_bytes(seq_len: usize) -> Vec<u8> {
             buf[offset..offset + 2].copy_from_slice(bytes);
         }
     }
-    buf
+    Ok(buf)
 }
 
 #[cfg(test)]

@@ -1295,6 +1295,15 @@ impl Context {
         max_bias: f32,
         logit_softcap: f32,
     ) -> Result<Tensor<'ctx, f32>> {
+        if let Some(m) = mask {
+            let actual = m.ggml_type();
+            if actual != Type::F16 {
+                return Err(Error::TypeMismatch {
+                    expected: Type::F16.as_raw(),
+                    actual: actual.as_raw(),
+                });
+            }
+        }
         let mask_raw = mask.map_or(ptr::null_mut(), |t| t.raw.as_ptr());
         let raw = unsafe {
             ffi::ggml_flash_attn_ext(
@@ -1468,6 +1477,11 @@ impl<'ctx> DynTensor<'ctx> {
         unsafe { ffi::ggml_nbytes(self.raw.as_ptr()) }
     }
 
+    /// Returns the ggml element type of this tensor.
+    pub fn ggml_type(&self) -> Type {
+        Type::from_raw(unsafe { self.raw.as_ref().type_ } as c_int)
+    }
+
     pub fn set_name(&self, name: &str) -> Result<()> {
         let name = CString::new(name)?;
         let raw = unsafe { ffi::ggml_set_name(self.raw.as_ptr(), name.as_ptr()) };
@@ -1507,7 +1521,7 @@ impl<'ctx> DynTensor<'ctx> {
     pub fn write_bytes_backend(&self, data: &[u8]) -> Result<()> {
         let expected = self.nbytes();
         if data.len() != expected {
-            return Err(Error::LengthMismatch {
+            return Err(Error::UnexpectedTensorByteSize {
                 expected,
                 actual: data.len(),
             });

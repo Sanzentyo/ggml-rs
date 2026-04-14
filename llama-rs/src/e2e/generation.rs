@@ -353,7 +353,7 @@ fn try_build_persistent_projections(
             }
         };
 
-        let result: Result<(Context, PersistentDecodeProjection<'static>), E2eError> =
+        let result: Result<(PersistentDecodeProjection<'static>, Context), E2eError> =
             match attention {
                 AttentionLayerPlan::Qwen35Full(attn) => build_one_persistent_full(attn, backend),
                 AttentionLayerPlan::Qwen35Linear(attn) => {
@@ -366,7 +366,7 @@ fn try_build_persistent_projections(
             };
 
         match result {
-            Ok((ctx, proj)) => {
+            Ok((proj, ctx)) => {
                 contexts.push(Some(ctx));
                 projections.push(Some(proj));
             }
@@ -382,7 +382,7 @@ fn try_build_persistent_projections(
 fn build_one_persistent_full(
     attn: &Qwen35FullAttentionLayerPlan,
     backend: &Backend,
-) -> Result<(Context, PersistentDecodeProjection<'static>), E2eError> {
+) -> Result<(PersistentDecodeProjection<'static>, Context), E2eError> {
     let hidden_features = full_attention_hidden_features(attn)?;
     let query_features = checked_mul(attn.head_count, attn.head_dimension)?;
     let kv_features = checked_mul(attn.kv_head_count, attn.head_dimension)?;
@@ -428,13 +428,13 @@ fn build_one_persistent_full(
             },
         )
     };
-    Ok((ctx, proj))
+    Ok((proj, ctx))
 }
 
 fn build_one_persistent_linear(
     attn: &Qwen35LinearAttentionLayerPlan,
     backend: &Backend,
-) -> Result<(Context, PersistentDecodeProjection<'static>), E2eError> {
+) -> Result<(PersistentDecodeProjection<'static>, Context), E2eError> {
     let hidden_features = linear_attention_hidden_features(attn)?;
     let conv_channels = linear_attention_conv_channels(attn)?;
     let inner_size = attn.inner_size;
@@ -485,7 +485,7 @@ fn build_one_persistent_linear(
             },
         )
     };
-    Ok((ctx, proj))
+    Ok((proj, ctx))
 }
 
 type PersistentKvCacheSets = (
@@ -511,7 +511,7 @@ fn try_build_persistent_kv_caches(
         match &layer_plan.attention {
             Some(AttentionLayerPlan::Qwen35Full(attn)) => {
                 match build_persistent_kv_cache(attn, max_tokens, backend) {
-                    Ok((ctx, cache)) => {
+                    Ok((cache, ctx)) => {
                         contexts.push(Some(ctx));
                         caches.push(Some(cache));
                     }
@@ -557,7 +557,7 @@ fn try_build_persistent_mlps(
             rms_norm_eps,
             backend,
         ) {
-            Ok((ctx, mlp)) => {
+            Ok((mlp, ctx)) => {
                 contexts.push(Some(ctx));
                 mlps.push(Some(mlp));
             }

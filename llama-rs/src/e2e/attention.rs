@@ -111,14 +111,15 @@ impl<'ctx> PersistentKvCache<'ctx> {
 
 /// Build a persistent backend-resident KV cache for one full attention layer.
 ///
-/// Returns `(Context, PersistentKvCache<'static>)`. The context must be stored
-/// in a parallel container and outlive the cache handles (same pattern as
-/// `PersistentDecodeProjection`).
+/// Returns `(PersistentKvCache<'static>, Context)`. The handle is first so
+/// that even if stored as a single value, it drops before the context.
+/// The context must be stored in a parallel container and outlive the cache
+/// handles (same pattern as `PersistentDecodeProjection`).
 pub(super) fn build_persistent_kv_cache(
     attention: &Qwen35FullAttentionLayerPlan,
     max_tokens: usize,
     backend: &Backend,
-) -> Result<(Context, PersistentKvCache<'static>), E2eError> {
+) -> Result<(PersistentKvCache<'static>, Context), E2eError> {
     let d = attention.head_dimension;
     let hkv = attention.kv_head_count;
 
@@ -156,7 +157,7 @@ pub(super) fn build_persistent_kv_cache(
         )
     };
 
-    Ok((ctx, cache))
+    Ok((cache, ctx))
 }
 
 /// Pre-reserved graph allocator for GPU-accelerated attention scoring.
@@ -1162,7 +1163,7 @@ fn fully_fused_attention_graph(
         .map_err(|source| E2eError::ggml("write<positions>", source))?;
 
     // Causal mask as f16.
-    let mask_bytes = build_causal_mask_f16_bytes(t);
+    let mask_bytes = build_causal_mask_f16_bytes(t)?;
     mask.write_bytes_backend(&mask_bytes)
         .map_err(|source| E2eError::ggml("write<mask>", source))?;
 

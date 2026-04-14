@@ -229,8 +229,10 @@ impl<'ctx> PersistentMlp<'ctx> {
 /// Build a persistent MLP graph for single-token decode (`seq_len=1`).
 ///
 /// Creates a dedicated ggml context, builds the graph, uploads all weights
-/// (gate, up, down, norm) once. Returns `(Context, PersistentMlp<'static>)`
+/// (gate, up, down, norm) once. Returns `(PersistentMlp<'static>, Context)`
 /// where the context owns the tensors and must outlive the handle.
+/// The handle is first in the tuple so that even if stored as a single
+/// value, it drops before the context (Rust drops tuple fields in order).
 ///
 /// # Safety (transmute)
 ///
@@ -243,7 +245,7 @@ pub(super) fn build_persistent_mlp(
     norm_weight: &[f32],
     rms_norm_eps: f32,
     backend: &Backend,
-) -> Result<(Context, PersistentMlp<'static>), E2eError> {
+) -> Result<(PersistentMlp<'static>, Context), E2eError> {
     let hidden_features = weights.hidden_features;
     let ffn_features = weights.ffn_features;
 
@@ -273,7 +275,7 @@ pub(super) fn build_persistent_mlp(
             hidden_features,
         })
     };
-    Ok((ctx, mlp))
+    Ok((mlp, ctx))
 }
 
 /// Recommended context size for a persistent MLP graph (seq_len=1).
