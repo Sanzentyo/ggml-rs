@@ -3193,3 +3193,30 @@ sub-struct via a single match, eliminating the 3-field multi-arm destructure.
 | `llama-rs/src/e2e/tensor_ops.rs` | Added `OutputProjectionGraph`, `build_output_projection_graph`; refactored both `*GraphParts` structs, both builders, `PersistentDecodeProjection` enum, `project_output`, and test callers |
 | `llama-rs/src/e2e/generation.rs` | Updated `build_one_persistent_full` and `build_one_persistent_linear` to use `g.output.w` and compose `output: g.output` |
 | `llama-rs/Cargo.toml` | Added `postcard` + `serde` dependencies |
+
+---
+
+## Item 50 — Hoist `upload_weight` to `tensor_ops` + Apply Across All Modules
+
+### 50.1 Motivation
+
+Item 48 extracted `upload_weight` in `generation.rs`, but `write_data_backend` + `map_err`
+boilerplate was still duplicated across `attention.rs` (23 occurrences),
+`linear_attention.rs` (15), and `mlp.rs` (10).
+
+### 50.2 Implementation
+
+Moved `upload_weight` to `tensor_ops.rs` as `pub(super)`, then applied it across all
+four e2e modules. Calls using non-f32 types (`i32` position indices, `f16` mask bytes)
+or `write_data_backend_at` (offset-based KV cache writes) remain manual since
+`upload_weight` is typed for `Tensor<'_, f32>` + `&[f32]`.
+
+### 50.3 Files Modified
+
+| File | Changes |
+|------|---------|
+| `llama-rs/src/e2e/tensor_ops.rs` | Added `pub(super) fn upload_weight` |
+| `llama-rs/src/e2e/generation.rs` | Removed local `upload_weight`, added `use` import |
+| `llama-rs/src/e2e/attention.rs` | 4 upload sites (23 calls) converted to `upload_weight` |
+| `llama-rs/src/e2e/linear_attention.rs` | 3 upload sites (15 calls) converted to `upload_weight` |
+| `llama-rs/src/e2e/mlp.rs` | 2 upload sites (10 calls) converted to `upload_weight` |

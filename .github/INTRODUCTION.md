@@ -440,6 +440,13 @@ And you should write rusty code(ADT, enum, type state pattern)
   enum variants also compose with the sub-struct, simplifying `project_output`.
   See comparison doc item 49.
 
+- **Hoist `upload_weight` to `tensor_ops` + apply across all modules** (item 50):
+  Moved `upload_weight` from `generation.rs` to `tensor_ops.rs` as `pub(super)`.
+  Applied across `attention.rs` (23→4 occurrences), `linear_attention.rs` (15→0),
+  `mlp.rs` (10→0), eliminating 66 lines of `write_data_backend` + `map_err`
+  boilerplate while preserving per-weight error labels.
+  See comparison doc item 50.
+
 ## Validation checkpoints completed on this branch
 
 - `cargo fmt --all`
