@@ -565,6 +565,19 @@ And you should write rusty code(ADT, enum, type state pattern)
   GenerationInputs, GenerationOutput, process_all_layers, generation loops,
   public entry points, tests. Zero clippy warnings, 229 tests pass.
 
+- **Split tensor_ops.rs into 5 thematic submodules** (item 66):
+  Split the 1460-line `tensor_ops.rs` into 5 focused submodules:
+  `normalization.rs` (rms_norm_with_weight, rms_norm_single[_into],
+  per_head_{rms,l2}_norm), `host_ops.rs` (add_in_place, project_sequence,
+  head_slice[_mut], gather_embeddings), `projection.rs` (ProjectionSpec,
+  BuiltProjection, OutputProjectionGraph, batch/sequence projection builders,
+  upload_weight, sum_matmul_memories), `lm_head.rs` (LmHeadGraphParts,
+  build_lm_head_graph, argmax_token_id, lm_head_sample_step),
+  `persistent_decode.rs` (PersistentDecodeProjection, FullAttentionGraphParts,
+  LinearAttentionGraphParts, RawLinearProjections, persistent graph builders).
+  Visibility: pub(in crate::e2e) for e2e consumers, pub(super) for internal,
+  module-private where sole user is same file. Zero clippy warnings, 229 tests pass.
+
 ## Validation checkpoints completed on this branch
 
 - `cargo fmt --all`

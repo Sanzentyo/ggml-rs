@@ -3987,3 +3987,54 @@ pattern established in items 63-64.
 | llama-rs/src/e2e/generation/strategy.rs | NEW — Attention dispatch strategies |
 | llama-rs/src/e2e/generation/resources.rs | NEW — Persistent GPU resource management |
 
+
+## Item 66 — Split tensor_ops.rs into 5 thematic submodules
+
+### 66.1 Motivation
+
+`tensor_ops.rs` had grown to 1460 lines covering normalization, host-side projections,
+GPU projection graph builders, LM-head graph construction, and persistent decode graph
+builders. The rubber-duck critique recommended 5 modules (not the initially planned 7)
+and suggested: renaming the attention submodule to `persistent_decode.rs` (avoiding name
+collision with `e2e::attention`), co-locating memory estimators with their builders
+(no separate `memory.rs`), and broader `projection.rs` (merge batch projection + related).
+
+### 66.2 Module Decomposition
+
+| Submodule | Responsibility | ~LOC |
+|-----------|---------------|------|
+| `normalization.rs` | rms_norm_with_weight, rms_norm_single[_into], per_head_{rms,l2}_norm | ~140 |
+| `host_ops.rs` | add_in_place, project_sequence, head_slice[_mut], gather_embeddings | ~100 |
+| `projection.rs` | ProjectionSpec, BuiltProjection, OutputProjectionGraph, batch/sequence projection builders, upload_weight, sum_matmul_memories | ~190 |
+| `lm_head.rs` | LmHeadGraphParts, build_lm_head_graph, argmax_token_id, lm_head_sample_step | ~220 |
+| `persistent_decode.rs` | PersistentDecodeProjection, FullAttentionGraphParts, LinearAttentionGraphParts, RawLinearProjections, build_persistent_{full,linear}_attention_graphs | ~380 |
+| Root | mod declarations, re-exports, 9 test functions | ~210 |
+
+### 66.3 Key Design Decisions
+
+- **Visibility layering**: Items needed by e2e consumers use `pub(in crate::e2e)` in submodule, re-exported `pub(super)` from root. Items internal to tensor_ops use `pub(super)` in submodule (no re-export). Module-private where sole consumer is the same file (e.g. `recommended_single_projection_memory`).
+- **OutputProjectionGraph kept `pub(in crate::e2e)`**: Used as a field type in `PersistentDecodeProjection` which is e2e-visible; Rust requires the field type be at least as visible as the struct.
+- **Struct field visibility preserved**: `RawLinearProjections` fields stay `pub(in crate::e2e)` for direct construction in generation/resources.rs.
+- **Test-only re-exports**: `argmax_token_id` and `lm_head_graph` wrapped in `#[cfg(test)]` since they are only used in tensor_ops test suite.
+- **Unused re-exports removed**: `FullAttentionGraphParts`, `LinearAttentionGraphParts`, `RawLinearProjections`, `LmHeadGraphParts`, `recommended_single_projection_memory` are accessed through type inference or not needed externally.
+
+### 66.4 Metrics
+
+| Metric | Before | After |
+|--------|--------|-------|
+| tensor_ops.rs LOC | 1460 | ~210 (root + tests) |
+| Submodule files | 0 | 5 |
+| External import breakage | 0 | 0 (re-exports + pub(in crate::e2e) preserve paths) |
+| Clippy warnings | 0 | 0 |
+| Tests | 229 pass | 229 pass |
+
+### 66.5 Files Modified
+
+| File | Changes |
+|------|---------|
+| llama-rs/src/e2e/tensor_ops.rs | Replaced 1460-line monolith with module root: mod declarations, re-exports, test suite |
+| llama-rs/src/e2e/tensor_ops/normalization.rs | NEW: RMS normalization + per-head norms |
+| llama-rs/src/e2e/tensor_ops/host_ops.rs | NEW: CPU-side tensor operations |
+| llama-rs/src/e2e/tensor_ops/projection.rs | NEW: GPU projection graph builders + batch utilities |
+| llama-rs/src/e2e/tensor_ops/lm_head.rs | NEW: LM head graph construction + sampling |
+| llama-rs/src/e2e/tensor_ops/persistent_decode.rs | NEW: Persistent decode projection graphs (full + linear attention) |
