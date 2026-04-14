@@ -6,33 +6,30 @@
 //! layers support cached state, or `FullReprocess` as a fallback.
 //!
 //! Implementation is split across coherent submodules:
+//! - [`api`]: Public API entry points (path/model generation, EOS, tokenizer)
+//! - [`loops`]: Core generation loops (full-reprocess and two-phase)
 //! - [`strategy`]: Attention dispatch strategies (inference, prefill, decode)
 //! - [`resources`]: Persistent GPU resource management (projections, KV, MLP, LM head)
 
+mod api;
+mod loops;
 mod resources;
 mod strategy;
 
 // Re-exports: keep existing import paths stable for e2e consumers.
+pub use api::{
+    generate_token_ids_from_model, generate_token_ids_from_path, resolve_eos_token_id,
+    tokenize_prompt_text,
+};
 pub(super) use resources::{LmHeadResources, PersistentDecodeResources};
 pub(super) use strategy::{AttentionStrategy, DecodeStrategy, InferenceStrategy, PrefillStrategy};
 
-use super::config::{E2eGenerationConfig, E2eGenerationReport};
-use super::decode::decode_norm_tensor;
 use super::error::E2eError;
 use super::mlp::{PersistentMlp, mlp_sequence_inference_with_weights};
-use super::numeric::{checked_mul, validate_token_id, value_to_i32};
+use super::numeric::checked_mul;
 use super::plan::LayerPlan;
-use super::planner::build_layer_plans;
-use super::resolve::resolve_global_tensor_names;
-use super::state::GenerationState;
-use super::tensor_ops::{add_in_place, gather_embeddings, rms_norm_with_weight};
-use crate::backend::ensure_backends_loaded;
-use crate::metadata::resolve_transformer_metadata;
-use crate::model::GgufModel;
-use crate::tokenizer::tokenize_text_prompt;
+use super::tensor_ops::{add_in_place, rms_norm_with_weight};
 use ggml_rs::Backend;
-use std::path::Path;
-use std::time::Instant;
 
 /// Controls which execution strategy the generation loop uses.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -138,396 +135,6 @@ fn graph_sample_fallback(
     )
 }
 
-pub fn resolve_eos_token_id(model: &GgufModel) -> Option<i32> {
-    model
-        .kv_value("tokenizer.ggml.eos_token_id")
-        .and_then(value_to_i32)
-}
-
-pub fn tokenize_prompt_text(model: &GgufModel, prompt_text: &str) -> Result<Vec<i32>, E2eError> {
-    tokenize_text_prompt(model, prompt_text)
-        .map_err(|source| E2eError::tokenizer("tokenize_text_prompt", source))
-}
-
-pub fn generate_token_ids_from_path(
-    model_path: impl AsRef<Path>,
-    config: &E2eGenerationConfig,
-) -> Result<E2eGenerationReport, E2eError> {
-    let model =
-        GgufModel::open(model_path).map_err(|source| E2eError::model("GgufModel::open", source))?;
-    generate_token_ids_from_model(&model, config)
-}
-
-pub fn generate_token_ids_from_model(
-    model: &GgufModel,
-    config: &E2eGenerationConfig,
-) -> Result<E2eGenerationReport, E2eError> {
-    let prompt_token_count = config.prompt_token_ids.len();
-    if prompt_token_count == 0 {
-        return Err(E2eError::EmptyPrompt);
-    }
-
-    let total_sequence_length = prompt_token_count
-        .checked_add(config.max_new_tokens)
-        .ok_or(E2eError::MemorySizeOverflow)?;
-    let metadata = resolve_transformer_metadata(model)
-        .map_err(|source| E2eError::metadata("resolve_transformer_metadata", source))?;
-    if let Some(context_length) = metadata.context_length()
-        && total_sequence_length > context_length
-    {
-        return Err(E2eError::SequenceTooLong {
-            requested: total_sequence_length,
-            context_length,
-        });
-    }
-
-    let hidden_features = metadata.embedding_length();
-    let rms_norm_eps = metadata.attention_layer_norm_rms_epsilon();
-    let global_names = resolve_global_tensor_names(model)?;
-
-    let token_embedding_values = model
-        .tensor_values::<f32>(&global_names.token_embedding)
-        .map_err(|source| E2eError::model("GgufModel::tensor_values(token_embedding)", source))?;
-    if hidden_features == 0 || !token_embedding_values.len().is_multiple_of(hidden_features) {
-        return Err(E2eError::InvalidTokenEmbeddingShape {
-            tensor_name: global_names.token_embedding.clone(),
-            hidden_features,
-            tensor_len: token_embedding_values.len(),
-        });
-    }
-    let vocab_size = token_embedding_values.len() / hidden_features;
-
-    let output_weight_values = if let Some(output_name) = global_names.output.as_deref() {
-        let values = model.tensor_values::<f32>(output_name).map_err(|source| {
-            E2eError::model("GgufModel::tensor_values(output_projection)", source)
-        })?;
-        let expected = checked_mul(hidden_features, vocab_size)?;
-        if values.len() != expected {
-            return Err(E2eError::OutputWeightLengthMismatch {
-                tensor_name: output_name.to_string(),
-                expected,
-                actual: values.len(),
-            });
-        }
-        Some(values)
-    } else {
-        None
-    };
-    let output_weight_values = output_weight_values
-        .as_deref()
-        .unwrap_or(token_embedding_values.as_slice());
-
-    let output_norm_values = decode_norm_tensor(
-        model,
-        &global_names.output_norm,
-        hidden_features,
-        "output_norm",
-    )?;
-    let layer_plans = build_layer_plans(
-        model,
-        &metadata,
-        hidden_features,
-        total_sequence_length,
-        config.mixed_layer_policy,
-    )?;
-    let attention_layer_count = layer_plans
-        .iter()
-        .filter(|layer_plan| layer_plan.attention.is_some())
-        .count();
-    let mlp_only_layer_count = layer_plans.len() - attention_layer_count;
-
-    let _ = validate_token_id(config.pad_token_id, vocab_size)?;
-    if let Some(eos_token_id) = config.eos_token_id {
-        let _ = validate_token_id(eos_token_id, vocab_size)?;
-    }
-    for &token_id in &config.prompt_token_ids {
-        let _ = validate_token_id(token_id, vocab_size)?;
-    }
-
-    let mut all_token_ids = vec![config.pad_token_id; total_sequence_length];
-    all_token_ids[..prompt_token_count].copy_from_slice(&config.prompt_token_ids);
-    ensure_backends_loaded();
-    let backend = Backend::new(config.backend.into())
-        .map_err(|source| E2eError::ggml("Backend::new", source))?;
-    let backend_name = backend
-        .name()
-        .map(|name| name.to_string())
-        .map_err(|source| E2eError::ggml("Backend::name", source))?;
-
-    let start = Instant::now();
-    let inputs = GenerationInputs {
-        layer_plans: &layer_plans,
-        token_embedding_values: &token_embedding_values,
-        output_weight_values,
-        output_norm_values: &output_norm_values,
-        hidden_features,
-        vocab_size,
-        rms_norm_eps,
-        prompt_token_ids: &config.prompt_token_ids,
-        max_new_tokens: config.max_new_tokens,
-        pad_token_id: config.pad_token_id,
-        eos_token_id: config.eos_token_id,
-        backend: &backend,
-        total_sequence_length,
-    };
-    let output = generate_from_plans(&inputs, GenerationMode::Auto)?;
-    let elapsed = start.elapsed();
-
-    Ok(E2eGenerationReport {
-        backend_name,
-        prompt_token_count,
-        generated_token_ids: output.generated_token_ids,
-        all_token_ids: output.all_token_ids,
-        attention_layer_count,
-        mlp_only_layer_count,
-        elapsed,
-    })
-}
-
-pub(super) fn generate_from_plans(
-    inputs: &GenerationInputs<'_>,
-    mode: GenerationMode,
-) -> Result<GenerationOutput, E2eError> {
-    let prompt_token_count = inputs.prompt_token_ids.len();
-    if prompt_token_count == 0 {
-        return Err(E2eError::EmptyPrompt);
-    }
-
-    let mut all_token_ids = vec![inputs.pad_token_id; inputs.total_sequence_length];
-    all_token_ids[..prompt_token_count].copy_from_slice(inputs.prompt_token_ids);
-    let mut generated_token_ids = Vec::with_capacity(inputs.max_new_tokens);
-    let mut current_token_count = prompt_token_count;
-
-    let effective_mode = match mode {
-        GenerationMode::Auto => {
-            if inputs.max_new_tokens == 0 {
-                GenerationMode::FullReprocess
-            } else {
-                GenerationMode::TwoPhase
-            }
-        }
-        other => other,
-    };
-
-    match effective_mode {
-        GenerationMode::FullReprocess | GenerationMode::Auto => {
-            full_reprocess_loop(
-                inputs,
-                &mut all_token_ids,
-                &mut generated_token_ids,
-                &mut current_token_count,
-            )?;
-        }
-        GenerationMode::TwoPhase => {
-            two_phase_loop(
-                inputs,
-                &mut all_token_ids,
-                &mut generated_token_ids,
-                &mut current_token_count,
-            )?;
-        }
-    }
-
-    Ok(GenerationOutput {
-        generated_token_ids,
-        all_token_ids: all_token_ids[..current_token_count].to_vec(),
-    })
-}
-
-fn full_reprocess_loop(
-    inputs: &GenerationInputs<'_>,
-    all_token_ids: &mut [i32],
-    generated_token_ids: &mut Vec<i32>,
-    current_token_count: &mut usize,
-) -> Result<(), E2eError> {
-    let mut strategy = InferenceStrategy;
-
-    // Persistent LM head: build graph and upload weights once.
-    let mut lm_head = LmHeadResources::try_build(
-        inputs.hidden_features,
-        inputs.vocab_size,
-        inputs.rms_norm_eps,
-        inputs.output_weight_values,
-        inputs.output_norm_values,
-        inputs.backend,
-    );
-
-    for _step in 0..inputs.max_new_tokens {
-        let active_token_ids = &all_token_ids[..*current_token_count];
-        let mut hidden = gather_embeddings(
-            inputs.token_embedding_values,
-            inputs.hidden_features,
-            inputs.vocab_size,
-            active_token_ids,
-        )?;
-
-        process_all_layers(
-            &mut hidden,
-            inputs.layer_plans,
-            &mut strategy,
-            *current_token_count,
-            inputs.rms_norm_eps,
-            inputs.backend,
-            &mut [],
-        )?;
-
-        let last_index = current_token_count
-            .checked_sub(1)
-            .ok_or(E2eError::EmptyPrompt)?;
-
-        let next_token_id = if let Some(ref mut lm) = lm_head {
-            let offset = checked_mul(last_index, inputs.hidden_features)?;
-            let last_hidden = &hidden[offset..offset + inputs.hidden_features];
-            lm.sample_hidden(last_hidden, inputs.backend)?
-        } else {
-            graph_sample_fallback(&hidden, last_index, inputs)?
-        };
-
-        generated_token_ids.push(next_token_id);
-        if *current_token_count < inputs.total_sequence_length {
-            all_token_ids[*current_token_count] = next_token_id;
-            *current_token_count += 1;
-        }
-
-        if inputs.eos_token_id.is_some_and(|eos| eos == next_token_id) {
-            break;
-        }
-    }
-    Ok(())
-}
-
-fn two_phase_loop(
-    inputs: &GenerationInputs<'_>,
-    all_token_ids: &mut [i32],
-    generated_token_ids: &mut Vec<i32>,
-    current_token_count: &mut usize,
-) -> Result<(), E2eError> {
-    let prompt_token_count = inputs.prompt_token_ids.len();
-
-    if inputs.max_new_tokens == 0 {
-        return Ok(());
-    }
-
-    let mut state = GenerationState::new(inputs.layer_plans, inputs.total_sequence_length)?;
-
-    // Build all persistent resources upfront (LM head, projections, KV caches,
-    // scoring ctx, linear scratch, MLPs). LM head is reused for both prefill
-    // sampling and decode loop — no duplicate graph build.
-    let mut resources = LmHeadResources::try_build(
-        inputs.hidden_features,
-        inputs.vocab_size,
-        inputs.rms_norm_eps,
-        inputs.output_weight_values,
-        inputs.output_norm_values,
-        inputs.backend,
-    )
-    .map(|lm_head| {
-        PersistentDecodeResources::try_build(
-            inputs.layer_plans,
-            lm_head,
-            inputs.rms_norm_eps,
-            inputs.total_sequence_length,
-            inputs.backend,
-        )
-    });
-
-    // Phase 1: Prefill — process all prompt tokens at once, capturing state.
-    let prompt_ids = &all_token_ids[..prompt_token_count];
-    let mut hidden = gather_embeddings(
-        inputs.token_embedding_values,
-        inputs.hidden_features,
-        inputs.vocab_size,
-        prompt_ids,
-    )?;
-
-    {
-        let mut strategy = PrefillStrategy { state: &mut state };
-        process_all_layers(
-            &mut hidden,
-            inputs.layer_plans,
-            &mut strategy,
-            prompt_token_count,
-            inputs.rms_norm_eps,
-            inputs.backend,
-            &mut [],
-        )?;
-    }
-
-    let last_index = prompt_token_count
-        .checked_sub(1)
-        .ok_or(E2eError::EmptyPrompt)?;
-
-    // Sample first token using persistent LM head if available.
-    let first_token_id = if let Some(ref mut res) = resources {
-        res.sample_token(&hidden, last_index, inputs.hidden_features, inputs.backend)?
-    } else {
-        graph_sample_fallback(&hidden, last_index, inputs)?
-    };
-
-    generated_token_ids.push(first_token_id);
-    all_token_ids[prompt_token_count] = first_token_id;
-    *current_token_count = prompt_token_count + 1;
-
-    if inputs.eos_token_id.is_some_and(|eos| eos == first_token_id) {
-        return Ok(());
-    }
-
-    if inputs.max_new_tokens <= 1 {
-        return Ok(());
-    }
-
-    // Seed persistent KV caches from host prefill state.
-    if let Some(ref res) = resources {
-        res.seed_kv_caches(&state);
-    }
-
-    // Phase 2: Decode — one token at a time using cached state.
-    for _step in 1..inputs.max_new_tokens {
-        let new_token_id = all_token_ids[*current_token_count - 1];
-        let mut hidden = gather_embeddings(
-            inputs.token_embedding_values,
-            inputs.hidden_features,
-            inputs.vocab_size,
-            &[new_token_id],
-        )?;
-
-        let next_token_id = if let Some(ref mut res) = resources {
-            res.decode_step(
-                &mut hidden,
-                inputs.layer_plans,
-                &mut state,
-                inputs.hidden_features,
-                inputs.rms_norm_eps,
-                inputs.backend,
-            )?;
-            res.sample_token(&hidden, 0, inputs.hidden_features, inputs.backend)?
-        } else {
-            let mut strategy = DecodeStrategy { state: &mut state };
-            process_all_layers(
-                &mut hidden,
-                inputs.layer_plans,
-                &mut strategy,
-                1,
-                inputs.rms_norm_eps,
-                inputs.backend,
-                &mut [],
-            )?;
-            graph_sample_fallback(&hidden, 0, inputs)?
-        };
-
-        generated_token_ids.push(next_token_id);
-        if *current_token_count < inputs.total_sequence_length {
-            all_token_ids[*current_token_count] = next_token_id;
-            *current_token_count += 1;
-        }
-
-        if inputs.eos_token_id.is_some_and(|eos| eos == next_token_id) {
-            break;
-        }
-    }
-    Ok(())
-}
-
 pub(super) fn greedy_next_token_id(
     hidden_states: &[f32],
     token_index: usize,
@@ -570,6 +177,8 @@ pub(super) fn greedy_next_token_id(
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "link-system")]
+    use super::loops::generate_from_plans;
     use super::*;
 
     #[test]
