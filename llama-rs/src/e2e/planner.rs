@@ -428,3 +428,270 @@ fn build_mlp_only_layer_plan(
         mlp: build_layer_mlp_plan(model, layer, hidden_features)?,
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::gguf::GgufKvEntry;
+    use ggml_rs::GgufValue;
+
+    // ── Helpers ────────────────────────────────────────────────────────
+
+    /// Build a stub with tensors sized by f32 element count.
+    fn stub_model(tensors: &[(&str, usize)], kv: Vec<(&str, GgufValue)>) -> GgufModel {
+        let byte_tensors: Vec<_> = tensors
+            .iter()
+            .map(|&(name, elements)| (name, elements * 4))
+            .collect();
+        let kv_entries: Vec<_> = kv
+            .into_iter()
+            .map(|(key, value)| GgufKvEntry {
+                key: key.to_string(),
+                value,
+            })
+            .collect();
+        GgufModel::stub(&byte_tensors, kv_entries)
+    }
+
+    /// MLP tensors for a single layer 0 with given dimensions.
+    fn mlp_tensors(hidden: usize, ffn: usize) -> Vec<(&'static str, usize)> {
+        vec![
+            ("blk.0.ffn_norm.weight", hidden),
+            ("blk.0.ffn_gate.weight", hidden * ffn),
+            ("blk.0.ffn_up.weight", hidden * ffn),
+            ("blk.0.ffn_down.weight", hidden * ffn),
+        ]
+    }
+
+    /// Standard attention tensors for layer 0.
+    /// q/k/v/output sized for: hidden=H, heads=Nh, kv_heads=Nkv, head_dim=D.
+    fn attention_tensors(
+        hidden: usize,
+        heads: usize,
+        kv_heads: usize,
+        head_dim: usize,
+    ) -> Vec<(&'static str, usize)> {
+        vec![
+            ("blk.0.attn_norm.weight", hidden),
+            ("blk.0.attn_q.weight", hidden * heads * head_dim),
+            ("blk.0.attn_k.weight", hidden * kv_heads * head_dim),
+            ("blk.0.attn_v.weight", hidden * kv_heads * head_dim),
+            ("blk.0.attn_output.weight", heads * head_dim * hidden),
+        ]
+    }
+
+    /// Minimal llama KV metadata for 1 block.
+    fn llama_kv_1block(
+        hidden: usize,
+        heads: usize,
+        kv_heads: usize,
+    ) -> Vec<(&'static str, GgufValue)> {
+        vec![
+            ("general.architecture", GgufValue::String("llama".into())),
+            ("llama.block_count", GgufValue::U32(1)),
+            ("llama.embedding_length", GgufValue::U32(hidden as u32)),
+            ("llama.attention.head_count", GgufValue::U32(heads as u32)),
+            (
+                "llama.attention.head_count_kv",
+                GgufValue::U32(kv_heads as u32),
+            ),
+        ]
+    }
+
+    /// Qwen3.5 metadata KV for 1 block.
+    fn qwen35_kv_1block(
+        hidden: usize,
+        heads: usize,
+        kv_heads: usize,
+    ) -> Vec<(&'static str, GgufValue)> {
+        vec![
+            ("general.architecture", GgufValue::String("qwen35".into())),
+            ("qwen35.block_count", GgufValue::U32(1)),
+            ("qwen35.embedding_length", GgufValue::U32(hidden as u32)),
+            ("qwen35.attention.head_count", GgufValue::U32(heads as u32)),
+            (
+                "qwen35.attention.head_count_kv",
+                GgufValue::U32(kv_heads as u32),
+            ),
+        ]
+    }
+
+    fn build_metadata(kv: &[(&str, GgufValue)]) -> TransformerMetadata {
+        let entries: Vec<_> = kv.iter().map(|(k, v)| (*k, v)).collect();
+        crate::metadata::resolve_transformer_metadata_from_kv(entries).unwrap()
+    }
+
+    // ── required_transformer_usize ─────────────────────────────────────
+
+    #[test]
+    fn required_transformer_usize_some_returns_value() {
+        assert_eq!(
+            required_transformer_usize(Some(42), "test.key").unwrap(),
+            42
+        );
+    }
+
+    #[test]
+    fn required_transformer_usize_none_returns_error() {
+        let err = required_transformer_usize(None, "test.key").unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("test.key"), "error should mention key: {msg}");
+    }
+
+    // ── build_layer_mlp_plan ───────────────────────────────────────────
+
+    #[test]
+    fn mlp_plan_succeeds_with_correctly_sized_tensors() {
+        let hidden = 8;
+        let ffn = 16;
+        let model = stub_model(&mlp_tensors(hidden, ffn), vec![]);
+        let plan = build_layer_mlp_plan(&model, 0, hidden).unwrap();
+        assert_eq!(plan.weights.hidden_features, hidden);
+        assert_eq!(plan.weights.ffn_features, ffn);
+    }
+
+    #[test]
+    fn mlp_plan_invalid_gate_shape_not_divisible() {
+        let hidden = 8;
+        let model = stub_model(
+            &[
+                ("blk.0.ffn_norm.weight", hidden),
+                ("blk.0.ffn_gate.weight", hidden * 3 + 1), // not divisible by hidden
+                ("blk.0.ffn_up.weight", hidden * 3),
+                ("blk.0.ffn_down.weight", hidden * 3),
+            ],
+            vec![],
+        );
+        let err = build_layer_mlp_plan(&model, 0, hidden).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("gate") || msg.contains("Gate") || msg.contains("MLP"),
+            "error should reference MLP gate: {msg}"
+        );
+    }
+
+    #[test]
+    fn mlp_plan_hidden_features_zero_returns_error() {
+        let model = stub_model(
+            &[
+                ("blk.0.ffn_norm.weight", 0),
+                ("blk.0.ffn_gate.weight", 0),
+                ("blk.0.ffn_up.weight", 0),
+                ("blk.0.ffn_down.weight", 0),
+            ],
+            vec![],
+        );
+        assert!(build_layer_mlp_plan(&model, 0, 0).is_err());
+    }
+
+    // ── build_layer_plans policy: Strict vs SkipUnsupportedAttention ──
+
+    #[test]
+    fn strict_policy_errors_on_missing_attention_qwen35() {
+        // Qwen3.5 arch, 1 layer, MLP-only tensors → Ok(None) → Strict errors.
+        let hidden = 8;
+        let ffn = 16;
+        let kv = qwen35_kv_1block(hidden, 2, 2);
+        let metadata = build_metadata(&kv);
+        let model = stub_model(&mlp_tensors(hidden, ffn), kv);
+        let result = build_layer_plans(&model, &metadata, hidden, 1, MixedLayerPolicy::Strict);
+        assert!(
+            result.is_err(),
+            "Strict should fail when attention is missing"
+        );
+        let msg = format!("{}", result.unwrap_err());
+        assert!(
+            msg.contains("attention"),
+            "error should mention attention: {msg}"
+        );
+    }
+
+    #[test]
+    fn skip_policy_builds_mlp_only_on_missing_attention_qwen35() {
+        // Qwen3.5 arch, 1 layer, MLP-only tensors → Ok(None) → Skip builds MLP-only.
+        let hidden = 8;
+        let ffn = 16;
+        let kv = qwen35_kv_1block(hidden, 2, 2);
+        let metadata = build_metadata(&kv);
+        let model = stub_model(&mlp_tensors(hidden, ffn), kv);
+        let plans = build_layer_plans(
+            &model,
+            &metadata,
+            hidden,
+            1,
+            MixedLayerPolicy::SkipUnsupportedAttention,
+        )
+        .unwrap();
+        assert_eq!(plans.len(), 1);
+        assert!(plans[0].attention.is_none(), "should skip attention");
+    }
+
+    #[test]
+    fn strict_policy_propagates_malformed_attention_error() {
+        // Non-qwen35 arch, partial attention tensors (attn_q present, attn_k missing)
+        // → resolve_llama_layer_tensor_names returns Err → Strict propagates.
+        let hidden = 8;
+        let ffn = 16;
+        let kv = llama_kv_1block(hidden, 2, 2);
+        let metadata = build_metadata(&kv);
+        let mut tensors = mlp_tensors(hidden, ffn);
+        tensors.push(("blk.0.attn_norm.weight", hidden));
+        tensors.push(("blk.0.attn_q.weight", hidden * 2 * 4)); // attn_q exists
+        // attn_k is missing → naming error
+        let model = stub_model(&tensors, kv);
+        let result = build_layer_plans(&model, &metadata, hidden, 1, MixedLayerPolicy::Strict);
+        assert!(
+            result.is_err(),
+            "Strict should propagate malformed attention error"
+        );
+    }
+
+    #[test]
+    fn skip_policy_recovers_from_malformed_attention() {
+        // Non-qwen35 arch, partial attention tensors → naming error → Skip builds MLP-only.
+        let hidden = 8;
+        let ffn = 16;
+        let kv = llama_kv_1block(hidden, 2, 2);
+        let metadata = build_metadata(&kv);
+        let mut tensors = mlp_tensors(hidden, ffn);
+        tensors.push(("blk.0.attn_norm.weight", hidden));
+        tensors.push(("blk.0.attn_q.weight", hidden * 2 * 4));
+        // attn_k missing → error → Skip
+        let model = stub_model(&tensors, kv);
+        let plans = build_layer_plans(
+            &model,
+            &metadata,
+            hidden,
+            1,
+            MixedLayerPolicy::SkipUnsupportedAttention,
+        )
+        .unwrap();
+        assert_eq!(plans.len(), 1);
+        assert!(plans[0].attention.is_none());
+    }
+
+    // ── Standard attention smoke test ──────────────────────────────────
+
+    #[test]
+    fn standard_attention_plan_succeeds_with_minimal_model() {
+        // Minimal llama model: hidden=4, heads=1, kv_heads=1, head_dim=4, ffn=8.
+        let hidden = 4;
+        let heads = 1;
+        let kv_heads = 1;
+        let head_dim = hidden / heads;
+        let ffn = 8;
+        let kv = llama_kv_1block(hidden, heads, kv_heads);
+        let metadata = build_metadata(&kv);
+        let mut tensors = mlp_tensors(hidden, ffn);
+        tensors.extend(attention_tensors(hidden, heads, kv_heads, head_dim));
+        let model = stub_model(&tensors, kv);
+        let plans =
+            build_layer_plans(&model, &metadata, hidden, 1, MixedLayerPolicy::Strict).unwrap();
+        assert_eq!(plans.len(), 1);
+        assert!(plans[0].attention.is_some(), "should have attention plan");
+        match &plans[0].attention {
+            Some(AttentionLayerPlan::Standard(_)) => {}
+            other => panic!("expected Standard attention, got: {other:?}"),
+        }
+    }
+}
