@@ -4288,3 +4288,36 @@ Standard attention (1):
 ### Result
 - 273 tests pass (up from 263), zero clippy warnings.
 - Commit: `8da9ba8`
+
+---
+
+## Item 75: Comprehensive unit tests for numeric.rs
+
+### Problem
+`numeric.rs` (150 lines) contained 9 pure math functions with only 1 test (`value_to_i32`).
+This is the highest-value test target among remaining untested files because all functions are
+pure (no backend dependency) with meaningful edge cases.
+
+### Solution
+
+Added 32 new tests (expanding the 1 existing) organized by function:
+
+**checked_mul** (2): success + overflow to MemorySizeOverflow
+**validate_token_id** (3): valid (incl boundary), negative, out-of-range
+**value_to_i32** (4): all GgufValue variants, U32 overflow, fractional F32/F64, integral float out-of-range (3e9)
+**dot** (2): basic [1,2,3]·[4,5,6]=32, empty slices → 0.0
+**softmax_prefix** (4): uniform scores, dominated score, prefix-only semantics (tail ignored), len=0 → empty
+**sigmoid/silu/softplus** (5): sigmoid(0)=0.5, silu(0)=0, softplus ln-path vs identity, boundary at 20.0
+**f32_to_f16_bits** (10): zero, neg zero (0x8000), ±1, ±Inf, NaN (quiet), overflow→Inf, subnormal 2^-24→0x0001, below-subnormal→flush
+**build_causal_mask_f16_bytes** (3): seq=1 (single zero), seq=3 full lower-triangular check, overflow
+
+### Key decisions
+- Rubber-duck critique identified: prefix-semantics test for softmax_prefix (tail must be ignored),
+  exact subnormal boundary (2^-24 → 0x0001), negative infinity (0xFC00, used by causal mask),
+  integral-float-out-of-range path in value_to_i32.
+- Skipped `dot` mismatched-length test — truncation via zip is implicit, not an API contract.
+- softplus boundary: `> 20.0` means 20.0 itself uses ln path, 20.001 takes identity.
+
+### Result
+- 305 tests pass (up from 273), zero clippy warnings.
+- Commit: `bb47cca`

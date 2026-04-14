@@ -660,6 +660,18 @@ And you should write rusty code(ADT, enum, type state pattern)
   llama/qwen35 KV metadata builders.
   273 tests pass, zero clippy warnings.
 
+75. **Comprehensive unit tests for numeric.rs** — DONE (commit `bb47cca`)
+  32 new tests (expanding 1 existing) covering all pure math functions:
+  - checked_mul: success + overflow
+  - validate_token_id: valid/negative/boundary/out-of-range
+  - value_to_i32: all GgufValue variants, overflow, fractional, float out-of-range
+  - dot: basic product + empty
+  - softmax_prefix: uniform, dominated, prefix-only semantics, len=0
+  - sigmoid/silu/softplus: known values, boundary at 20.0 threshold
+  - f32_to_f16_bits: zero, neg zero, ±1, ±Inf, NaN, overflow, subnormal boundary
+  - build_causal_mask_f16_bytes: seq=1, seq=3 lower-triangular, overflow
+  305 tests pass, zero clippy warnings.
+
 ## Validation checkpoints completed on this branch
 
 - `cargo fmt --all`
