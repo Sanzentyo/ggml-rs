@@ -845,6 +845,35 @@ And you should write rusty code(ADT, enum, type state pattern)
   Both `standard_attention_graph` and `standard_attention_decode_step`
   now share dimension extraction. Mirrors `FullAttentionDims` pattern.
   365 tests pass, zero clippy warnings.
+105. **KV cache trait duplicate impls** — SKIPPED
+  Duplication is trivial (2 one-line methods). Trait plumbing or macros
+  would add more complexity than the code saved.
+106. **Consolidate prefill/inference wrappers** — SKIPPED
+  Thin wrappers are intentional API/documentation points. Consolidating
+  saves little and hurts call-site clarity.
+107. **Extract GenericAttentionGraphBuilder** — SKIPPED
+  Premature abstraction trap. The two graphs share structure but differ
+  exactly where correctness is fragile: gate handling, Q deinterleave,
+  RoPE config, mask policy.
+108. **Extract generation config helpers from api.rs** — DONE (commit `64d3b4e`)
+  Extracted `load_token_embeddings`, `load_output_weights`, and
+  `validate_config_token_ids` from `generate_token_ids_from_model`.
+  Main function now reads as clear orchestration with focused helpers.
+  365 tests pass, zero clippy warnings.
+109. **Reorganize EOS/tokenize helpers** — SKIPPED
+  Mostly namespace churn. Current api.rs already isolates these concerns.
+110. **AttentionDecodeStep trait** — SKIPPED
+  Shared shape is superficial; standard, gated, and delta-net decode have
+  fundamentally different core computations.
+111. **Consolidate generation loops** — SKIPPED
+  Two-phase and full-reprocess loops differ in semantics (prefill, state
+  capture, KV seeding). A merged loop would be branch-heavy.
+112. **Extract test fixtures** — DONE (commit `d7d6f93`)
+  Added `Qwen35FullAttentionLayerPlan::deterministic()` #[cfg(test)]
+  builder that produces reproducible pseudo-random weights. Replaced 4
+  identical inline construction sites in attention.rs, generation.rs,
+  and bench_graphs/helpers.rs. Net −65 lines of duplicated code.
+  365 tests pass, zero clippy warnings.
 
 ## Validation checkpoints completed on this branch
 

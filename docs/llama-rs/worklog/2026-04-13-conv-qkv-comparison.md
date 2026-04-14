@@ -4974,3 +4974,46 @@ validate_gqa_heads). Now both use StandardAttentionDims::new(attention).
 
 - llama-rs/src/e2e/attention/standard.rs -- +StandardAttentionDims struct,
   refactored both graph and decode functions
+
+## Items 105-112: Rubber-duck prioritization and focused extraction
+
+### Rubber-duck analysis
+
+Evaluated items 105-112 against over-abstraction risk:
+- **DO**: 112 (test fixtures), 108 (generation config helpers)
+- **SKIP**: 105 (trivial duplication), 106 (intentional wrappers),
+  107 (premature abstraction), 109 (namespace churn),
+  110 (superficial shared shape), 111 (different semantics)
+
+### Item 112: Extract Qwen35FullAttentionLayerPlan::deterministic()
+
+Added #[cfg(test)] builder on Qwen35FullAttentionLayerPlan producing
+reproducible pseudo-random weights with the shared seed formulas
+(mod 7/5/11/13 patterns).
+
+#### Call sites replaced (4)
+
+- attention.rs: prefill_then_decode test + gpu_scoring test
+- generation.rs: two_phase_matches_full_reprocess test (make_full closure)
+- bench_graphs/helpers.rs: build_full_attention_plan function
+
+#### Files changed (4)
+
+- llama-rs/src/e2e/plan.rs -- +deterministic() #[cfg(test)] impl
+- llama-rs/src/e2e/attention.rs -- replaced 2 inline constructions
+- llama-rs/src/e2e/generation.rs -- replaced make_full closure body
+- llama-rs/src/e2e/bench_graphs/helpers.rs -- delegated to deterministic()
+
+### Item 108: Extract generation config helpers
+
+Decomposed generate_token_ids_from_model (124 LOC) into focused helpers:
+
+- load_token_embeddings(model, name, hidden) -> (Vec<f32>, vocab_size)
+- load_output_weights(model, name, hidden, vocab) -> Option<Vec<f32>>
+- validate_config_token_ids(config, vocab) -> Result<()>
+
+Main function now reads as orchestration: validate → load → plan → run → report.
+
+#### Files changed (1)
+
+- llama-rs/src/e2e/generation/api.rs -- extracted 3 private helpers
