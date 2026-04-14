@@ -672,6 +672,12 @@ And you should write rusty code(ADT, enum, type state pattern)
   - build_causal_mask_f16_bytes: seq=1, seq=3 lower-triangular, overflow
   305 tests pass, zero clippy warnings.
 
+76. **GgmlResultExt extension trait** — DONE (commit `3fd472b`)
+  Added `GgmlResultExt<T>` trait on `Result<T, ggml_rs::Error>` with `.ggml_ctx(context)`
+  method, replacing `.map_err(|source| E2eError::ggml(..., source))` across 14 files,
+  262 call sites. Net reduction: 206 lines. No behavior change.
+  305 tests pass, zero clippy warnings.
+
 ## Validation checkpoints completed on this branch
 
 - `cargo fmt --all`

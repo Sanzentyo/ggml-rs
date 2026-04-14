@@ -4321,3 +4321,34 @@ Added 32 new tests (expanding the 1 existing) organized by function:
 ### Result
 - 305 tests pass (up from 273), zero clippy warnings.
 - Commit: `bb47cca`
+
+---
+
+## Item 76: GgmlResultExt extension trait
+
+### Problem
+262 call sites across 14 e2e files used the verbose pattern:
+```rust
+.map_err(|source| E2eError::ggml("label", source))?
+```
+This boilerplate obscured the actual logic and added ~206 lines of noise.
+
+### Solution
+Added `GgmlResultExt<T>` trait in `error.rs`:
+```rust
+pub(super) trait GgmlResultExt<T> {
+    fn ggml_ctx(self, context: &'static str) -> Result<T, E2eError>;
+}
+```
+Applied to all 262 sites. Variable-label sites (e.g. `label: &'static str` params) also converted.
+One type annotation needed (`name: &str`) where `.map().ggml_ctx()` chain lost inference.
+
+### Key decisions
+- Rubber-duck critique: keep it narrow to just `GgmlResultExt`, not a family of traits (only 4 `inference` sites vs 262 `ggml`).
+- Named `.ggml_ctx()` not `.ggml_context()` — shorter, consistent with codebase style.
+- No behavior change — purely mechanical transformation.
+
+### Result
+- Net -206 lines across 15 files (14 consumers + error.rs).
+- 305 tests pass, zero clippy warnings.
+- Commit: `3fd472b`
