@@ -4505,3 +4505,70 @@ calculation.
 - No behavioral change; same f64 precision path preserved
 - 325 tests pass, zero clippy warnings
 - Commit: `9bdea77`
+
+
+## Item 82: KvCacheView trait + host_attention_scoring extraction
+
+### Problem
+Two decode functions had an identical 22-line host-side attention scoring loop:
+- standard_attention_decode_step (standard.rs)
+- full_attention_decode_core (qwen35_full.rs)
+
+Both computed GQA group mapping, scored Q against all cached K via dot product,
+applied softmax, and aggregated weighted V. The only difference was Qwen3.5 per-head
+sigmoid gating applied after the core loop.
+
+The two state types (StandardAttentionState, Qwen35FullAttentionState) had identical
+k_head_at/v_head_at signatures but no shared interface.
+
+### Solution
+1. Defined KvCacheView trait in attention/shared.rs with k_head_at/v_head_at
+2. Implemented for both state types (delegating to existing inherent methods)
+3. Extracted host_attention_scoring() using impl KvCacheView (static dispatch)
+4. Standard decode calls it directly
+5. Qwen3.5 decode calls it then applies per-head sigmoid gating using iter_mut().zip()
+
+### Key decisions
+- Trait placed in attention/shared.rs (not state.rs) per rubber-duck advice
+- Static dispatch (impl KvCacheView) per project preference over dynamic dispatch
+- Trait kept minimal (2 read-only methods); token_count and append_batch not included
+- Added debug_asserts for q_values length and GQA divisibility invariants
+- Gating loop rewritten with iter_mut().zip() instead of index loop
+
+### Result
+- 22 lines of scoring duplication eliminated
+- Updated 3 files (shared.rs, standard.rs, qwen35_full.rs)
+- 305 tests pass, zero clippy warnings
+- Commit: 1864347
+
+## Item 83: validate_gqa_heads + InvalidGqaHeadConfig error
+
+### Problem
+The GQA head validation check (h == 0 or hkv == 0 or h not divisible by hkv)
+was duplicated across 4 sites:
+1. standard_attention_graph (standard.rs)
+2. standard_attention_decode_step (standard.rs)
+3. full_attention_decode_core (qwen35_full.rs) - missing head_count==0 check
+4. FullAttentionDims::new (projection.rs) - missing h==0 check
+
+All sites used BufferLengthMismatch as the error variant, which was misleading
+for a head configuration problem.
+
+### Solution
+1. Added InvalidGqaHeadConfig error variant to E2eError with descriptive message
+2. Extracted validate_gqa_heads(head_count, kv_head_count) -> Result<(), E2eError>
+   to attention/shared.rs
+3. Replaced all 4 inline checks with calls to the shared helper
+4. Fixed the missing head_count==0 validation in sites 3 and 4 (bug fix)
+
+### Key decisions
+- Dedicated error variant rather than repurposing BufferLengthMismatch
+- pub(in crate::e2e) visibility to cover both attention and projection modules
+- Consolidated both the zero-check and divisibility-check into single function
+
+### Result
+- 4 validation blocks (~6 lines each) replaced with 1-line calls
+- Fixed missing zero-head validation in 2 sites (behavior change / bug fix)
+- Added InvalidGqaHeadConfig error variant with proper error message
+- 305 tests pass, zero clippy warnings
+- Commit: d14aba2

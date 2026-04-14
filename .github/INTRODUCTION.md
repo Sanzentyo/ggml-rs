@@ -710,6 +710,23 @@ And you should write rusty code(ADT, enum, type state pattern)
   `rms_norm_single_into`, and `rms_norm_single_in_place`.
   325 tests pass, zero clippy warnings.
 
+82. **KvCacheView trait + host_attention_scoring extraction** — DONE (commit `1864347`)
+  Extracted the 22-line host-side attention scoring loop duplicated between
+  `standard_attention_decode_step` and `full_attention_decode_core` into a shared
+  `host_attention_scoring()` function in `attention/shared.rs`. Introduced `KvCacheView`
+  trait with `k_head_at`/`v_head_at` methods, implemented for both `StandardAttentionState`
+  and `Qwen35FullAttentionState`. Static dispatch via `impl KvCacheView`. Qwen3.5 applies
+  per-head sigmoid gating after calling the shared function.
+  305 tests pass, zero clippy warnings.
+
+83. **validate_gqa_heads + InvalidGqaHeadConfig error** — DONE (commit `d14aba2`)
+  Centralized the GQA head validation check into `validate_gqa_heads()` in
+  `attention/shared.rs`. Replaced 4 inline checks across `standard_attention_graph`,
+  `standard_attention_decode_step`, `full_attention_decode_core`, and
+  `FullAttentionDims::new`. Added proper `InvalidGqaHeadConfig` error variant replacing
+  misleading `BufferLengthMismatch`. Fixed missing `head_count==0` check in projection.rs.
+  305 tests pass, zero clippy warnings.
+
 ## Validation checkpoints completed on this branch
 
 - `cargo fmt --all`
