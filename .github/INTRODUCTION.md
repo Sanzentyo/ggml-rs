@@ -432,6 +432,14 @@ And you should write rusty code(ADT, enum, type state pattern)
   preserving per-weight error labels for debuggability.
   See comparison doc item 48.
 
+- **`OutputProjectionGraph` sub-struct extraction** (item 49):
+  Extracted shared output projection fields (`w`, `x`, `y`, `graph`) from
+  `FullAttentionGraphParts` and `LinearAttentionGraphParts` into `OutputProjectionGraph`.
+  Both graph builder functions now call `build_output_projection_graph` instead of
+  duplicating ~15 lines of tensor creation + graph wiring. `PersistentDecodeProjection`
+  enum variants also compose with the sub-struct, simplifying `project_output`.
+  See comparison doc item 49.
+
 ## Validation checkpoints completed on this branch
 
 - `cargo fmt --all`

@@ -3164,4 +3164,32 @@ Extracted `upload_weight(tensor: &Tensor<f32>, data: &[f32], label: &'static str
 |------|---------|
 | `llama-rs/src/e2e/tensor_ops.rs` | Added `sum_matmul_memories`; refactored both `recommended_persistent_*_memory` to use it |
 | `llama-rs/src/e2e/generation.rs` | Added `upload_weight`; refactored both `build_one_persistent_*` to use it |
+
+---
+
+## Item 49 — `OutputProjectionGraph` Sub-Struct Extraction
+
+### 49.1 Motivation
+
+`FullAttentionGraphParts` and `LinearAttentionGraphParts` each contain identical output
+projection fields (`out_x`, `w_out`, `out_y`, `output_graph`) and their builders duplicate
+~15 lines of `new_tensor_2d` → `mul_mat` → `new_graph` → `build_forward_expand` code.
+The `PersistentDecodeProjection` enum also duplicates these 4 fields in both variants.
+
+### 49.2 Implementation
+
+Extracted `OutputProjectionGraph<'ctx>` struct with fields `{ w, x, y, graph }` and a
+`build_output_projection_graph(ctx, input_features, output_features, label)` helper.
+
+Both `FullAttentionGraphParts` and `LinearAttentionGraphParts` now contain an
+`output: OutputProjectionGraph<'ctx>` field instead of 4 separate fields. The
+`project_output` method on `PersistentDecodeProjection` now extracts the shared
+sub-struct via a single match, eliminating the 3-field multi-arm destructure.
+
+### 49.3 Files Modified
+
+| File | Changes |
+|------|---------|
+| `llama-rs/src/e2e/tensor_ops.rs` | Added `OutputProjectionGraph`, `build_output_projection_graph`; refactored both `*GraphParts` structs, both builders, `PersistentDecodeProjection` enum, `project_output`, and test callers |
+| `llama-rs/src/e2e/generation.rs` | Updated `build_one_persistent_full` and `build_one_persistent_linear` to use `g.output.w` and compose `output: g.output` |
 | `llama-rs/Cargo.toml` | Added `postcard` + `serde` dependencies |
