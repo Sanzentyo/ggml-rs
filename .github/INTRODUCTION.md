@@ -556,6 +556,14 @@ And you should write rusty code(ADT, enum, type state pattern)
   ssm_recurrence_step, split_and_norm_qk). Root retains entry points
   (inference/prefill/decode), core logic, bench utilities, tests.
   Zero clippy warnings, 229 tests pass.
+- **Split generation.rs into coherent submodules** (item 65):
+  Split the 1810-line monolithic `generation.rs` into 2 focused submodules:
+  `strategy.rs` (AttentionStrategy trait, InferenceStrategy, PrefillStrategy,
+  DecodeStrategy — pure dispatch pattern), `resources.rs` (LmHeadResources,
+  PersistentDecodeResources, persistent projection/KV cache/MLP builders,
+  unsafe transmute + drop-order safety logic). Root retains GenerationMode,
+  GenerationInputs, GenerationOutput, process_all_layers, generation loops,
+  public entry points, tests. Zero clippy warnings, 229 tests pass.
 
 ## Validation checkpoints completed on this branch
 

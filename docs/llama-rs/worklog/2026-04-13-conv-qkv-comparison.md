@@ -3945,3 +3945,45 @@ established in item 63 (attention.rs split).
 | llama-rs/src/e2e/linear_attention/conv.rs | NEW — Causal depthwise convolution (host, graph, fused, decode step) |
 | llama-rs/src/e2e/linear_attention/ssm.rs | NEW — SSM recurrence logic and scratch buffers |
 
+---
+
+## Item 65 — Split generation.rs into coherent submodules
+
+### 65.1 Goal
+
+Split the 1810-line monolithic `generation.rs` into 2 focused submodules
+to separate strategy dispatch from resource management, following the same
+pattern established in items 63-64.
+
+### 65.2 Submodule Design
+
+| Submodule | Responsibility | ~LOC |
+|-----------|---------------|------|
+| `strategy.rs` | AttentionStrategy trait + 3 implementations (InferenceStrategy, PrefillStrategy, DecodeStrategy) | ~170 |
+| `resources.rs` | Persistent GPU resource management — LmHeadResources, PersistentDecodeResources, projection/KV/MLP builders, unsafe transmute + drop-order safety | ~665 |
+| Root | GenerationMode, GenerationInputs, GenerationOutput, process_all_layers, generation loops, public entry points, greedy_next_token_id, tests | ~980 |
+
+### 65.3 Key Design Decisions
+
+- **Rubber-duck identified session.rs as important consumer**: Required `pub(super)` re-exports from root for `DecodeStrategy`, `InferenceStrategy`, `PrefillStrategy`, `LmHeadResources`, `PersistentDecodeResources`, `greedy_next_token_id`, `process_all_layers`
+- **Drop-order safety preserved**: `LmHeadResources` and `PersistentDecodeResources` keep their struct definitions + builders colocated in resources.rs; all SAFETY comments for `unsafe { transmute }` patterns remain with the code they justify
+- **graph_sample_fallback() kept in root**: It's loop orchestration, not resource ownership
+
+### 65.4 Metrics
+
+| Metric | Before | After |
+|--------|--------|-------|
+| generation.rs LOC | 1810 | ~980 (root + tests) |
+| Submodule files | 0 | 2 |
+| External import breakage | — | 0 (re-exports preserve paths) |
+| Clippy warnings | 0 | 0 |
+| Tests | 229 pass | 229 pass |
+
+### 65.5 Files Modified
+
+| File | Changes |
+|------|---------|
+| llama-rs/src/e2e/generation.rs | Replaced 1810-line monolith with module root: mod declarations, re-exports, types, loops, entry points, tests |
+| llama-rs/src/e2e/generation/strategy.rs | NEW — Attention dispatch strategies |
+| llama-rs/src/e2e/generation/resources.rs | NEW — Persistent GPU resource management |
+
