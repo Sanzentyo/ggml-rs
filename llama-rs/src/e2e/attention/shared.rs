@@ -76,19 +76,23 @@ pub(in crate::e2e) trait KvCacheView {
 
 impl KvCacheView for StandardAttentionState {
     fn k_head_at(&self, token: usize, kv_head: usize, head_dim: usize) -> &[f32] {
-        self.k_head_at(token, kv_head, head_dim)
+        let offset = token * self.kv_features + kv_head * head_dim;
+        &self.k_cache[offset..offset + head_dim]
     }
     fn v_head_at(&self, token: usize, kv_head: usize, head_dim: usize) -> &[f32] {
-        self.v_head_at(token, kv_head, head_dim)
+        let offset = token * self.kv_features + kv_head * head_dim;
+        &self.v_cache[offset..offset + head_dim]
     }
 }
 
 impl KvCacheView for Qwen35FullAttentionState {
     fn k_head_at(&self, token: usize, kv_head: usize, head_dim: usize) -> &[f32] {
-        self.k_head_at(token, kv_head, head_dim)
+        let offset = token * self.kv_features + kv_head * head_dim;
+        &self.k_cache[offset..offset + head_dim]
     }
     fn v_head_at(&self, token: usize, kv_head: usize, head_dim: usize) -> &[f32] {
-        self.v_head_at(token, kv_head, head_dim)
+        let offset = token * self.kv_features + kv_head * head_dim;
+        &self.v_cache[offset..offset + head_dim]
     }
 }
 

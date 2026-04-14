@@ -158,18 +158,6 @@ impl StandardAttentionState {
     pub(super) fn token_count(&self) -> usize {
         self.cached_len
     }
-
-    /// Get a K slice for a specific token and KV head.
-    pub(super) fn k_head_at(&self, token: usize, kv_head: usize, head_dim: usize) -> &[f32] {
-        let token_offset = token * self.kv_features + kv_head * head_dim;
-        &self.k_cache[token_offset..token_offset + head_dim]
-    }
-
-    /// Get a V slice for a specific token and KV head.
-    pub(super) fn v_head_at(&self, token: usize, kv_head: usize, head_dim: usize) -> &[f32] {
-        let token_offset = token * self.kv_features + kv_head * head_dim;
-        &self.v_cache[token_offset..token_offset + head_dim]
-    }
 }
 
 impl Qwen35FullAttentionState {
@@ -224,18 +212,6 @@ impl Qwen35FullAttentionState {
     /// Number of tokens currently in the cache.
     pub(super) fn token_count(&self) -> usize {
         self.cached_len
-    }
-
-    /// Get a K slice for a specific token and KV head.
-    pub(super) fn k_head_at(&self, token: usize, kv_head: usize, head_dim: usize) -> &[f32] {
-        let token_offset = token * self.kv_features + kv_head * head_dim;
-        &self.k_cache[token_offset..token_offset + head_dim]
-    }
-
-    /// Get a V slice for a specific token and KV head.
-    pub(super) fn v_head_at(&self, token: usize, kv_head: usize, head_dim: usize) -> &[f32] {
-        let token_offset = token * self.kv_features + kv_head * head_dim;
-        &self.v_cache[token_offset..token_offset + head_dim]
     }
 }
 
