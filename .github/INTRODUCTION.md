@@ -617,6 +617,17 @@ And you should write rusty code(ADT, enum, type state pattern)
   `bench_graphs/micro.rs` (~380 lines): conv vs QKV packing micro-benchmarks.
   8 ignored bench tests preserved, 246 total tests, zero clippy warnings.
 
+71. **Split `generation.rs` root into api + loops submodules** — DONE (commit `0477f13`)
+  Root was 980 lines with 2 existing submodules (resources, strategy).
+  Extracted:
+  `generation/api.rs` (~166 lines): public API entry points
+    (generate_from_path/model, resolve_eos_token_id, tokenize_prompt_text).
+  `generation/loops.rs` (~255 lines): core generation loops
+    (generate_from_plans, full_reprocess_loop, two_phase_loop).
+  Root now ~180 lines (excl. tests): types, process_all_layers, sampling.
+  Submodule count: 2 → 4 (api, loops, resources, strategy).
+  246 tests pass, zero clippy warnings.
+
 ## Validation checkpoints completed on this branch
 
 - `cargo fmt --all`

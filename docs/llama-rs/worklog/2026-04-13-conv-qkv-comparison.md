@@ -4130,3 +4130,21 @@ Zero clippy warnings.
 | llama-rs/src/e2e/bench_graphs/inference.rs | NEW: 6 inference graph benches |
 | llama-rs/src/e2e/bench_graphs/lm_head.rs | NEW: LM head sampling bench |
 | llama-rs/src/e2e/bench_graphs/micro.rs | NEW: Conv vs QKV micro-benches |
+
+
+## Item 71: Split generation.rs root into api + loops submodules
+
+**Commit:** `0477f13`
+
+### Motivation
+
+`generation.rs` root was 980 lines despite already having 2 submodules (resources, strategy).
+Public API entry points and core loop logic were interleaved, making the module hard to navigate.
+
+### Changes
+
+| File | Description |
+|------|-------------|
+| llama-rs/src/e2e/generation.rs | Module root (~180 lines excl. tests, from 980) |
+| llama-rs/src/e2e/generation/api.rs | NEW: Public API (generate_from_path/model, EOS, tokenize) |
+| llama-rs/src/e2e/generation/loops.rs | NEW: Core loops (full_reprocess, two_phase) |
