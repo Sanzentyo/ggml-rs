@@ -102,23 +102,20 @@ impl ModelFingerprint {
         let layer_types = layer_plans
             .iter()
             .map(|plan| match &plan.attention {
-                Some(AttentionLayerPlan::Standard(attn)) => LayerTypeTag::Standard {
-                    kv_head_count: attn.weights.config.layout.kv_head_count(),
-                    head_dimension: attn.weights.config.layout.head_dimension(),
+                Some(attn @ AttentionLayerPlan::Standard(_)) => LayerTypeTag::Standard {
+                    kv_head_count: attn.kv_head_count(),
+                    head_dimension: attn.head_dimension(),
                 },
-                Some(AttentionLayerPlan::Qwen35Full(attn)) => LayerTypeTag::Qwen35Full {
-                    kv_head_count: attn.kv_head_count,
-                    head_dimension: attn.head_dimension,
+                Some(attn @ AttentionLayerPlan::Qwen35Full(_)) => LayerTypeTag::Qwen35Full {
+                    kv_head_count: attn.kv_head_count(),
+                    head_dimension: attn.head_dimension(),
                 },
-                Some(AttentionLayerPlan::Qwen35Linear(attn)) => {
-                    let conv_channels = attn.inner_size + 2 * attn.group_count * attn.state_size;
-                    LayerTypeTag::Qwen35Linear {
-                        conv_kernel: attn.conv_kernel,
-                        conv_channels,
-                        time_step_rank: attn.time_step_rank,
-                        state_size: attn.state_size,
-                    }
-                }
+                Some(AttentionLayerPlan::Qwen35Linear(lin)) => LayerTypeTag::Qwen35Linear {
+                    conv_kernel: lin.conv_kernel,
+                    conv_channels: lin.conv_channels(),
+                    time_step_rank: lin.time_step_rank,
+                    state_size: lin.state_size,
+                },
                 None => LayerTypeTag::None,
             })
             .collect();

@@ -296,29 +296,26 @@ impl GenerationState {
         let mut layers = Vec::with_capacity(layer_plans.len());
         for plan in layer_plans {
             let state = match &plan.attention {
-                Some(AttentionLayerPlan::Standard(attn)) => {
-                    let config = &attn.weights.config;
+                Some(attn @ AttentionLayerPlan::Standard(_)) => {
                     LayerAttentionState::Standard(StandardAttentionState::new(
                         total_sequence_length,
-                        config.layout.kv_head_count(),
-                        config.layout.head_dimension(),
+                        attn.kv_head_count(),
+                        attn.head_dimension(),
                     )?)
                 }
-                Some(AttentionLayerPlan::Qwen35Full(attn)) => {
+                Some(attn @ AttentionLayerPlan::Qwen35Full(_)) => {
                     LayerAttentionState::Qwen35Full(Qwen35FullAttentionState::new(
                         total_sequence_length,
-                        attn.kv_head_count,
-                        attn.head_dimension,
+                        attn.kv_head_count(),
+                        attn.head_dimension(),
                     )?)
                 }
-                Some(AttentionLayerPlan::Qwen35Linear(attn)) => {
-                    let conv_channels = attn.inner_size
-                        + checked_mul(checked_mul(attn.group_count, attn.state_size)?, 2)?;
+                Some(AttentionLayerPlan::Qwen35Linear(lin)) => {
                     LayerAttentionState::Qwen35Linear(LinearAttentionState::new(
-                        attn.conv_kernel,
-                        conv_channels,
-                        attn.time_step_rank,
-                        attn.state_size,
+                        lin.conv_kernel,
+                        lin.conv_channels(),
+                        lin.time_step_rank,
+                        lin.state_size,
                     )?)
                 }
                 None => LayerAttentionState::None,

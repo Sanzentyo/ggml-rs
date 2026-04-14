@@ -10,7 +10,7 @@ use super::super::decode::decode_norm_tensor;
 use super::super::error::{E2eError, GgmlResultExt};
 use super::super::generation::GenerationMode;
 use super::super::numeric::{checked_mul, validate_token_id};
-use super::super::plan::{AttentionLayerPlan, LayerPlan};
+use super::super::plan::LayerPlan;
 use super::super::planner::build_layer_plans;
 use super::super::resolve::resolve_global_tensor_names;
 use super::super::state::GenerationState;
@@ -105,7 +105,7 @@ impl ResolvedModel {
 fn determine_mode(layer_plans: &[LayerPlan], max_new_tokens: usize) -> GenerationMode {
     let has_standard = layer_plans
         .iter()
-        .any(|p| matches!(p.attention, Some(AttentionLayerPlan::Standard(_))));
+        .any(|p| p.attention.as_ref().is_some_and(|a| a.is_standard()));
     if has_standard || max_new_tokens == 0 {
         GenerationMode::FullReprocess
     } else {

@@ -69,6 +69,36 @@ impl AttentionLayerPlan {
             Self::Qwen35Linear(a) => &a.norm_values,
         }
     }
+
+    /// True when this variant is [`Standard`](Self::Standard).
+    pub(super) fn is_standard(&self) -> bool {
+        matches!(self, Self::Standard(_))
+    }
+
+    /// KV head count, unified across attention variants.
+    pub(super) fn kv_head_count(&self) -> usize {
+        match self {
+            Self::Standard(a) => a.weights.config.layout.kv_head_count(),
+            Self::Qwen35Full(a) => a.kv_head_count,
+            Self::Qwen35Linear(a) => a.group_count,
+        }
+    }
+
+    /// Per-head dimension, unified across attention variants.
+    pub(super) fn head_dimension(&self) -> usize {
+        match self {
+            Self::Standard(a) => a.weights.config.layout.head_dimension(),
+            Self::Qwen35Full(a) => a.head_dimension,
+            Self::Qwen35Linear(a) => a.state_size,
+        }
+    }
+}
+
+impl Qwen35LinearAttentionLayerPlan {
+    /// Convolution channel count: `inner_size + 2 × group_count × state_size`.
+    pub(super) fn conv_channels(&self) -> usize {
+        self.inner_size + 2 * self.group_count * self.state_size
+    }
 }
 
 #[derive(Debug, Clone)]
