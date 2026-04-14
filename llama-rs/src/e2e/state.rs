@@ -8,6 +8,39 @@ use super::error::E2eError;
 use super::numeric::checked_mul;
 use super::plan::{AttentionLayerPlan, LayerPlan};
 
+/// Shared append logic for KV caches that store flat `[max_tokens × kv_features]`
+/// slices. Both `StandardAttentionState` and `Qwen35FullAttentionState` delegate
+/// their `append_batch` methods here.
+fn kv_cache_append_batch(
+    k_cache: &mut [f32],
+    v_cache: &mut [f32],
+    cached_len: &mut usize,
+    kv_features: usize,
+    k_values: &[f32],
+    v_values: &[f32],
+    count: usize,
+) -> Result<(), E2eError> {
+    debug_assert_eq!(k_cache.len(), v_cache.len(), "K/V cache size mismatch");
+    let batch_size = checked_mul(count, kv_features)?;
+    if k_values.len() != batch_size || v_values.len() != batch_size {
+        return Err(E2eError::BufferLengthMismatch {
+            expected: batch_size,
+            actual: k_values.len().min(v_values.len()),
+        });
+    }
+    let offset = checked_mul(*cached_len, kv_features)?;
+    if offset + batch_size > k_cache.len() {
+        return Err(E2eError::SequenceTooLong {
+            requested: *cached_len + count,
+            context_length: k_cache.len() / kv_features,
+        });
+    }
+    k_cache[offset..offset + batch_size].copy_from_slice(k_values);
+    v_cache[offset..offset + batch_size].copy_from_slice(v_values);
+    *cached_len += count;
+    Ok(())
+}
+
 /// Per-layer attention state for autoregressive generation.
 #[derive(Debug, Clone)]
 pub(super) enum LayerAttentionState {
@@ -110,24 +143,15 @@ impl StandardAttentionState {
         v_values: &[f32],
         count: usize,
     ) -> Result<(), E2eError> {
-        let batch_size = checked_mul(count, self.kv_features)?;
-        if k_values.len() != batch_size || v_values.len() != batch_size {
-            return Err(E2eError::BufferLengthMismatch {
-                expected: batch_size,
-                actual: k_values.len().min(v_values.len()),
-            });
-        }
-        let offset = checked_mul(self.cached_len, self.kv_features)?;
-        if offset + batch_size > self.k_cache.len() {
-            return Err(E2eError::SequenceTooLong {
-                requested: self.cached_len + count,
-                context_length: self.k_cache.len() / self.kv_features,
-            });
-        }
-        self.k_cache[offset..offset + batch_size].copy_from_slice(k_values);
-        self.v_cache[offset..offset + batch_size].copy_from_slice(v_values);
-        self.cached_len += count;
-        Ok(())
+        kv_cache_append_batch(
+            &mut self.k_cache,
+            &mut self.v_cache,
+            &mut self.cached_len,
+            self.kv_features,
+            k_values,
+            v_values,
+            count,
+        )
     }
 
     /// Number of tokens currently in the cache.
@@ -172,24 +196,15 @@ impl Qwen35FullAttentionState {
         v_values: &[f32],
         count: usize,
     ) -> Result<(), E2eError> {
-        let batch_size = checked_mul(count, self.kv_features)?;
-        if k_values.len() != batch_size || v_values.len() != batch_size {
-            return Err(E2eError::BufferLengthMismatch {
-                expected: batch_size,
-                actual: k_values.len().min(v_values.len()),
-            });
-        }
-        let offset = checked_mul(self.cached_len, self.kv_features)?;
-        if offset + batch_size > self.k_cache.len() {
-            return Err(E2eError::SequenceTooLong {
-                requested: self.cached_len + count,
-                context_length: self.k_cache.len() / self.kv_features,
-            });
-        }
-        self.k_cache[offset..offset + batch_size].copy_from_slice(k_values);
-        self.v_cache[offset..offset + batch_size].copy_from_slice(v_values);
-        self.cached_len += count;
-        Ok(())
+        kv_cache_append_batch(
+            &mut self.k_cache,
+            &mut self.v_cache,
+            &mut self.cached_len,
+            self.kv_features,
+            k_values,
+            v_values,
+            count,
+        )
     }
 
     /// Get a K slice for a specific token.
