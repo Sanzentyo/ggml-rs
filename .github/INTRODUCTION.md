@@ -805,6 +805,25 @@ And you should write rusty code(ADT, enum, type state pattern)
   `attention_scale` comes from GGUF metadata (`metadata.attention_scale()` in
   `planner.rs:273-275`), NOT always `1/sqrt(hd)`. Removing the stored field
   would break models with non-default values.
+98. **Memory estimation cleanup** — DONE (commit `d013659`)
+  Renamed `PROJECTION_SLACK_BYTES` → `MATMUL_GRAPH_SLACK_BYTES` (neutral name
+  reflecting actual usage across projections, MLP, conv, lm_head). Removed
+  duplicate `MLP_BACKEND_SLACK_BYTES` from mlp.rs. Extracted named constants:
+  `STANDARD_ATTENTION_OVERHEAD_BYTES` (64MB) in standard.rs,
+  `FULL_ATTENTION_BASE_SLACK_BYTES` (1MB) in attention/projection.rs.
+  Hardened unchecked arithmetic in `FullAttentionDims::estimate_memory()` and
+  `standard_attention_graph()` with checked_mul/checked_add chains.
+  `estimate_memory()` now returns `Result<Bytes, E2eError>`.
+  365 tests pass, zero clippy warnings.
+99. **decode.rs unit tests** — DONE (commit `1f7b2c4`)
+  9 tests for `decode_norm_tensor`, `decode_exact_tensor`, `decode_matrix_tensor`
+  covering valid decoding, dimension mismatch, missing tensor, and overflow
+  scenarios. Uses `GgufModel::stub()` for precise element counts.
+100. **error.rs + config.rs unit tests** — DONE (commit `1f7b2c4`)
+  error.rs: 9 tests covering all 6 constructor helpers, `GgmlResultExt` ok/err,
+  and `Display` includes context. config.rs: 6 tests covering valid construction,
+  empty prompt rejection, builder chaining, and `avg_generated_token_ms` (empty,
+  normal, zero duration). 365 tests pass, zero clippy warnings.
 
 ## Validation checkpoints completed on this branch
 

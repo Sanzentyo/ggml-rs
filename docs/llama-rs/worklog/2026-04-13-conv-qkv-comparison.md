@@ -4839,3 +4839,81 @@ kv_cache_append_and_retrieve.
 attention_scale comes from GGUF metadata (metadata.attention_scale().unwrap_or(...) in
 planner.rs:273-275). NOT always 1/sqrt(hd). Removing the stored field would break
 models with non-default attention scale values.
+
+## Item 98: Memory estimation cleanup
+
+Unified the duplicated memory slack constants and hardened unchecked arithmetic
+in memory estimation paths.
+
+### Changes
+
+- Renamed PROJECTION_SLACK_BYTES to MATMUL_GRAPH_SLACK_BYTES in
+  tensor_ops/projection.rs -- neutral name reflecting actual usage across
+  projections, MLP, conv, lm_head, and bench_graphs.
+- Removed duplicate MLP_BACKEND_SLACK_BYTES from mlp.rs -- now imports
+  MATMUL_GRAPH_SLACK_BYTES from tensor_ops.
+- Extracted STANDARD_ATTENTION_OVERHEAD_BYTES (64MB) in standard.rs
+  replacing inline 64 * 1024 * 1024.
+- Extracted FULL_ATTENTION_BASE_SLACK_BYTES (1MB) in
+  attention/projection.rs replacing inline 1_048_576.
+- Replaced inline 4 * 1024 * 1024 in bench_graphs/micro.rs with the
+  shared constant.
+- Hardened arithmetic in FullAttentionDims::estimate_memory() -- now uses
+  checked_mul/checked_add chains and returns Result<Bytes, E2eError>
+  instead of Bytes.
+- Hardened arithmetic in standard_attention_graph() memory estimate --
+  all intermediate products use checked operations.
+
+### Files changed (10)
+
+- llama-rs/src/e2e/tensor_ops/projection.rs -- constant rename + doc update
+- llama-rs/src/e2e/tensor_ops.rs -- re-export rename
+- llama-rs/src/e2e/tensor_ops/lm_head.rs -- import rename
+- llama-rs/src/e2e/linear_attention/projection.rs -- import rename
+- llama-rs/src/e2e/linear_attention/conv.rs -- import rename
+- llama-rs/src/e2e/attention/projection.rs -- new constant + checked arithmetic
+- llama-rs/src/e2e/attention/standard.rs -- new constant + checked arithmetic
+- llama-rs/src/e2e/attention/qwen35_full.rs -- adjusted call site for Result
+- llama-rs/src/e2e/mlp.rs -- removed duplicate constant, import shared one
+- llama-rs/src/e2e/bench_graphs/micro.rs -- use shared constant
+
+## Item 99: decode.rs unit tests
+
+9 tests for the tensor decoding helpers in llama-rs/src/e2e/decode.rs.
+
+### Tests added
+
+1. decode_norm_tensor_valid -- 4 f32 elements, shape [4]
+2. decode_norm_tensor_mismatch -- wrong element count -> DimensionMismatch
+3. decode_norm_tensor_missing -- tensor not in model -> MissingTensor
+4. decode_exact_tensor_valid -- 12 f32 elements, shape [3,4]
+5. decode_exact_tensor_mismatch -- wrong shape -> DimensionMismatch
+6. decode_matrix_tensor_valid -- 20 f32 elements, shape [4,5]
+7. decode_matrix_tensor_dimension_mismatch -- rows != expected
+8. decode_matrix_tensor_overflow -- usize::MAX dimensions -> MemorySizeOverflow
+9. Additional edge cases for decode helpers
+
+Used GgufModel::stub with precise byte sizes for test tensors.
+
+## Item 100: error.rs + config.rs unit tests
+
+### error.rs tests (9)
+
+1. ggml_error_helper -- E2eError::ggml_error(code, "ctx")
+2. metadata_error_helper -- E2eError::metadata_error(inner)
+3. naming_error_helper -- E2eError::naming_error(inner)
+4. tokenizer_error_helper -- E2eError::tokenizer_error(inner)
+5. inference_error_helper -- E2eError::inference_error(inner)
+6. ggml_ctx_helper -- E2eError::ggml_ctx("label")
+7. ggml_result_ext_ok -- Ok(42).ggml_ctx("ok")
+8. ggml_result_ext_err -- Err(e).ggml_ctx("fail")
+9. display_includes_context -- verify Display output includes variant info
+
+### config.rs tests (6)
+
+1. config_valid_construction -- basic builder with valid inputs
+2. config_empty_prompt_rejected -- empty token slice -> error
+3. config_builder_chaining -- all builder setters return &mut Self
+4. report_avg_generated_token_ms_empty -- no durations -> 0.0
+5. report_avg_generated_token_ms_normal -- valid durations -> correct average
+6. report_avg_generated_token_ms_zero_duration -- zero duration -> 0.0
