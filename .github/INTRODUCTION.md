@@ -874,6 +874,25 @@ And you should write rusty code(ADT, enum, type state pattern)
   identical inline construction sites in attention.rs, generation.rs,
   and bench_graphs/helpers.rs. Net −65 lines of duplicated code.
   365 tests pass, zero clippy warnings.
+113. **Persistent builder deduplication** — SKIPPED
+  Safety-critical code with `unsafe transmute`. A generic helper would
+  hide safety reasoning rather than improve it.
+114. **Parallel vec-building loop deduplication** — SKIPPED
+  Three loops look similar but encode different failure policies
+  (all-or-nothing vs per-layer opportunistic fallback).
+115. **Decompose persistent_decode_all_layers** — SKIPPED
+  Already delegates heavy work to per-layer helpers. Extracting dispatch
+  would just move code without reducing complexity.
+116. **Data-driven linear projection fallback** — DONE (commit `0d9d197`)
+  Replaced 4 sequential `project_sequence()` calls with a specs-driven
+  loop using `linear_projection_specs()`, mirroring the GPU batch path.
+117. **conv buffer signed index cleanup** — SKIPPED
+  `saturating_sub` is NOT equivalent — would collapse "no history" and
+  "oldest valid row" into the same index. Current signed comparison is
+  intentionally correct.
+118. **Array destructuring for projection results** — DONE (commit `0d9d197`)
+  Replaced iterator + 4× `expect()` with `try_into()` array destructuring
+  in both graph and fallback paths — single expect point instead of four.
 
 ## Validation checkpoints completed on this branch
 

@@ -5017,3 +5017,29 @@ Main function now reads as orchestration: validate → load → plan → run →
 #### Files changed (1)
 
 - llama-rs/src/e2e/generation/api.rs -- extracted 3 private helpers
+
+
+## Items 113-118: Rubber-duck prioritization round 2
+
+### Rubber-duck analysis
+
+- **DO**: 116 (specs-driven fallback), 118 (array destructuring) -- same file, low risk
+- **SKIP**: 113 (unsafe transmute safety), 114 (different failure policies),
+  115 (just moves code), 117 (saturating_sub is NOT equivalent -- key insight)
+
+### Item 117 insight: signed comparison is correct
+
+The as isize - lookback as isize pattern in conv.rs:349 intentionally
+distinguishes no history available (negative) from oldest valid row
+(index 0). Using saturating_sub would collapse both to 0, silently
+reading the wrong data.
+
+### Item 116 + 118: Data-driven projection + destructuring
+
+Replaced 4 sequential project_sequence() calls in the host fallback path
+with a specs-driven loop mirroring the GPU batch path. Both paths now use
+try_into() array destructuring instead of iterator + 4x expect().
+
+#### Files changed (1)
+
+- llama-rs/src/e2e/linear_attention/projection.rs -- specs loop + destructuring
