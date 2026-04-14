@@ -638,6 +638,17 @@ And you should write rusty code(ADT, enum, type state pattern)
   Submodule count: 3 → 6 (bench, conv, decode, projection, sequence, ssm).
   246 tests pass, zero clippy warnings.
 
+73. **Unit tests for resolve.rs + GgufModel test stub** — DONE (commit `fae4281`)
+  Added `#[cfg(test)]` stub constructors to `GgufModel` (`stub` with configurable
+  tensor sizes + KV entries, `stub_from_names` convenience). Enforces name uniqueness.
+  17 tests covering:
+  - Pure candidate generators (global, layer, SSM patterns)
+  - Resolution precedence (earliest candidate wins, not model order)
+  - Error payloads (role, layer, tried candidates in error messages)
+  - Optional vs required tensor resolution
+  - Alternative naming conventions (HuggingFace-style)
+  263 tests pass, zero clippy warnings.
+
 ## Validation checkpoints completed on this branch
 
 - `cargo fmt --all`

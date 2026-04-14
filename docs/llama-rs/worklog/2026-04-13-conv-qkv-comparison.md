@@ -4174,3 +4174,61 @@ Decode core, full-sequence core, and bench instrumentation were all in the root,
 - `bench.rs` gated with `#[cfg(test)]` at the `mod` declaration — only compiled during testing.
 - `decode.rs` items use `pub(in crate::e2e)` to support re-export from root without broadening visibility.
 - Root keeps thin wrappers (inference/prefill), utility functions, and all 7 tests.
+
+---
+
+## Item 73: Unit tests for resolve.rs + GgufModel test stub
+
+### Problem
+`resolve.rs` (184 lines) had zero test coverage despite containing 14+ pure candidate generator
+functions and 4 resolution functions that form the foundation of tensor name lookup. Testing these
+functions required creating `GgufModel` instances, but `GgufModel` has private fields and can only
+be constructed via `GgufModel::open()` which needs a real GGUF file.
+
+### Solution
+
+#### GgufModel test stubs (model.rs)
+Added two `#[cfg(test)]` constructors:
+- `GgufModel::stub(tensors, kv_entries)` — configurable tensor byte sizes and KV entries.
+  Enforces name uniqueness via assert (mirrors real constructor behavior).
+- `GgufModel::stub_from_names(names)` — convenience wrapper, 16 bytes each, no KV entries.
+
+Both populate only `tensor_index` and `kv_index` (the fields `find_tensor()` checks), with minimal
+`bytes` backing. Extensible for future planner.rs tests that need real tensor sizes and KV metadata.
+
+#### resolve.rs test suite (17 tests)
+
+**Candidate generator tests** (6):
+- `global_token_embedding_candidates_has_expected_patterns` — verifies 3 patterns
+- `global_output_norm_candidates_has_expected_patterns` — verifies 3 patterns
+- `global_output_projection_candidates_has_expected_patterns` — verifies 3 patterns
+- `layer_candidates_format_layer_number_correctly` — all layer generators include `blk.42.`
+- `layer_ssm_candidates_produce_single_pattern_each` — 7 SSM generators each produce exactly 1
+- `layer_candidates_at_zero` — edge case: layer 0 formatting
+
+**Resolution logic tests** (5):
+- `resolve_first_tensor_name_returns_first_candidate_match` — candidate order wins over model order
+- `resolve_first_tensor_name_returns_none_on_no_match` — disjoint candidates
+- `resolve_first_tensor_name_empty_candidates_returns_none` — empty slice
+- `resolve_required_global_returns_ok_on_match` — happy path
+- `resolve_required_global_returns_error_with_tried_candidates` — error payload has role + tried names
+
+**Layer resolution tests** (2):
+- `resolve_required_layer_returns_ok_on_match` — layer 3 with blk.3 tensor
+- `resolve_required_layer_error_includes_layer_number` — error contains layer number + role
+
+**Global orchestration tests** (4):
+- `resolve_global_tensor_names_all_found` — all 3 globals resolve
+- `resolve_global_tensor_names_output_optional_missing` — output (optional) returns None
+- `resolve_global_tensor_names_fails_on_missing_required` — missing token_embedding errors
+- `resolve_global_prefers_alternative_naming_conventions` — HuggingFace-style names work
+
+### Key decisions
+- Stub enforces uniqueness to match real constructor behavior (rubber-duck finding).
+- Precedence test: first *candidate* present in model wins, even if model has later candidates first.
+- Error payload assertions check for role, layer, and tried candidate names (not just `is_err()`).
+- Stub is extensible: configurable tensor sizes + KV entries for future planner tests.
+
+### Result
+- 263 tests pass (up from 246), zero clippy warnings.
+- Commit: `fae4281`
