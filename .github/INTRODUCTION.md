@@ -697,6 +697,13 @@ And you should write rusty code(ADT, enum, type state pattern)
   Removed unused `BuiltProjection` re-export from `tensor_ops.rs`.
   325 tests pass, zero clippy warnings.
 
+80. **greedy_sample_at_index + LayerPassConfig hoist** — DONE (commit `f25b0ed`)
+  Extracted `greedy_sample_at_index()` in generation.rs to unify sampling
+  fallback logic between `graph_sample_fallback` and `sample_next`.
+  Uses `rms_norm_single` instead of full-buffer `rms_norm_with_weight`.
+  Hoisted duplicate `LayerPassConfig` construction in `step_two_phase`.
+  325 tests pass, zero clippy warnings.
+
 ## Validation checkpoints completed on this branch
 
 - `cargo fmt --all`

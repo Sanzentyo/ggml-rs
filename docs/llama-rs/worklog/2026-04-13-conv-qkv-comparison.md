@@ -4450,3 +4450,36 @@ destructure the result into their typed wrapper struct.
 - Updated 3 files (tensor_ops/projection.rs, attention/projection.rs, linear_attention/projection.rs)
 - 325 tests pass, zero clippy warnings
 - Commit: `73d36f9`
+
+## Item 80: greedy_sample_at_index + LayerPassConfig hoist
+
+### Problem
+Two independent sampling fallback implementations existed:
+1. `graph_sample_fallback` (generation.rs): slices hidden to target token, rms_norm on single token,
+   greedy argmax. Used by batch generation loops.
+2. `sample_next` (session/runtime.rs): normalizes FULL hidden buffer with seq_len=token_index+1,
+   greedy at token_index. Used by session runtime. Wasteful for multi-token buffers.
+
+Additionally, `step_two_phase` in runtime.rs constructed identical `LayerPassConfig` in both
+branches of an if/else.
+
+### Solution
+Extracted `greedy_sample_at_index()` as a shared free function in `generation.rs`:
+- Slices hidden buffer to target token (efficient single-token path)
+- Uses `rms_norm_single` instead of `rms_norm_with_weight` (semantic precision per rubber-duck advice)
+- Includes explicit bounds validation with `BufferLengthMismatch` error
+- Both `graph_sample_fallback` and `sample_next` now delegate to it
+
+Hoisted `LayerPassConfig` construction above the if/else in `step_two_phase`.
+
+### Key decisions
+- `pub(super)` visibility — narrowest scope that covers both generation.rs and session/runtime.rs
+- Used `rms_norm_single` for semantic clarity (normalizing exactly one token)
+- Added bounds check before slice to return proper error instead of panic
+- Kept `sample_next` as thin method on GenerationSession for ergonomics at call sites
+
+### Result
+- Eliminated ~20 lines of sampling duplication across 2 files
+- Removed 6 lines of LayerPassConfig duplication in step_two_phase
+- 325 tests pass, zero clippy warnings
+- Commit: `f25b0ed`
