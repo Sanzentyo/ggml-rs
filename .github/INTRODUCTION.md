@@ -578,6 +578,23 @@ And you should write rusty code(ADT, enum, type state pattern)
   Visibility: pub(in crate::e2e) for e2e consumers, pub(super) for internal,
   module-private where sole user is same file. Zero clippy warnings, 229 tests pass.
 
+- **Fix Standard-attention checkpoint validation bug** (item 67):
+  `validate_invariants()` was checking `total_sequence_length * kv_features` for
+  Standard-attention caches, but `From<&LayerAttentionState>` serializes trimmed
+  caches (`cached_len * kv_features`). Fixed to check `cached_len * kv_features`,
+  matching Qwen35Full branch. Added `standard_capture_roundtrip_via_from_impl` test.
+
+- **Split checkpoint.rs into dto + runtime submodules** (item 68):
+  Split the 1030-line `checkpoint.rs` into 3 files:
+  `checkpoint.rs` root (~90 lines): module declarations, GenerationCheckpoint
+  public API (save_to, load_from, accessors), facade roundtrip tests.
+  `checkpoint/dto.rs` (~320 lines): CheckpointV1, ModelFingerprint, LayerTypeTag,
+  LayerStateDto, CHECKPOINT_VERSION, from_plans, validate_against,
+  validate_invariants + 24 validation tests.
+  `checkpoint/runtime.rs` (~270 lines): From<&LayerAttentionState>, into_runtime_state,
+  CaptureInput, capture, restore_state + 7 conversion/capture tests.
+  Total test count increased from 230 to 244. Zero clippy warnings.
+
 ## Validation checkpoints completed on this branch
 
 - `cargo fmt --all`

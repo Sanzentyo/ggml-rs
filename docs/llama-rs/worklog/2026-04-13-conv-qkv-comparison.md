@@ -4038,3 +4038,56 @@ collision with `e2e::attention`), co-locating memory estimators with their build
 | llama-rs/src/e2e/tensor_ops/projection.rs | NEW: GPU projection graph builders + batch utilities |
 | llama-rs/src/e2e/tensor_ops/lm_head.rs | NEW: LM head graph construction + sampling |
 | llama-rs/src/e2e/tensor_ops/persistent_decode.rs | NEW: Persistent decode projection graphs (full + linear attention) |
+
+### Item 67: Fix Standard-attention checkpoint validation bug
+
+**Problem**: `validate_invariants()` checked `total_sequence_length * kv_features`
+for Standard-attention caches, but `From<&LayerAttentionState>` serializes trimmed
+caches (`cached_len * kv_features`). This caused false-negative validation failures
+for Standard-attention checkpoints with `cached_len < total_sequence_length`.
+
+**Fix**: Changed Standard branch in `validate_invariants()` to check
+`cached_len * kv_features`, matching Qwen35Full branch logic. Updated
+`sample_checkpoint_with_standard()` test helper to use correctly trimmed caches.
+Added `standard_capture_roundtrip_via_from_impl()` test exercising full
+From->save->load->restore pipeline.
+
+| File | Change |
+|------|--------|
+| llama-rs/src/e2e/checkpoint.rs | Fixed Standard validate_invariants, +1 test |
+
+### Item 68: Split checkpoint.rs into dto + runtime submodules
+
+Split the 1030-line `checkpoint.rs` into a 3-file module:
+
+**Root `checkpoint.rs`** (~90 lines):
+- Module declarations, `CHECKPOINT_MAGIC` constant
+- `GenerationCheckpoint` public API (`save_to`, `load_from`, accessors)
+- Re-exports of `CheckpointV1`, `ModelFingerprint`, `CaptureInput` for sibling modules
+- 5 facade roundtrip tests
+
+**`checkpoint/dto.rs`** (~320 lines):
+- `CheckpointV1`, `ModelFingerprint`, `LayerTypeTag`, `LayerStateDto` structs/enums
+- `CHECKPOINT_VERSION` constant
+- `ModelFingerprint::from_plans()`, `validate_against()`
+- `CheckpointV1::validate_invariants()`
+- 24 validation and fingerprint tests
+
+**`checkpoint/runtime.rs`** (~270 lines):
+- `From<&LayerAttentionState> for LayerStateDto` (runtime->DTO conversion)
+- `LayerStateDto::into_runtime_state()` (DTO->runtime with cache re-allocation)
+- `CaptureInput` struct + `CheckpointV1::capture()` + `restore_state()`
+- 7 conversion/capture/restore tests
+
+**Visibility**: `pub(in crate::e2e)` for items used by session.rs;
+`pub(super)` for checkpoint-internal items only. Re-exports in root
+for items needing path access through `super::checkpoint::X`.
+
+Total test count: 230->244 (net +14 from improved coverage).
+Zero clippy warnings.
+
+| File | Change |
+|------|--------|
+| llama-rs/src/e2e/checkpoint.rs | Module root (~90 lines from 1030) |
+| llama-rs/src/e2e/checkpoint/dto.rs | NEW: Versioned DTO types + validation |
+| llama-rs/src/e2e/checkpoint/runtime.rs | NEW: Runtime conversion + capture/restore |
