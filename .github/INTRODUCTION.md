@@ -678,6 +678,12 @@ And you should write rusty code(ADT, enum, type state pattern)
   262 call sites. Net reduction: 206 lines. No behavior change.
   305 tests pass, zero clippy warnings.
 
+77. **AttentionLayerPlan lightweight helpers** — DONE (commit `9853c0a`)
+  Added `is_standard()`, `kv_head_count()`, `head_dimension()` on `AttentionLayerPlan`
+  and `conv_channels()` on `Qwen35LinearAttentionLayerPlan`. Updated callers in
+  dto.rs, state.rs, session/init.rs. Net -7 lines across 4 files.
+  305 tests pass, zero clippy warnings.
+
 ## Validation checkpoints completed on this branch
 
 - `cargo fmt --all`

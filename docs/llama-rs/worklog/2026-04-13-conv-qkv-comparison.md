@@ -4352,3 +4352,34 @@ One type annotation needed (`name: &str`) where `.map().ggml_ctx()` chain lost i
 - Net -206 lines across 15 files (14 consumers + error.rs).
 - 305 tests pass, zero clippy warnings.
 - Commit: `3fd472b`
+
+---
+
+## Item 77: AttentionLayerPlan lightweight helpers
+
+### Problem
+`AttentionLayerPlan` callers manually destructure variants to extract common properties
+like `kv_head_count` and `head_dimension`, and inline the `conv_channels` formula
+(`inner_size + 2 * group_count * state_size`) in 7+ places.
+
+### Solution
+Added methods to `plan.rs`:
+- `AttentionLayerPlan::is_standard()` — variant check without destructuring
+- `AttentionLayerPlan::kv_head_count()` — unified across Standard/Qwen35Full/Qwen35Linear
+- `AttentionLayerPlan::head_dimension()` — unified across all variants
+- `Qwen35LinearAttentionLayerPlan::conv_channels()` — encapsulates the formula
+
+Updated callers:
+- `checkpoint/dto.rs` — `from_plans()` uses `attn.kv_head_count()` / `attn.head_dimension()` / `lin.conv_channels()`
+- `state.rs` — state creation uses `attn.kv_head_count()` / `attn.head_dimension()` / `lin.conv_channels()`
+- `session/init.rs` — `determine_mode()` uses `a.is_standard()` instead of `matches!`
+
+### Key decisions
+- Rubber-duck critique: do NOT centralize runtime dispatch (strategy.rs) onto the enum — keep as data ADT.
+- `resources.rs` left unchanged: its sites use `checked_mul` for overflow safety and access many inner fields.
+- `state.rs` Qwen35Linear: switched to `lin.conv_channels()` (non-overflow-checked) since plan validates dimensions during construction.
+
+### Result
+- Net -7 lines across 4 files.
+- 305 tests pass, zero clippy warnings.
+- Commit: `9853c0a`
