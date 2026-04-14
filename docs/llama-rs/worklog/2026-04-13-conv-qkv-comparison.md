@@ -4483,3 +4483,25 @@ Hoisted `LayerPassConfig` construction above the if/else in `step_two_phase`.
 - Removed 6 lines of LayerPassConfig duplication in step_two_phase
 - 325 tests pass, zero clippy warnings
 - Commit: `f25b0ed`
+
+## Item 81: compute_inv_rms extraction
+
+### Problem
+The inverse-RMS calculation (mean of squares in f64, then inverse sqrt) was
+duplicated across three functions in `tensor_ops/normalization.rs`:
+1. `rms_norm_with_weight` (multi-token loop body)
+2. `rms_norm_single_into` (single-token to destination buffer)
+3. `rms_norm_single_in_place` (single-token in-place)
+
+Each had 4-5 identical lines computing `mean_square` and `inv_rms`.
+
+### Solution
+Extracted `compute_inv_rms(values: &[f32], eps: f32) -> f32` as a private
+helper. All three normalization functions now call it instead of inlining the
+calculation.
+
+### Result
+- 5 lines saved (21 → 16 in the core calculation area)
+- No behavioral change; same f64 precision path preserved
+- 325 tests pass, zero clippy warnings
+- Commit: `9bdea77`

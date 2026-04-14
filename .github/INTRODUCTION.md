@@ -704,6 +704,12 @@ And you should write rusty code(ADT, enum, type state pattern)
   Hoisted duplicate `LayerPassConfig` construction in `step_two_phase`.
   325 tests pass, zero clippy warnings.
 
+81. **compute_inv_rms extraction** — DONE (commit `9bdea77`)
+  Extracted shared `compute_inv_rms(values, eps) -> f32` helper in normalization.rs.
+  Eliminates triplicated mean_square→inv_rms calculation across `rms_norm_with_weight`,
+  `rms_norm_single_into`, and `rms_norm_single_in_place`.
+  325 tests pass, zero clippy warnings.
+
 ## Validation checkpoints completed on this branch
 
 - `cargo fmt --all`
