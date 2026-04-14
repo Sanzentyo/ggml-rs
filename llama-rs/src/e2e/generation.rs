@@ -423,7 +423,7 @@ fn build_one_persistent_full(
     upload_weight(&g.w_q, &attn.q_weight_values, "write<W_Q>(pfa)")?;
     upload_weight(&g.w_k, &attn.k_weight_values, "write<W_K>(pfa)")?;
     upload_weight(&g.w_v, &attn.v_weight_values, "write<W_V>(pfa)")?;
-    upload_weight(&g.w_out, &attn.output_weight_values, "write<W_OUT>(pfa)")?;
+    upload_weight(&g.output.w, &attn.output_weight_values, "write<W_OUT>(pfa)")?;
 
     // SAFETY: see the comment block in `try_build_persistent_projections`.
     let proj = unsafe {
@@ -434,9 +434,7 @@ fn build_one_persistent_full(
                 k_out: g.k_out,
                 v_out: g.v_out,
                 input_graph: g.input_graph,
-                out_x: g.out_x,
-                out_y: g.out_y,
-                output_graph: g.output_graph,
+                output: g.output,
                 _buffer: buffer,
             },
         )
@@ -478,7 +476,11 @@ fn build_one_persistent_linear(
     upload_weight(&g.w_z, &attn.gate_weight_values, "write<W_Z>(pla)")?;
     upload_weight(&g.w_alpha, &attn.alpha_weight_values, "write<W_ALPHA>(pla)")?;
     upload_weight(&g.w_beta, &attn.beta_weight_values, "write<W_BETA>(pla)")?;
-    upload_weight(&g.w_out, &attn.ssm_out_weight_values, "write<W_OUT>(pla)")?;
+    upload_weight(
+        &g.output.w,
+        &attn.ssm_out_weight_values,
+        "write<W_OUT>(pla)",
+    )?;
 
     let proj = unsafe {
         std::mem::transmute::<PersistentDecodeProjection<'_>, PersistentDecodeProjection<'static>>(
@@ -489,9 +491,7 @@ fn build_one_persistent_linear(
                 alpha_out: g.alpha_out,
                 beta_out: g.beta_out,
                 input_graph: g.input_graph,
-                out_x: g.out_x,
-                out_y: g.out_y,
-                output_graph: g.output_graph,
+                output: g.output,
                 _buffer: buffer,
             },
         )

@@ -577,9 +577,7 @@ pub(super) enum PersistentDecodeProjection<'ctx> {
         k_out: Tensor<'ctx, f32>,
         v_out: Tensor<'ctx, f32>,
         input_graph: Graph<'ctx>,
-        out_x: Tensor<'ctx, f32>,
-        out_y: Tensor<'ctx, f32>,
-        output_graph: Graph<'ctx>,
+        output: OutputProjectionGraph<'ctx>,
         _buffer: BackendBuffer<'ctx>,
     },
     LinearAttention {
@@ -589,9 +587,7 @@ pub(super) enum PersistentDecodeProjection<'ctx> {
         alpha_out: Tensor<'ctx, f32>,
         beta_out: Tensor<'ctx, f32>,
         input_graph: Graph<'ctx>,
-        out_x: Tensor<'ctx, f32>,
-        out_y: Tensor<'ctx, f32>,
-        output_graph: Graph<'ctx>,
+        output: OutputProjectionGraph<'ctx>,
         _buffer: BackendBuffer<'ctx>,
     },
 }
@@ -676,6 +672,43 @@ pub(super) fn recommended_persistent_linear_attention_memory(
     ])
 }
 
+/// Shared output projection sub-graph returned by [`build_output_projection_graph`].
+pub(super) struct OutputProjectionGraph<'ctx> {
+    /// Weight tensor `[input_features, output_features]` — uploaded once.
+    pub w: Tensor<'ctx, f32>,
+    /// Input tensor `[input_features, 1]` — written per step.
+    pub x: Tensor<'ctx, f32>,
+    /// Output tensor `[output_features, 1]` — read per step.
+    pub y: Tensor<'ctx, f32>,
+    /// Compute graph: matmul(W, X).
+    pub graph: Graph<'ctx>,
+}
+
+/// Build a single matmul output projection graph: `y = W × x`.
+///
+/// Reused by both full-attention and linear-attention persistent graph builders.
+fn build_output_projection_graph<'ctx>(
+    ctx: &'ctx Context,
+    input_features: usize,
+    output_features: usize,
+    label: &'static str,
+) -> Result<OutputProjectionGraph<'ctx>, E2eError> {
+    let w = ctx
+        .new_tensor_2d::<f32>(Shape2D::new(input_features, output_features))
+        .map_err(|source| E2eError::ggml(label, source))?;
+    let x = ctx
+        .new_tensor_2d::<f32>(Shape2D::new(input_features, 1))
+        .map_err(|source| E2eError::ggml(label, source))?;
+    let y = ctx
+        .mul_mat(&w, &x)
+        .map_err(|source| E2eError::ggml(label, source))?;
+    let mut graph = ctx
+        .new_graph()
+        .map_err(|source| E2eError::ggml(label, source))?;
+    graph.build_forward_expand(&y);
+    Ok(OutputProjectionGraph { w, x, y, graph })
+}
+
 /// Built parts of a persistent full attention projection graph pair.
 ///
 /// Returned by [`build_persistent_full_attention_graphs`].
@@ -692,14 +725,8 @@ pub(super) struct FullAttentionGraphParts<'ctx> {
     pub v_out: Tensor<'ctx, f32>,
     /// Input projection compute graph.
     pub input_graph: Graph<'ctx>,
-    /// Output projection input tensor — written per step.
-    pub out_x: Tensor<'ctx, f32>,
-    /// Output projection weight tensor (uploaded once).
-    pub w_out: Tensor<'ctx, f32>,
-    /// Output projection result — read per step.
-    pub out_y: Tensor<'ctx, f32>,
-    /// Output projection compute graph.
-    pub output_graph: Graph<'ctx>,
+    /// Output projection sub-graph (shared structure with linear attention).
+    pub output: OutputProjectionGraph<'ctx>,
 }
 
 /// Build a persistent full-attention input + output projection graph.
@@ -747,21 +774,9 @@ pub(super) fn build_persistent_full_attention_graphs<'ctx>(
     input_graph.build_forward_expand(&k_out);
     input_graph.build_forward_expand(&v_out);
 
-    // Output projection tensors
-    let w_out = ctx
-        .new_tensor_2d::<f32>(Shape2D::new(query_features, hidden_features))
-        .map_err(|source| E2eError::ggml("new_tensor_2d<W_OUT>(pfa)", source))?;
-    let out_x = ctx
-        .new_tensor_2d::<f32>(Shape2D::new(query_features, 1))
-        .map_err(|source| E2eError::ggml("new_tensor_2d<OUT_X>(pfa)", source))?;
-    let out_y = ctx
-        .mul_mat(&w_out, &out_x)
-        .map_err(|source| E2eError::ggml("mul_mat<OUT>(pfa)", source))?;
-
-    let mut output_graph = ctx
-        .new_graph()
-        .map_err(|source| E2eError::ggml("new_graph(pfa_out)", source))?;
-    output_graph.build_forward_expand(&out_y);
+    // Output projection sub-graph
+    let output =
+        build_output_projection_graph(ctx, query_features, hidden_features, "output_proj(pfa)")?;
 
     Ok(FullAttentionGraphParts {
         x_in,
@@ -772,10 +787,7 @@ pub(super) fn build_persistent_full_attention_graphs<'ctx>(
         k_out,
         v_out,
         input_graph,
-        out_x,
-        w_out,
-        out_y,
-        output_graph,
+        output,
     })
 }
 
@@ -797,14 +809,8 @@ pub(super) struct LinearAttentionGraphParts<'ctx> {
     pub beta_out: Tensor<'ctx, f32>,
     /// Input projection compute graph.
     pub input_graph: Graph<'ctx>,
-    /// Output projection input tensor — written per step.
-    pub out_x: Tensor<'ctx, f32>,
-    /// Output projection weight tensor (uploaded once).
-    pub w_out: Tensor<'ctx, f32>,
-    /// Output projection result — read per step.
-    pub out_y: Tensor<'ctx, f32>,
-    /// Output projection compute graph.
-    pub output_graph: Graph<'ctx>,
+    /// Output projection sub-graph (shared structure with full attention).
+    pub output: OutputProjectionGraph<'ctx>,
 }
 
 /// Build a persistent linear attention input + output projection graph.
@@ -852,20 +858,9 @@ pub(super) fn build_persistent_linear_attention_graphs<'ctx>(
     input_graph.build_forward_expand(&alpha_out);
     input_graph.build_forward_expand(&beta_out);
 
-    let w_out = ctx
-        .new_tensor_2d::<f32>(Shape2D::new(inner_size, hidden_features))
-        .map_err(|source| E2eError::ggml("new_tensor_2d<W_OUT>(pla)", source))?;
-    let out_x = ctx
-        .new_tensor_2d::<f32>(Shape2D::new(inner_size, 1))
-        .map_err(|source| E2eError::ggml("new_tensor_2d<OUT_X>(pla)", source))?;
-    let out_y = ctx
-        .mul_mat(&w_out, &out_x)
-        .map_err(|source| E2eError::ggml("mul_mat<OUT>(pla)", source))?;
-
-    let mut output_graph = ctx
-        .new_graph()
-        .map_err(|source| E2eError::ggml("new_graph(pla_out)", source))?;
-    output_graph.build_forward_expand(&out_y);
+    // Output projection sub-graph
+    let output =
+        build_output_projection_graph(ctx, inner_size, hidden_features, "output_proj(pla)")?;
 
     Ok(LinearAttentionGraphParts {
         x_in,
@@ -878,10 +873,7 @@ pub(super) fn build_persistent_linear_attention_graphs<'ctx>(
         alpha_out,
         beta_out,
         input_graph,
-        out_x,
-        w_out,
-        out_y,
-        output_graph,
+        output,
     })
 }
 
@@ -984,30 +976,20 @@ impl<'ctx> PersistentDecodeProjection<'ctx> {
         core_output: &[f32],
         backend: &Backend,
     ) -> Result<Vec<f32>, E2eError> {
-        match self {
-            Self::FullAttention {
-                out_x,
-                out_y,
-                output_graph,
-                ..
-            }
-            | Self::LinearAttention {
-                out_x,
-                out_y,
-                output_graph,
-                ..
-            } => {
-                out_x
-                    .write_data_backend(core_output)
-                    .map_err(|source| E2eError::ggml("write<OUT_X>(proj_out_step)", source))?;
-                backend
-                    .compute(output_graph)
-                    .map_err(|source| E2eError::ggml("compute(proj_output_step)", source))?;
-                out_y
-                    .read_data_backend()
-                    .map_err(|source| E2eError::ggml("read<OUT_Y>(proj_out_step)", source))
-            }
-        }
+        let output = match self {
+            Self::FullAttention { output, .. } | Self::LinearAttention { output, .. } => output,
+        };
+        output
+            .x
+            .write_data_backend(core_output)
+            .map_err(|source| E2eError::ggml("write<OUT_X>(proj_out_step)", source))?;
+        backend
+            .compute(&mut output.graph)
+            .map_err(|source| E2eError::ggml("compute(proj_output_step)", source))?;
+        output
+            .y
+            .read_data_backend()
+            .map_err(|source| E2eError::ggml("read<OUT_Y>(proj_out_step)", source))
     }
 }
 
@@ -1254,7 +1236,7 @@ mod tests {
         g.w_q.write_data_backend(&w_q).expect("write W_Q");
         g.w_k.write_data_backend(&w_k).expect("write W_K");
         g.w_v.write_data_backend(&w_v).expect("write W_V");
-        g.w_out.write_data_backend(&w_out).expect("write W_OUT");
+        g.output.w.write_data_backend(&w_out).expect("write W_OUT");
 
         let mut proj = PersistentDecodeProjection::FullAttention {
             x_in: g.x_in,
@@ -1262,9 +1244,7 @@ mod tests {
             k_out: g.k_out,
             v_out: g.v_out,
             input_graph: g.input_graph,
-            out_x: g.out_x,
-            out_y: g.out_y,
-            output_graph: g.output_graph,
+            output: g.output,
             _buffer: _buf,
         };
         proj.project_input(&input, &backend).expect("project_input");
@@ -1358,7 +1338,7 @@ mod tests {
             .write_data_backend(&w_alpha)
             .expect("write W_ALPHA");
         g.w_beta.write_data_backend(&w_beta).expect("write W_BETA");
-        g.w_out.write_data_backend(&w_out).expect("write W_OUT");
+        g.output.w.write_data_backend(&w_out).expect("write W_OUT");
 
         let mut proj = PersistentDecodeProjection::LinearAttention {
             x_in: g.x_in,
@@ -1367,9 +1347,7 @@ mod tests {
             alpha_out: g.alpha_out,
             beta_out: g.beta_out,
             input_graph: g.input_graph,
-            out_x: g.out_x,
-            out_y: g.out_y,
-            output_graph: g.output_graph,
+            output: g.output,
             _buffer: _buf,
         };
         proj.project_input(&input, &backend).expect("project_input");
