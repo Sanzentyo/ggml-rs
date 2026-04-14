@@ -5043,3 +5043,31 @@ try_into() array destructuring instead of iterator + 4x expect().
 #### Files changed (1)
 
 - llama-rs/src/e2e/linear_attention/projection.rs -- specs loop + destructuring
+
+
+## Items 119-123: Rubber-duck prioritization round 3
+
+### Rubber-duck analysis
+
+- **DO**: 121 (KV cache helper extraction + cached_len guard)
+- **SKIP**: 119 (3 occurrences too few), 122 (thin pattern), 123 (overconstrained API)
+- **PARTIAL**: 120 (dedup skipped, but added layer_types length guard)
+
+### Key rubber-duck catches
+
+1. **cached_len > total_sequence_length** was not validated in into_runtime_state.
+   Malformed checkpoint could panic on copy_from_slice. Fixed in restore_kv_cache.
+2. **zip silently truncates** in validate_against if layer_types.len() diverges
+   from layer_count. Added explicit length check after the zip loop.
+
+### Item 121: restore_kv_cache helper
+
+Extracted common KV cache reconstruction logic from Standard and Qwen35Full
+match arms. Both now call restore_kv_cache() which validates kv_features > 0,
+cached_len <= total_sequence_length, data length consistency, then allocates
+and populates full-size caches.
+
+#### Files changed (2)
+
+- llama-rs/src/e2e/checkpoint/runtime.rs -- restore_kv_cache helper + 2 new tests
+- llama-rs/src/e2e/checkpoint/dto.rs -- layer_types length guard + 1 new test

@@ -893,6 +893,24 @@ And you should write rusty code(ADT, enum, type state pattern)
 118. **Array destructuring for projection results** — DONE (commit `0d9d197`)
   Replaced iterator + 4× `expect()` with `try_into()` array destructuring
   in both graph and fallback paths — single expect point instead of four.
+119. **planner.rs error wrapping** — SKIPPED
+  Only 3 occurrences in one function. A macro/helper would hide
+  the operation-name context that makes error messages useful.
+120. **checkpoint/dto.rs validate_against field helper** — SKIPPED (as dedup),
+  BUT added defensive `layer_types` length check (commit `6310b2e`).
+  Rubber-duck caught that `zip` silently ignores extra entries if a
+  malformed fingerprint has `layer_count != layer_types.len()`.
+121. **Extract restore_kv_cache helper** — DONE (commit `6310b2e`)
+  Extracted duplicated KV cache reconstruction from Standard and Qwen35Full
+  match arms into `restore_kv_cache()`. Added missing `cached_len <=
+  total_sequence_length` guard — rubber-duck catch: malformed checkpoints
+  could panic on `copy_from_slice`. 3 new tests.
+122. **persistent_decode.rs memory estimation** — SKIPPED
+  Shared pattern too thin — just "build different spec array, call helper."
+  Abstraction would make memory formulas less readable.
+123. **projection.rs debug_assert type safety** — SKIPPED
+  Const generics would overconstrain an API that naturally takes slices.
+  368 tests pass, zero clippy warnings.
 
 ## Validation checkpoints completed on this branch
 
