@@ -2,10 +2,11 @@
 
 ## Branch Summary
 
-41 commits implementing a complete Qwen3.5 E2E inference pipeline with
+68 commits implementing a complete Qwen3.5 E2E inference pipeline with
 verified token-ID parity against llama.cpp, plus comprehensive ggml-rs
 API improvements (typed tensors, safe view/reshape wrappers, graph-level
-projections, resumable generation sessions, chat infrastructure).
+projections, resumable generation sessions, chat infrastructure) and a
+thorough structural DRY refactoring pass (items 34-60).
 
 ## Completed Work Items
 
@@ -85,8 +86,8 @@ projections, resumable generation sessions, chat infrastructure).
 
 ## Test Coverage
 
-- **192 tests** pass with `--features link-system` (1 ignored: upstream suite)
-- **0 clippy warnings** (2 expected `too_many_arguments` in llama-rs, not errors)
+- **222 tests** pass with `--features link-system` (7 ignored: benchmark + upstream suite)
+- **0 new clippy warnings** (pre-existing: 2 `too_many_arguments` in llama-rs, 1 in ggml-rs tests)
 - **0 fmt issues**
 - Key test categories:
   - 18 type system tests
@@ -102,6 +103,7 @@ projections, resumable generation sessions, chat infrastructure).
   - 20+ tokenizer/chat unit tests
   - 15 view/reshape wrapper tests (ggml-rs)
   - 1 graph projection parity test (host vs graph)
+  - 7 bench graph tests (attention, linear attention, MLP, LM head, conv/QKV)
 
 ## Known Limitations
 
@@ -116,12 +118,11 @@ projections, resumable generation sessions, chat infrastructure).
 - [x] `cargo fmt --all`
 - [x] `cargo clippy --workspace --all-targets`
 - [x] `cargo test --workspace`
-- [x] `cargo test --workspace --features link-system` (192 pass, 1 ignored)
+- [x] `cargo test --workspace --features link-system` (222 pass, 7 ignored)
 - [x] Zero TODOs/FIXMEs in codebase
 - [x] All docs updated and consistent
 - [x] Module doc comments on all e2e submodules
-- [x] INTRODUCTION.md items 1-8 all marked DONE
+- [x] INTRODUCTION.md items 1-8 all marked DONE, items 34-60 documented
 - [x] CPU runtime smoke test: avg=0.252 ms (no regression from 0.256 ms baseline)
 - [x] Metal runtime smoke test: avg=0.595 ms, checksum matches CPU
 - [x] Self code review: no issues found (5 areas verified)
-- [x] PR #1 created: https://github.com/Sanzentyo/ggml-rs/pull/1
