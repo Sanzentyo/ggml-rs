@@ -22,7 +22,8 @@ And you should write rusty code(ADT, enum, type state pattern)
 6. ~~Autoregressive decode state management (prefill/decode split).~~ **DONE** — KV cache for full attention, conv buffer + SSM states for linear attention, decode equivalence tests pass.
 7. ~~Two-phase generation loop (prefill + incremental decode).~~ **DONE** — generation.rs branches on layer types: all-Qwen3.5 → two-phase (prefill all prompt tokens, then decode one-at-a-time), otherwise → full-reprocess fallback.
 8. ~~Backend example enhancement (review_3 item 11) + README (item 12).~~ **DONE** — `backend_ops.rs` example, fixed stale README snippets, multi-op + Metal parity tests added.
-9. Merge back to `master` only after validation and runtime checks pass. **READY** — PR #2 created, Copilot review 6/6 comments addressed (commit `97faee0`). See `docs/llama-rs/worklog/2026-04-14-merge-prep.md`.
+9. Merge back to `master` only after validation and runtime checks pass. **DONE** — PR #2 merged (73 commits). Copilot review 6/6 comments addressed (commit `97faee0`). See `docs/llama-rs/worklog/2026-04-14-merge-prep.md`.
+10. ~~Comprehensive coverage comparison table.~~ **DONE** — 3-bucket taxonomy (Native Rust / Upstream Harness / Missing). 231 total tests, 43 examples, 8 benchmark programs. See `docs/ggml-rs/COVERAGE_TABLE.md`.
 
 ## Completed refactor items
 

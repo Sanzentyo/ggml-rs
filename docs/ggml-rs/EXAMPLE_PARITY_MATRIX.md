@@ -26,8 +26,6 @@ Status legend:
 | `mnist-train` | `examples/models/mnist_train.rs` | Done (synthetic) | PASS | `~56.55x` | MNIST model/dataset missing |
 | `sam` | `examples/models/sam.rs` | Done (synthetic) | PASS | `~16.70x` | SAM model missing (example image present) |
 | `yolov3-tiny` | `examples/models/yolov3_tiny.rs` | Done (synthetic) | PASS | `~36.21x` | YOLO model/input/labels missing |
-| `backend-ops` | `examples/backends/backend_ops.rs` | Done (direct) | checksum delta `0.0` (CPU/Metal) | N/A | none |
-
 ## Additional examples (no upstream counterpart)
 
 | Example | Purpose |
@@ -36,6 +34,9 @@ Status legend:
 | `examples/basics/arithmetic_expr.rs` | Expression-style arithmetic API demo |
 | `examples/benchmarks/bench_matmul.rs` | Context-path matmul benchmarking |
 | `examples/benchmarks/bench_upstream_suite.rs` | Upstream benchmark suite runner |
+
+See also: [`COVERAGE_TABLE.md`](./COVERAGE_TABLE.md) for comprehensive 3-bucket
+coverage comparison (Native Rust / Upstream Harness / Missing).
 
 ## Artifacts
 
