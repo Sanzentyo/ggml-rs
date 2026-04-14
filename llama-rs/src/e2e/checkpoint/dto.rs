@@ -168,6 +168,17 @@ impl ModelFingerprint {
                 });
             }
         }
+        // Guard against malformed fingerprints where layer_count and
+        // layer_types.len() diverge — zip alone would silently skip extras.
+        if self.layer_types.len() != other.layer_types.len() {
+            return Err(E2eError::CheckpointModelMismatch {
+                reason: format!(
+                    "layer_types length mismatch: checkpoint has {}, model has {}",
+                    self.layer_types.len(),
+                    other.layer_types.len()
+                ),
+            });
+        }
         Ok(())
     }
 }
@@ -438,6 +449,19 @@ mod tests {
         b.layer_types[0] = LayerTypeTag::None;
         let err = a.validate_against(&b).unwrap_err().to_string();
         assert!(err.contains("type mismatch"), "got: {err}");
+    }
+
+    #[test]
+    fn fingerprint_validate_against_rejects_layer_types_length_mismatch() {
+        let a = sample_fingerprint();
+        let mut b = sample_fingerprint();
+        // Same layer_count but extra layer_type entry — malformed fingerprint
+        b.layer_types.push(LayerTypeTag::None);
+        let err = a.validate_against(&b).unwrap_err().to_string();
+        assert!(
+            err.contains("layer_types length"),
+            "should catch length divergence: {err}"
+        );
     }
 
     fn sample_checkpoint_v1() -> CheckpointV1 {

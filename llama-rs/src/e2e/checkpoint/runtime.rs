@@ -47,6 +47,62 @@ impl From<&LayerAttentionState> for LayerStateDto {
 // Conversion: DTO → runtime state
 // ---------------------------------------------------------------------------
 
+/// Validated KV cache pair restored from checkpoint data.
+struct RestoredKvCache {
+    k_cache: Vec<f32>,
+    v_cache: Vec<f32>,
+    cached_len: usize,
+    kv_features: usize,
+}
+
+/// Validate and re-allocate a KV cache pair from checkpoint data.
+///
+/// Checks `kv_features > 0`, `cached_len ≤ total_sequence_length`, and that
+/// the serialised data lengths match `cached_len * kv_features`. Returns
+/// full-size zero-initialised caches with the serialised portion copied in.
+fn restore_kv_cache(
+    k_data: Vec<f32>,
+    v_data: Vec<f32>,
+    cached_len: usize,
+    kv_features: usize,
+    total_sequence_length: usize,
+    label: &str,
+) -> Result<RestoredKvCache, E2eError> {
+    if kv_features == 0 {
+        return Err(E2eError::CheckpointDeserialize(format!(
+            "{label} kv_features must be > 0"
+        )));
+    }
+    if cached_len > total_sequence_length {
+        return Err(E2eError::CheckpointDeserialize(format!(
+            "{label} cached_len ({cached_len}) exceeds total_sequence_length ({total_sequence_length})"
+        )));
+    }
+    let cache_size = total_sequence_length
+        .checked_mul(kv_features)
+        .ok_or(E2eError::MemorySizeOverflow)?;
+    let data_len = cached_len
+        .checked_mul(kv_features)
+        .ok_or(E2eError::MemorySizeOverflow)?;
+    if k_data.len() != data_len || v_data.len() != data_len {
+        return Err(E2eError::CheckpointDeserialize(format!(
+            "{label} KV data length mismatch: expected {data_len}, got k={} v={}",
+            k_data.len(),
+            v_data.len()
+        )));
+    }
+    let mut k_cache = vec![0.0f32; cache_size];
+    let mut v_cache = vec![0.0f32; cache_size];
+    k_cache[..data_len].copy_from_slice(&k_data);
+    v_cache[..data_len].copy_from_slice(&v_data);
+    Ok(RestoredKvCache {
+        k_cache,
+        v_cache,
+        cached_len,
+        kv_features,
+    })
+}
+
 impl LayerStateDto {
     /// Convert DTO back into runtime state, re-allocating full-size caches.
     pub(in crate::e2e) fn into_runtime_state(
@@ -55,74 +111,46 @@ impl LayerStateDto {
     ) -> Result<LayerAttentionState, E2eError> {
         match self {
             LayerStateDto::Standard {
-                k_cache: k_data,
-                v_cache: v_data,
+                k_cache,
+                v_cache,
                 cached_len,
                 kv_features,
             } => {
-                if kv_features == 0 {
-                    return Err(E2eError::CheckpointDeserialize(
-                        "standard kv_features must be > 0".into(),
-                    ));
-                }
-                let cache_size = total_sequence_length
-                    .checked_mul(kv_features)
-                    .ok_or(E2eError::MemorySizeOverflow)?;
-                let data_len = cached_len
-                    .checked_mul(kv_features)
-                    .ok_or(E2eError::MemorySizeOverflow)?;
-                if k_data.len() != data_len || v_data.len() != data_len {
-                    return Err(E2eError::CheckpointDeserialize(format!(
-                        "standard KV data length mismatch: expected {data_len}, got k={} v={}",
-                        k_data.len(),
-                        v_data.len()
-                    )));
-                }
-                let mut k_cache = vec![0.0; cache_size];
-                let mut v_cache = vec![0.0; cache_size];
-                k_cache[..data_len].copy_from_slice(&k_data);
-                v_cache[..data_len].copy_from_slice(&v_data);
-                Ok(LayerAttentionState::Standard(StandardAttentionState {
+                let kv = restore_kv_cache(
                     k_cache,
                     v_cache,
                     cached_len,
                     kv_features,
+                    total_sequence_length,
+                    "standard",
+                )?;
+                Ok(LayerAttentionState::Standard(StandardAttentionState {
+                    k_cache: kv.k_cache,
+                    v_cache: kv.v_cache,
+                    cached_len: kv.cached_len,
+                    kv_features: kv.kv_features,
                 }))
             }
             LayerStateDto::Qwen35Full {
-                k_cache: k_data,
-                v_cache: v_data,
+                k_cache,
+                v_cache,
                 cached_len,
                 kv_features,
             } => {
-                if kv_features == 0 {
-                    return Err(E2eError::CheckpointDeserialize(
-                        "kv_features must be > 0".into(),
-                    ));
-                }
-                let cache_size = total_sequence_length
-                    .checked_mul(kv_features)
-                    .ok_or(E2eError::MemorySizeOverflow)?;
-                let data_len = cached_len
-                    .checked_mul(kv_features)
-                    .ok_or(E2eError::MemorySizeOverflow)?;
-                if k_data.len() != data_len || v_data.len() != data_len {
-                    return Err(E2eError::CheckpointDeserialize(format!(
-                        "KV cache data length mismatch: expected {data_len}, got k={} v={}",
-                        k_data.len(),
-                        v_data.len()
-                    )));
-                }
-                let mut k_cache = vec![0.0f32; cache_size];
-                let mut v_cache = vec![0.0f32; cache_size];
-                k_cache[..data_len].copy_from_slice(&k_data);
-                v_cache[..data_len].copy_from_slice(&v_data);
+                let kv = restore_kv_cache(
+                    k_cache,
+                    v_cache,
+                    cached_len,
+                    kv_features,
+                    total_sequence_length,
+                    "qwen35_full",
+                )?;
                 Ok(LayerAttentionState::Qwen35Full(
                     super::super::state::Qwen35FullAttentionState {
-                        k_cache,
-                        v_cache,
-                        cached_len,
-                        kv_features,
+                        k_cache: kv.k_cache,
+                        v_cache: kv.v_cache,
+                        cached_len: kv.cached_len,
+                        kv_features: kv.kv_features,
                         gpu_scoring_failed: false,
                     },
                 ))
@@ -394,5 +422,38 @@ mod tests {
             }
             _ => panic!("expected Qwen35Linear"),
         }
+    }
+
+    #[test]
+    fn restore_rejects_cached_len_exceeding_sequence_length() {
+        // cached_len=5 but total_sequence_length=4 → must fail
+        let dto = LayerStateDto::Standard {
+            k_cache: vec![1.0; 40],
+            v_cache: vec![2.0; 40],
+            cached_len: 5,
+            kv_features: 8,
+        };
+        let err = dto.into_runtime_state(4).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("cached_len"),
+            "error should mention cached_len: {msg}"
+        );
+    }
+
+    #[test]
+    fn restore_rejects_cached_len_exceeding_sequence_length_qwen35() {
+        let dto = LayerStateDto::Qwen35Full {
+            k_cache: vec![1.0; 24],
+            v_cache: vec![2.0; 24],
+            cached_len: 3,
+            kv_features: 8,
+        };
+        let err = dto.into_runtime_state(2).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("cached_len"),
+            "error should mention cached_len: {msg}"
+        );
     }
 }
