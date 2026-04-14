@@ -2,7 +2,7 @@
 
 use super::shared::{
     FlashAttentionConfig, RopeParams, apply_neox_rope_in_place, apply_optional_per_head_norm,
-    host_attention_scoring, run_flash_attention_pipeline,
+    host_attention_scoring, run_flash_attention_pipeline, validate_gqa_heads,
 };
 use crate::e2e::error::{E2eError, GgmlResultExt};
 use crate::e2e::numeric::checked_mul;
@@ -93,12 +93,7 @@ fn standard_attention_graph(
     let qf = checked_mul(h, d)?;
     let kvf = checked_mul(hkv, d)?;
 
-    if h == 0 || hkv == 0 || !h.is_multiple_of(hkv) {
-        return Err(E2eError::BufferLengthMismatch {
-            expected: h,
-            actual: hkv,
-        });
-    }
+    validate_gqa_heads(h, hkv)?;
 
     let expected_input = checked_mul(hidden, t)?;
     if input.len() != expected_input {
@@ -353,12 +348,7 @@ pub(in crate::e2e) fn standard_attention_decode_step(
     let qf = checked_mul(h, d)?;
     let kvf = checked_mul(hkv, d)?;
 
-    if h == 0 || hkv == 0 || !h.is_multiple_of(hkv) {
-        return Err(E2eError::BufferLengthMismatch {
-            expected: h,
-            actual: hkv,
-        });
-    }
+    validate_gqa_heads(h, hkv)?;
 
     if input.len() != hidden {
         return Err(E2eError::BufferLengthMismatch {

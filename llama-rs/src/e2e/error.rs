@@ -92,6 +92,13 @@ pub enum E2eError {
     },
     #[error("buffer length mismatch: expected {expected}, got {actual}")]
     BufferLengthMismatch { expected: usize, actual: usize },
+    #[error(
+        "invalid GQA head configuration: head_count={head_count}, kv_head_count={kv_head_count} (must be positive and head_count must be a multiple of kv_head_count)"
+    )]
+    InvalidGqaHeadConfig {
+        head_count: usize,
+        kv_head_count: usize,
+    },
     #[error("memory size overflow while building generation graph")]
     MemorySizeOverflow,
     #[error(

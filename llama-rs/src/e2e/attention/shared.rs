@@ -7,6 +7,25 @@ use crate::e2e::state::{Qwen35FullAttentionState, StandardAttentionState};
 use ggml_rs::{Context, DynTensor, Tensor};
 
 // ---------------------------------------------------------------------------
+// GQA head validation
+// ---------------------------------------------------------------------------
+
+/// Validate that a GQA head configuration is valid: both counts must be
+/// positive and `head_count` must be a multiple of `kv_head_count`.
+pub(in crate::e2e) fn validate_gqa_heads(
+    head_count: usize,
+    kv_head_count: usize,
+) -> Result<(), E2eError> {
+    if head_count == 0 || kv_head_count == 0 || !head_count.is_multiple_of(kv_head_count) {
+        return Err(E2eError::InvalidGqaHeadConfig {
+            head_count,
+            kv_head_count,
+        });
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // KV cache read-only access (for host-side attention scoring)
 // ---------------------------------------------------------------------------
 

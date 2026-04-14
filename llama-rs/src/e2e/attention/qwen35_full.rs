@@ -6,7 +6,7 @@ use super::persistent::{
 use super::projection::{FullAttentionDims, PreparedAttention, project_and_prepare_qkv};
 use super::shared::{
     FlashAttentionConfig, RopeParams, apply_neox_rope_in_place, apply_optional_per_head_norm,
-    host_attention_scoring, run_flash_attention_pipeline,
+    host_attention_scoring, run_flash_attention_pipeline, validate_gqa_heads,
 };
 use crate::e2e::error::{E2eError, GgmlResultExt};
 use crate::e2e::numeric::{checked_mul, sigmoid_scalar};
@@ -456,13 +456,7 @@ pub(in crate::e2e) fn full_attention_decode_core(
         query_features,
     } = prepared;
 
-    if attention.kv_head_count == 0 || !attention.head_count.is_multiple_of(attention.kv_head_count)
-    {
-        return Err(E2eError::BufferLengthMismatch {
-            expected: attention.head_count,
-            actual: attention.kv_head_count,
-        });
-    }
+    validate_gqa_heads(attention.head_count, attention.kv_head_count)?;
 
     let hd = attention.head_dimension;
 

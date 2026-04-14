@@ -1,5 +1,6 @@
 //! QKV projection, deinterleaving, and preparation for full attention.
 
+use super::shared::validate_gqa_heads;
 use crate::e2e::error::{E2eError, GgmlResultExt};
 use crate::e2e::numeric::checked_mul;
 use crate::e2e::plan::Qwen35FullAttentionLayerPlan;
@@ -72,12 +73,7 @@ impl FullAttentionDims {
                 actual: 0,
             })?;
 
-        if !h.is_multiple_of(hkv) {
-            return Err(E2eError::BufferLengthMismatch {
-                expected: 0,
-                actual: h % hkv,
-            });
-        }
+        validate_gqa_heads(h, hkv)?;
 
         let qf = h * d;
         let qf2 = qf * 2;
