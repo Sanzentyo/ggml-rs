@@ -447,6 +447,19 @@ And you should write rusty code(ADT, enum, type state pattern)
   boilerplate while preserving per-weight error labels.
   See comparison doc item 50.
 
+- **Tail-only `qkv_pre_conv` readback** (item 51):
+  `project_and_conv_fused_graph` previously read back the FULL pre-conv QKV tensor
+  from GPU. Now reads only the last `kernel_size - 1` rows via `read_data_backend_at`
+  (~680x reduction for 2048-token prompts). When no decode state is needed, skips
+  the readback entirely.
+  See comparison doc item 51.
+
+- **Direct SSM recurrence into persistent state** (item 52):
+  `qwen35_linear_attention_core` now writes SSM recurrence directly into
+  `state.ssm_states` instead of allocating a temporary buffer + memcpy.
+  Removed dead `capture_ssm_states` method. Added `debug_assert_eq` for size invariant.
+  See comparison doc item 52.
+
 ## Validation checkpoints completed on this branch
 
 - `cargo fmt --all`

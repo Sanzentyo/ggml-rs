@@ -3220,3 +3220,63 @@ or `write_data_backend_at` (offset-based KV cache writes) remain manual since
 | `llama-rs/src/e2e/attention.rs` | 4 upload sites (23 calls) converted to `upload_weight` |
 | `llama-rs/src/e2e/linear_attention.rs` | 3 upload sites (15 calls) converted to `upload_weight` |
 | `llama-rs/src/e2e/mlp.rs` | 2 upload sites (10 calls) converted to `upload_weight` |
+
+---
+
+## Item 51 — Tail-Only `qkv_pre_conv` Readback
+
+### 51.1 Motivation
+
+`project_and_conv_fused_graph` always read back the FULL `qkv_pre_conv` tensor
+(seq_len x conv_channels) from the GPU, but `capture_conv_buffer` only needs the
+last `kernel_size - 1` rows (typically 3). For a 2048-token prompt with
+conv_channels=1024, this was reading ~8 MB when only ~12 KB was needed (~680x).
+
+When no decode state was needed, the readback was entirely unnecessary.
+
+### 51.2 Implementation
+
+- Added `conv_tail_rows: usize` parameter to `project_and_conv_fused_graph`
+- When `conv_tail_rows > 0`: keep `build_forward_expand(&qkv_out)` to preserve
+  memory, use `read_data_backend_at(offset, len)` to read only the tail
+- When `conv_tail_rows == 0`: skip `build_forward_expand(&qkv_out)` -- allocator
+  can reuse the buffer, no host<-device transfer
+- Changed `FusedLinearOutputs.qkv_pre_conv` to `Option<Vec<f32>>` (renamed to
+  `qkv_pre_conv_tail`)
+- Caller computes `conv_tail_rows` from state presence + kernel_size
+- Edge case: `kernel_size==1` with state -> `conv_tail_rows==0`, reset `conv_valid=0`
+
+Rubber-duck recommended `read_data_backend_at` over `view_2d` to avoid
+view/backend interaction ambiguity.
+
+### 51.3 Files Modified
+
+| File | Changes |
+|------|---------|
+| `llama-rs/src/e2e/linear_attention.rs` | `FusedLinearOutputs.qkv_pre_conv_tail: Option<Vec<f32>>`, added `conv_tail_rows` param, conditional `build_forward_expand`, tail-only `read_data_backend_at`, updated caller |
+
+---
+
+## Item 52 — Direct SSM Recurrence into Persistent State
+
+### 52.1 Motivation
+
+`qwen35_linear_attention_core` allocated a fresh `states = vec![0.0; states_len]`,
+ran the SSM recurrence into it, then copied the entire buffer into
+`state.ssm_states` via `capture_ssm_states`. The allocation + memcpy was
+unnecessary when the persistent state buffer was already the right size.
+
+### 52.2 Implementation
+
+- When `state.is_some()`: use `&mut state.ssm_states[..states_len]` directly as
+  the recurrence target, with `fill(0.0)` for reset
+- When `state.is_none()`: allocate fresh temporary buffer as before
+- Added `debug_assert_eq!` for SSM state size invariant
+- Removed now-dead `capture_ssm_states` method from `LinearAttentionState`
+
+### 52.3 Files Modified
+
+| File | Changes |
+|------|---------|
+| `llama-rs/src/e2e/linear_attention.rs` | Direct-write SSM state, removed `capture_ssm_states` call |
+| `llama-rs/src/e2e/state.rs` | Removed dead `capture_ssm_states` method |
