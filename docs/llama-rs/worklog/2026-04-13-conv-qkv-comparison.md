@@ -3481,3 +3481,51 @@ Applied loop-shape cleanup per rubber-duck recommendation (no new data structure
 |------|---------|
 | llama-rs/src/e2e/linear_attention.rs | Hoisted constants, chunks_exact_mut, token_rank_base in both production and bench paths |
 
+
+---
+
+## Item 56 — Generic Batch Projection Helper (build_batch_projections)
+
+### 56.1 Motivation
+
+Explore agent identified ~100 lines of duplication across 11 projection graph
+building sites. The core pattern repeated 3-4 times per site:
+  new_tensor_2d(hidden, out_features) + map_err
+  mul_mat(w, x_in) + map_err
+
+Rubber-duck recommended: named ProjectionSpec struct (not tuple), accept existing
+input tensor (not auto-create), do NOT build/expand graph (caller manages topology),
+return Vec then convert to array at call sites for arity checking.
+
+### 56.2 Implementation
+
+Added to tensor_ops.rs:
+- ProjectionSpec struct: weight_label, matmul_label, out_features
+- BuiltProjection struct: w (weight tensor), y (output tensor)
+- build_batch_projections(): accepts ctx + existing x_in + input_features + specs,
+  returns Vec of BuiltProjection. Does NOT create graph or expand outputs.
+
+Refactored 3 sites to use the helper:
+1. build_persistent_full_attention_graphs — 3 projections (Q/K/V)
+2. build_persistent_linear_attention_graphs — 4 projections (QKV/Z/alpha/beta)
+3. project_qkv_graph in attention.rs — 3 projections (Q/K/V), one-shot
+
+Left project_and_conv_fused_graph specialized per rubber-duck advice
+(pre-normed input, conditional qkv_out expansion).
+
+### 56.3 Design Decisions
+
+- Vec -> array at call sites: projs.try_into().ok().expect("...")
+  gives arity checking without const generics.
+- Separate weight_label / matmul_label preserves diagnostic quality
+  (different error context for tensor creation vs matmul).
+- Helper is a graph-topology builder, not an end-to-end function —
+  consistent with existing build_output_projection_graph pattern.
+
+### 56.4 Files Modified
+
+| File | Changes |
+|------|---------|
+| llama-rs/src/e2e/tensor_ops.rs | Added ProjectionSpec, BuiltProjection, build_batch_projections; refactored persistent graph builders |
+| llama-rs/src/e2e/attention.rs | Refactored project_qkv_graph to use build_batch_projections |
+

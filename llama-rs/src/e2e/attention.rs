@@ -8,8 +8,8 @@ use super::numeric::{checked_mul, dot, sigmoid_scalar, softmax_prefix};
 use super::plan::Qwen35FullAttentionLayerPlan;
 use super::state::Qwen35FullAttentionState;
 use super::tensor_ops::{
-    PROJECTION_SLACK_BYTES, per_head_rms_norm, project_sequence, project_sequence_graph,
-    upload_weight,
+    BuiltProjection, PROJECTION_SLACK_BYTES, ProjectionSpec, build_batch_projections,
+    per_head_rms_norm, project_sequence, project_sequence_graph, upload_weight,
 };
 use ggml_rs::{Backend, BackendBuffer, Bytes, Context, GraphAllocator, Shape2D, Shape4D, Tensor};
 
@@ -533,58 +533,66 @@ fn project_qkv_graph(
     let ctx = Context::new_no_alloc_bytes(ctx_size)
         .map_err(|source| E2eError::ggml("Context::new_no_alloc_bytes(QKV)", source))?;
 
-    let w_q = ctx
-        .new_tensor_2d::<f32>(Shape2D::new(hidden_features, query_features_x2))
-        .map_err(|source| E2eError::ggml("new_tensor_2d<W_Q>", source))?;
-    let w_k = ctx
-        .new_tensor_2d::<f32>(Shape2D::new(hidden_features, kv_features))
-        .map_err(|source| E2eError::ggml("new_tensor_2d<W_K>", source))?;
-    let w_v = ctx
-        .new_tensor_2d::<f32>(Shape2D::new(hidden_features, kv_features))
-        .map_err(|source| E2eError::ggml("new_tensor_2d<W_V>", source))?;
     let x = ctx
         .new_tensor_2d::<f32>(Shape2D::new(hidden_features, sequence_length))
         .map_err(|source| E2eError::ggml("new_tensor_2d<X>", source))?;
 
-    let q_out = ctx
-        .mul_mat(&w_q, &x)
-        .map_err(|source| E2eError::ggml("mul_mat(Q)", source))?;
-    let k_out = ctx
-        .mul_mat(&w_k, &x)
-        .map_err(|source| E2eError::ggml("mul_mat(K)", source))?;
-    let v_out = ctx
-        .mul_mat(&w_v, &x)
-        .map_err(|source| E2eError::ggml("mul_mat(V)", source))?;
+    let projs = build_batch_projections(
+        &ctx,
+        &x,
+        hidden_features,
+        &[
+            ProjectionSpec {
+                weight_label: "new_tensor_2d<W_Q>",
+                matmul_label: "mul_mat(Q)",
+                out_features: query_features_x2,
+            },
+            ProjectionSpec {
+                weight_label: "new_tensor_2d<W_K>",
+                matmul_label: "mul_mat(K)",
+                out_features: kv_features,
+            },
+            ProjectionSpec {
+                weight_label: "new_tensor_2d<W_V>",
+                matmul_label: "mul_mat(V)",
+                out_features: kv_features,
+            },
+        ],
+    )?;
+    let [q, k, v]: [BuiltProjection<'_>; 3] = projs
+        .try_into()
+        .ok()
+        .expect("internal spec mismatch: expected 3 projections");
 
     let mut graph = ctx
         .new_graph()
         .map_err(|source| E2eError::ggml("new_graph(QKV)", source))?;
-    graph.build_forward_expand(&q_out);
-    graph.build_forward_expand(&k_out);
-    graph.build_forward_expand(&v_out);
+    graph.build_forward_expand(&q.y);
+    graph.build_forward_expand(&k.y);
+    graph.build_forward_expand(&v.y);
 
     let _buffer = ctx
         .allocate_tensors(backend)
         .map_err(|source| E2eError::ggml("allocate_tensors(QKV)", source))?;
 
-    upload_weight(&w_q, &attention.q_weight_values, "write<W_Q>")?;
-    upload_weight(&w_k, &attention.k_weight_values, "write<W_K>")?;
-    upload_weight(&w_v, &attention.v_weight_values, "write<W_V>")?;
+    upload_weight(&q.w, &attention.q_weight_values, "write<W_Q>")?;
+    upload_weight(&k.w, &attention.k_weight_values, "write<W_K>")?;
+    upload_weight(&v.w, &attention.v_weight_values, "write<W_V>")?;
     upload_weight(&x, input, "write<X>")?;
 
     backend
         .compute(&mut graph)
         .map_err(|source| E2eError::ggml("compute(QKV)", source))?;
 
-    let q_full = q_out
-        .read_data_backend()
-        .map_err(|source| E2eError::ggml("read_data_backend<Q>", source))?;
-    let k_proj = k_out
-        .read_data_backend()
-        .map_err(|source| E2eError::ggml("read_data_backend<K>", source))?;
-    let v_proj = v_out
-        .read_data_backend()
-        .map_err(|source| E2eError::ggml("read_data_backend<V>", source))?;
+    let q_full =
+        q.y.read_data_backend()
+            .map_err(|source| E2eError::ggml("read_data_backend<Q>", source))?;
+    let k_proj =
+        k.y.read_data_backend()
+            .map_err(|source| E2eError::ggml("read_data_backend<K>", source))?;
+    let v_proj =
+        v.y.read_data_backend()
+            .map_err(|source| E2eError::ggml("read_data_backend<V>", source))?;
     Ok(QkvProjections {
         q_full,
         k_proj,

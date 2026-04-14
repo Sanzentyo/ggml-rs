@@ -479,6 +479,13 @@ And you should write rusty code(ADT, enum, type state pattern)
   Hoisted `token_rank_base`. Result: ~6% SSM recurrence improvement across all
   backends (4.794→4.491ms Metal seq=256). See comparison doc item 55.
 
+- **Batch projection helper** (item 56):
+  Added `ProjectionSpec` / `BuiltProjection` / `build_batch_projections()` to
+  `tensor_ops.rs`. Refactored 3 sites (persistent full attention, persistent
+  linear attention, one-shot QKV) to use the shared helper. Eliminates ~50
+  lines of repeated `new_tensor_2d` + `mul_mat` boilerplate. Named struct
+  preserves diagnostic labels. See comparison doc item 56.
+
 ## Validation checkpoints completed on this branch
 
 - `cargo fmt --all`

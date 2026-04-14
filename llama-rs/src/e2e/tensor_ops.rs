@@ -624,6 +624,52 @@ pub(super) fn upload_weight(
         .map_err(|source| E2eError::ggml(label, source))
 }
 
+// ---------------------------------------------------------------------------
+// Batch projection builder: shared input → N parallel matmuls
+// ---------------------------------------------------------------------------
+
+/// Specification for a single projection in a batch.
+pub(super) struct ProjectionSpec {
+    /// Error label for the weight tensor creation (`new_tensor_2d`).
+    pub weight_label: &'static str,
+    /// Error label for the matmul operation.
+    pub matmul_label: &'static str,
+    /// Output dimension of this projection (columns of the weight matrix).
+    pub out_features: usize,
+}
+
+/// A projection built by [`build_batch_projections`]: weight tensor + output.
+pub(super) struct BuiltProjection<'ctx> {
+    /// Weight tensor `[input_features, out_features]` — upload once.
+    pub w: Tensor<'ctx, f32>,
+    /// Matmul output `[out_features, sequence_length]` — read after compute.
+    pub y: Tensor<'ctx, f32>,
+}
+
+/// Build N parallel `mul_mat` projections from a shared input tensor.
+///
+/// Creates one weight tensor + one `mul_mat` output per spec. Does **not**
+/// create a graph or call `build_forward_expand` — the caller manages graph
+/// topology (some callers conditionally expand only a subset of outputs).
+pub(super) fn build_batch_projections<'ctx>(
+    ctx: &'ctx Context,
+    x_in: &Tensor<'ctx, f32>,
+    input_features: usize,
+    specs: &[ProjectionSpec],
+) -> Result<Vec<BuiltProjection<'ctx>>, E2eError> {
+    let mut projs = Vec::with_capacity(specs.len());
+    for spec in specs {
+        let w = ctx
+            .new_tensor_2d::<f32>(Shape2D::new(input_features, spec.out_features))
+            .map_err(|source| E2eError::ggml(spec.weight_label, source))?;
+        let y = ctx
+            .mul_mat(&w, x_in)
+            .map_err(|source| E2eError::ggml(spec.matmul_label, source))?;
+        projs.push(BuiltProjection { w, y });
+    }
+    Ok(projs)
+}
+
 /// Estimate ggml context metadata bytes for a full attention persistent
 /// projection (both input and output graphs in a single context).
 pub(super) fn recommended_persistent_full_attention_memory(
@@ -754,36 +800,43 @@ pub(super) fn build_persistent_full_attention_graphs<'ctx>(
     kv_features: usize,
     query_features: usize,
 ) -> Result<FullAttentionGraphParts<'ctx>, E2eError> {
-    // Input projection tensors
-    let w_q = ctx
-        .new_tensor_2d::<f32>(Shape2D::new(hidden_features, query_features_x2))
-        .map_err(|source| E2eError::ggml("new_tensor_2d<W_Q>(pfa)", source))?;
-    let w_k = ctx
-        .new_tensor_2d::<f32>(Shape2D::new(hidden_features, kv_features))
-        .map_err(|source| E2eError::ggml("new_tensor_2d<W_K>(pfa)", source))?;
-    let w_v = ctx
-        .new_tensor_2d::<f32>(Shape2D::new(hidden_features, kv_features))
-        .map_err(|source| E2eError::ggml("new_tensor_2d<W_V>(pfa)", source))?;
     let x_in = ctx
         .new_tensor_2d::<f32>(Shape2D::new(hidden_features, 1))
         .map_err(|source| E2eError::ggml("new_tensor_2d<X_IN>(pfa)", source))?;
 
-    let q_out = ctx
-        .mul_mat(&w_q, &x_in)
-        .map_err(|source| E2eError::ggml("mul_mat<Q>(pfa)", source))?;
-    let k_out = ctx
-        .mul_mat(&w_k, &x_in)
-        .map_err(|source| E2eError::ggml("mul_mat<K>(pfa)", source))?;
-    let v_out = ctx
-        .mul_mat(&w_v, &x_in)
-        .map_err(|source| E2eError::ggml("mul_mat<V>(pfa)", source))?;
+    let projs = build_batch_projections(
+        ctx,
+        &x_in,
+        hidden_features,
+        &[
+            ProjectionSpec {
+                weight_label: "new_tensor_2d<W_Q>(pfa)",
+                matmul_label: "mul_mat<Q>(pfa)",
+                out_features: query_features_x2,
+            },
+            ProjectionSpec {
+                weight_label: "new_tensor_2d<W_K>(pfa)",
+                matmul_label: "mul_mat<K>(pfa)",
+                out_features: kv_features,
+            },
+            ProjectionSpec {
+                weight_label: "new_tensor_2d<W_V>(pfa)",
+                matmul_label: "mul_mat<V>(pfa)",
+                out_features: kv_features,
+            },
+        ],
+    )?;
+    let [q, k, v]: [BuiltProjection<'_>; 3] = projs
+        .try_into()
+        .ok()
+        .expect("internal spec mismatch: expected 3 projections");
 
     let mut input_graph = ctx
         .new_graph()
         .map_err(|source| E2eError::ggml("new_graph(pfa_in)", source))?;
-    input_graph.build_forward_expand(&q_out);
-    input_graph.build_forward_expand(&k_out);
-    input_graph.build_forward_expand(&v_out);
+    input_graph.build_forward_expand(&q.y);
+    input_graph.build_forward_expand(&k.y);
+    input_graph.build_forward_expand(&v.y);
 
     // Output projection sub-graph
     let output =
@@ -791,12 +844,12 @@ pub(super) fn build_persistent_full_attention_graphs<'ctx>(
 
     Ok(FullAttentionGraphParts {
         x_in,
-        w_q,
-        w_k,
-        w_v,
-        q_out,
-        k_out,
-        v_out,
+        w_q: q.w,
+        w_k: k.w,
+        w_v: v.w,
+        q_out: q.y,
+        k_out: k.y,
+        v_out: v.y,
         input_graph,
         output,
     })
@@ -832,42 +885,49 @@ pub(super) fn build_persistent_linear_attention_graphs<'ctx>(
     inner_size: usize,
     time_step_rank: usize,
 ) -> Result<LinearAttentionGraphParts<'ctx>, E2eError> {
-    let w_qkv = ctx
-        .new_tensor_2d::<f32>(Shape2D::new(hidden_features, conv_channels))
-        .map_err(|source| E2eError::ggml("new_tensor_2d<W_QKV>(pla)", source))?;
-    let w_z = ctx
-        .new_tensor_2d::<f32>(Shape2D::new(hidden_features, inner_size))
-        .map_err(|source| E2eError::ggml("new_tensor_2d<W_Z>(pla)", source))?;
-    let w_alpha = ctx
-        .new_tensor_2d::<f32>(Shape2D::new(hidden_features, time_step_rank))
-        .map_err(|source| E2eError::ggml("new_tensor_2d<W_ALPHA>(pla)", source))?;
-    let w_beta = ctx
-        .new_tensor_2d::<f32>(Shape2D::new(hidden_features, time_step_rank))
-        .map_err(|source| E2eError::ggml("new_tensor_2d<W_BETA>(pla)", source))?;
     let x_in = ctx
         .new_tensor_2d::<f32>(Shape2D::new(hidden_features, 1))
         .map_err(|source| E2eError::ggml("new_tensor_2d<X_IN>(pla)", source))?;
 
-    let qkv_out = ctx
-        .mul_mat(&w_qkv, &x_in)
-        .map_err(|source| E2eError::ggml("mul_mat<QKV>(pla)", source))?;
-    let z_out = ctx
-        .mul_mat(&w_z, &x_in)
-        .map_err(|source| E2eError::ggml("mul_mat<Z>(pla)", source))?;
-    let alpha_out = ctx
-        .mul_mat(&w_alpha, &x_in)
-        .map_err(|source| E2eError::ggml("mul_mat<ALPHA>(pla)", source))?;
-    let beta_out = ctx
-        .mul_mat(&w_beta, &x_in)
-        .map_err(|source| E2eError::ggml("mul_mat<BETA>(pla)", source))?;
+    let projs = build_batch_projections(
+        ctx,
+        &x_in,
+        hidden_features,
+        &[
+            ProjectionSpec {
+                weight_label: "new_tensor_2d<W_QKV>(pla)",
+                matmul_label: "mul_mat<QKV>(pla)",
+                out_features: conv_channels,
+            },
+            ProjectionSpec {
+                weight_label: "new_tensor_2d<W_Z>(pla)",
+                matmul_label: "mul_mat<Z>(pla)",
+                out_features: inner_size,
+            },
+            ProjectionSpec {
+                weight_label: "new_tensor_2d<W_ALPHA>(pla)",
+                matmul_label: "mul_mat<ALPHA>(pla)",
+                out_features: time_step_rank,
+            },
+            ProjectionSpec {
+                weight_label: "new_tensor_2d<W_BETA>(pla)",
+                matmul_label: "mul_mat<BETA>(pla)",
+                out_features: time_step_rank,
+            },
+        ],
+    )?;
+    let [qkv, z, alpha, beta]: [BuiltProjection<'_>; 4] = projs
+        .try_into()
+        .ok()
+        .expect("internal spec mismatch: expected 4 projections");
 
     let mut input_graph = ctx
         .new_graph()
         .map_err(|source| E2eError::ggml("new_graph(pla_in)", source))?;
-    input_graph.build_forward_expand(&qkv_out);
-    input_graph.build_forward_expand(&z_out);
-    input_graph.build_forward_expand(&alpha_out);
-    input_graph.build_forward_expand(&beta_out);
+    input_graph.build_forward_expand(&qkv.y);
+    input_graph.build_forward_expand(&z.y);
+    input_graph.build_forward_expand(&alpha.y);
+    input_graph.build_forward_expand(&beta.y);
 
     // Output projection sub-graph
     let output =
@@ -875,14 +935,14 @@ pub(super) fn build_persistent_linear_attention_graphs<'ctx>(
 
     Ok(LinearAttentionGraphParts {
         x_in,
-        w_qkv,
-        w_z,
-        w_alpha,
-        w_beta,
-        qkv_out,
-        z_out,
-        alpha_out,
-        beta_out,
+        w_qkv: qkv.w,
+        w_z: z.w,
+        w_alpha: alpha.w,
+        w_beta: beta.w,
+        qkv_out: qkv.y,
+        z_out: z.y,
+        alpha_out: alpha.y,
+        beta_out: beta.y,
         input_graph,
         output,
     })
