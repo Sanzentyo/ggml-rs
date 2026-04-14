@@ -4148,3 +4148,29 @@ Public API entry points and core loop logic were interleaved, making the module 
 | llama-rs/src/e2e/generation.rs | Module root (~180 lines excl. tests, from 980) |
 | llama-rs/src/e2e/generation/api.rs | NEW: Public API (generate_from_path/model, EOS, tokenize) |
 | llama-rs/src/e2e/generation/loops.rs | NEW: Core loops (full_reprocess, two_phase) |
+
+
+## Item 72: Split linear_attention.rs root into decode + sequence + bench submodules
+
+**Commit:** `5f7bbee`
+
+### Motivation
+
+`linear_attention.rs` root was 912 lines despite already having 3 submodules (conv, projection, ssm).
+Decode core, full-sequence core, and bench instrumentation were all in the root, mixing concerns.
+
+### Changes
+
+| File | Description |
+|------|-------------|
+| llama-rs/src/e2e/linear_attention.rs | Module root (~450 lines incl. tests, from 912) |
+| llama-rs/src/e2e/linear_attention/decode.rs | NEW: decode core + decode_step wrapper |
+| llama-rs/src/e2e/linear_attention/sequence.rs | NEW: full-sequence SSM recurrence core |
+| llama-rs/src/e2e/linear_attention/bench.rs | NEW: phase timing instrumentation (test-only) |
+
+### Key decisions
+
+- Named `sequence.rs` (not `core.rs`) to avoid `core::` collision with Rust std core crate.
+- `bench.rs` gated with `#[cfg(test)]` at the `mod` declaration — only compiled during testing.
+- `decode.rs` items use `pub(in crate::e2e)` to support re-export from root without broadening visibility.
+- Root keeps thin wrappers (inference/prefill), utility functions, and all 7 tests.

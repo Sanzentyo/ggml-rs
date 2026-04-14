@@ -628,6 +628,16 @@ And you should write rusty code(ADT, enum, type state pattern)
   Submodule count: 2 → 4 (api, loops, resources, strategy).
   246 tests pass, zero clippy warnings.
 
+72. **Split `linear_attention.rs` root into decode + sequence + bench submodules** — DONE (commit `5f7bbee`)
+  Root was 912 lines with 3 existing submodules (conv, projection, ssm).
+  Extracted:
+  `linear_attention/decode.rs` (~140 lines): `linear_attention_decode_core` + `qwen35_linear_attention_decode_step`.
+  `linear_attention/sequence.rs` (~170 lines): `qwen35_linear_attention_core` (full-sequence SSM recurrence).
+  `linear_attention/bench.rs` (~160 lines, `#[cfg(test)]`): `LinearAttentionPhaseTimings` + `bench_linear_attention_phases`.
+  Root now ~450 lines (incl. tests): thin wrappers, utilities, re-exports, 7 tests.
+  Submodule count: 3 → 6 (bench, conv, decode, projection, sequence, ssm).
+  246 tests pass, zero clippy warnings.
+
 ## Validation checkpoints completed on this branch
 
 - `cargo fmt --all`
