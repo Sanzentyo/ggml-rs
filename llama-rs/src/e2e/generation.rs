@@ -379,6 +379,17 @@ fn try_build_persistent_projections(
     Some((contexts, projections))
 }
 
+/// Upload a weight buffer to a backend tensor with a descriptive error label.
+fn upload_weight(
+    tensor: &ggml_rs::Tensor<'_, f32>,
+    data: &[f32],
+    label: &'static str,
+) -> Result<(), E2eError> {
+    tensor
+        .write_data_backend(data)
+        .map_err(|source| E2eError::ggml(label, source))
+}
+
 fn build_one_persistent_full(
     attn: &Qwen35FullAttentionLayerPlan,
     backend: &Backend,
@@ -409,19 +420,10 @@ fn build_one_persistent_full(
         .allocate_tensors(backend)
         .map_err(|source| E2eError::ggml("allocate(pfa)", source))?;
 
-    // Upload weights once.
-    g.w_q
-        .write_data_backend(&attn.q_weight_values)
-        .map_err(|source| E2eError::ggml("write<W_Q>(pfa)", source))?;
-    g.w_k
-        .write_data_backend(&attn.k_weight_values)
-        .map_err(|source| E2eError::ggml("write<W_K>(pfa)", source))?;
-    g.w_v
-        .write_data_backend(&attn.v_weight_values)
-        .map_err(|source| E2eError::ggml("write<W_V>(pfa)", source))?;
-    g.w_out
-        .write_data_backend(&attn.output_weight_values)
-        .map_err(|source| E2eError::ggml("write<W_OUT>(pfa)", source))?;
+    upload_weight(&g.w_q, &attn.q_weight_values, "write<W_Q>(pfa)")?;
+    upload_weight(&g.w_k, &attn.k_weight_values, "write<W_K>(pfa)")?;
+    upload_weight(&g.w_v, &attn.v_weight_values, "write<W_V>(pfa)")?;
+    upload_weight(&g.w_out, &attn.output_weight_values, "write<W_OUT>(pfa)")?;
 
     // SAFETY: see the comment block in `try_build_persistent_projections`.
     let proj = unsafe {
@@ -472,21 +474,11 @@ fn build_one_persistent_linear(
         .allocate_tensors(backend)
         .map_err(|source| E2eError::ggml("allocate(pla)", source))?;
 
-    g.w_qkv
-        .write_data_backend(&attn.qkv_weight_values)
-        .map_err(|source| E2eError::ggml("write<W_QKV>(pla)", source))?;
-    g.w_z
-        .write_data_backend(&attn.gate_weight_values)
-        .map_err(|source| E2eError::ggml("write<W_Z>(pla)", source))?;
-    g.w_alpha
-        .write_data_backend(&attn.alpha_weight_values)
-        .map_err(|source| E2eError::ggml("write<W_ALPHA>(pla)", source))?;
-    g.w_beta
-        .write_data_backend(&attn.beta_weight_values)
-        .map_err(|source| E2eError::ggml("write<W_BETA>(pla)", source))?;
-    g.w_out
-        .write_data_backend(&attn.ssm_out_weight_values)
-        .map_err(|source| E2eError::ggml("write<W_OUT>(pla)", source))?;
+    upload_weight(&g.w_qkv, &attn.qkv_weight_values, "write<W_QKV>(pla)")?;
+    upload_weight(&g.w_z, &attn.gate_weight_values, "write<W_Z>(pla)")?;
+    upload_weight(&g.w_alpha, &attn.alpha_weight_values, "write<W_ALPHA>(pla)")?;
+    upload_weight(&g.w_beta, &attn.beta_weight_values, "write<W_BETA>(pla)")?;
+    upload_weight(&g.w_out, &attn.ssm_out_weight_values, "write<W_OUT>(pla)")?;
 
     let proj = unsafe {
         std::mem::transmute::<PersistentDecodeProjection<'_>, PersistentDecodeProjection<'static>>(

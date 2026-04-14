@@ -596,6 +596,27 @@ pub(super) enum PersistentDecodeProjection<'ctx> {
     },
 }
 
+/// Sum `recommended_backend_matmul_memory` for a batch of projections.
+///
+/// Each entry is `(weight_shape, input_shape, label)`.  The label is used
+/// in the error message if the memory query fails.  Returns the total plus
+/// `2 × PROJECTION_SLACK_BYTES` for ggml graph/tensor overhead.
+fn sum_matmul_memories(
+    projections: &[(Shape2D, Shape2D, &'static str)],
+) -> Result<Bytes, E2eError> {
+    let total = projections
+        .iter()
+        .try_fold(0usize, |acc, &(weight, input, label)| {
+            let mem = Context::recommended_backend_matmul_memory::<f32>(weight, input)
+                .map_err(|source| E2eError::ggml(label, source))?;
+            acc.checked_add(mem.get())
+                .ok_or(E2eError::MemorySizeOverflow)
+        })?
+        .checked_add(PROJECTION_SLACK_BYTES * 2)
+        .ok_or(E2eError::MemorySizeOverflow)?;
+    Ok(Bytes::new(total))
+}
+
 /// Estimate ggml context metadata bytes for a full attention persistent
 /// projection (both input and output graphs in a single context).
 pub(super) fn recommended_persistent_full_attention_memory(
@@ -604,36 +625,21 @@ pub(super) fn recommended_persistent_full_attention_memory(
     kv_features: usize,
     query_features: usize,
 ) -> Result<Bytes, E2eError> {
-    let input_shape = Shape2D::new(hidden_features, 1);
-    let q_mem = Context::recommended_backend_matmul_memory::<f32>(
-        Shape2D::new(hidden_features, query_features_x2),
-        input_shape,
-    )
-    .map_err(|source| E2eError::ggml("mem(pfa_q)", source))?;
-    let k_mem = Context::recommended_backend_matmul_memory::<f32>(
-        Shape2D::new(hidden_features, kv_features),
-        input_shape,
-    )
-    .map_err(|source| E2eError::ggml("mem(pfa_k)", source))?;
-    let v_mem = Context::recommended_backend_matmul_memory::<f32>(
-        Shape2D::new(hidden_features, kv_features),
-        input_shape,
-    )
-    .map_err(|source| E2eError::ggml("mem(pfa_v)", source))?;
-    let out_mem = Context::recommended_backend_matmul_memory::<f32>(
-        Shape2D::new(query_features, hidden_features),
-        Shape2D::new(query_features, 1),
-    )
-    .map_err(|source| E2eError::ggml("mem(pfa_out)", source))?;
-
-    let total = q_mem
-        .get()
-        .checked_add(k_mem.get())
-        .and_then(|v| v.checked_add(v_mem.get()))
-        .and_then(|v| v.checked_add(out_mem.get()))
-        .and_then(|v| v.checked_add(PROJECTION_SLACK_BYTES * 2))
-        .ok_or(E2eError::MemorySizeOverflow)?;
-    Ok(Bytes::new(total))
+    let h1 = Shape2D::new(hidden_features, 1);
+    sum_matmul_memories(&[
+        (
+            Shape2D::new(hidden_features, query_features_x2),
+            h1,
+            "mem(pfa_q)",
+        ),
+        (Shape2D::new(hidden_features, kv_features), h1, "mem(pfa_k)"),
+        (Shape2D::new(hidden_features, kv_features), h1, "mem(pfa_v)"),
+        (
+            Shape2D::new(query_features, hidden_features),
+            Shape2D::new(query_features, 1),
+            "mem(pfa_out)",
+        ),
+    ])
 }
 
 /// Estimate ggml context metadata bytes for a linear attention persistent
@@ -644,42 +650,30 @@ pub(super) fn recommended_persistent_linear_attention_memory(
     inner_size: usize,
     time_step_rank: usize,
 ) -> Result<Bytes, E2eError> {
-    let input_shape = Shape2D::new(hidden_features, 1);
-    let qkv_mem = Context::recommended_backend_matmul_memory::<f32>(
-        Shape2D::new(hidden_features, conv_channels),
-        input_shape,
-    )
-    .map_err(|source| E2eError::ggml("mem(pla_qkv)", source))?;
-    let z_mem = Context::recommended_backend_matmul_memory::<f32>(
-        Shape2D::new(hidden_features, inner_size),
-        input_shape,
-    )
-    .map_err(|source| E2eError::ggml("mem(pla_z)", source))?;
-    let alpha_mem = Context::recommended_backend_matmul_memory::<f32>(
-        Shape2D::new(hidden_features, time_step_rank),
-        input_shape,
-    )
-    .map_err(|source| E2eError::ggml("mem(pla_alpha)", source))?;
-    let beta_mem = Context::recommended_backend_matmul_memory::<f32>(
-        Shape2D::new(hidden_features, time_step_rank),
-        input_shape,
-    )
-    .map_err(|source| E2eError::ggml("mem(pla_beta)", source))?;
-    let out_mem = Context::recommended_backend_matmul_memory::<f32>(
-        Shape2D::new(inner_size, hidden_features),
-        Shape2D::new(inner_size, 1),
-    )
-    .map_err(|source| E2eError::ggml("mem(pla_out)", source))?;
-
-    let total = qkv_mem
-        .get()
-        .checked_add(z_mem.get())
-        .and_then(|v| v.checked_add(alpha_mem.get()))
-        .and_then(|v| v.checked_add(beta_mem.get()))
-        .and_then(|v| v.checked_add(out_mem.get()))
-        .and_then(|v| v.checked_add(PROJECTION_SLACK_BYTES * 2))
-        .ok_or(E2eError::MemorySizeOverflow)?;
-    Ok(Bytes::new(total))
+    let h1 = Shape2D::new(hidden_features, 1);
+    sum_matmul_memories(&[
+        (
+            Shape2D::new(hidden_features, conv_channels),
+            h1,
+            "mem(pla_qkv)",
+        ),
+        (Shape2D::new(hidden_features, inner_size), h1, "mem(pla_z)"),
+        (
+            Shape2D::new(hidden_features, time_step_rank),
+            h1,
+            "mem(pla_alpha)",
+        ),
+        (
+            Shape2D::new(hidden_features, time_step_rank),
+            h1,
+            "mem(pla_beta)",
+        ),
+        (
+            Shape2D::new(inner_size, hidden_features),
+            Shape2D::new(inner_size, 1),
+            "mem(pla_out)",
+        ),
+    ])
 }
 
 /// Built parts of a persistent full attention projection graph pair.
