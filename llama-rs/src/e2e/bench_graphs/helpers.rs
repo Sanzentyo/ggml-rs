@@ -71,32 +71,7 @@ pub(super) fn build_full_attention_plan(
     kv_head_count: usize,
     hd: usize,
 ) -> Qwen35FullAttentionLayerPlan {
-    let query_features = head_count * hd;
-    let kv_features = kv_head_count * hd;
-    Qwen35FullAttentionLayerPlan {
-        norm_values: vec![1.0_f32; hidden],
-        q_norm_values: vec![1.0_f32; hd],
-        k_norm_values: vec![1.0_f32; hd],
-        q_weight_values: (0..hidden * query_features * 2)
-            .map(|i| ((i % 7) as f32 - 3.0) * 0.05)
-            .collect(),
-        k_weight_values: (0..hidden * kv_features)
-            .map(|i| ((i % 5) as f32 - 2.0) * 0.08)
-            .collect(),
-        v_weight_values: (0..hidden * kv_features)
-            .map(|i| ((i % 11) as f32 - 5.0) * 0.03)
-            .collect(),
-        output_weight_values: (0..query_features * hidden)
-            .map(|i| ((i % 13) as f32 - 6.0) * 0.02)
-            .collect(),
-        head_count,
-        kv_head_count,
-        head_dimension: hd,
-        attention_scale: 1.0 / (hd as f32).sqrt(),
-        rope_n_dims: hd,
-        rope_freq_base: 10000.0,
-        rope_freq_scale: 1.0,
-    }
+    Qwen35FullAttentionLayerPlan::deterministic(hidden, head_count, kv_head_count, hd)
 }
 
 pub(super) fn build_linear_attention_plan(

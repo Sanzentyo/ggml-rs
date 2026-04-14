@@ -213,42 +213,14 @@ mod tests {
         let head_count = 2;
         let kv_head_count = 1;
         let hd = 4;
-        let query_features = head_count * hd; // 8
-        let kv_features = kv_head_count * hd; // 4
         let hidden = 6;
 
-        // Q weight: hidden → query_features*2 (Q+Gate interleaved)
-        let q_weight: Vec<f32> = (0..hidden * query_features * 2)
-            .map(|i| ((i % 7) as f32 - 3.0) * 0.05)
-            .collect();
-        let k_weight: Vec<f32> = (0..hidden * kv_features)
-            .map(|i| ((i % 5) as f32 - 2.0) * 0.08)
-            .collect();
-        let v_weight: Vec<f32> = (0..hidden * kv_features)
-            .map(|i| ((i % 11) as f32 - 5.0) * 0.03)
-            .collect();
-        let output_weight: Vec<f32> = (0..query_features * hidden)
-            .map(|i| ((i % 13) as f32 - 6.0) * 0.02)
-            .collect();
-        let q_norm = vec![1.0_f32; hd];
-        let k_norm = vec![1.0_f32; hd];
-
-        let plan = super::super::plan::Qwen35FullAttentionLayerPlan {
-            norm_values: vec![1.0; hidden],
-            q_norm_values: q_norm,
-            k_norm_values: k_norm,
-            q_weight_values: q_weight,
-            k_weight_values: k_weight,
-            v_weight_values: v_weight,
-            output_weight_values: output_weight,
+        let plan = super::super::plan::Qwen35FullAttentionLayerPlan::deterministic(
+            hidden,
             head_count,
             kv_head_count,
-            head_dimension: hd,
-            attention_scale: 1.0 / (hd as f32).sqrt(),
-            rope_n_dims: hd,
-            rope_freq_base: 10000.0,
-            rope_freq_scale: 1.0,
-        };
+            hd,
+        );
 
         // 3-token prompt + 1 decode token.
         let prompt: Vec<f32> = (0..3 * hidden).map(|i| (i as f32 + 1.0) * 0.1).collect();
@@ -304,42 +276,14 @@ mod tests {
         let head_count = 4;
         let kv_head_count = 2; // GQA: 2 groups
         let hd = 4;
-        let query_features = head_count * hd; // 16
-        let kv_features = kv_head_count * hd; // 8
         let hidden = 6;
 
-        // Deterministic weights.
-        let q_weight: Vec<f32> = (0..hidden * query_features * 2)
-            .map(|i| ((i % 7) as f32 - 3.0) * 0.05)
-            .collect();
-        let k_weight: Vec<f32> = (0..hidden * kv_features)
-            .map(|i| ((i % 5) as f32 - 2.0) * 0.08)
-            .collect();
-        let v_weight: Vec<f32> = (0..hidden * kv_features)
-            .map(|i| ((i % 11) as f32 - 5.0) * 0.03)
-            .collect();
-        let output_weight: Vec<f32> = (0..query_features * hidden)
-            .map(|i| ((i % 13) as f32 - 6.0) * 0.02)
-            .collect();
-        let q_norm = vec![1.0_f32; hd];
-        let k_norm = vec![1.0_f32; hd];
-
-        let plan = super::super::plan::Qwen35FullAttentionLayerPlan {
-            norm_values: vec![1.0; hidden],
-            q_norm_values: q_norm,
-            k_norm_values: k_norm,
-            q_weight_values: q_weight,
-            k_weight_values: k_weight,
-            v_weight_values: v_weight,
-            output_weight_values: output_weight,
+        let plan = super::super::plan::Qwen35FullAttentionLayerPlan::deterministic(
+            hidden,
             head_count,
             kv_head_count,
-            head_dimension: hd,
-            attention_scale: 1.0 / (hd as f32).sqrt(),
-            rope_n_dims: hd,
-            rope_freq_base: 10000.0,
-            rope_freq_scale: 1.0,
-        };
+            hd,
+        );
 
         // 5-token prompt + 1 decode token — ensures Tkv > 1 for cache.
         let prompt: Vec<f32> = (0..5 * hidden).map(|i| (i as f32 + 1.0) * 0.1).collect();
