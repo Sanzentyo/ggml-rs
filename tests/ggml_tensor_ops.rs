@@ -192,7 +192,7 @@ fn view_2d_strided_with_offset() -> Result<(), Error> {
         assert_eq!(viewed.get_data(TensorIndex::new(1))?, 1.0);
 
         // View with offset: start at element 1
-        let viewed_off = ctx.view_2d(&base, 2, 2, 4 * elem_size, 1 * elem_size)?;
+        let viewed_off = ctx.view_2d(&base, 2, 2, 4 * elem_size, elem_size)?;
         assert_eq!(viewed_off.get_data(TensorIndex::new(0))?, 1.0);
         Ok(())
     })

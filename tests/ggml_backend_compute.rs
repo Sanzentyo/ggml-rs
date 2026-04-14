@@ -345,6 +345,7 @@ fn sigmoid_metal_cpu_parity() -> Result<(), Error> {
 
 /// Reference causal attention (no flash) via manual scoring.
 /// Data layout: `[D, T, H]` — column-major per head as ggml stores it.
+#[allow(clippy::too_many_arguments)] // mathematical params map to Q/K/V dimensions
 fn reference_causal_attention(
     q: &[f32],
     k: &[f32],
@@ -441,6 +442,7 @@ fn f32_to_f16_bytes(values: &[f32]) -> Vec<u8> {
 
 /// Run flash_attn_ext on backend with causal mask, returning `[D, T, H]`
 /// after permute+cont.
+#[allow(clippy::too_many_arguments)] // mathematical params map to Q/K/V dimensions + backend
 fn flash_attn_ext_on_backend(
     q_data: &[f32],
     k_data: &[f32],

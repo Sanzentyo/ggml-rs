@@ -3,10 +3,12 @@
 ## Branch Summary
 
 71 commits implementing a complete Qwen3.5 E2E inference pipeline with
-verified token-ID parity against llama.cpp, plus comprehensive ggml-rs
-API improvements (typed tensors, safe view/reshape wrappers, graph-level
-projections, resumable generation sessions, chat infrastructure) and a
-thorough structural DRY refactoring pass (items 34-60).
+verified token-ID parity against llama.cpp (4 prompt lengths tested;
+known precision edge: prompt `[5]` diverges at token 5 due to adjacent
+logits), plus comprehensive ggml-rs API improvements (typed tensors,
+safe view/reshape wrappers, graph-level projections, resumable generation
+sessions, chat infrastructure) and a thorough structural DRY refactoring
+pass (items 34-60).
 
 PR #2 created and reviewed by Copilot — all 6 review comments addressed.
 
@@ -89,7 +91,7 @@ PR #2 created and reviewed by Copilot — all 6 review comments addressed.
 ## Test Coverage
 
 - **222 tests** pass with `--features link-system` (7 ignored: benchmark + upstream suite)
-- **0 new clippy warnings** (pre-existing: 1 `too_many_arguments` in ggml-rs `flash_attn_ext`, 2 in test files)
+- **0 clippy warnings** across entire workspace (pre-existing warnings resolved: `#[allow]` on C-API-mirroring functions, `identity_op` fix)
 - **0 fmt issues**
 - Key test categories:
   - 18 type system tests

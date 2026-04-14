@@ -1285,6 +1285,7 @@ impl Context {
     /// - `scale`: attention scale (typically `1/√D`)
     /// - `max_bias`: ALiBi positional bias maximum; `0.0` for no bias
     /// - `logit_softcap`: soft-cap on logits before softmax; `0.0` for no cap
+    #[allow(clippy::too_many_arguments)] // mirrors ggml_flash_attn_ext C API
     pub fn flash_attn_ext<'ctx>(
         &'ctx self,
         q: &Tensor<'ctx, f32>,

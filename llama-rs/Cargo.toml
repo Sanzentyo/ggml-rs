@@ -38,8 +38,8 @@ required-features = ["link-system"]
 # --- Benchmarks ---
 
 [[example]]
-name = "bench_matmul"
-path = "examples/benchmarks/bench_matmul.rs"
+name = "bench_llama_matmul"
+path = "examples/benchmarks/bench_llama_matmul.rs"
 required-features = ["link-system"]
 
 [[example]]
