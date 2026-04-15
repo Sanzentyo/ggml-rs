@@ -358,3 +358,270 @@ pub(in crate::e2e) fn causal_depthwise_conv_decode_step(
     state.push_conv_row(new_row)?;
     Ok(output)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::e2e::numeric::silu_scalar;
+
+    // -----------------------------------------------------------------------
+    // Item 127: causal_depthwise_conv unit tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn causal_conv_first_token_sees_only_zero_history() {
+        // kernel_size=3, channels=2, seq_len=1
+        // First token has no history → only the last kernel tap (tap=2) touches
+        // the actual input; earlier taps read zero padding.
+        let channels = 2;
+        let kernel_size = 3;
+        let weight: Vec<f32> = (0..channels * kernel_size)
+            .map(|i| (i as f32 + 1.0) * 0.1)
+            .collect();
+        let input = vec![1.0, 2.0]; // single token
+
+        let output = causal_depthwise_conv(&input, 1, channels, kernel_size, &weight).unwrap();
+
+        // ch0: 0*w[0] + 0*w[1] + 1.0*w[2]  → silu(1.0 * 0.3)
+        // ch1: 0*w[3] + 0*w[4] + 2.0*w[5]  → silu(2.0 * 0.6)
+        let expected_ch0 = silu_scalar(1.0 * weight[2]);
+        let expected_ch1 = silu_scalar(2.0 * weight[5]);
+        assert!(
+            (output[0] - expected_ch0).abs() < 1e-7,
+            "ch0: got {} expected {}",
+            output[0],
+            expected_ch0
+        );
+        assert!(
+            (output[1] - expected_ch1).abs() < 1e-7,
+            "ch1: got {} expected {}",
+            output[1],
+            expected_ch1
+        );
+    }
+
+    #[test]
+    fn causal_conv_no_future_leakage() {
+        // A 5-token sequence: token i = i+1. If future leaks, earlier tokens
+        // would see larger values than expected from causal-only history.
+        let channels = 1;
+        let kernel_size = 2;
+        let weight = vec![0.5, 0.5]; // uniform kernel
+
+        let input: Vec<f32> = (1..=5).map(|i| i as f32).collect();
+        let output = causal_depthwise_conv(&input, 5, channels, kernel_size, &weight).unwrap();
+
+        // token 0: 0*0.5 + 1.0*0.5 = 0.5
+        // token 1: 1.0*0.5 + 2.0*0.5 = 1.5
+        // token 2: 2.0*0.5 + 3.0*0.5 = 2.5
+        // token 3: 3.0*0.5 + 4.0*0.5 = 3.5
+        // token 4: 4.0*0.5 + 5.0*0.5 = 4.5
+        let expected_sums = [0.5, 1.5, 2.5, 3.5, 4.5];
+        for (i, &expected_sum) in expected_sums.iter().enumerate() {
+            let expected = silu_scalar(expected_sum);
+            assert!(
+                (output[i] - expected).abs() < 1e-6,
+                "token {i}: got {} expected silu({expected_sum})={}",
+                output[i],
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn causal_conv_hand_computed_3ch_k2() {
+        let channels = 3;
+        let kernel_size = 2;
+        // weight layout: [ch0_tap0, ch0_tap1, ch1_tap0, ch1_tap1, ch2_tap0, ch2_tap1]
+        let weight = vec![0.1, 0.2, 0.3, 0.4, 0.5, 0.6];
+        // 3 tokens × 3 channels
+        let input = vec![
+            1.0, 2.0, 3.0, // token 0
+            4.0, 5.0, 6.0, // token 1
+            7.0, 8.0, 9.0, // token 2
+        ];
+        let output = causal_depthwise_conv(&input, 3, channels, kernel_size, &weight).unwrap();
+
+        // token 0: pad=0 for tap0, input[0] for tap1
+        //   ch0: 0*0.1 + 1.0*0.2 = 0.2
+        //   ch1: 0*0.3 + 2.0*0.4 = 0.8
+        //   ch2: 0*0.5 + 3.0*0.6 = 1.8
+        // token 1: input[0] for tap0, input[1] for tap1
+        //   ch0: 1.0*0.1 + 4.0*0.2 = 0.9
+        //   ch1: 2.0*0.3 + 5.0*0.4 = 2.6
+        //   ch2: 3.0*0.5 + 6.0*0.6 = 5.1
+        // token 2: input[1] for tap0, input[2] for tap1
+        //   ch0: 4.0*0.1 + 7.0*0.2 = 1.8
+        //   ch1: 5.0*0.3 + 8.0*0.4 = 4.7
+        //   ch2: 6.0*0.5 + 9.0*0.6 = 8.4
+        let expected_sums = [0.2, 0.8, 1.8, 0.9, 2.6, 5.1, 1.8, 4.7, 8.4];
+        for (i, &expected_sum) in expected_sums.iter().enumerate() {
+            let expected = silu_scalar(expected_sum);
+            assert!(
+                (output[i] - expected).abs() < 1e-6,
+                "idx {i}: got {} expected silu({expected_sum})={}",
+                output[i],
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn causal_conv_kernel_size_1_is_pointwise_silu() {
+        // kernel_size=1: no history, just pointwise weight × input → silu
+        let channels = 4;
+        let kernel_size = 1;
+        let weight = vec![0.5, 1.0, 1.5, 2.0];
+        let input = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]; // 2 tokens
+
+        let output = causal_depthwise_conv(&input, 2, channels, kernel_size, &weight).unwrap();
+
+        let expected: Vec<f32> = input
+            .iter()
+            .zip(weight.iter().cycle())
+            .map(|(x, w)| silu_scalar(x * w))
+            .collect();
+
+        for (i, (got, exp)) in output.iter().zip(expected.iter()).enumerate() {
+            assert!(
+                (got - exp).abs() < 1e-7,
+                "idx {i}: got {got} expected {exp}"
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Item 126: fused projection + conv graph tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn fused_graph_with_padding_matches_reference() {
+        // kernel_size=3 → pad=2, exercises the concat(zeros, qkv) path
+        crate::backend::ensure_backends_loaded();
+        let backend =
+            ggml_rs::Backend::new(ggml_rs::BackendKind::Cpu).expect("CPU backend available");
+
+        let (plan, dims) = make_linear_plan(3, 4, 2, 2, 2);
+        let hidden = dims.hidden;
+        let seq_len = 5;
+        let input: Vec<f32> = (0..hidden * seq_len)
+            .map(|i| ((i % 7) as f32 - 3.0) * 0.05)
+            .collect();
+
+        let fused = project_and_conv_fused_graph(
+            &plan, &dims, &input, seq_len, 1e-5, 0, // no tail readback
+            &backend,
+        )
+        .expect("fused graph should succeed");
+
+        // Output shape: conv channels × seq_len
+        assert_eq!(
+            fused.conv.len(),
+            dims.conv_channels * seq_len,
+            "conv output length"
+        );
+        assert_eq!(fused.z.len(), dims.inner_size * seq_len, "z output length");
+        assert_eq!(
+            fused.alpha.len(),
+            dims.time_step_rank * seq_len,
+            "alpha output length"
+        );
+        assert_eq!(
+            fused.beta.len(),
+            dims.time_step_rank * seq_len,
+            "beta output length"
+        );
+        assert!(fused.qkv_pre_conv_tail.is_none());
+    }
+
+    #[test]
+    fn fused_graph_no_padding_kernel_1() {
+        // kernel_size=1 → pad=0, exercises the no-pad reshape path
+        crate::backend::ensure_backends_loaded();
+        let backend =
+            ggml_rs::Backend::new(ggml_rs::BackendKind::Cpu).expect("CPU backend available");
+
+        let (plan, dims) = make_linear_plan(1, 4, 2, 2, 2);
+        let hidden = dims.hidden;
+        let seq_len = 3;
+        let input: Vec<f32> = (0..hidden * seq_len)
+            .map(|i| ((i % 5) as f32 - 2.0) * 0.1)
+            .collect();
+
+        let fused = project_and_conv_fused_graph(&plan, &dims, &input, seq_len, 1e-5, 0, &backend)
+            .expect("fused graph (no pad) should succeed");
+
+        assert_eq!(fused.conv.len(), dims.conv_channels * seq_len);
+        assert_eq!(fused.z.len(), dims.inner_size * seq_len);
+    }
+
+    #[test]
+    fn fused_graph_tail_readback() {
+        // Verify that conv_tail_rows readback returns the correct number of
+        // pre-conv QKV elements.
+        crate::backend::ensure_backends_loaded();
+        let backend =
+            ggml_rs::Backend::new(ggml_rs::BackendKind::Cpu).expect("CPU backend available");
+
+        let (plan, dims) = make_linear_plan(3, 4, 2, 2, 2);
+        let hidden = dims.hidden;
+        let seq_len = 5;
+        let conv_tail_rows = 2; // request last 2 rows
+        let input: Vec<f32> = (0..hidden * seq_len)
+            .map(|i| ((i % 11) as f32 - 5.0) * 0.03)
+            .collect();
+
+        let fused = project_and_conv_fused_graph(
+            &plan,
+            &dims,
+            &input,
+            seq_len,
+            1e-5,
+            conv_tail_rows,
+            &backend,
+        )
+        .expect("fused graph with tail should succeed");
+
+        let tail = fused.qkv_pre_conv_tail.expect("tail should be Some");
+        assert_eq!(
+            tail.len(),
+            conv_tail_rows * dims.conv_channels,
+            "tail length = tail_rows × conv_channels"
+        );
+    }
+
+    // --- Test helper ---
+
+    fn make_linear_plan(
+        conv_kernel: usize,
+        time_step_rank: usize,
+        state_size: usize,
+        group_count: usize,
+        num_groups_for_conv: usize,
+    ) -> (Qwen35LinearAttentionLayerPlan, LinearAttentionDims) {
+        let inner_size = time_step_rank * state_size;
+        let conv_channels = inner_size + num_groups_for_conv * group_count * state_size;
+        let hidden = inner_size;
+
+        let plan = Qwen35LinearAttentionLayerPlan {
+            norm_values: vec![1.0_f32; hidden],
+            qkv_weight_values: vec![0.01_f32; hidden * conv_channels],
+            gate_weight_values: vec![0.01_f32; hidden * inner_size],
+            alpha_weight_values: vec![0.01_f32; hidden * time_step_rank],
+            beta_weight_values: vec![0.01_f32; hidden * time_step_rank],
+            conv_weight_values: vec![1.0_f32; conv_channels * conv_kernel],
+            dt_bias_values: vec![0.0_f32; time_step_rank],
+            ssm_a_values: vec![-1.0_f32; time_step_rank],
+            ssm_norm_values: vec![1.0_f32; state_size],
+            ssm_out_weight_values: vec![0.01_f32; inner_size * hidden],
+            state_size,
+            group_count,
+            time_step_rank,
+            inner_size,
+            conv_kernel,
+        };
+
+        let dims = LinearAttentionDims::new(&plan).expect("dims should be valid");
+        (plan, dims)
+    }
+}
